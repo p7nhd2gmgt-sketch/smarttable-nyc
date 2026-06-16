@@ -1,0 +1,9 @@
+{
+  "name": "Smarttable.com",
+  "short_name": "Smarttable",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#fbfaf6",
+  "theme_color": "#0f735d",
+  "description": "Discounted New York restaurant reservation requests."
+}
