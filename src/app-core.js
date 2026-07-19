@@ -43,6 +43,15 @@ function normalizeRuntimeEnvironment(value = "") {
   return "development";
 }
 
+function detectRuntimeEnvironment(env = process.env) {
+  const vercelEnvironment = normalizeRuntimeEnvironment(env.VERCEL_ENV || "");
+  const nodeEnvironment = normalizeRuntimeEnvironment(env.NODE_ENV || "");
+  if (vercelEnvironment === "production") return "production";
+  if (vercelEnvironment === "preview" || vercelEnvironment === "staging") return vercelEnvironment;
+  if (nodeEnvironment === "production" && env.VERCEL) return "production";
+  return normalizeRuntimeEnvironment(env.SMARTTABLE_ENV || env.APP_ENV || env.VERCEL_ENV || env.NODE_ENV || "development");
+}
+
 function normalizeBaseUrl(value = "") {
   return envClean(value).replace(/\/+$/, "");
 }
@@ -81,7 +90,7 @@ function parseEmailAllowlist(value = "") {
     .filter(Boolean);
 }
 
-const RUNTIME_ENVIRONMENT = normalizeRuntimeEnvironment(process.env.SMARTTABLE_ENV || process.env.APP_ENV || process.env.VERCEL_ENV || process.env.NODE_ENV || "development");
+const RUNTIME_ENVIRONMENT = detectRuntimeEnvironment(process.env);
 const IS_PRODUCTION_RUNTIME = RUNTIME_ENVIRONMENT === "production";
 const SUPABASE_URL = normalizeBaseUrl(process.env.SUPABASE_URL || "");
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || "";
@@ -3873,6 +3882,7 @@ async function supabaseFetch(path, options = {}) {
     const message = payload?.message || payload?.error_description || payload?.error || raw || "Supabase request failed.";
     const error = new Error(message);
     error.status = response.status;
+    error.code = payload?.error_code || payload?.code || payload?.error || "SUPABASE_REQUEST_FAILED";
     error.detail = payload;
     throw error;
   }
@@ -3894,6 +3904,47 @@ async function getSupabaseProfile(token) {
     }),
     email_verified: Boolean(user.email_confirmed_at)
   });
+}
+
+function accountSetupIncompleteError(reason = "PROFILE_MISSING") {
+  const error = new Error("Account setup is incomplete. Please contact SmartTable support.");
+  error.status = 409;
+  error.code = "ACCOUNT_SETUP_INCOMPLETE";
+  error.setupReason = reason;
+  return error;
+}
+
+function authServiceUnavailableError() {
+  const error = new Error("Sign in is temporarily unavailable. Please try again.");
+  error.status = 503;
+  error.code = "AUTH_SERVICE_UNAVAILABLE";
+  return error;
+}
+
+async function getSupabaseLoginProfile(token) {
+  const user = await supabaseFetch("/auth/v1/user", { service: false, token });
+  const encodedId = encodeURIComponent(user.id);
+  const rows = await supabaseFetch(`/rest/v1/profiles?select=*&id=eq.${encodedId}&limit=1`, { service: true });
+  const row = rows?.[0];
+  const setupIncomplete = (reason) => {
+    const error = accountSetupIncompleteError(reason);
+    error.authUser = user;
+    throw error;
+  };
+  if (!row?.id) setupIncomplete("PROFILE_MISSING");
+  const profile = clientProfile({
+    ...row,
+    email_verified: Boolean(user.email_confirmed_at)
+  });
+  if (normalizeRole(profile.role) === "guest") {
+    const guests = await supabaseFetch(`/rest/v1/guests?select=id,status&user_id=eq.${encodedId}&limit=1`, { service: true });
+    const guest = guests?.[0];
+    if (!guest?.id) setupIncomplete("GUEST_RECORD_MISSING");
+    if (clean(guest.status).toLowerCase() === "deleted") setupIncomplete("GUEST_ACCOUNT_DELETED");
+    const guestProfiles = await supabaseFetch(`/rest/v1/guest_profiles?select=id&guest_id=eq.${encodeURIComponent(guest.id)}&limit=1`, { service: true });
+    if (!guestProfiles?.[0]?.id) setupIncomplete("GUEST_PREFERENCES_MISSING");
+  }
+  return profile;
 }
 
 async function requireProfile(headers, roles = []) {
@@ -6967,22 +7018,88 @@ function genericLoginError(status = 401) {
   return error;
 }
 
+function supabaseAuthErrorText(error = {}) {
+  return [
+    error.message,
+    error.code,
+    error.detail?.message,
+    error.detail?.error_description,
+    error.detail?.error,
+    error.detail?.error_code,
+    error.detail?.code
+  ].filter(Boolean).join(" ").toLowerCase();
+}
+
+function isSupabaseEmailNotConfirmedError(error = {}) {
+  const text = supabaseAuthErrorText(error);
+  return /email.*not.*confirm|not.*confirmed|email_not_confirmed|email_not_confirmed/i.test(text);
+}
+
+function emailNotConfirmedError() {
+  const error = new Error("Email verification is required before you can sign in.");
+  error.status = 403;
+  error.code = "EMAIL_NOT_CONFIRMED";
+  return error;
+}
+
+function mapSupabaseSignupError(error = {}) {
+  const text = supabaseAuthErrorText(error);
+  if (/already.*registered|already.*exists|user.*exists|email.*exists|email_exists|user_already_exists/.test(text)) {
+    return { status: 409, code: "ACCOUNT_ALREADY_EXISTS", error: "Account already exists." };
+  }
+  if (/weak.*password|password.*weak|password.*short|weak_password|password.*should|password.*at least/.test(text)) {
+    return { status: 400, code: "WEAK_PASSWORD", error: "Password does not meet the required strength." };
+  }
+  if (/invalid.*email|email.*invalid|bad email|invalid_email/.test(text)) {
+    return { status: 400, code: "INVALID_EMAIL", error: "Enter a valid email address." };
+  }
+  const status = error.status && error.status < 500 ? error.status : 502;
+  return {
+    status,
+    code: "AUTH_SIGNUP_FAILED",
+    error: "Account creation could not be completed. Please try again."
+  };
+}
+
 async function login(body) {
   const email = lower(body.email);
   const password = String(body.password || "");
   if (!email || !password) return json(400, { error: "Email and password are required." });
   if (!isValidSignupEmail(email)) return json(400, { error: "Enter a valid email address." });
+  logSafeServerEvent("guest_login_started", {
+    mode: supabaseConfigured ? "supabase" : "demo",
+    email_hash: hashEmailValue(email).slice(0, 16)
+  });
 
   if (!supabaseConfigured) {
     ensureDemo();
     const attempt = recordAuthAttempt(email, false);
-    if (attempt.locked) throw genericLoginError(429);
+    if (attempt.locked) {
+      logSafeServerEvent("guest_login_failed", {
+        mode: "demo",
+        category: "rate_limited",
+        email_hash: hashEmailValue(email).slice(0, 16)
+      });
+      throw genericLoginError(429);
+    }
     const user = demo.users.find((item) => item.email === email && item.password === password);
-    if (!user) throw genericLoginError(401);
+    if (!user) {
+      logSafeServerEvent("guest_login_failed", {
+        mode: "demo",
+        category: "invalid_credentials",
+        email_hash: hashEmailValue(email).slice(0, 16)
+      });
+      throw genericLoginError(401);
+    }
     recordAuthAttempt(email, true);
     const profile = clientProfile({
       ...demo.profiles.find((item) => item.id === user.id),
       email_verified: true
+    });
+    logSafeServerEvent("guest_login_success", {
+      mode: "demo",
+      user_hash: hashEmailValue(profile.id).slice(0, 16),
+      role: normalizeRole(profile.role)
     });
     return json(200, {
       mode: "demo",
@@ -6998,10 +7115,69 @@ async function login(body) {
       service: false,
       body: { email, password }
     });
-  } catch {
+  } catch (error) {
+    const emailNotConfirmed = isSupabaseEmailNotConfirmedError(error);
+    logSafeServerEvent("guest_login_rejected_by_auth_provider", {
+      status: error.status || 401,
+      code: emailNotConfirmed ? "EMAIL_NOT_CONFIRMED" : "AUTH_LOGIN_REJECTED",
+      email_hash: hashEmailValue(email).slice(0, 16)
+    });
+    logSafeServerEvent("guest_login_failed", {
+      mode: "supabase",
+      category: emailNotConfirmed ? "email_not_confirmed" : "invalid_credentials",
+      status: error.status || 401,
+      code: emailNotConfirmed ? "EMAIL_NOT_CONFIRMED" : "AUTH_LOGIN_REJECTED",
+      email_hash: hashEmailValue(email).slice(0, 16)
+    });
+    if (emailNotConfirmed) throw emailNotConfirmedError();
     throw genericLoginError(401);
   }
-  const profile = await getSupabaseProfile(session.access_token);
+  let profile;
+  try {
+    profile = await getSupabaseLoginProfile(session.access_token);
+  } catch (error) {
+    const setupIncomplete = error.code === "ACCOUNT_SETUP_INCOMPLETE";
+    logSafeServerEvent("guest_login_failed", {
+      mode: "supabase",
+      category: setupIncomplete ? "account_setup_incomplete" : "service_unavailable",
+      status: error.status || 503,
+      code: setupIncomplete ? "ACCOUNT_SETUP_INCOMPLETE" : "AUTH_SERVICE_UNAVAILABLE",
+      email_hash: hashEmailValue(email).slice(0, 16)
+    });
+    if (setupIncomplete) {
+      const authUser = error.authUser || await supabaseFetch("/auth/v1/user", {
+        service: false,
+        token: session.access_token
+      }).catch(() => null);
+      if (!authUser?.id) throw error;
+      return json(409, {
+        error: "Account setup is incomplete. Finish onboarding to activate your SmartTable profile.",
+        code: "ACCOUNT_SETUP_INCOMPLETE",
+        onboarding_required: true,
+        redirect: "/signup",
+        setup_reason: error.setupReason || "PROFILE_MISSING",
+        mode: "supabase",
+        access_token: session.access_token,
+        refresh_token: session.refresh_token,
+        expires_in: session.expires_in,
+        profile: clientProfile({
+          id: authUser.id,
+          email: authUser.email || email,
+          full_name: authUser.user_metadata?.full_name || authUser.email || email,
+          role: "guest",
+          restaurant_id: null,
+          preferred_language: normalizeLanguage(authUser.user_metadata?.preferred_language || "en"),
+          email_verified: Boolean(authUser.email_confirmed_at)
+        })
+      });
+    }
+    throw authServiceUnavailableError();
+  }
+  logSafeServerEvent("guest_login_success", {
+    mode: "supabase",
+    user_hash: hashEmailValue(profile.id).slice(0, 16),
+    role: normalizeRole(profile.role)
+  });
   return json(200, {
     mode: "supabase",
     access_token: session.access_token,
@@ -7406,10 +7582,15 @@ async function rollbackSupabaseGuestSignup({ userId, guestId, email, profileKey 
   await Promise.allSettled(tasks);
 }
 
-async function signupGuest(body) {
+async function signupGuest(body, headers = {}) {
   const payload = normalizeGuestSignup(body);
   const validationError = validateGuestSignupPayload(payload);
   if (validationError) return json(400, { error: validationError });
+  logSafeServerEvent("guest_signup_request_started", {
+    mode: supabaseConfigured ? "supabase" : "demo",
+    email_hash: hashEmailValue(payload.email).slice(0, 16),
+    locale: payload.preferredLanguage
+  });
 
   if (!supabaseConfigured) {
     ensureDemo();
@@ -7473,11 +7654,25 @@ async function signupGuest(body) {
       created_at: nowIso(),
       updated_at: nowIso()
     });
+    logSafeServerEvent("guest_signup_profile_creation_success", {
+      mode: "demo",
+      user_hash: hashEmailValue(id).slice(0, 16),
+      locale: payload.preferredLanguage
+    });
     const registrationEmail = await sendGuestRegistrationEmail({
       email: payload.email,
       guestName: payload.fullName,
       lang: payload.preferredLanguage,
       userId: id
+    });
+    const delivery = emailDeliverySummary([registrationEmail]);
+    logSafeServerEvent("guest_signup_welcome_email_result", {
+      mode: "demo",
+      user_hash: hashEmailValue(id).slice(0, 16),
+      accepted_count: delivery.accepted_count,
+      failed_count: delivery.failed_count,
+      status: registrationEmail?.status || "failed",
+      error_code: registrationEmail?.errorCode || null
     });
     return json(201, {
       mode: "demo",
@@ -7485,32 +7680,101 @@ async function signupGuest(body) {
       profile,
       preferences: payload.preferences,
       emails: [registrationEmail],
-      email_delivery: emailDeliverySummary([registrationEmail])
+      email_delivery: delivery,
+      email_verification_required: false
     });
+  }
+
+  const existingAuthToken = authToken(headers);
+  let resumeAuthUser = null;
+  if (existingAuthToken) {
+    try {
+      resumeAuthUser = await supabaseFetch("/auth/v1/user", { service: false, token: existingAuthToken });
+    } catch (error) {
+      logSafeServerEvent("guest_signup_resume_auth_failed", {
+        status: error.status || 401,
+        code: error.code || "AUTHENTICATION_REQUIRED",
+        email_hash: hashEmailValue(payload.email).slice(0, 16)
+      });
+      return json(401, {
+        error: "Please sign in again before completing onboarding.",
+        code: "AUTHENTICATION_REQUIRED"
+      });
+    }
+    if (lower(resumeAuthUser.email) !== payload.email) {
+      logSafeServerEvent("guest_signup_resume_email_mismatch", {
+        user_hash: hashEmailValue(resumeAuthUser.id || "").slice(0, 16),
+        email_hash: hashEmailValue(payload.email).slice(0, 16)
+      });
+      return json(403, {
+        error: "Authenticated account does not match the signup email.",
+        code: "AUTH_EMAIL_MISMATCH"
+      });
+    }
   }
 
   const existingProfiles = await supabaseFetch(`/rest/v1/profiles?select=id&email=eq.${encodeURIComponent(payload.email)}&limit=1`, { service: true }).catch(() => []);
   const existingGuests = await supabaseFetch(`/rest/v1/guests?select=id&email=eq.${encodeURIComponent(payload.email)}&limit=1`, { service: true }).catch(() => []);
-  if (existingProfiles?.length || existingGuests?.length) return json(409, { error: "Account already exists." });
+  if ((existingProfiles?.length || existingGuests?.length) && !resumeAuthUser) return json(409, { error: "Account already exists." });
 
-  const signup = await supabaseFetch("/auth/v1/signup", {
-    method: "POST",
-    service: false,
-    body: {
-      email: payload.email,
-      password: payload.password,
-      data: {
-        full_name: payload.fullName,
-        first_name: payload.firstName,
-        last_name: payload.lastName,
-        phone: payload.phone,
-        preferred_language: payload.preferredLanguage
-      }
+  let signup;
+  let createdNewAuthUser = false;
+  if (resumeAuthUser) {
+    signup = {
+      user: resumeAuthUser,
+      session: { access_token: existingAuthToken }
+    };
+    logSafeServerEvent("guest_signup_resume_auth_success", {
+      mode: "supabase",
+      user_hash: hashEmailValue(resumeAuthUser.id).slice(0, 16),
+      email_hash: hashEmailValue(payload.email).slice(0, 16)
+    });
+  } else {
+    try {
+      signup = await supabaseFetch("/auth/v1/signup", {
+        method: "POST",
+        service: false,
+        body: {
+          email: payload.email,
+          password: payload.password,
+          data: {
+            full_name: payload.fullName,
+            first_name: payload.firstName,
+            last_name: payload.lastName,
+            phone: payload.phone,
+            preferred_language: payload.preferredLanguage
+          }
+        }
+      });
+      createdNewAuthUser = true;
+    } catch (error) {
+      const mapped = mapSupabaseSignupError(error);
+      logSafeServerEvent("guest_signup_rejected_by_auth_provider", {
+        status: error.status || mapped.status,
+        code: mapped.code,
+        email_hash: hashEmailValue(payload.email).slice(0, 16)
+      });
+      return json(mapped.status, { error: mapped.error, code: mapped.code });
     }
-  });
+  }
   const user = signup.user || signup;
   const userId = user?.id;
-  if (!userId) return json(500, { error: "Account provider did not return a user ID. Account creation was not completed." });
+  if (!userId) {
+    logSafeServerEvent("guest_signup_missing_auth_user_id", {
+      code: "AUTH_SIGNUP_MISSING_USER_ID",
+      email_hash: hashEmailValue(payload.email).slice(0, 16)
+    });
+    return json(502, {
+      error: "Account creation could not be completed. Please try again.",
+      code: "AUTH_SIGNUP_MISSING_USER_ID"
+    });
+  }
+  logSafeServerEvent("guest_signup_auth_success", {
+    mode: "supabase",
+    user_hash: hashEmailValue(userId).slice(0, 16),
+    email_hash: hashEmailValue(payload.email).slice(0, 16),
+    email_verification_required: !signup.session?.access_token
+  });
   let createdGuestId = null;
   if (userId) {
     try {
@@ -7579,9 +7843,28 @@ async function signupGuest(body) {
           calendar_opt_in: false
         }
       });
+      logSafeServerEvent("guest_signup_profile_creation_success", {
+        mode: "supabase",
+        user_hash: hashEmailValue(userId).slice(0, 16),
+        guest_hash: hashEmailValue(createdGuestId).slice(0, 16),
+        locale: payload.preferredLanguage
+      });
     } catch (error) {
-      await rollbackSupabaseGuestSignup({ userId, guestId: createdGuestId, email: payload.email, profileKey: payload.profileKey });
-      return json(500, { error: `Account creation rolled back: ${error.message}` });
+      if (createdNewAuthUser) {
+        await rollbackSupabaseGuestSignup({ userId, guestId: createdGuestId, email: payload.email, profileKey: payload.profileKey });
+      }
+      logSafeServerEvent("guest_signup_profile_creation_failed", {
+        status: error.status || 500,
+        code: "SIGNUP_PROFILE_CREATION_FAILED",
+        email_hash: hashEmailValue(payload.email).slice(0, 16),
+        user_hash: hashEmailValue(userId).slice(0, 16),
+        rolled_back: createdNewAuthUser
+      });
+      return json(500, {
+        error: "Account setup could not be completed. Please try again or contact support.",
+        code: "SIGNUP_PROFILE_CREATION_FAILED",
+        rolled_back: createdNewAuthUser
+      });
     }
   }
   const session = signup.session || null;
@@ -7590,6 +7873,15 @@ async function signupGuest(body) {
     guestName: payload.fullName,
     lang: payload.preferredLanguage,
     userId
+  });
+  const registrationDelivery = emailDeliverySummary([registrationEmail]);
+  logSafeServerEvent("guest_signup_welcome_email_result", {
+    mode: "supabase",
+    user_hash: hashEmailValue(userId).slice(0, 16),
+    accepted_count: registrationDelivery.accepted_count,
+    failed_count: registrationDelivery.failed_count,
+    status: registrationEmail?.status || "failed",
+    error_code: registrationEmail?.errorCode || null
   });
   if (session?.access_token) {
     const profile = await getSupabaseProfile(session.access_token).catch(() => ({
@@ -7607,7 +7899,8 @@ async function signupGuest(body) {
       profile,
       preferences: payload.preferences,
       emails: [registrationEmail],
-      email_delivery: emailDeliverySummary([registrationEmail])
+      email_delivery: registrationDelivery,
+      email_verification_required: false
     });
   }
   return json(201, {
@@ -7615,7 +7908,8 @@ async function signupGuest(body) {
     preferences: payload.preferences,
     message: "Guest account created. Confirm email if Supabase email confirmation is enabled.",
     emails: [registrationEmail],
-    email_delivery: emailDeliverySummary([registrationEmail])
+    email_delivery: registrationDelivery,
+    email_verification_required: true
   });
 }
 
@@ -7733,7 +8027,10 @@ async function setPlatformSettings(updates = {}, profile) {
 async function listPublicConfig() {
   const platformSettings = await getPlatformSettings();
   return json(200, {
-    mode: supabaseConfigured ? "supabase" : "demo",
+    mode: deploymentDataMode(),
+    environment: RUNTIME_ENVIRONMENT,
+    runtime_mode: RUNTIME_ENVIRONMENT,
+    production_runtime: IS_PRODUCTION_RUNTIME,
     public_base_url: PUBLIC_BASE_URL,
     ...platformSettings,
     feature_registry: platformFeatureRegistry,
@@ -11234,7 +11531,7 @@ async function guestNotifications(method, body, headers, query) {
   if (method !== "GET" && method !== "PATCH") return json(405, { error: "Method not allowed." });
   const guestEmail = lower(authProfile?.email || query.get("guest_email") || query.get("email"));
   const profileKey = clean(query.get("profile_key") || (authProfile?.email ? aiProfileKey(authProfile.email) : ""));
-  if (!guestEmail && !profileKey) return json(400, { error: "Guest email or profile key is required." });
+  if (!guestEmail && !profileKey) return json(401, { error: "Authentication required.", code: "AUTHENTICATION_REQUIRED" });
   if (!supabaseConfigured) {
     ensureDemo();
     const rows = demo.guestNotifications.filter((item) => (
@@ -12797,7 +13094,7 @@ export async function handleApiRequest(input) {
     if (method === "GET" && pathname === "/system/checklists") return await systemChecklists();
     if (method === "POST" && pathname === "/auth/login") return await login(body);
     if (pathname === "/auth/logout") return await authLogout(method, body, headers);
-    if (method === "POST" && pathname === "/auth/signup-guest") return await signupGuest(body);
+    if (method === "POST" && pathname === "/auth/signup-guest") return await signupGuest(body, headers);
     if (pathname === "/auth/forgot-password") return await forgotPassword(method, body);
     if (pathname === "/auth/reset-password") return await resetPassword(method, body);
     if (pathname === "/auth/verification") return await authVerification(method, body, headers);

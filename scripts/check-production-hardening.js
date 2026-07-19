@@ -51,6 +51,22 @@ assert.equal(blockedPublic.body.code, "PRODUCTION_CONFIGURATION_INCOMPLETE");
 assert(!JSON.stringify(blockedPublic.body).includes("SUPABASE_SERVICE_ROLE_KEY"), "Production config failure response must not expose secret variable names.");
 
 resetEnv({
+  SMARTTABLE_ENV: "development",
+  VERCEL_ENV: "production",
+  SUPABASE_URL: "",
+  SUPABASE_ANON_KEY: "",
+  SUPABASE_SERVICE_ROLE_KEY: "",
+  PUBLIC_BASE_URL: "",
+  EMAIL_FROM: "",
+  RESEND_API_KEY: ""
+});
+const vercelProductionCore = await importCore("vercel-production-wins");
+const vercelProductionHealth = await rawApi(vercelProductionCore, "GET", "/health");
+assert.equal(vercelProductionHealth.status, 503, "Vercel production must not be downgraded to development by SMARTTABLE_ENV.");
+assert.equal(vercelProductionHealth.body.environment, "production");
+assert.equal(vercelProductionHealth.body.mode, "configuration_error");
+
+resetEnv({
   SMARTTABLE_ENV: "production",
   SUPABASE_URL: "https://example.supabase.co",
   SUPABASE_ANON_KEY: "anon-key",

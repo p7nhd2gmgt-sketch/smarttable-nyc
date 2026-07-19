@@ -307,8 +307,8 @@ assertLocaleKeys(locales, [
   "reserve_button"
 ], "Phase 20 public guest localization");
 
-assert(/id="adminNav"[^>]*hidden/.test(indexHtml), "Super Admin entry must be hidden from the unauthenticated public header by default.");
-assert(/id="restaurantNav"[^>]*hidden/.test(indexHtml), "Partner entry must be hidden from the unauthenticated public header by default.");
+assert(!indexHtml.includes('id="adminNav"'), "Super Admin entry must not appear in the unauthenticated public header.");
+assert(!indexHtml.includes('id="restaurantNav"'), "Partner entry must not appear in the primary public header.");
 assert(indexHtml.includes("id=\"restaurantsNav\""), "Public header must include a consumer restaurant-list navigation link.");
 assert(indexHtml.includes("id=\"contactNav\""), "Public header must include a consumer contact navigation link.");
 includesAll(app, [
@@ -317,10 +317,10 @@ includesAll(app, [
   "history.pushState(null, \"\", \"/offers\")",
   "history.pushState(null, \"\", \"/restaurants\")",
   "history.pushState(null, \"\", \"/contact\")",
-  "adminNav.hidden = !isAdminRole(state.session?.profile?.role)",
-  "restaurantNav.hidden = normalizeRole(state.session?.profile?.role) !== \"partner\"",
-  "document.querySelector(\"#adminNav\")?.addEventListener",
-  "document.querySelector(\"#restaurantNav\")?.addEventListener"
+  "function publicFooter()",
+  "footer_partner_login_link",
+  "href=\"/partner\"",
+  "if (state.mode === \"partner\")"
 ], "Public chrome internal-entry hardening");
 
 assertLocaleKeys(locales, [

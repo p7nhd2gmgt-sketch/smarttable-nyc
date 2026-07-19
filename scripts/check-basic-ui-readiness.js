@@ -157,7 +157,8 @@ includesAll(app, [
 ], "Accessible states and action feedback");
 
 includesAll(app, [
-  "const demoMode = state.apiMode === \"demo\"",
+  "function canShowDemoCredentials()",
+  "state.apiMode === \"demo\" && isLocalBrowserRuntime() && !isProductionApiRuntime()",
   "value=\"${escapeAttr(demoEmail)}\"",
   "value=\"${escapeAttr(demoPassword)}\"",
   "data-toggle-dashboard-password",

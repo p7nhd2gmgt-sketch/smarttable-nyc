@@ -83,12 +83,22 @@ async function assertLocales() {
     "signup_validation_summary_title",
     "signup_profile_ready_title",
     "signup_profile_ready_message",
+    "signup_email_verification_required_title",
+    "signup_email_verification_required_body",
+    "signup_email_delivery_failed_title",
+    "signup_email_delivery_failed_body",
+    "signup_success_email_issue",
     "signup_explore_restaurants",
     "signup_view_preferences",
     "signup_terms_link",
     "signup_privacy_link",
     "signup_error_select_one",
-    "signup_error_consent"
+    "signup_error_consent",
+    "login_email_not_confirmed_error",
+    "login_account_setup_incomplete_error",
+    "login_account_setup_incomplete_redirect",
+    "login_account_setup_incomplete_toast",
+    "login_service_unavailable_error"
   ];
   for (const locale of ["en", "es", "hu"]) {
     const messages = JSON.parse(await readFile(new URL(`../public/locales/${locale}.json`, import.meta.url), "utf8"));
@@ -107,6 +117,14 @@ async function assertFrontendWiring() {
   assert(app.includes("renderGuestSignup()"), "Dedicated signup page must render through renderGuestSignup().");
   assert(!app.includes("Skip for now") && !app.includes("Complete later") && !app.includes("Continue without answering"), "Signup must not include skip/complete-later options.");
   assert(app.includes("signup_create_my_account"), "Final signup button must use Create My SmartTable Account translation key.");
+  assert(app.includes("signup_email_verification_required_title"), "Signup success UI must explain when email verification is required.");
+  assert(app.includes("signup_email_delivery_failed_title"), "Signup success UI must surface failed registration email delivery.");
+  assert(app.includes("signup_success_email_issue"), "Signup toast must not imply email delivery succeeded when it failed.");
+  assert(app.includes("login_email_not_confirmed_error"), "Guest login must show a specific email-verification-required state.");
+  assert(app.includes("login_account_setup_incomplete_error"), "Guest login must show an incomplete account setup state.");
+  assert(app.includes("login_account_setup_incomplete_redirect") && app.includes("history.pushState(null, \"\", \"/signup\")"), "Guest login must redirect recoverable incomplete accounts to onboarding.");
+  assert(app.includes("login_service_unavailable_error"), "Guest login must show a temporary service-unavailable state.");
+  assert(app.includes("error.payload?.code") && app.includes('errorCode === "EMAIL_NOT_CONFIRMED"'), "Guest login must use the backend EMAIL_NOT_CONFIRMED code.");
   assert(app.includes("createDisabled") && app.includes("disabled"), "Final signup button must be disabled until the form is complete.");
   assert(app.includes("signupValidationSummaryHtml()"), "Signup must show a validation summary with incomplete section links.");
   assert(app.includes("data-signup-back") && app.includes("data-signup-step"), "Back and forward step navigation must exist.");
@@ -211,7 +229,9 @@ async function assertModeBehavior() {
 async function assertRollbackSupport() {
   const core = await readFile(new URL("../src/app-core.js", import.meta.url), "utf8");
   assert(core.includes("rollbackSupabaseGuestSignup"), "Supabase signup must include rollback support.");
-  assert(core.includes("Account creation rolled back"), "Signup failures after auth creation must report rollback.");
+  assert(core.includes("SIGNUP_PROFILE_CREATION_FAILED"), "Signup failures after auth creation must report a safe rollback code.");
+  assert(core.includes("EMAIL_NOT_CONFIRMED"), "Supabase login must distinguish unverified accounts from invalid credentials.");
+  assert(core.includes("mapSupabaseSignupError"), "Supabase signup failures must be mapped before the UI reports success.");
   assert(core.includes("guestPreferenceColumns"), "Important preference data must be persisted as structured fields.");
   assert(core.includes("sanitizeSignupAnalyticsProperties"), "Backend analytics must strip private field values.");
 }

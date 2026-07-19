@@ -1152,6 +1152,20 @@ function publicBaseUrl() {
   return "https://smarttablenyc.com";
 }
 
+function isLocalBrowserRuntime() {
+  const hostname = String(window.location?.hostname || "").toLowerCase();
+  return ["localhost", "127.0.0.1", "::1"].includes(hostname) || hostname.endsWith(".localhost");
+}
+
+function isProductionApiRuntime() {
+  const runtime = String(state.config?.runtime_mode || state.config?.environment || "").toLowerCase();
+  return Boolean(state.config?.production_runtime) || runtime === "production";
+}
+
+function canShowDemoCredentials() {
+  return state.apiMode === "demo" && isLocalBrowserRuntime() && !isProductionApiRuntime();
+}
+
 function updateMeta() {
   const meta = publicRouteMeta();
   const title = meta.title;
@@ -1433,6 +1447,15 @@ function publicRouteTarget(route) {
   }, 80);
 }
 
+function publicFooter() {
+  return `
+    <footer class="site-footer">
+      <span>${escapeHtml(t("footer_text", "SmartTable serves New York restaurants and guests."))}</span>
+      <a class="footer-partner-link" href="/partner">${escapeHtml(t("footer_partner_login_link", "Restaurant partners"))}</a>
+    </footer>
+  `;
+}
+
 function renderPublicGuestInfoPage(route) {
   app.innerHTML = `
     ${layoutHero(`
@@ -1446,7 +1469,7 @@ function renderPublicGuestInfoPage(route) {
         </div>
       </section>
     `)}
-    <footer class="site-footer">${escapeHtml(t("footer_text", "SmartTable serves New York restaurants and guests."))}</footer>
+    ${publicFooter()}
   `;
   finalizeRenderedLanguage();
   document.querySelector("#publicInfoRestaurants")?.addEventListener("click", async () => {
@@ -1966,6 +1989,7 @@ async function loadNewestRestaurants() {
 async function loadPublicConfig() {
   const payload = await api("/public/config");
   state.config = payload || {};
+  state.apiMode = payload.mode || state.apiMode;
   state.platformMode = normalizePlatformMode(payload?.platform_mode);
   state.aiDemoVisibility = normalizeBooleanSetting(payload?.ai_demo_visibility, false);
   state.showAiModeBadge = normalizeBooleanSetting(payload?.show_ai_mode_badge, true);
@@ -3700,12 +3724,22 @@ function signupStepBody() {
 
 function signupSuccessPanel() {
   const showAi = canShowFeature("ai.concierge", { audience: "guest", allowDemo: true });
+  const success = state.signupSuccess || {};
+  const notices = [
+    success.emailVerificationRequired
+      ? `<div class="warning-box" role="status"><strong>${escapeHtml(t("signup_email_verification_required_title", "Check your email to finish sign-in."))}</strong><p>${escapeHtml(t("signup_email_verification_required_body", "Supabase email confirmation is enabled. Use the verification link sent to your inbox before signing in."))}</p></div>`
+      : "",
+    success.emailDeliveryFailed
+      ? `<div class="warning-box" role="alert"><strong>${escapeHtml(t("signup_email_delivery_failed_title", "Registration email was not accepted."))}</strong><p>${escapeHtml(t("signup_email_delivery_failed_body", "Your account data was saved, but SmartTable could not send the registration email. Please use password reset or contact support if you do not receive verification instructions."))}</p></div>`
+      : ""
+  ].join("");
   return `
     <section class="panel signup-success-panel" role="status" aria-live="polite">
       <div>
         <span class="section-kicker">${escapeHtml(t("signup_success_kicker", "Account ready"))}</span>
         <h2>${escapeHtml(t("signup_profile_ready_title", "Your SmartTable profile is ready."))}</h2>
         <p class="muted">${escapeHtml(t("signup_profile_ready_message", "We will use your preferences to show more relevant restaurants and offers."))}</p>
+        ${notices}
       </div>
       <div class="button-row">
         <button class="primary-button" data-dismiss-signup-success type="button">${escapeHtml(t("signup_explore_restaurants", "Explore Restaurants"))}</button>
@@ -3891,19 +3925,25 @@ async function submitSignupStep(event) {
       preference_question_count: 28,
       marketing_consent: Boolean(signup.data.marketing_consent)
     }));
+    const emailDelivery = payload.email_delivery || {};
+    const emailDeliveryFailed = Number(emailDelivery.failed_count || 0) > 0;
     state.signupSuccess = {
       profile: payload.profile || null,
       preferences: payload.preferences || null,
-      emailVerificationRequired: !payload.access_token && Boolean(payload.message)
+      emailVerificationRequired: Boolean(payload.email_verification_required || (!payload.access_token && payload.message)),
+      emailDeliveryFailed,
+      emailDelivery
     };
     state.signup = null;
     history.pushState(null, "", "/");
     state.mode = "guest";
     await renderCurrentMode();
-    showToast(t("signup_success", "Your SmartTable account was created."));
+    showToast(emailDeliveryFailed
+      ? t("signup_success_email_issue", "Your account was created, but the registration email could not be sent.")
+      : t("signup_success", "Your SmartTable account was created."));
   } catch (error) {
     signup.submitting = false;
-    signup.submitError = /exists|registered|duplicate/i.test(error.message)
+    signup.submitError = error.payload?.code === "ACCOUNT_ALREADY_EXISTS" || /exists|registered|duplicate/i.test(error.message)
       ? t("signup_duplicate_email_error", "An account with this email already exists. Please sign in.")
       : error.message;
     renderGuestSignup();
@@ -4127,7 +4167,7 @@ function renderGuest(publicRoute = currentPublicGuestRoute()) {
       `)}
       ${aiModeBanner("guest")}
       ${postVisitRewardsPage()}
-      <footer class="site-footer">${escapeHtml(t("footer_text", "SmartTable serves New York restaurants and guests."))}</footer>
+      ${publicFooter()}
       ${guestModals()}
     `;
     bindGuestEvents(restaurants);
@@ -4173,7 +4213,7 @@ function renderGuest(publicRoute = currentPublicGuestRoute()) {
         <p>${escapeHtml(t("guests_body", "Find deals and receive email updates."))}</p>
       </article>
     </section>
-    <footer class="site-footer">${escapeHtml(t("footer_text", "SmartTable serves New York restaurants and guests."))}</footer>
+    ${publicFooter()}
     ${guestModals()}
   `;
   bindGuestEvents(restaurants);
@@ -4539,7 +4579,7 @@ function renderGuestLogin() {
         <button class="link-button" data-forgot-password type="button">${escapeHtml(t("forgot_password_link", "Forgot password?"))}</button>
         <button class="link-button" data-guest-signup type="button">${escapeHtml(t("signup_create_account", "Create account"))}</button>
       </div>
-      ${state.apiMode === "demo" ? `<p class="form-note">${escapeHtml(t("guest_demo_credentials_note", "Demo guest: guest@smarttable.com / guest123"))}</p>` : ""}
+      ${canShowDemoCredentials() ? `<p class="form-note">${escapeHtml(t("guest_demo_credentials_note", "Demo guest: guest@smarttable.com / guest123"))}</p>` : ""}
     </form>
   `);
   finalizeRenderedLanguage();
@@ -4598,9 +4638,61 @@ function bindGuestLoginEvents() {
       await renderCurrentMode();
       showToast(t("logged_in_toast", "Logged in."));
     } catch (error) {
-      trackGuestAccountEvent("login_failed", { error_category: /too many/i.test(error.message) ? "rate_limited" : "invalid_credentials" });
+      const errorCode = error.payload?.code || "";
+      trackGuestAccountEvent("login_failed", {
+        error_category: errorCode === "EMAIL_NOT_CONFIRMED"
+          ? "email_not_confirmed"
+          : errorCode === "ACCOUNT_SETUP_INCOMPLETE"
+          ? "account_setup_incomplete"
+          : /too many/i.test(error.message) ? "rate_limited" : "invalid_credentials"
+      });
+      if (errorCode === "ACCOUNT_SETUP_INCOMPLETE" && error.payload?.onboarding_required && error.payload?.access_token && error.payload?.profile) {
+        const profile = {
+          ...error.payload.profile,
+          role: normalizeRole(error.payload.profile.role)
+        };
+        saveSession({
+          mode: error.payload.mode || state.apiMode,
+          access_token: error.payload.access_token,
+          refresh_token: error.payload.refresh_token,
+          expires_in: error.payload.expires_in,
+          profile
+        }, { remember: Boolean(data.remember_me) });
+        const nameParts = String(profile.full_name || "").trim().split(/\s+/).filter(Boolean);
+        state.signup = {
+          step: 0,
+          data: {
+            ...defaultSignupData(),
+            full_name: profile.full_name || "",
+            first_name: nameParts[0] || "",
+            last_name: nameParts.slice(1).join(" "),
+            email: profile.email || data.email || ""
+          },
+          errors: {},
+          submitError: t("login_account_setup_incomplete_redirect", "Your account is signed in, but onboarding is incomplete. Finish these steps to activate your SmartTable profile."),
+          showPassword: false,
+          showConfirmPassword: false,
+          locating: false,
+          submitting: false,
+          analyticsStarted: false,
+          analyticsCompleted: false,
+          analyticsAbandoned: false
+        };
+        state.guestLogin = { showPassword: false, submitting: false, error: "", rememberMe: Boolean(data.remember_me) };
+        state.mode = "guest";
+        history.pushState(null, "", "/signup");
+        await renderCurrentMode();
+        showToast(t("login_account_setup_incomplete_toast", "Finish onboarding to activate your account."));
+        return;
+      }
       state.guestLogin.submitting = false;
-      state.guestLogin.error = /too many/i.test(error.message)
+      state.guestLogin.error = errorCode === "EMAIL_NOT_CONFIRMED"
+        ? t("login_email_not_confirmed_error", "Please verify your email before signing in. Check your inbox for the SmartTable verification link.")
+        : errorCode === "ACCOUNT_SETUP_INCOMPLETE"
+        ? t("login_account_setup_incomplete_error", "Your account was created, but setup is incomplete. Please contact SmartTable support.")
+        : errorCode === "AUTH_SERVICE_UNAVAILABLE"
+        ? t("login_service_unavailable_error", "Sign in is temporarily unavailable. Please try again.")
+        : /too many/i.test(error.message)
         ? t("login_rate_limited_error", "Too many login attempts. Please wait before trying again.")
         : t("login_generic_error", "Invalid email or password.");
       renderGuestLogin();
@@ -5900,7 +5992,7 @@ function renderLogin(role) {
     return;
   }
   const isAdmin = role === "admin";
-  const demoMode = state.apiMode === "demo";
+  const demoMode = canShowDemoCredentials();
   const demoEmail = demoMode ? (isAdmin ? "admin@smarttable.com" : "owner@hudsonhearth.com") : "";
   const demoPassword = demoMode ? (isAdmin ? "admin123" : "restaurant123") : "";
   const title = isAdmin
@@ -5923,7 +6015,7 @@ function renderLogin(role) {
         <div class="auth-link-row">
           <button class="link-button" data-dashboard-forgot-password type="button">${escapeHtml(t("forgot_password_link", "Forgot password?"))}</button>
         </div>
-        ${state.apiMode === "demo" ? `<p class="form-note">${escapeHtml(t("demo_credentials_prefilled", "Demo credentials are prefilled until Supabase is connected."))}</p>` : ""}
+        ${demoMode ? `<p class="form-note">${escapeHtml(t("demo_credentials_prefilled", "Demo credentials are prefilled until Supabase is connected."))}</p>` : ""}
       </form>
     `)}
   `;

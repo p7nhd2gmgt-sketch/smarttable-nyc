@@ -42,8 +42,9 @@ assert(browserApp.includes("escapeHtml("), "The browser app must retain HTML esc
 assert(browserApp.includes("escapeAttr("), "The browser app must retain attribute escaping helpers.");
 assert(browserApp.includes("SmartTable home"), "Public brand fallback text must not use old domain-branded copy.");
 assert(browserApp.includes("SmartTable serves New York restaurants and guests."), "Public footer fallback text must not use old domain-branded copy.");
-assert(browserApp.includes("adminNav.hidden = !isAdminRole(state.session?.profile?.role)"), "Super Admin navigation must stay hidden from public production users.");
-assert(browserApp.includes("restaurantNav.hidden = normalizeRole(state.session?.profile?.role) !== \"partner\""), "Partner access must remain available only through the intended authenticated partner navigation path.");
+assert(!indexHtml.includes('id="adminNav"'), "Super Admin navigation must not be present in the unauthenticated production header.");
+assert(!indexHtml.includes('id="restaurantNav"'), "Partner navigation must not be present in the primary public header.");
+assert(browserApp.includes("footer_partner_login_link") && browserApp.includes("href=\"/partner\""), "Partner access must remain available through the intentional partner route link.");
 assert(browserApp.includes("if (state.session && isSessionExpired(state.session))"), "Expired client sessions must be detected.");
 assert(browserApp.includes("else if (state.mode === \"guest\") renderGuestLogin();"), "Expired guest sessions must show the login form instead of protected content.");
 assert(browserApp.includes("showToast(t(\"session_expired_message\""), "Expired sessions must show a localized user-facing message.");

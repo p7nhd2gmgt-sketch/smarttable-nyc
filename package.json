@@ -24,12 +24,13 @@
     "check:basic-security-boundaries": "node scripts/check-basic-security-boundaries.js",
     "check:basic-user-journey": "node scripts/check-basic-user-journey.js",
     "check:production-hardening": "node scripts/check-production-hardening.js",
+    "check:production-auth-flow": "node scripts/check-production-auth-flow.js",
     "check:basic-security-hardening": "node scripts/check-basic-security-hardening.js",
     "check:route-protection": "node scripts/check-route-protection.js",
     "check:routes": "node scripts/check-route-map.js",
     "check:architecture": "node scripts/check-architecture-foundation.js",
     "check:email": "node scripts/check-email-service.js",
-    "test": "npm run check:offer-validity && npm run check:signup && npm run check:guest-account && npm run check:reservation-lifecycle && npm run check:public-experience && npm run check:guest-design-system && npm run check:basic-ui && npm run check:basic-ui-behavior && npm run check:basic-visual-readiness && npm run check:basic-security-boundaries && npm run check:basic-user-journey && npm run check:production-hardening && npm run check:basic-security-hardening && npm run check:route-protection && npm run check:routes && npm run check:architecture && npm run check:email",
+    "test": "npm run check:offer-validity && npm run check:signup && npm run check:guest-account && npm run check:reservation-lifecycle && npm run check:public-experience && npm run check:guest-design-system && npm run check:basic-ui && npm run check:basic-ui-behavior && npm run check:basic-visual-readiness && npm run check:basic-security-boundaries && npm run check:basic-user-journey && npm run check:production-hardening && npm run check:production-auth-flow && npm run check:basic-security-hardening && npm run check:route-protection && npm run check:routes && npm run check:architecture && npm run check:email",
     "docs:pdf": "node scripts/generate-docs.mjs"
   },
   "engines": {
