@@ -3,12 +3,12 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Smarttable.com | Discounted restaurant reservations</title>
-    <meta name="description" content="Book discounted restaurant tables across New York with Smarttable.com. Choose a restaurant, send a reservation request, and get email confirmation from the restaurant.">
+    <title>SmartTable | Discounted New York restaurant reservations</title>
+    <meta name="description" content="Book discounted restaurant tables across New York and send reservation requests directly to restaurants.">
     <meta name="robots" content="index, follow">
     <meta property="og:site_name" content="Smarttable.com">
-    <meta property="og:title" content="Smarttable.com | Discounted restaurant reservations">
-    <meta property="og:description" content="Find discounted New York restaurant reservations and request tables in off-peak dining windows.">
+    <meta property="og:title" content="SmartTable | Discounted New York restaurant reservations">
+    <meta property="og:description" content="Discounted restaurant reservations and table offers for New York.">
     <meta property="og:type" content="website">
     <meta property="og:url" content="https://smarttable.com/">
     <meta property="og:image" content="https://smarttable.com/assets/restaurant-hero.png">
@@ -16,7 +16,7 @@
     <meta name="theme-color" content="#0f735d">
     <link rel="canonical" href="https://smarttable.com/">
     <link rel="manifest" href="/site.webmanifest">
-    <link rel="stylesheet" href="/styles.css?v=mvp-1">
+    <link rel="stylesheet" href="/styles.css?v=guest-account-1">
     <script type="application/ld+json">
       {
         "@context": "https://schema.org",
@@ -24,14 +24,14 @@
           {
             "@type": "Organization",
             "@id": "https://smarttable.com/#organization",
-            "name": "Smarttable.com",
+            "name": "SmartTable",
             "url": "https://smarttable.com/"
           },
           {
             "@type": "WebSite",
             "@id": "https://smarttable.com/#website",
             "url": "https://smarttable.com/",
-            "name": "Smarttable.com",
+            "name": "SmartTable",
             "publisher": {
               "@id": "https://smarttable.com/#organization"
             }
@@ -39,39 +39,47 @@
           {
             "@type": "WebApplication",
             "@id": "https://smarttable.com/#app",
-            "name": "Smarttable.com",
+            "name": "SmartTable",
             "url": "https://smarttable.com/",
             "applicationCategory": "LifestyleApplication",
             "operatingSystem": "Any",
-            "description": "Discounted New York restaurant reservation requests with guest and restaurant email notifications."
+            "description": "Discounted restaurant reservations and table offers for New York."
           }
         ]
       }
     </script>
   </head>
   <body>
+    <a class="skip-link" href="#app">Skip to main content</a>
     <div class="shell">
       <header class="topbar">
         <a class="brand" href="/" aria-label="Smarttable.com home">
           <span class="brand-mark">ST</span>
           <span>
-            <strong>Smarttable.com</strong>
-            <small>Reservations marketplace</small>
+            <strong>SmartTable</strong>
+            <small>Discounted restaurant reservations</small>
           </span>
         </a>
 
         <nav class="top-actions" aria-label="Primary navigation">
           <button class="ghost-button" id="guestNav" type="button">Offers</button>
+          <button class="ghost-button" id="aiConciergeNav" type="button" hidden>AI Concierge</button>
           <button class="ghost-button" id="adminNav" type="button">Admin</button>
-          <button class="ghost-button" id="restaurantNav" type="button">Restaurant</button>
+          <button class="ghost-button" id="restaurantNav" type="button">Partner</button>
+          <button class="ghost-button" id="signupNav" type="button">Sign Up</button>
+          <span class="language-switcher" aria-label="Language switcher">
+            <button class="ghost-button" id="langEn" data-lang="en" type="button">English &#x1F1FA;&#x1F1F8;</button>
+            <button class="ghost-button" id="langEs" data-lang="es" type="button">Espa&#241;ol &#x1F1EA;&#x1F1F8;</button>
+            <button class="ghost-button" id="langHu" data-lang="hu" type="button">Magyar &#x1F1ED;&#x1F1FA;</button>
+          </span>
           <button class="primary-button" id="sessionButton" type="button">Login</button>
         </nav>
       </header>
 
-      <main id="app" class="app-shell" aria-live="polite"></main>
+      <main id="app" class="app-shell" aria-live="polite" tabindex="-1"></main>
     </div>
 
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
-    <script src="/app.js?v=mvp-1" type="module"></script>
+    <script src="/app.js?v=guest-account-1" type="module"></script>
   </body>
 </html>

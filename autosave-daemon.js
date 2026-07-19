@@ -86,13 +86,17 @@ async function copySnapshot(reason) {
   const snapshotName = `smarttable-${archiveTimestamp()}-${reason}`;
   const snapshotPath = path.join(backupRoot, snapshotName);
 
-  await cp(projectRoot, snapshotPath, {
-    recursive: true,
-    filter: (source) => {
-      const name = path.basename(source);
-      return !excludedNames.has(name);
-    }
-  });
+  await mkdir(snapshotPath, { recursive: true });
+  const entries = await readdir(projectRoot, { withFileTypes: true });
+  for (const entry of entries) {
+    if (excludedNames.has(entry.name)) continue;
+    const source = path.join(projectRoot, entry.name);
+    const destination = path.join(snapshotPath, entry.name);
+    await cp(source, destination, {
+      recursive: true,
+      filter: (candidate) => !excludedNames.has(path.basename(candidate))
+    });
+  }
 
   await writeFile(
     path.join(backupRoot, "latest.txt"),

@@ -7,7 +7,28 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "check": "node --check server.js && node --check src/app-core.js && node --check api/index.js && node --check public/app.js"
+    "build": "npm run check",
+    "check": "node --check server.js && node --check src/env-loader.js && node --check src/app-core.js && node --check src/email-service.js && node --check src/push-service.js && node --check api/index.js && node --check public/shared-contracts.js && node --check public/api-client.js && node --check public/shared/layout-shells.js && node --check public/guest/layout.js && node --check public/partner/layout.js && node --check public/admin/layout.js && node --check public/app.js",
+    "lint": "node scripts/check-static-quality.js",
+    "typecheck": "npm run check",
+    "check:platform-mode": "node scripts/check-platform-mode.js",
+    "check:offer-validity": "node scripts/check-offer-validity.js",
+    "check:signup": "node scripts/check-guest-signup.js",
+    "check:guest-account": "node scripts/check-guest-account.js",
+    "check:reservation-lifecycle": "node scripts/check-reservation-lifecycle.js",
+    "check:public-experience": "node scripts/check-public-experience.js",
+    "check:guest-design-system": "node scripts/check-guest-design-system.js",
+    "check:basic-ui": "node scripts/check-basic-ui-readiness.js",
+    "check:basic-ui-behavior": "node scripts/check-basic-ui-behavior.js",
+    "check:basic-visual-readiness": "node scripts/check-basic-visual-readiness.js",
+    "check:basic-security-boundaries": "node scripts/check-basic-security-boundaries.js",
+    "check:basic-user-journey": "node scripts/check-basic-user-journey.js",
+    "check:route-protection": "node scripts/check-route-protection.js",
+    "check:routes": "node scripts/check-route-map.js",
+    "check:architecture": "node scripts/check-architecture-foundation.js",
+    "check:email": "node scripts/check-email-service.js",
+    "test": "npm run check:offer-validity && npm run check:signup && npm run check:guest-account && npm run check:reservation-lifecycle && npm run check:public-experience && npm run check:guest-design-system && npm run check:basic-ui && npm run check:basic-ui-behavior && npm run check:basic-visual-readiness && npm run check:basic-security-boundaries && npm run check:basic-user-journey && npm run check:route-protection && npm run check:routes && npm run check:architecture && npm run check:email",
+    "docs:pdf": "node scripts/generate-docs.mjs"
   },
   "engines": {
     "node": ">=18"

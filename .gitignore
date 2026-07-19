@@ -1,0 +1,28 @@
+# Dependencies and build output
+node_modules/
+dist/
+build/
+coverage/
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Local runtime state and diagnostics
+data/
+tmp/
+tmp-*.json
+backups/
+*.log
+server-debug.*
+.autosave.*
+
+# Generated caches
+__pycache__/
+*.pyc
+
+# OS/editor temporary files
+.DS_Store
+Thumbs.db
+~$*

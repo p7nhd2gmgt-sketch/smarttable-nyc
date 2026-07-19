@@ -22,7 +22,7 @@ New-Item -ItemType Directory -Force -Path $tempRoot | Out-Null
 
 try {
   Get-ChildItem -LiteralPath $projectRoot -Force |
-    Where-Object { $_.Name -notin @("backups", ".autosave.pid", "autosave.log") } |
+    Where-Object { $_.Name -notin @("backups", ".autosave.pid", ".autosave.heartbeat", "autosave.log") } |
     ForEach-Object {
       $destination = Join-Path $tempRoot $_.Name
       Copy-Item -LiteralPath $_.FullName -Destination $destination -Recurse -Force
