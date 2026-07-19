@@ -9,7 +9,9 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const publicDir = path.join(__dirname, "public");
 const port = Number(process.env.PORT || 4173);
-const publicSiteUrl = (process.env.PUBLIC_SITE_URL || "https://smarttable.com").replace(/\/+$/, "");
+const publicSiteUrl = (process.env.PUBLIC_BASE_URL || process.env.PUBLIC_SITE_URL || "https://smarttablenyc.com").replace(/\/+$/, "");
+const runtimeEnvironment = String(process.env.SMARTTABLE_ENV || process.env.APP_ENV || process.env.VERCEL_ENV || process.env.NODE_ENV || "development").toLowerCase();
+const isProductionRuntime = ["production", "prod"].includes(runtimeEnvironment);
 
 const contentTypes = {
   ".html": "text/html; charset=utf-8",
@@ -18,6 +20,7 @@ const contentTypes = {
   ".png": "image/png",
   ".jpg": "image/jpeg",
   ".webp": "image/webp",
+  ".svg": "image/svg+xml; charset=utf-8",
   ".json": "application/json; charset=utf-8",
   ".txt": "text/plain; charset=utf-8",
   ".xml": "application/xml; charset=utf-8",
@@ -60,6 +63,12 @@ function isNoIndexPath(pathname = "") {
     "/login",
     "/forgot-password",
     "/reset-password",
+    "/verify-email",
+    "/ai",
+    "/ai-concierge",
+    "/ai-preferences",
+    "/partner-ai-demand",
+    "/admin-ai-controls",
     "/guest/rewards/photo-upload"
   ].some((prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`));
 }
@@ -184,6 +193,12 @@ async function serveRobots(res) {
     "Disallow: /login",
     "Disallow: /forgot-password",
     "Disallow: /reset-password",
+    "Disallow: /verify-email",
+    "Disallow: /ai",
+    "Disallow: /ai-concierge",
+    "Disallow: /ai-preferences",
+    "Disallow: /partner-ai-demand",
+    "Disallow: /admin-ai-controls",
     "Disallow: /guest/rewards/photo-upload",
     `Sitemap: ${publicSiteUrl}/sitemap.xml`,
     ""
@@ -281,13 +296,19 @@ const server = http.createServer(async (req, res) => {
       await serveStatic(req, res, url.pathname);
     }
   } catch (error) {
+    console.error(JSON.stringify({
+      event: "http_request_failed",
+      timestamp: new Date().toISOString(),
+      environment: runtimeEnvironment,
+      status: 500
+    }));
     res.writeHead(500, securityHeaders({ "content-type": "application/json; charset=utf-8" }));
-    res.end(JSON.stringify({ error: error.message || "Server error." }));
+    res.end(JSON.stringify({ error: isProductionRuntime ? "Server error." : error.message || "Server error." }));
   }
 });
 
 server.listen(port, () => {
-  console.log(`Smarttable.com running at http://localhost:${port}`);
+  console.log(`SmartTable running at http://localhost:${port}`);
   if (!process.env.RESEND_API_KEY) {
     console.log("Email provider not configured: outbound emails will be logged as failed until RESEND_API_KEY is set.");
   }

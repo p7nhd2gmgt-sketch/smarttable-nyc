@@ -4888,9 +4888,24 @@ th {
   }
 }
 
+.guest-standalone-page {
+  box-sizing: border-box;
+  margin: 0 auto;
+  max-width: 1240px;
+  min-width: 0;
+  padding: clamp(28px, 5vw, 64px) clamp(16px, 4vw, 32px);
+  width: 100%;
+}
+
+.guest-signup-shell {
+  display: grid;
+}
+
 .signup-page {
   display: grid;
   gap: 22px;
+  margin: 0 auto;
+  min-width: 0;
   width: min(1080px, 100%);
 }
 
@@ -4905,6 +4920,21 @@ th {
   margin: 0;
 }
 
+.signup-progress-nav {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  width: 100%;
+}
+
+.signup-progress-summary {
+  color: var(--green-dark);
+  font-size: 0.94rem;
+  font-weight: 800;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
 .signup-progress {
   display: grid;
   gap: 10px;
@@ -4912,6 +4942,12 @@ th {
   list-style: none;
   margin: 0;
   padding: 0;
+  width: 100%;
+}
+
+.signup-progress li {
+  display: flex;
+  min-width: 0;
 }
 
 .signup-progress button {
@@ -4922,10 +4958,18 @@ th {
   color: var(--muted);
   display: grid;
   gap: 6px;
-  min-height: 74px;
+  grid-template-rows: auto 1fr;
+  height: 100%;
+  min-height: 76px;
+  min-width: 0;
   padding: 10px;
   text-align: left;
   width: 100%;
+}
+
+.signup-progress button[aria-current="step"] {
+  outline: 3px solid rgba(15, 115, 93, 0.22);
+  outline-offset: 2px;
 }
 
 .signup-progress span {
@@ -4944,6 +4988,11 @@ th {
 .signup-progress b {
   font-size: 0.82rem;
   line-height: 1.2;
+  max-width: 100%;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  white-space: normal;
+  word-break: normal;
 }
 
 .signup-progress .active button,
@@ -4951,6 +5000,15 @@ th {
   border-color: rgba(15, 115, 93, 0.34);
   box-shadow: 0 12px 28px rgba(15, 115, 93, 0.09);
   color: var(--text);
+}
+
+.signup-progress .active button {
+  background: #ffffff;
+  transform: translateY(-1px);
+}
+
+.signup-progress .done button {
+  background: linear-gradient(180deg, #ffffff, #eef8f4);
 }
 
 .signup-card {
@@ -5467,12 +5525,21 @@ th {
 
 @media (max-width: 860px) {
   .signup-progress {
-    grid-template-columns: 1fr;
+    grid-template-columns: repeat(7, minmax(92px, 1fr));
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding-bottom: 6px;
+    scroll-snap-type: x proximity;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .signup-progress li {
+    scroll-snap-align: start;
   }
 
   .signup-progress button {
-    grid-template-columns: auto 1fr;
-    min-height: 0;
+    min-height: 68px;
+    padding: 9px;
   }
 
   .signup-review-grid {

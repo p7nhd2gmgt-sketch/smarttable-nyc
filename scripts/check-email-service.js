@@ -294,6 +294,7 @@ async function runConfiguredProviderChecks() {
   process.env.RESEND_API_KEY = "test-key";
   process.env.EMAIL_FROM = "SmartTable <reservations@mail.smarttablenyc.com>";
   process.env.EMAIL_REPLY_TO = "reply@example.com";
+  process.env.EMAIL_RECIPIENT_ALLOWLIST = "reply@example.com,*@example.com,*@smarttable.com,*@hudsonhearth.example,*@casaluna.example,*@smarttable.local";
   process.env.RESEND_WEBHOOK_SECRET = "configured-provider-secret";
   const configured = await import(`../src/app-core.js?email-configured=${Date.now()}`);
 

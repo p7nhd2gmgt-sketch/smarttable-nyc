@@ -1,4 +1,4 @@
-# Smarttable.com Production Deployment
+# SmartTable NYC BASIC Production Deployment
 
 This MVP is designed for:
 
@@ -7,13 +7,14 @@ This MVP is designed for:
 - Resend transactional email
 - Admin-editable `site_content`
 - Partner restaurant dashboards
-- English/Spanish public localization
+- English/Spanish/Hungarian public localization
 - Supabase Storage image uploads
 - Admin reservation notifications
 - Super Admin/Restaurant Partner/Guest role separation
 - Restaurant ordering, follower subscriptions, and Google Maps-ready location fields
-- AI Dining Concierge preferences, recommendations, learning events, and demand intelligence
-- Restaurant intelligence: service-time estimates, route planning, dining photo rewards, trend analytics, and anonymized BI
+- BASIC discounted restaurant reservation marketplace mode
+
+AI Concierge, AI Demand, route planning, calendar intelligence, Stripe, and webhook delivery-state tracking remain deferred unless explicitly launched in a later separate change set. SmartTable integrates with reservation systems only and does not connect to restaurant POS systems.
 
 ## 1. Supabase project
 
@@ -81,14 +82,16 @@ Import this folder as a Vercel project.
 Set these environment variables in Vercel:
 
 ```text
-PUBLIC_BASE_URL=https://smarttable.com
+SMARTTABLE_ENV=production
+PUBLIC_BASE_URL=https://smarttablenyc.com
 SUPABASE_URL=https://<your-project-ref>.supabase.co
 SUPABASE_ANON_KEY=<your anon key>
 SUPABASE_SERVICE_ROLE_KEY=<your service role key>
 EMAIL_FROM=SmartTable <reservations@mail.smarttablenyc.com>
 EMAIL_REPLY_TO=support@smarttablenyc.com
 RESEND_API_KEY=<your Resend key>
-RESEND_WEBHOOK_SECRET=<your Resend webhook signing secret>
+RESEND_WEBHOOK_SECRET=
+EMAIL_RECIPIENT_ALLOWLIST=
 EMAIL_TEMPLATE_VERSION=2026-07-19
 EMAIL_RETRY_LIMIT=3
 EMAIL_WEBHOOK_TOLERANCE_SECONDS=300
@@ -102,10 +105,13 @@ Important:
 
 - `SUPABASE_SERVICE_ROLE_KEY` must only be stored server-side in Vercel environment variables.
 - Do not expose the service role key in frontend code.
-- Configure `PUBLIC_BASE_URL=https://smarttable.com` before testing email links.
+- Configure `PUBLIC_BASE_URL=https://smarttablenyc.com` before testing production email links.
+- Production fails safely instead of falling back to demo storage when mandatory Supabase, Resend, sender, or public base URL configuration is missing.
 - `EMAIL_RETRY_LIMIT` controls repeated attempts for temporary provider failures. Permanent failures are logged and not retried indefinitely.
-- `RESEND_WEBHOOK_SECRET` is required before SmartTable can mark provider events as delivered, bounced, deferred, complained, or failed. Without it, logs only prove provider acceptance.
-- Resend webhook endpoint for production is `https://smarttablenyc.com/api/webhooks/resend`.
+- `RESEND_WEBHOOK_SECRET` is intentionally deferred for BASIC launch. Without it, logs prove provider acceptance only and never claim delivery.
+- In preview/development deployments with a real `RESEND_API_KEY`, configure `EMAIL_RECIPIENT_ALLOWLIST` with explicit test recipients. Non-production real email sends are blocked unless the recipient is allowlisted.
+- Reserved `.example` TLD recipients are blocked in production before contacting Resend.
+- Deferred Resend webhook endpoint for production is `https://smarttablenyc.com/api/webhooks/resend`.
 - Restrict the Google Maps key in Google Cloud to the production domain.
 - `IMPERSONATION_SECRET` signs short-lived Super Admin "View as partner" sessions.
 
@@ -113,7 +119,7 @@ Important:
 
 In Vercel:
 
-1. Add `smarttable.com` as a domain.
+1. Add `smarttablenyc.com` as a domain.
 2. Add the DNS records Vercel gives you at your domain registrar.
 3. Wait for HTTPS to become active.
 
@@ -125,11 +131,11 @@ In Resend:
 2. Configure SPF/DKIM DNS records.
 3. Use `reservations@mail.smarttablenyc.com` or another verified sender in `EMAIL_FROM`.
 4. Set `EMAIL_REPLY_TO` to a monitored support or reservation inbox.
-5. Configure a Resend webhook pointing to `https://smarttablenyc.com/api/webhooks/resend`, copy its signing secret to `RESEND_WEBHOOK_SECRET`, and keep the secret server-side only.
-6. Set `ADMIN_NOTIFICATION_EMAIL` to the admin inbox that should receive every new reservation request.
-7. Apply all `supabase/migrations` so `email_logs` has idempotency, attempt-count, provider-message, locale, and timestamp fields.
+5. Set `ADMIN_NOTIFICATION_EMAIL` to the admin inbox that should receive every new reservation request.
+6. Apply all `supabase/migrations` so `email_logs` has idempotency, attempt-count, provider-message, locale, and timestamp fields.
+7. Leave `RESEND_WEBHOOK_SECRET` empty until delivery webhook tracking is intentionally enabled after BASIC launch.
 
-Required Resend webhook events:
+Deferred Resend webhook events for a later post-launch task:
 
 ```text
 email.sent
@@ -139,8 +145,9 @@ email.failed
 email.complained
 ```
 
-Localhost cannot receive production Resend webhooks directly. For local testing,
-use a secure tunnel or webhook-forwarding tool that forwards Resend events to:
+Localhost cannot receive production Resend webhooks directly. If webhook tracking
+is enabled later, use a secure tunnel or webhook-forwarding tool that forwards
+Resend events to:
 
 ```text
 http://localhost:4173/api/webhooks/resend
@@ -150,8 +157,8 @@ To test signature verification, send one request with an invalid signature and
 confirm SmartTable returns `401`, then send a valid signed event using the same
 `RESEND_WEBHOOK_SECRET` value and confirm the matching `email_logs` and
 `email_queue` rows update by `provider_message_id`. Delivered status should be
-claimed only after a verified `email.delivered` webhook updates the log. Bounced,
-failed, and complained events should appear in Super Admin email diagnostics.
+claimed only after a verified `email.delivered` webhook updates the log. Until
+then, SmartTable reports provider acceptance only.
 
 ## 5.1 Supabase Storage
 
@@ -175,18 +182,18 @@ image/webp
 
 After the production URL loads:
 
-1. Add `https://smarttable.com` in Google Search Console.
+1. Add `https://smarttablenyc.com` in Google Search Console.
 2. Verify ownership using the DNS TXT record Google provides.
 3. Submit:
 
 ```text
-https://smarttable.com/sitemap.xml
+https://smarttablenyc.com/sitemap.xml
 ```
 
 4. Use URL Inspection for:
 
 ```text
-https://smarttable.com/
+https://smarttablenyc.com/
 ```
 
 5. Request indexing.
@@ -220,6 +227,9 @@ http://localhost:4173
 After deployment, verify:
 
 - `/api/health` returns `mode: "supabase"`
+- `/api/health` returns `environment: "production"`
+- `/api/health` returns `platform_mode_default: "basic"`
+- `/api/health` returns `public_base_url_uses_localhost: false`
 - Admin can edit `site_content`
 - Admin can edit email template content keys
 - Super Admin can create partner logins
@@ -227,7 +237,7 @@ After deployment, verify:
 - Super Admin can edit/disable restaurants
 - Super Admin can set restaurant custom sort order and map coordinates
 - Super Admin can edit discounts and offer status
-- English/Español switcher changes public copy
+- English/Spanish/Hungarian switcher changes public copy
 - Partner can update restaurant profile
 - Public offers show one restaurant card with nested active offers
 - Guest can filter/sort offers and switch between list/map views
@@ -236,19 +246,13 @@ After deployment, verify:
 - Admin can moderate reviews
 - Admin receives partner activity notifications and can mark them as read
 - Public homepage shows Newest Restaurants This Week
-- Public homepage shows AI Dining Concierge recommendations
-- Guest can open the AI preference wizard and save preferences
-- AI recommendations return match score and smart discount suggestion
-- Partner dashboard shows AI demand outlook
-- Partner/Admin can edit AI discount guardrails on restaurant profiles
-- Guest can create a route plan and receive service-time/travel-time estimates
-- Guest can submit dining photo intelligence and receive loyalty points
-- Partner dashboard shows aggregated Restaurant Intelligence without personal data
-- Admin dashboard shows live food trend analytics
+- BASIC mode hides AI Concierge, AI Demand, AI score, route planning, calendar sync, and unfinished AI surfaces
+- No POS, payment, order, transaction, inventory, or cash-register integration appears
 - Partner can upload/assign cover, gallery, and offer images
 - Partner can create, edit, and soft-delete an offer
 - Guest reservation creates `pending` reservation
 - Guest reservation form appears only after clicking Reserve
 - Partner `accepted` or `rejected` status sends guest email
 - Partner can save reservation notes
-- Admin notification email is logged in `email_events`
+- Reservation transactional emails are queued/logged and provider acceptance is reported truthfully
+- Resend webhook delivery tracking remains deferred unless `RESEND_WEBHOOK_SECRET` is explicitly configured and tested later

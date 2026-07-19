@@ -7,6 +7,12 @@ Disallow: /account
 Disallow: /login
 Disallow: /forgot-password
 Disallow: /reset-password
+Disallow: /verify-email
+Disallow: /ai
+Disallow: /ai-concierge
+Disallow: /ai-preferences
+Disallow: /partner-ai-demand
+Disallow: /admin-ai-controls
 Disallow: /guest/rewards/photo-upload
 
-Sitemap: https://smarttable.com/sitemap.xml
+Sitemap: https://smarttablenyc.com/sitemap.xml

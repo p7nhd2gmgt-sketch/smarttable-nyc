@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="SmartTable">
+  <rect width="64" height="64" rx="16" fill="#0f735d"/>
+  <path d="M18 20h28v7H35v21h-7V27H18z" fill="#fffaf0"/>
+  <path d="M40 38c0-5 4-9 9-9v19h-5v-8z" fill="#f0c36a"/>
+</svg>

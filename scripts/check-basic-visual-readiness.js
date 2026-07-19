@@ -63,6 +63,7 @@ const viewportMatrix = {
     [1280, 720]
   ],
   tablet: [
+    [1024, 900],
     [1024, 768],
     [820, 1180],
     [768, 1024]
@@ -71,13 +72,19 @@ const viewportMatrix = {
     [430, 932],
     [390, 844],
     [375, 667],
-    [360, 800]
+    [360, 800],
+    [320, 568]
   ]
 };
 
 assert(viewportMatrix.desktop.length === 3, "Desktop visual QA matrix must include 3 viewport sizes.");
-assert(viewportMatrix.tablet.length === 3, "Tablet visual QA matrix must include 3 viewport sizes.");
-assert(viewportMatrix.mobile.length === 4, "Mobile visual QA matrix must include 4 viewport sizes.");
+assert(viewportMatrix.tablet.length === 4, "Tablet visual QA matrix must include 4 viewport sizes.");
+assert(viewportMatrix.mobile.length === 5, "Mobile visual QA matrix must include 5 viewport sizes.");
+
+for (const width of [320, 390, 768, 1024, 1366]) {
+  const covered = Object.values(viewportMatrix).flat().some(([candidate]) => candidate === width);
+  assert(covered, `Signup stepper requested viewport width ${width}px must remain in the regression matrix.`);
+}
 
 includesAll(indexHtml, [
   "class=\"skip-link\"",
@@ -134,6 +141,40 @@ includesAll(styles, [
   "overflow-wrap: anywhere",
   "white-space: normal"
 ], "Mobile header action containment regression coverage");
+
+includesAll(app, [
+  "function guestStandaloneShell(",
+  "guestStandaloneShell(`",
+  "shortLabelKey: \"signup_step_short_account\"",
+  "function signupStepNavLabel(",
+  "signupStepNavLabel(index)",
+  "class=\"signup-progress-summary\"",
+  "aria-current=\"step\"",
+  "aria-hidden=\"true\"",
+  "function scrollActiveSignupStepIntoView(",
+  "scrollIntoView({ block: \"nearest\", inline: \"center\" })",
+  "signupStepTitle()"
+], "Signup stepper uses short navigation labels while preserving full content titles");
+
+includesAll(styles, [
+  ".guest-standalone-page",
+  "max-width: 1240px",
+  ".guest-signup-shell",
+  ".signup-progress-nav",
+  ".signup-progress-summary",
+  ".signup-progress",
+  "grid-template-columns: repeat(7, minmax(0, 1fr))",
+  ".signup-progress li",
+  "display: flex",
+  "min-width: 0",
+  "height: 100%",
+  "grid-template-rows: auto 1fr",
+  "overflow-wrap: anywhere",
+  "white-space: normal",
+  "grid-template-columns: repeat(7, minmax(92px, 1fr))",
+  "overflow-x: auto",
+  "scroll-snap-type: x proximity"
+], "Signup stepper responsive non-overlap regression coverage");
 
 includesAll(styles, [
   ".modal-backdrop",
@@ -244,6 +285,8 @@ includesAll(app, [
 assertLocaleKeys(locales, [
   "basic_brand_title",
   "nav_offers",
+  "nav_restaurants",
+  "nav_contact",
   "nav_partner",
   "nav_admin",
   "signup_nav_button",
@@ -264,6 +307,22 @@ assertLocaleKeys(locales, [
   "reserve_button"
 ], "Phase 20 public guest localization");
 
+assert(/id="adminNav"[^>]*hidden/.test(indexHtml), "Super Admin entry must be hidden from the unauthenticated public header by default.");
+assert(/id="restaurantNav"[^>]*hidden/.test(indexHtml), "Partner entry must be hidden from the unauthenticated public header by default.");
+assert(indexHtml.includes("id=\"restaurantsNav\""), "Public header must include a consumer restaurant-list navigation link.");
+assert(indexHtml.includes("id=\"contactNav\""), "Public header must include a consumer contact navigation link.");
+includesAll(app, [
+  "document.querySelector(\"#restaurantsNav\").textContent = t(\"nav_restaurants\", \"Restaurants\")",
+  "document.querySelector(\"#contactNav\").textContent = t(\"nav_contact\", \"Contact\")",
+  "history.pushState(null, \"\", \"/offers\")",
+  "history.pushState(null, \"\", \"/restaurants\")",
+  "history.pushState(null, \"\", \"/contact\")",
+  "adminNav.hidden = !isAdminRole(state.session?.profile?.role)",
+  "restaurantNav.hidden = normalizeRole(state.session?.profile?.role) !== \"partner\"",
+  "document.querySelector(\"#adminNav\")?.addEventListener",
+  "document.querySelector(\"#restaurantNav\")?.addEventListener"
+], "Public chrome internal-entry hardening");
+
 assertLocaleKeys(locales, [
   "signup_title",
   "guest_login_title",
@@ -282,6 +341,16 @@ assertLocaleKeys(locales, [
   "profile_saved_toast",
   "preferences_saved_toast"
 ], "Phase 20 auth and account localization");
+
+assertLocaleKeys(locales, [
+  "signup_step_short_account",
+  "signup_step_short_location",
+  "signup_step_short_preferences",
+  "signup_step_short_habits",
+  "signup_step_short_budget",
+  "signup_step_short_notifications",
+  "signup_step_short_consent"
+], "Signup stepper short-label localization");
 
 assertLocaleKeys(locales, [
   "reservation_success_title",

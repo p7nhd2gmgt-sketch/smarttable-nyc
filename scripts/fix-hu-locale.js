@@ -646,7 +646,7 @@ const literalOverrides = {
   "Your photos and review help other guests and improve SmartTable AI recommendations.": "Fot\u00f3id \u00e9s \u00e9rt\u00e9kel\u00e9sed m\u00e1s vend\u00e9geknek is seg\u00edtenek, \u00e9s jav\u00edtj\u00e1k a SmartTable AI aj\u00e1nl\u00e1sait.",
   "Personal behavior is never shared with restaurants.": "A szem\u00e9lyes viselked\u00e9s soha nem ker\u00fcl megoszt\u00e1sra \u00e9ttermekkel.",
   "Your reservation request has been successfully sent to the restaurant. You will receive a confirmation email shortly at the email address you provided. If your reservation time is very soon, we recommend contacting the restaurant directly at least 30 minutes before your reservation.": "A foglal\u00e1si k\u00e9relmedet sikeresen elk\u00fcldt\u00fck az \u00e9tteremnek. Hamarosan visszaigazol\u00f3 emailt kapsz a megadott email c\u00edmre. Ha a foglal\u00e1si id\u0151pont nagyon k\u00f6zeli, javasoljuk, hogy legal\u00e1bb 30 perccel a foglal\u00e1s el\u0151tt k\u00f6zvetlen\u00fcl is vedd fel a kapcsolatot az \u00e9tteremmel.",
-  "Smarttable.com serves New York restaurants and guests.": "A Smarttable.com New York-i \u00e9ttermeket \u00e9s vend\u00e9geket szolg\u00e1l ki.",
+  "Smarttable.com serves New York restaurants and guests.": "A SmartTable New York-i \u00e9ttermeket \u00e9s vend\u00e9geket szolg\u00e1l ki.",
   "Control discounts, tables, reservations, and stats.": "Kezeld a kedvezm\u00e9nyeket, asztalokat, foglal\u00e1sokat \u00e9s statisztik\u00e1kat.",
   "Provider connections and data import status": "Szolg\u00e1ltat\u00f3i kapcsolatok \u00e9s adatimport \u00e1llapot",
   "No integration providers configured.": "Nincs integr\u00e1ci\u00f3s szolg\u00e1ltat\u00f3 be\u00e1ll\u00edtva.",

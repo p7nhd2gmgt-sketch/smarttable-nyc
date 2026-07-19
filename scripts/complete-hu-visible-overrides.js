@@ -12,7 +12,7 @@ const exact = {
   "Dashboard sections": "Dashboard szekci\u00f3k",
   "Primary navigation": "Els\u0151dleges navig\u00e1ci\u00f3",
   "Language switcher": "Nyelvv\u00e1laszt\u00f3",
-  "Smarttable.com home": "Smarttable.com f\u0151oldal",
+  "Smarttable.com home": "SmartTable f\u0151oldal",
   "Primary navigation": "Els\u0151dleges navig\u00e1ci\u00f3",
   "Language switcher": "Nyelvv\u00e1laszt\u00f3",
 

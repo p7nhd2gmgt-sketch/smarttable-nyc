@@ -32,12 +32,65 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const DEMO_SETTINGS_FILE = path.join(__dirname, "..", "data", "app-settings.json");
 
-const SUPABASE_URL = (process.env.SUPABASE_URL || "").replace(/\/$/, "");
+function envClean(value = "") {
+  return String(value ?? "").trim();
+}
+
+function normalizeRuntimeEnvironment(value = "") {
+  const normalized = envClean(value).toLowerCase();
+  if (["prod", "production"].includes(normalized)) return "production";
+  if (["preview", "staging", "stage"].includes(normalized)) return normalized === "stage" ? "staging" : normalized;
+  return "development";
+}
+
+function normalizeBaseUrl(value = "") {
+  return envClean(value).replace(/\/+$/, "");
+}
+
+function isValidHttpUrl(value = "") {
+  try {
+    const url = new URL(value);
+    return ["http:", "https:"].includes(url.protocol);
+  } catch {
+    return false;
+  }
+}
+
+function isLocalBaseUrl(value = "") {
+  try {
+    const hostname = new URL(value).hostname.toLowerCase();
+    return ["localhost", "127.0.0.1", "::1", "[::1]"].includes(hostname) || hostname.endsWith(".localhost");
+  } catch {
+    return true;
+  }
+}
+
+function isDeprecatedPublicBaseDomain(value = "") {
+  try {
+    const hostname = new URL(value).hostname.toLowerCase();
+    return hostname === "smarttable.com" || hostname === "www.smarttable.com";
+  } catch {
+    return false;
+  }
+}
+
+function parseEmailAllowlist(value = "") {
+  return envClean(value)
+    .split(/[,\s]+/)
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+const RUNTIME_ENVIRONMENT = normalizeRuntimeEnvironment(process.env.SMARTTABLE_ENV || process.env.APP_ENV || process.env.VERCEL_ENV || process.env.NODE_ENV || "development");
+const IS_PRODUCTION_RUNTIME = RUNTIME_ENVIRONMENT === "production";
+const SUPABASE_URL = normalizeBaseUrl(process.env.SUPABASE_URL || "");
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || "";
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
-const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || "https://smarttable.com").replace(/\/$/, "");
-const EMAIL_FROM = process.env.EMAIL_FROM || "SmartTable <reservations@mail.smarttablenyc.com>";
-const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
+const RAW_PUBLIC_BASE_URL = normalizeBaseUrl(process.env.PUBLIC_BASE_URL || process.env.PUBLIC_SITE_URL || "");
+const PUBLIC_BASE_URL = RAW_PUBLIC_BASE_URL || "https://smarttablenyc.com";
+const RAW_EMAIL_FROM = envClean(process.env.EMAIL_FROM || "");
+const EMAIL_FROM = RAW_EMAIL_FROM || "SmartTable <reservations@mail.smarttablenyc.com>";
+const RESEND_API_KEY = envClean(process.env.RESEND_API_KEY || "");
 const ADMIN_NOTIFICATION_EMAIL = process.env.ADMIN_NOTIFICATION_EMAIL || "admin@smarttable.com";
 const SUPABASE_STORAGE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET || "smarttable-media";
 const GOOGLE_MAPS_API_KEY = process.env.VITE_GOOGLE_MAPS_API_KEY || process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY || process.env.GOOGLE_MAPS_API_KEY || "";
@@ -51,6 +104,10 @@ const EMAIL_REPLY_TO = process.env.EMAIL_REPLY_TO || "";
 const RESEND_WEBHOOK_SECRET = process.env.RESEND_WEBHOOK_SECRET || "";
 const EMAIL_WEBHOOK_TOLERANCE_SECONDS = Math.max(60, Number(process.env.EMAIL_WEBHOOK_TOLERANCE_SECONDS || 300));
 const EMAIL_QUEUE_RETRY_DELAYS_MS = [60_000, 5 * 60_000, 30 * 60_000];
+const EMAIL_RECIPIENT_ALLOWLIST = parseEmailAllowlist(process.env.EMAIL_RECIPIENT_ALLOWLIST || process.env.EMAIL_ALLOWED_RECIPIENTS || "");
+const SUPABASE_REQUEST_TIMEOUT_MS = Math.max(1000, Number(process.env.SUPABASE_REQUEST_TIMEOUT_MS || 8000));
+const APPLICATION_VERSION = envClean(process.env.npm_package_version || process.env.SMARTTABLE_VERSION || "");
+const APPLICATION_COMMIT = envClean(process.env.VERCEL_GIT_COMMIT_SHA || process.env.GIT_COMMIT_SHA || "").slice(0, 40);
 
 const supabaseConfigured = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY && SUPABASE_SERVICE_ROLE_KEY);
 const emailService = createEmailService({
@@ -58,8 +115,89 @@ const emailService = createEmailService({
   resendApiKey: RESEND_API_KEY,
   defaultFrom: EMAIL_FROM,
   defaultReplyTo: EMAIL_REPLY_TO,
+  environment: RUNTIME_ENVIRONMENT,
+  enforceRecipientAllowlist: !IS_PRODUCTION_RUNTIME && Boolean(RESEND_API_KEY),
+  recipientAllowlist: EMAIL_RECIPIENT_ALLOWLIST,
   fetchImpl: fetch
 });
+
+function productionConfigurationIssues() {
+  if (!IS_PRODUCTION_RUNTIME) return [];
+  const issues = [];
+  if (!supabaseConfigured) issues.push("SUPABASE_CONFIGURATION_MISSING");
+  if (!RAW_PUBLIC_BASE_URL) issues.push("PUBLIC_BASE_URL_MISSING");
+  if (RAW_PUBLIC_BASE_URL && !isValidHttpUrl(RAW_PUBLIC_BASE_URL)) issues.push("PUBLIC_BASE_URL_INVALID");
+  if (RAW_PUBLIC_BASE_URL && isLocalBaseUrl(RAW_PUBLIC_BASE_URL)) issues.push("PUBLIC_BASE_URL_LOCALHOST");
+  if (RAW_PUBLIC_BASE_URL && isDeprecatedPublicBaseDomain(RAW_PUBLIC_BASE_URL)) issues.push("PUBLIC_BASE_URL_DEPRECATED_DOMAIN");
+  if (!RAW_EMAIL_FROM) issues.push("EMAIL_FROM_MISSING");
+  if (!RESEND_API_KEY) issues.push("RESEND_API_KEY_MISSING");
+  return issues;
+}
+
+function productionConfigurationReady() {
+  return productionConfigurationIssues().length === 0;
+}
+
+function deploymentDataMode() {
+  if (IS_PRODUCTION_RUNTIME && !productionConfigurationReady()) return "configuration_error";
+  return supabaseConfigured ? "supabase" : "demo";
+}
+
+function logSafeServerEvent(eventType, metadata = {}) {
+  const safeMetadata = {
+    event: String(eventType || "server_event"),
+    timestamp: new Date().toISOString(),
+    environment: RUNTIME_ENVIRONMENT,
+    ...metadata
+  };
+  for (const key of Object.keys(safeMetadata)) {
+    if (/secret|token|password|key|authorization/i.test(key)) {
+      delete safeMetadata[key];
+    }
+  }
+  console.error(JSON.stringify(safeMetadata));
+}
+
+async function checkDatabaseReachable() {
+  if (!supabaseConfigured) return false;
+  try {
+    await supabaseFetch("/rest/v1/restaurants?select=id&limit=1", {
+      service: true,
+      timeoutMs: Math.min(SUPABASE_REQUEST_TIMEOUT_MS, 2500)
+    });
+    return true;
+  } catch (error) {
+    logSafeServerEvent("database_health_check_failed", {
+      status: error.status || 500,
+      code: error.code || "DATABASE_UNREACHABLE"
+    });
+    return false;
+  }
+}
+
+async function runtimeHealthPayload() {
+  const issues = productionConfigurationIssues();
+  const databaseReachable = await checkDatabaseReachable();
+  const ok = issues.length === 0 && (!IS_PRODUCTION_RUNTIME || databaseReachable);
+  return {
+    ok,
+    status: ok ? "ok" : "degraded",
+    environment: RUNTIME_ENVIRONMENT,
+    runtime_mode: RUNTIME_ENVIRONMENT,
+    mode: deploymentDataMode(),
+    platform_mode_default: defaultPlatformSettings.platform_mode,
+    version: APPLICATION_VERSION || null,
+    commit: APPLICATION_COMMIT || null,
+    public_base_url_configured: Boolean(RAW_PUBLIC_BASE_URL),
+    public_base_url_uses_localhost: Boolean(PUBLIC_BASE_URL && isLocalBaseUrl(PUBLIC_BASE_URL)),
+    supabase_configured: supabaseConfigured,
+    database_reachable: databaseReachable,
+    email_configured: emailService.configured,
+    resend_webhook_configured: Boolean(RESEND_WEBHOOK_SECRET),
+    webhook_status: RESEND_WEBHOOK_SECRET ? "configured" : "deferred",
+    production_configuration_issues: issues
+  };
+}
 
 const allowedReservationStatuses = new Set(ALLOWED_RESERVATION_STATUSES);
 const bookingSources = new Set(BOOKING_SOURCES);
@@ -1542,8 +1680,8 @@ const defaultSiteContent = [
   },
   {
     key: "footer_text",
-    value_en: "Smarttable.com serves New York restaurants and guests with discounted reservation technology.",
-    value_es: "Smarttable.com conecta restaurantes y clientes de Nueva York con tecnologia de reservas con descuento.",
+    value_en: "SmartTable serves New York restaurants and guests with discounted reservation technology.",
+    value_es: "SmartTable conecta restaurantes y clientes de Nueva York con tecnologia de reservas con descuento.",
     content_type: "textarea",
     group_name: "footer"
   },
@@ -3696,16 +3834,30 @@ async function supabaseFetch(path, options = {}) {
   const service = options.service !== false;
   const key = service ? SUPABASE_SERVICE_ROLE_KEY : SUPABASE_ANON_KEY;
   const token = options.token || key;
-  const response = await fetch(`${SUPABASE_URL}${path}`, {
-    method: options.method || "GET",
-    headers: {
-      apikey: key,
-      authorization: `Bearer ${token}`,
-      "content-type": "application/json",
-      ...(options.headers || {})
-    },
-    body: options.body === undefined ? undefined : JSON.stringify(options.body)
-  });
+  const timeoutMs = Math.max(500, Number(options.timeoutMs || SUPABASE_REQUEST_TIMEOUT_MS));
+  const controller = options.signal ? null : new AbortController();
+  const timeout = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+  let response;
+  try {
+    response = await fetch(`${SUPABASE_URL}${path}`, {
+      method: options.method || "GET",
+      headers: {
+        apikey: key,
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+        ...(options.headers || {})
+      },
+      body: options.body === undefined ? undefined : JSON.stringify(options.body),
+      signal: options.signal || controller?.signal
+    });
+  } catch (error) {
+    const timeoutError = new Error(error.name === "AbortError" ? "Upstream request timed out." : "Upstream service is unavailable.");
+    timeoutError.status = error.name === "AbortError" ? 504 : 502;
+    timeoutError.code = error.name === "AbortError" ? "UPSTREAM_TIMEOUT" : "UPSTREAM_UNAVAILABLE";
+    throw timeoutError;
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
 
   const raw = await response.text();
   let payload = null;
@@ -7582,6 +7734,7 @@ async function listPublicConfig() {
   const platformSettings = await getPlatformSettings();
   return json(200, {
     mode: supabaseConfigured ? "supabase" : "demo",
+    public_base_url: PUBLIC_BASE_URL,
     ...platformSettings,
     feature_registry: platformFeatureRegistry,
     google_maps_api_key: GOOGLE_MAPS_API_KEY,
@@ -9944,6 +10097,7 @@ function emailProviderDiagnostics() {
   const replyTo = parseSenderAddress(EMAIL_REPLY_TO);
   return {
     provider: "resend",
+    environment: RUNTIME_ENVIRONMENT,
     mode: emailService.configured ? "external_provider_configured" : "not_configured",
     can_send_real_email: emailService.configured,
     delivery_status_limit: RESEND_WEBHOOK_SECRET ? "provider_webhook_can_update_delivery_events" : "provider_acceptance_only_until_webhook_secret_is_configured",
@@ -9968,7 +10122,13 @@ function emailProviderDiagnostics() {
       EMAIL_FROM: Boolean(EMAIL_FROM),
       EMAIL_REPLY_TO: Boolean(EMAIL_REPLY_TO),
       PUBLIC_BASE_URL: Boolean(PUBLIC_BASE_URL),
-      RESEND_WEBHOOK_SECRET: Boolean(RESEND_WEBHOOK_SECRET)
+      RESEND_WEBHOOK_SECRET: Boolean(RESEND_WEBHOOK_SECRET),
+      EMAIL_RECIPIENT_ALLOWLIST: Boolean(EMAIL_RECIPIENT_ALLOWLIST.length)
+    },
+    non_production_recipient_safety: {
+      enabled: emailService.nonProductionRecipientRestrictionEnabled,
+      allowlist_configured: emailService.recipientAllowlistConfigured,
+      allowlist_count: EMAIL_RECIPIENT_ALLOWLIST.length
     },
     dns_readiness: {
       verified_sender_or_domain_required: true,
@@ -12614,7 +12774,14 @@ export async function handleApiRequest(input) {
 
   try {
     if (method === "GET" && pathname === "/health") {
-      return json(200, { ok: true, mode: supabaseConfigured ? "supabase" : "demo", publicBaseUrl: PUBLIC_BASE_URL });
+      const health = await runtimeHealthPayload();
+      return json(health.ok ? 200 : 503, health);
+    }
+    if (IS_PRODUCTION_RUNTIME && !productionConfigurationReady()) {
+      return json(503, {
+        error: "Service temporarily unavailable.",
+        code: "PRODUCTION_CONFIGURATION_INCOMPLETE"
+      });
     }
     if (pathname === "/webhooks/resend") return await emailProviderWebhook(method, body, headers);
     if (method === "GET" && pathname === "/system/feature-status") {
@@ -12695,13 +12862,28 @@ export async function handleApiRequest(input) {
     if (method === "GET" && pathname === "/partner/stats") return await partnerStats(headers, url.searchParams);
     return json(404, { error: "API endpoint not found." });
   } catch (error) {
-    const payload = { error: error.message || "Server error." };
+    const status = error.status || 500;
+    logSafeServerEvent("api_request_failed", {
+      method,
+      path: pathname,
+      status,
+      code: error.code || "API_ERROR"
+    });
+    const payload = {
+      error: IS_PRODUCTION_RUNTIME && status >= 500
+        ? "Server error."
+        : error.message || "Server error."
+    };
     if (error.code) payload.code = error.code;
     if (error.details?.send_after) payload.send_after = error.details.send_after;
-    return json(error.status || 500, payload);
+    return json(status, payload);
   }
 }
 
 export function isSupabaseConfigured() {
   return supabaseConfigured;
+}
+
+export async function getRuntimeHealth() {
+  return runtimeHealthPayload();
 }

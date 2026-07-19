@@ -346,13 +346,13 @@ const aiWizardOptions = {
 };
 
 const signupSteps = [
-  { key: "account", labelKey: "signup_step_account", fallback: "Account" },
-  { key: "location", labelKey: "signup_step_location", fallback: "Location" },
-  { key: "preferences", labelKey: "signup_step_preferences", fallback: "Food and drink preferences" },
-  { key: "habits", labelKey: "signup_step_habits", fallback: "Dining habits" },
-  { key: "budget", labelKey: "signup_step_budget", fallback: "Budget and discounts" },
-  { key: "notifications", labelKey: "signup_step_notifications", fallback: "Notifications" },
-  { key: "consent", labelKey: "signup_step_consent", fallback: "Review and consent" }
+  { key: "account", labelKey: "signup_step_account", fallback: "Account", shortLabelKey: "signup_step_short_account", shortFallback: "Account" },
+  { key: "location", labelKey: "signup_step_location", fallback: "Location", shortLabelKey: "signup_step_short_location", shortFallback: "Location" },
+  { key: "preferences", labelKey: "signup_step_preferences", fallback: "Food and drink preferences", shortLabelKey: "signup_step_short_preferences", shortFallback: "Food" },
+  { key: "habits", labelKey: "signup_step_habits", fallback: "Dining habits", shortLabelKey: "signup_step_short_habits", shortFallback: "Habits" },
+  { key: "budget", labelKey: "signup_step_budget", fallback: "Budget and discounts", shortLabelKey: "signup_step_short_budget", shortFallback: "Budget" },
+  { key: "notifications", labelKey: "signup_step_notifications", fallback: "Notifications", shortLabelKey: "signup_step_short_notifications", shortFallback: "Alerts" },
+  { key: "consent", labelKey: "signup_step_consent", fallback: "Review and consent", shortLabelKey: "signup_step_short_consent", shortFallback: "Review" }
 ];
 
 const signupAnalyticsEvents = new Set([
@@ -1047,7 +1047,7 @@ function updateChromeText() {
   document.documentElement.lang = state.lang;
   const skipLink = document.querySelector(".skip-link");
   if (skipLink) skipLink.textContent = t("skip_to_content", "Skip to main content");
-  document.querySelector(".brand")?.setAttribute("aria-label", t("brand_home_label", "Smarttable.com home"));
+  document.querySelector(".brand")?.setAttribute("aria-label", t("brand_home_label", "SmartTable home"));
   document.querySelector(".top-actions")?.setAttribute("aria-label", t("primary_navigation_label", "Primary navigation"));
   document.querySelector(".language-switcher")?.setAttribute("aria-label", t("language_switcher_label", "Language switcher"));
   Object.entries(supportedLanguages).forEach(([lang, config]) => {
@@ -1060,6 +1060,8 @@ function updateChromeText() {
   document.querySelector(".brand strong").textContent = isBasicMode() ? t("basic_brand_title", "SmartTable") : t("brand_title", "SmartTable AI");
   document.querySelector(".brand small").textContent = isBasicMode() ? t("basic_brand_subtitle", "Discounted restaurant reservations") : t("brand_subtitle", "The AI Revenue Operating System for Restaurants");
   document.querySelector("#guestNav").textContent = t("nav_offers", "Offers");
+  document.querySelector("#restaurantsNav").textContent = t("nav_restaurants", "Restaurants");
+  document.querySelector("#contactNav").textContent = t("nav_contact", "Contact");
   if (signupNav) {
     signupNav.textContent = t("signup_nav_button", "Sign Up");
     signupNav.hidden = Boolean(state.session);
@@ -1069,14 +1071,22 @@ function updateChromeText() {
     aiNav.hidden = !canShowFeature("ai.concierge", { allowDemo: true });
     aiNav.textContent = t("ai_concierge_nav_label", "AI Concierge");
   }
-  document.querySelector("#adminNav").textContent = t("nav_admin", "Super Admin");
-  document.querySelector("#restaurantNav").textContent = t("nav_partner", "Partner");
+  const adminNav = document.querySelector("#adminNav");
+  if (adminNav) {
+    adminNav.textContent = t("nav_admin", "Super Admin");
+    adminNav.hidden = !isAdminRole(state.session?.profile?.role);
+  }
+  const restaurantNav = document.querySelector("#restaurantNav");
+  if (restaurantNav) {
+    restaurantNav.textContent = t("nav_partner", "Partner");
+    restaurantNav.hidden = normalizeRole(state.session?.profile?.role) !== "partner";
+  }
   updateSessionButton();
 }
 
 function publicRouteMeta() {
   const path = window.location.pathname.replace(/\/+$/, "") || "/";
-  const noindexPrefixes = ["/admin", "/partner", "/restaurant", "/account", "/login", "/forgot-password", "/reset-password", "/guest/rewards/photo-upload"];
+  const noindexPrefixes = ["/admin", "/partner", "/restaurant", "/account", "/login", "/forgot-password", "/reset-password", "/verify-email", "/ai", "/ai-concierge", "/ai-preferences", "/partner-ai-demand", "/admin-ai-controls", "/guest/rewards/photo-upload"];
   const noindex = noindexPrefixes.some((prefix) => path === prefix || path.startsWith(`${prefix}/`));
   if (path === "/restaurants") {
     return {
@@ -1134,11 +1144,19 @@ function publicRouteMeta() {
   };
 }
 
+function publicBaseUrl() {
+  const configured = String(state.config?.public_base_url || "").replace(/\/+$/, "");
+  if (configured) return configured;
+  const origin = String(window.location?.origin || "").replace(/\/+$/, "");
+  if (origin && !/^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(?::|$)/i.test(origin)) return origin;
+  return "https://smarttablenyc.com";
+}
+
 function updateMeta() {
   const meta = publicRouteMeta();
   const title = meta.title;
   const description = meta.description;
-  const canonical = `https://smarttable.com${meta.canonicalPath === "/" ? "/" : meta.canonicalPath}`;
+  const canonical = `${publicBaseUrl()}${meta.canonicalPath === "/" ? "/" : meta.canonicalPath}`;
   document.title = title;
   document.querySelector('meta[name="description"]')?.setAttribute("content", description);
   document.querySelector('meta[name="robots"]')?.setAttribute("content", meta.noindex ? "noindex, nofollow" : "index, follow");
@@ -1428,7 +1446,7 @@ function renderPublicGuestInfoPage(route) {
         </div>
       </section>
     `)}
-    <footer class="site-footer">${escapeHtml(t("footer_text", "Smarttable.com serves New York restaurants and guests."))}</footer>
+    <footer class="site-footer">${escapeHtml(t("footer_text", "SmartTable serves New York restaurants and guests."))}</footer>
   `;
   finalizeRenderedLanguage();
   document.querySelector("#publicInfoRestaurants")?.addEventListener("click", async () => {
@@ -1472,6 +1490,11 @@ const noFavoriteRestaurantOption = "I do not have a favorite SmartTable restaura
 function signupStepTitle(index = ensureSignupState().step) {
   const step = signupSteps[index] || signupSteps[0];
   return t(step.labelKey, step.fallback);
+}
+
+function signupStepNavLabel(index) {
+  const step = signupSteps[index] || signupSteps[0];
+  return t(step.shortLabelKey, step.shortFallback || step.fallback);
 }
 
 function passwordStrength(password = "") {
@@ -3528,17 +3551,25 @@ function signupRadioGroup(name, options) {
 
 function signupProgress() {
   const current = ensureSignupState().step;
+  const currentTitle = signupStepTitle(current);
   return `
-    <ol class="signup-progress" aria-label="${escapeAttr(t("signup_progress_label", "Signup progress"))}">
-      ${signupSteps.map((step, index) => `
-        <li class="${index < current ? "done" : index === current ? "active" : ""}">
-          <button data-signup-step="${index}" type="button" ${index > current ? "disabled" : ""}>
-            <span>${index + 1}</span>
-            <b>${escapeHtml(t(step.labelKey, step.fallback))}</b>
-          </button>
-        </li>
-      `).join("")}
-    </ol>
+    <nav class="signup-progress-nav" aria-label="${escapeAttr(t("signup_progress_label", "Signup progress"))}">
+      <p class="signup-progress-summary">${escapeHtml(`${t("signup_step_label", "Step")} ${current + 1} / ${signupSteps.length}: ${currentTitle}`)}</p>
+      <ol class="signup-progress">
+        ${signupSteps.map((step, index) => {
+          const fullTitle = t(step.labelKey, step.fallback);
+          const isCurrent = index === current;
+          return `
+          <li class="${index < current ? "done" : isCurrent ? "active" : ""}">
+            <button data-signup-step="${index}" type="button" aria-label="${escapeAttr(`${t("signup_step_label", "Step")} ${index + 1}: ${fullTitle}`)}" ${isCurrent ? 'aria-current="step"' : ""} ${index > current ? "disabled" : ""}>
+              <span aria-hidden="true">${index + 1}</span>
+              <b>${escapeHtml(signupStepNavLabel(index))}</b>
+            </button>
+          </li>
+        `;
+        }).join("")}
+      </ol>
+    </nav>
   `;
 }
 
@@ -3693,8 +3724,7 @@ function renderGuestSignup() {
   }
   const finalStep = signup.step === signupSteps.length - 1;
   const createDisabled = finalStep && !isSignupReadyToCreate();
-  app.innerHTML = `
-    ${layoutHero(`
+  app.innerHTML = guestStandaloneShell(`
       <section class="signup-page">
         <div class="signup-header">
           <span class="section-kicker">${escapeHtml(t("signup_kicker", "Guest account"))}</span>
@@ -3718,10 +3748,18 @@ function renderGuestSignup() {
           </div>
         </form>
       </section>
-    `)}
-  `;
+    `, "guest-signup-shell");
   bindSignupEvents();
+  scrollActiveSignupStepIntoView();
   finalizeRenderedLanguage();
+}
+
+function scrollActiveSignupStepIntoView() {
+  const activeStep = document.querySelector(".signup-progress .active");
+  if (!activeStep) return;
+  requestAnimationFrame(() => {
+    activeStep.scrollIntoView({ block: "nearest", inline: "center" });
+  });
 }
 
 function bindSignupEvents() {
@@ -4089,7 +4127,7 @@ function renderGuest(publicRoute = currentPublicGuestRoute()) {
       `)}
       ${aiModeBanner("guest")}
       ${postVisitRewardsPage()}
-      <footer class="site-footer">${escapeHtml(t("footer_text", "Smarttable.com serves New York restaurants and guests."))}</footer>
+      <footer class="site-footer">${escapeHtml(t("footer_text", "SmartTable serves New York restaurants and guests."))}</footer>
       ${guestModals()}
     `;
     bindGuestEvents(restaurants);
@@ -4135,7 +4173,7 @@ function renderGuest(publicRoute = currentPublicGuestRoute()) {
         <p>${escapeHtml(t("guests_body", "Find deals and receive email updates."))}</p>
       </article>
     </section>
-    <footer class="site-footer">${escapeHtml(t("footer_text", "Smarttable.com serves New York restaurants and guests."))}</footer>
+    <footer class="site-footer">${escapeHtml(t("footer_text", "SmartTable serves New York restaurants and guests."))}</footer>
     ${guestModals()}
   `;
   bindGuestEvents(restaurants);
@@ -4451,6 +4489,10 @@ async function submitConsumptionUpload(event) {
 
 function guestAuthShell(inner) {
   return layoutHero(`<section class="account-auth-page">${inner}</section>`);
+}
+
+function guestStandaloneShell(inner, className = "") {
+  return `<section class="guest-standalone-page ${escapeAttr(className)}">${inner}</section>`;
 }
 
 function renderPasswordField(name, label, value = "", stateKey = "showPassword", autocomplete = "current-password") {
@@ -10292,7 +10334,19 @@ async function renderCurrentMode() {
 function bindNav() {
   document.querySelector("#guestNav").addEventListener("click", async () => {
     maybeTrackSignupAbandoned("guest_navigation");
-    history.pushState(null, "", "/");
+    history.pushState(null, "", "/offers");
+    state.mode = "guest";
+    await renderCurrentMode();
+  });
+  document.querySelector("#restaurantsNav")?.addEventListener("click", async () => {
+    maybeTrackSignupAbandoned("restaurants_navigation");
+    history.pushState(null, "", "/restaurants");
+    state.mode = "guest";
+    await renderCurrentMode();
+  });
+  document.querySelector("#contactNav")?.addEventListener("click", async () => {
+    maybeTrackSignupAbandoned("contact_navigation");
+    history.pushState(null, "", "/contact");
     state.mode = "guest";
     await renderCurrentMode();
   });
@@ -10302,13 +10356,13 @@ function bindNav() {
     state.mode = "guest";
     await renderCurrentMode();
   });
-  document.querySelector("#adminNav").addEventListener("click", async () => {
+  document.querySelector("#adminNav")?.addEventListener("click", async () => {
     maybeTrackSignupAbandoned("admin_navigation");
     history.pushState(null, "", "/admin");
     state.mode = "admin";
     await renderCurrentMode();
   });
-  document.querySelector("#restaurantNav").addEventListener("click", async () => {
+  document.querySelector("#restaurantNav")?.addEventListener("click", async () => {
     maybeTrackSignupAbandoned("partner_navigation");
     history.pushState(null, "", "/partner");
     state.mode = "partner";

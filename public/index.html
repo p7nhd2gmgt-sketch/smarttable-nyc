@@ -6,15 +6,16 @@
     <title>SmartTable | Discounted New York restaurant reservations</title>
     <meta name="description" content="Book discounted restaurant tables across New York and send reservation requests directly to restaurants.">
     <meta name="robots" content="index, follow">
-    <meta property="og:site_name" content="Smarttable.com">
+    <meta property="og:site_name" content="SmartTable">
     <meta property="og:title" content="SmartTable | Discounted New York restaurant reservations">
     <meta property="og:description" content="Discounted restaurant reservations and table offers for New York.">
     <meta property="og:type" content="website">
-    <meta property="og:url" content="https://smarttable.com/">
-    <meta property="og:image" content="https://smarttable.com/assets/restaurant-hero.png">
+    <meta property="og:url" content="https://smarttablenyc.com/">
+    <meta property="og:image" content="https://smarttablenyc.com/assets/restaurant-hero.png">
     <meta name="twitter:card" content="summary_large_image">
     <meta name="theme-color" content="#0f735d">
-    <link rel="canonical" href="https://smarttable.com/">
+    <link rel="canonical" href="https://smarttablenyc.com/">
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg">
     <link rel="manifest" href="/site.webmanifest">
     <link rel="stylesheet" href="/styles.css?v=guest-account-1">
     <script type="application/ld+json">
@@ -23,24 +24,24 @@
         "@graph": [
           {
             "@type": "Organization",
-            "@id": "https://smarttable.com/#organization",
+            "@id": "https://smarttablenyc.com/#organization",
             "name": "SmartTable",
-            "url": "https://smarttable.com/"
+            "url": "https://smarttablenyc.com/"
           },
           {
             "@type": "WebSite",
-            "@id": "https://smarttable.com/#website",
-            "url": "https://smarttable.com/",
+            "@id": "https://smarttablenyc.com/#website",
+            "url": "https://smarttablenyc.com/",
             "name": "SmartTable",
             "publisher": {
-              "@id": "https://smarttable.com/#organization"
+              "@id": "https://smarttablenyc.com/#organization"
             }
           },
           {
             "@type": "WebApplication",
-            "@id": "https://smarttable.com/#app",
+            "@id": "https://smarttablenyc.com/#app",
             "name": "SmartTable",
-            "url": "https://smarttable.com/",
+            "url": "https://smarttablenyc.com/",
             "applicationCategory": "LifestyleApplication",
             "operatingSystem": "Any",
             "description": "Discounted restaurant reservations and table offers for New York."
@@ -53,7 +54,7 @@
     <a class="skip-link" href="#app">Skip to main content</a>
     <div class="shell">
       <header class="topbar">
-        <a class="brand" href="/" aria-label="Smarttable.com home">
+        <a class="brand" href="/" aria-label="SmartTable home">
           <span class="brand-mark">ST</span>
           <span>
             <strong>SmartTable</strong>
@@ -63,9 +64,11 @@
 
         <nav class="top-actions" aria-label="Primary navigation">
           <button class="ghost-button" id="guestNav" type="button">Offers</button>
+          <button class="ghost-button" id="restaurantsNav" type="button">Restaurants</button>
+          <button class="ghost-button" id="contactNav" type="button">Contact</button>
           <button class="ghost-button" id="aiConciergeNav" type="button" hidden>AI Concierge</button>
-          <button class="ghost-button" id="adminNav" type="button">Admin</button>
-          <button class="ghost-button" id="restaurantNav" type="button">Partner</button>
+          <button class="ghost-button" id="adminNav" type="button" hidden>Admin</button>
+          <button class="ghost-button" id="restaurantNav" type="button" hidden>Partner</button>
           <button class="ghost-button" id="signupNav" type="button">Sign Up</button>
           <span class="language-switcher" aria-label="Language switcher">
             <button class="ghost-button" id="langEn" data-lang="en" type="button">English &#x1F1FA;&#x1F1F8;</button>

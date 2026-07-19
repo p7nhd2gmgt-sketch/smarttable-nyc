@@ -41,8 +41,8 @@ The current BASIC release scope intentionally excludes AI Concierge, AI Demand E
 
 | Browser / engine | Status | Notes |
 | --- | --- | --- |
-| Microsoft Edge Chromium headless | PARTIAL PASS | Used for rendered route shell checks, responsive overflow metrics, and direct `/login` verification. |
-| In-app browser | BLOCKED | Windows sandbox failed with `CreateProcessAsUserW failed: 5`. |
+| Microsoft Edge Chromium headless | PARTIAL PASS | Used for rendered route shell checks, responsive overflow metrics, hidden internal-nav checks, signup stepper measurements, and screenshot capture. |
+| In-app browser | BLOCKED | Windows sandbox failed with `CreateProcessAsUserW failed: 5` again during the Phase 8-11 pass. |
 | Chrome desktop | NOT VERIFIED | Requires human/manual QA. |
 | Firefox desktop | NOT VERIFIED | Requires human/manual QA. |
 | Safari/WebKit | NOT VERIFIED | Requires human/manual QA on available hardware or WebKit-capable tooling. |
@@ -62,6 +62,14 @@ Rendered Edge/CDP overflow checks were executed for:
 - `1440x900`
 
 Route-shell checks included `/`, `/restaurants`, `/signup`, `/login`, `/forgot-password`, `/account`, `/partner`, and `/admin` at representative phone, tablet, and desktop widths. Tested combinations returned no page-level horizontal overflow after the mobile-header fix.
+
+Phase 8-11 follow-up measured `/`, `/restaurants`, `/offers`, `/signup`, `/login`, `/forgot-password`, `/reset-password`, `/account`, `/partner`, and `/admin` in Microsoft Edge headless. Core public/auth routes were measured at `320`, `390`, `768`, `1024`, and `1440`; the second route pass measured `/offers`, `/account`, `/reset-password`, `/partner`, and `/admin` at `390`, `1024`, and `1440`. The signup stepper was also measured at `320`, `375`, `390`, `430`, `768`, `1024`, `1366`, and `1440` widths after the standalone signup-shell fix. No page-level horizontal overflow was detected in those measurements.
+
+Screenshot artifacts:
+
+- `docs/qa/screenshots/home-desktop-1440x900.png`
+- `docs/qa/screenshots/signup-desktop-1366x768.png`
+- `docs/qa/screenshots/signup-mobile-390x844.png`
 
 ## Guest Flows Tested
 
