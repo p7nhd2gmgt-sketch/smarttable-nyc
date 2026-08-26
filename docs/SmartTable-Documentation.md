@@ -486,7 +486,7 @@ The app exposes 64 distinct backend route paths through `/api/*`.
 | `POST` | `/public/follow` | Public | Working |
 | `GET` | `/public/offers` | Public | Working |
 | `GET` | `/public/restaurants/newest` | Public | Working |
-| `POST` | `/public/reviews` | Public | Working |
+| `ANY` | `/guest/reviews/verified` | Guest / Verified token | Working |
 | `GET` | `/public/rewards/context` | Public | Working |
 | `POST` | `/reservations` | System / Public | Working |
 | `GET` | `/system/checklists` | System / Public | Working |

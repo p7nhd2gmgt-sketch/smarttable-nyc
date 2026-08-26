@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { handleApiRequest } from "../src/app-core.js";
+import { TEST_ACCOUNTS } from "./test-account-credentials.mjs";
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -40,10 +41,10 @@ function expectStatus(response, status, message) {
 }
 
 async function assertApiRouteProtection() {
-  const guest = await loginAs("guest@smarttable.com", "guest123");
-  const partner = await loginAs("owner@hudsonhearth.com", "restaurant123");
-  const admin = await loginAs("ops@smarttable.com", "admin123");
-  const superAdmin = await loginAs("admin@smarttable.com", "admin123");
+  const guest = await loginAs(TEST_ACCOUNTS.guest.email, TEST_ACCOUNTS.guest.password);
+  const partner = await loginAs(TEST_ACCOUNTS.partner.email, TEST_ACCOUNTS.partner.password);
+  const admin = await loginAs(TEST_ACCOUNTS.admin.email, TEST_ACCOUNTS.admin.password);
+  const superAdmin = await loginAs(TEST_ACCOUNTS.superadmin.email, TEST_ACCOUNTS.superadmin.password);
 
   assert(guest.profile.role === "guest", "Demo guest must retain the guest role.");
   assert(partner.profile.role === "partner", "Demo partner must retain the partner role.");
@@ -58,6 +59,9 @@ async function assertApiRouteProtection() {
   expectStatus(await apiRaw("GET", "/partner/reservations", {}, guest.headers), 403, "Guests must not access partner reservations.");
   expectStatus(await apiRaw("GET", "/admin/stats", {}, guest.headers), 403, "Guests must not access admin routes.");
   expectStatus(await apiRaw("GET", "/admin/restaurants", {}, partner.headers), 403, "Partners must not access admin routes.");
+  expectStatus(await apiRaw("GET", "/admin/restaurant-detail?id=10000000-0000-4000-8000-000000000001", {}, partner.headers), 403, "Partners must not access admin restaurant detail routes.");
+  expectStatus(await apiRaw("POST", "/admin/restaurant-capacity", { restaurant_id: "10000000-0000-4000-8000-000000000001" }, partner.headers), 403, "Partners must not manage restaurant capacity through admin routes.");
+  expectStatus(await apiRaw("GET", "/admin/audit-logs", {}, partner.headers), 403, "Partners must not access admin audit history.");
 
   const partnerProfile = await api("GET", "/partner/profile", {}, partner.headers);
   assert(partnerProfile.restaurant?.id === partner.profile.restaurant_id, "Partners must see only their linked restaurant profile.");
@@ -75,6 +79,8 @@ async function assertApiRouteProtection() {
 
   const adminStats = await api("GET", "/admin/stats", {}, admin.headers);
   assert(adminStats.stats, "Regular admins must access admin stats.");
+  const adminAuditLogs = await api("GET", "/admin/audit-logs", {}, admin.headers);
+  assert(Array.isArray(adminAuditLogs.audit_logs), "Regular admins must access scoped admin audit history.");
 
   const adminSettings = await api("GET", "/admin/settings/platform-mode", {}, admin.headers);
   assert(adminSettings.can_edit === false, "Regular admins may view but not edit platform mode.");
@@ -98,6 +104,9 @@ async function assertFrontendRouteGuards() {
     'path.startsWith("/account/")',
     'path.startsWith("/partner/")',
     'path.startsWith("/admin/")',
+    'path.startsWith("/superadmin/")',
+    'area === "superadmin"',
+    'role === "super_admin"',
     '"/account/reservations"',
     '"/account/favorites"',
     '"/account/security"'

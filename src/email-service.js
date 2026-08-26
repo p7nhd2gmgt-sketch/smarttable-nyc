@@ -17,6 +17,36 @@ function redactProviderPayload(payload) {
   return safe;
 }
 
+function normalizeAllowlist(values = []) {
+  const source = Array.isArray(values) ? values : String(values || "").split(/[,\s]+/);
+  return new Set(source.map((value) => clean(value).toLowerCase()).filter(Boolean));
+}
+
+function recipientDomain(value = "") {
+  return clean(value).toLowerCase().split("@").at(-1) || "";
+}
+
+function allowlistAllowsRecipient(recipient = "", allowlist = new Set()) {
+  const cleanRecipient = clean(recipient).toLowerCase();
+  const domain = recipientDomain(cleanRecipient);
+  return allowlist.has(cleanRecipient) || (domain && allowlist.has(`*@${domain}`));
+}
+
+function safeDiagnosticLog(result = {}, eventType = "email_send") {
+  const payload = {
+    event_type: eventType,
+    success: Boolean(result.accepted),
+    provider: result.provider || "unknown",
+    provider_message_id: result.messageId || result.provider_id || null,
+    status: result.status || "unknown",
+    error_code: result.errorCode || null,
+    provider_response: result.providerResponse || null,
+    timestamp: new Date().toISOString()
+  };
+  console.info("[smarttable-email]", JSON.stringify(payload));
+  return result;
+}
+
 export function isEmailAccepted(result) {
   return Boolean(result?.accepted === true && ["queued", "sent", "delivered"].includes(result.status));
 }
@@ -26,12 +56,23 @@ export function createEmailService({
   resendApiKey = "",
   defaultFrom = "",
   defaultReplyTo = "",
+  environment = "development",
+  enforceRecipientAllowlist = false,
+  recipientAllowlist = [],
+  rejectExampleRecipients = true,
+  diagnosticLogging = true,
   fetchImpl = globalThis.fetch
 } = {}) {
   const normalizedProvider = clean(provider || "resend").toLowerCase();
   const from = clean(defaultFrom);
   const replyTo = clean(defaultReplyTo);
   const apiKey = clean(resendApiKey);
+  const runtimeEnvironment = clean(environment || "development").toLowerCase();
+  const allowlist = normalizeAllowlist(recipientAllowlist);
+
+  function finish(result = {}, eventType = "email_send") {
+    return diagnosticLogging ? safeDiagnosticLog(result, eventType) : result;
+  }
 
   function baseResult(message = {}, overrides = {}) {
     const result = {
@@ -65,34 +106,57 @@ export function createEmailService({
     return "";
   }
 
+  function recipientRestrictionError(message = {}) {
+    const recipient = clean(message.to).toLowerCase();
+    const domain = recipientDomain(recipient);
+    if (rejectExampleRecipients && runtimeEnvironment === "production" && (domain === "example" || domain.endsWith(".example"))) {
+      return {
+        errorCode: "EMAIL_RECIPIENT_EXAMPLE_BLOCKED_PRODUCTION",
+        errorMessage: "Production email delivery to .example recipients is blocked."
+      };
+    }
+    if (enforceRecipientAllowlist && apiKey && !allowlistAllowsRecipient(recipient, allowlist)) {
+      return {
+        errorCode: "EMAIL_RECIPIENT_NOT_ALLOWED_NON_PRODUCTION",
+        errorMessage: "Non-production real email delivery is restricted to EMAIL_RECIPIENT_ALLOWLIST."
+      };
+    }
+    return null;
+  }
+
   async function sendEmail(message = {}) {
     const validationError = validate(message);
     if (validationError) {
-      return baseResult(message, {
+      return finish(baseResult(message, {
         errorCode: validationError,
         errorMessage: "Email message is missing required delivery fields."
-      });
+      }));
+    }
+
+    const restrictionError = recipientRestrictionError(message);
+    if (restrictionError) {
+      return finish(baseResult(message, restrictionError), "email_send_restricted");
     }
 
     if (normalizedProvider !== "resend") {
-      return baseResult(message, {
+      return finish(baseResult(message, {
         errorCode: "EMAIL_PROVIDER_UNSUPPORTED",
         errorMessage: `Email provider '${normalizedProvider}' is not supported by this build.`
-      });
+      }));
     }
 
     if (!apiKey) {
-      return baseResult(message, {
+      return finish(baseResult(message, {
         errorCode: "EMAIL_PROVIDER_NOT_CONFIGURED",
         errorMessage: "RESEND_API_KEY is not configured. No email was sent."
-      });
+      }));
     }
 
     if (typeof fetchImpl !== "function") {
-      return baseResult(message, {
+      return finish(baseResult(message, {
         errorCode: "EMAIL_FETCH_UNAVAILABLE",
         errorMessage: "The runtime fetch API is unavailable for email delivery."
-      });
+      }));
     }
 
     try {
@@ -113,26 +177,26 @@ export function createEmailService({
       });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) {
-        return baseResult(message, {
+        return finish(baseResult(message, {
           errorCode: `RESEND_${response.status}`,
           errorMessage: clean(payload.message || payload.error) || `Resend rejected the message with HTTP ${response.status}.`,
           providerResponse: redactProviderPayload(payload)
-        });
+        }));
       }
       const messageId = clean(payload.id);
-      return baseResult(message, {
+      return finish(baseResult(message, {
         accepted: true,
         messageId,
         provider_id: messageId,
         status: "sent",
         delivery: "sent",
         providerResponse: redactProviderPayload(payload)
-      });
+      }), "email_provider_accepted");
     } catch (error) {
-      return baseResult(message, {
+      return finish(baseResult(message, {
         errorCode: "EMAIL_PROVIDER_REQUEST_FAILED",
         errorMessage: safeErrorMessage(error)
-      });
+      }));
     }
   }
 
@@ -150,6 +214,9 @@ export function createEmailService({
   return {
     provider: normalizedProvider,
     configured: Boolean(normalizedProvider === "resend" && apiKey),
+    environment: runtimeEnvironment,
+    recipientAllowlistConfigured: allowlist.size > 0,
+    nonProductionRecipientRestrictionEnabled: Boolean(enforceRecipientAllowlist),
     sendEmail,
     sendTemplatedEmail
   };

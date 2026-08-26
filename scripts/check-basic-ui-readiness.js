@@ -14,6 +14,27 @@ function includesAll(source, tokens, label) {
   }
 }
 
+function excludesAll(source, tokens, label) {
+  for (const token of tokens) {
+    assert(!source.includes(token), `${label} must not include ${token}.`);
+  }
+}
+
+function functionBody(source, name) {
+  const start = source.indexOf(`function ${name}(`);
+  assert(start >= 0, `${name} must exist.`);
+  const bodyStart = source.indexOf("{", start);
+  assert(bodyStart >= 0, `${name} must have a function body.`);
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === "{") depth += 1;
+    if (char === "}") depth -= 1;
+    if (depth === 0) return source.slice(bodyStart, index + 1);
+  }
+  throw new Error(`${name} function body could not be parsed.`);
+}
+
 const [indexHtml, app, styles, guestDesign, routeMap, enLocale, esLocale, huLocale] = await Promise.all([
   read("public/index.html"),
   read("public/app.js"),
@@ -47,6 +68,7 @@ includesAll(app, [
   "function renderGuestLogin()",
   "function renderForgotPassword()",
   "function renderResetPassword()",
+  "async function renderAuthCallback()",
   "async function renderVerifyEmail()",
   "function renderGuestAccount()",
   "function accountReservationsPanel()",
@@ -69,9 +91,11 @@ includesAll(app, [
   "\"/login\"",
   "\"/forgot-password\"",
   "\"/reset-password\"",
+  "\"/auth/callback\"",
   "\"/verify-email\"",
   "\"/terms\"",
   "\"/privacy\"",
+  "\"/cookies\"",
   "\"/contact\"",
   "\"/help\"",
   "\"/account/reservations\"",
@@ -84,6 +108,12 @@ includesAll(app, [
   "\"/partner/offers\"",
   "\"/partner/reservations\"",
   "\"/partner/profile\"",
+  "\"/partner/capacity\"",
+  "\"/partner/availability\"",
+  "\"/partner/notifications\"",
+  "\"/partner/billing\"",
+  "\"/partner/reviews\"",
+  "\"/partner/analytics\"",
   "\"/partner/settings\"",
   "\"/admin/restaurants\"",
   "\"/admin/offers\"",
@@ -99,6 +129,57 @@ includesAll(routeMap, [
   "button.dataset.restaurantSlug",
   "routeForGuestAccountTab(state.guestAccountTab)"
 ], "Route compatibility checks");
+
+includesAll(app, [
+  "\"/partner/billing\": \"#partner-tab-panel-billing\""
+], "Partner billing route mapping");
+
+const basicPartnerBody = functionBody(app, "renderBasicPartner");
+excludesAll(basicPartnerBody, [
+  "partner_nav_communications",
+  "partnerCommunicationsPanel()",
+  "partnerPostVisitFeedbackPanel()"
+], "BASIC partner dashboard future-module hiding");
+
+includesAll(basicPartnerBody, [
+  "partner_nav_billing",
+  "partnerBillingPanel()"
+], "BASIC partner billing visibility");
+
+const notificationSettingsBody = functionBody(app, "accountNotificationSettingsForm");
+excludesAll(notificationSettingsBody, [
+  "push_not_available_label",
+  "transactional_sms_enabled_label",
+  "marketing_sms_enabled_label"
+], "BASIC guest notification channel hiding");
+
+includesAll(app, [
+  "basicMode ? Promise.resolve({ campaigns: [], templates: [] })",
+  "basicMode ? Promise.resolve({ campaigns: [], provider: { configured: false } })",
+  "basicMode ? Promise.resolve({ submissions: [], insights: null })"
+], "BASIC partner loader skips future modules");
+
+includesAll(app, [
+  "api(\"/partner/billing\").catch(() => ({ billing: null, plans: [], invoices: [], stripe: { configured: false } }))"
+], "BASIC partner loader includes launch billing");
+
+const renderAdminBody = functionBody(app, "renderAdmin");
+includesAll(renderAdminBody, [
+  "if (!isBasicMode())",
+  "futureAdminPanels",
+  "futureAdminGridPanels"
+], "BASIC admin dashboard future-module gates");
+const adminBaseNavigation = renderAdminBody.slice(0, renderAdminBody.indexOf("if (!isBasicMode())"));
+excludesAll(adminBaseNavigation, [
+  "admin-photo-submissions",
+  "admin_nav_broadcasts"
+], "BASIC admin base navigation future-module hiding");
+
+includesAll(app, [
+  "basicMode ? Promise.resolve({ submissions: [] }) : api(\"/admin/photo-reward-submissions\")",
+  "basicMode ? Promise.resolve({ campaigns: [], sms_provider: { configured: false } }) : api(\"/admin/system-messages\")",
+  "api(\"/admin/billing\").catch(() => ({ plans: [], subscriptions: [], invoices: [], payment_events: [], billing_events: [] }))"
+], "BASIC admin loader skips future modules");
 
 includesAll(styles, [
   "overflow-x: hidden",
@@ -157,14 +238,18 @@ includesAll(app, [
 ], "Accessible states and action feedback");
 
 includesAll(app, [
-  "const demoMode = state.apiMode === \"demo\"",
-  "value=\"${escapeAttr(demoEmail)}\"",
-  "value=\"${escapeAttr(demoPassword)}\"",
+  "function canShowDemoCredentials()",
+  "state.apiMode === \"demo\" && isLocalBrowserRuntime() && !isProductionApiRuntime()",
+  "Local test accounts require protected test credentials.",
+  "value=\"\"",
   "data-toggle-dashboard-password",
   "data-dashboard-forgot-password",
-  "partner_login_role_error",
-  "admin_login_role_error",
-  "const defaultRedirect = state.mode === \"admin\" ? \"/admin\" : state.mode === \"partner\" ? \"/partner\" : \"/account\""
+  "function normalizeRole(role)",
+  "\"restaurant_owner\"",
+  "\"super-admin\"",
+  "function defaultDashboardRouteForRole(role)",
+  "redirectFallback: defaultDashboardRouteForRole(payload.profile.role)",
+  "await completeAuthenticatedLogin(payload"
 ], "Phase 4 authentication UX safeguards");
 
 includesAll(app, [
@@ -213,9 +298,57 @@ includesAll(app, [
   "platform_mode_super_admin_only",
   "featureVisibilityLabel(feature)",
   "data-view-as-partner",
+  "data-view-as-guest",
   "function viewAsPartner(",
-  "\"/admin/impersonate-partner\""
+  "function viewAsAccount(",
+  "restaurant_onboarding_step_partner",
+  "partner_access_mode",
+  "partner.invitation_id || partner.id",
+  "\"/admin/impersonate-account\"",
+  "\"/api/admin/impersonation/end\""
 ], "Phase 6 admin and Super Admin UX safeguards");
+
+includesAll(app, [
+  "function restaurantAdminPanel(",
+  "function restaurantOnboardingWizard(",
+  "id=\"adminRestaurantFilters\"",
+  "data-restaurant-status-action",
+  "data-invite-restaurant",
+  "data-manage-restaurant-access",
+  "data-restaurant-audit",
+  "restaurant_onboarding_step_hours",
+  "restaurant_onboarding_step_reservations",
+  "restaurant_onboarding_step_capacity",
+  "restaurant_dining_areas_label",
+  "restaurant_tables_label",
+  "restaurant_capacity_overrides_label",
+  "restaurant_table_allocation_note",
+  "function restaurantDetailPanel(",
+  "data-restaurant-detail-tab",
+  "id=\"restaurantCapacityForm\"",
+  "data-restaurant-access-action",
+  "restaurant_filter_production",
+  "restaurant_filter_test",
+  "adminRestaurantPageSize",
+  "/admin/restaurant-detail",
+  "/admin/restaurant-capacity",
+  "/admin/audit-logs"
+], "Restaurant administration lifecycle UI safeguards");
+
+excludesAll(functionBody(app, "restaurantAdminPanel"), [
+  "restaurant_subscription_placeholder",
+  "restaurant_subscription_no_stripe_note"
+], "BASIC restaurant administration placeholder hiding");
+
+excludesAll(functionBody(app, "restaurantOnboardingWizard"), [
+  "restaurant_subscription_placeholder",
+  "restaurant_subscription_no_stripe_note"
+], "BASIC restaurant onboarding placeholder hiding");
+
+excludesAll(functionBody(app, "offerAnalyticsTable"), [
+  "analytics_revenue_placeholder",
+  "revenue_placeholder"
+], "BASIC offer analytics placeholder hiding");
 
 includesAll(app, [
   "function reservationStatusLabel(",

@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { handleApiRequest } from "../src/app-core.js";
+import { TEST_ACCOUNTS } from "./test-account-credentials.mjs";
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -124,9 +125,10 @@ function assertNoSensitiveKeys(value, path = "response") {
 }
 
 async function assertResponsiveSeoAndSecurityWiring() {
-  const [server, app, index, styles, guestDesign, en, es, hu] = await Promise.all([
+  const [server, app, appCore, index, styles, guestDesign, en, es, hu] = await Promise.all([
     read("server.js"),
     read("public/app.js"),
+    read("src/app-core.js"),
     read("public/index.html"),
     read("public/styles.css"),
     read("public/guest/design-system.css"),
@@ -159,6 +161,11 @@ async function assertResponsiveSeoAndSecurityWiring() {
   assert(app.includes("function publicRouteMeta") && app.includes("function updateMeta"), "Client must update SEO metadata after SPA route changes.");
   assert(app.includes("updateMeta();") && app.includes("restaurants_seo_title"), "Client route rendering must refresh localized SEO metadata.");
   assert(app.includes('loading="lazy"') && app.includes('decoding="async"'), "Guest account/public images should use lazy or async decoding where image elements are rendered.");
+  assert(app.includes("compact-restaurant-card") && app.includes("restaurant-discount-range"), "Public restaurant listings must render compact aggregated restaurant tiles.");
+  assert(app.includes("function restaurantDetailPage(") && app.includes("data-restaurant-detail-page"), "Public restaurant detail routes must render a dedicated detail page.");
+  assert(app.includes("async function loadPublicRestaurants()") && appCore.includes('pathname === "/public/restaurants"'), "Public restaurant listing must reuse the safe public restaurant-card API.");
+  assert(!app.includes("${offerRows(restaurant)}"), "Public restaurant listing cards must not embed individual offer cards.");
+  assert(styles.includes(".compact-restaurant-card") && styles.includes("grid-template-columns: repeat(auto-fit, minmax(260px, 1fr))"), "Restaurant listing must use a compact responsive grid.");
 
   for (const [locale, source] of [["en", en], ["es", es], ["hu", hu]]) {
     const messages = JSON.parse(source);
@@ -181,6 +188,26 @@ async function assertPublicApiDoesNotLeakPrivateFields() {
   const offers = await api("GET", "/public/offers?lang=hu");
   assert(Array.isArray(offers.offers) && offers.offers.length, "Public offers must load.");
   assertNoSensitiveKeys(offers.offers, "public.offers");
+  assert(!offers.offers.some((offer) => offer.slug === "smarttable-test-bistro" || offer.restaurant_name === "SmartTable Test Bistro"), "Public offers must exclude test restaurant rows unless test_mode is explicitly enabled.");
+  assert(!offers.offers.some((offer) => /verified\s+review\s+photo\s+qa|safe\s+production\s+qa|smarttable\s+qa/i.test([
+    offer.offer_title,
+    offer.title,
+    offer.title_en,
+    offer.offer_description,
+    offer.offer_description_en,
+    offer.description,
+    offer.description_en
+  ].filter(Boolean).join(" "))), "Public offers must exclude generated QA/test offer copy.");
+
+  const testModeOffers = await api("GET", "/public/offers?lang=hu&test_mode=true");
+  const testBistroOffers = testModeOffers.offers.filter((offer) => offer.slug === "smarttable-test-bistro" || offer.restaurant_name === "SmartTable Test Bistro");
+  assert(testBistroOffers.length >= 3, "Public offers must include the production-safe SmartTable Test Bistro seed.");
+  assert(testBistroOffers.every((offer) => offer.is_test_restaurant === true), "SmartTable Test Bistro offers must carry the public test restaurant flag.");
+  assert(testBistroOffers.every((offer) => Number(offer.available_tables || 0) >= 10), "SmartTable Test Bistro offers must expose at least 10 test slots.");
+  assert(testBistroOffers.every((offer) => String(offer.reservation_provider || "") === "internal_test"), "SmartTable Test Bistro must use the internal_test reservation provider.");
+  assert(testBistroOffers.every((offer) => String(offer.district || "") === "Manhattan"), "SmartTable Test Bistro must use the pilot-safe Manhattan test location.");
+  assert(testBistroOffers.every((offer) => String(offer.address || "").includes("Pilot Test Avenue")), "SmartTable Test Bistro must use an obviously fictional test address.");
+  assert(testBistroOffers.some((offer) => String(offer.test_badge || "").includes("Test restaurant")), "SmartTable Test Bistro public rows must expose the safe test badge text.");
 
   const config = await api("GET", "/public/config");
   assert(config.platform_mode, "Public config must expose the current platform mode.");
@@ -199,6 +226,7 @@ async function assertRouteCompatibility() {
     '"/forgot-password"',
     '"/terms"',
     '"/privacy"',
+    '"/cookies"',
     '"/contact"',
     '"/account"',
     '"/account/reservations"',
@@ -216,7 +244,7 @@ async function assertRouteCompatibility() {
 }
 
 async function assertGuestPartnerReservationFlow() {
-  const partner = await loginAs("owner@hudsonhearth.com", "restaurant123");
+  const partner = await loginAs(TEST_ACCOUNTS.partner.email, TEST_ACCOUNTS.partner.password);
   const guest = await createGuest();
   const offers = await api("GET", "/public/offers?lang=en");
   const offer = (offers.offers || []).find((item) => {

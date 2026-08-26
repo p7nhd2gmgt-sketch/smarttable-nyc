@@ -11,9 +11,13 @@ coverage/
 
 # Local runtime state and diagnostics
 data/
+data
 tmp/
+tmp
 tmp-*.json
+.tmp*
 backups/
+backups
 *.log
 server-debug.*
 .autosave.*
@@ -21,6 +25,17 @@ server-debug.*
 # Generated caches
 __pycache__/
 *.pyc
+.cache/
+.cache
+browser-cache/
+browser-cache
+playwright-report/
+playwright-report
+test-results/
+test-results
+
+# Local Vercel project metadata
+.vercel/
 
 # OS/editor temporary files
 .DS_Store

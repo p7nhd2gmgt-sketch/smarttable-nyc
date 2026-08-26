@@ -63,6 +63,7 @@ const viewportMatrix = {
     [1280, 720]
   ],
   tablet: [
+    [1024, 900],
     [1024, 768],
     [820, 1180],
     [768, 1024]
@@ -71,13 +72,19 @@ const viewportMatrix = {
     [430, 932],
     [390, 844],
     [375, 667],
-    [360, 800]
+    [360, 800],
+    [320, 568]
   ]
 };
 
 assert(viewportMatrix.desktop.length === 3, "Desktop visual QA matrix must include 3 viewport sizes.");
-assert(viewportMatrix.tablet.length === 3, "Tablet visual QA matrix must include 3 viewport sizes.");
-assert(viewportMatrix.mobile.length === 4, "Mobile visual QA matrix must include 4 viewport sizes.");
+assert(viewportMatrix.tablet.length === 4, "Tablet visual QA matrix must include 4 viewport sizes.");
+assert(viewportMatrix.mobile.length === 5, "Mobile visual QA matrix must include 5 viewport sizes.");
+
+for (const width of [320, 390, 768, 1024, 1366]) {
+  const covered = Object.values(viewportMatrix).flat().some(([candidate]) => candidate === width);
+  assert(covered, `Guest signup requested viewport width ${width}px must remain in the regression matrix.`);
+}
 
 includesAll(indexHtml, [
   "class=\"skip-link\"",
@@ -85,9 +92,11 @@ includesAll(indexHtml, [
   "<main id=\"app\"",
   "aria-live=\"polite\"",
   "tabindex=\"-1\"",
-  "data-lang=\"en\"",
-  "data-lang=\"es\"",
-  "data-lang=\"hu\""
+  "data-language-selector",
+  "id=\"languageSelectorButton\"",
+  "aria-haspopup=\"listbox\"",
+  "id=\"languageSelectorMenu\"",
+  "role=\"listbox\""
 ], "Accessible localized application shell");
 
 includesAll(styles, [
@@ -103,7 +112,10 @@ includesAll(styles, [
   "min-height: 44px",
   ".topbar",
   ".top-actions",
-  ".language-switcher",
+  ".language-selector",
+  ".language-selector__button",
+  ".language-selector__menu",
+  ".language-selector__option",
   ".mvp-hero",
   "max-width: 1440px",
   "grid-template-columns: minmax(0, 1.65fr) minmax(0, 0.95fr)",
@@ -129,11 +141,47 @@ includesAll(styles, [
   "@media (max-width: 760px)",
   ".top-actions",
   "grid-template-columns: repeat(2, minmax(0, 1fr))",
-  ".language-switcher",
-  "display: contents",
+  ".language-selector",
+  "grid-column: 1 / -1",
+  ".language-selector__menu",
   "overflow-wrap: anywhere",
   "white-space: normal"
 ], "Mobile header action containment regression coverage");
+
+includesAll(app, [
+  "function guestStandaloneShell(",
+  "guestStandaloneShell(`",
+  "function fastSignupErrors(",
+  "class=\"signup-card fast-signup-card\"",
+  "signup_phone_optional",
+  "legal_consent",
+  "terms_consent",
+  "privacy_consent",
+  "account_creation_phase: true",
+  "history.pushState(null, \"\", \"/signup/check-email\")",
+  "function renderSignupCheckEmail(",
+  "function accountWelcomePanel(",
+  "profile_setup_location_title",
+  "profile_setup_food_title",
+  "profile_setup_notifications_title"
+], "Simplified signup renders compact account creation and optional profile setup");
+
+includesAll(styles, [
+  ".guest-standalone-page",
+  "max-width: 1240px",
+  ".signup-page",
+  ".fast-signup-page",
+  ".fast-signup-card",
+  ".check-email-card",
+  ".signup-email-pill",
+  ".account-welcome-card",
+  ".preference-section",
+  ".account-tabs",
+  "grid-template-columns: minmax(0, 1fr)",
+  "min-height: 44px",
+  "overflow-wrap: anywhere",
+  "white-space: normal"
+], "Simplified signup and optional profile responsive non-overlap regression coverage");
 
 includesAll(styles, [
   ".modal-backdrop",
@@ -227,11 +275,15 @@ includesAll(app, [
   "function setLanguage(",
   "SUPPORTED_LANGUAGE_CONFIG as supportedLanguages",
   "localStorage.setItem(\"smarttable.lang\"",
-  "loadTranslations()",
+  "persistLanguagePreference",
   "document.documentElement.lang = state.lang",
-  "document.querySelectorAll(\"[data-lang]\")",
-  "button.setAttribute(\"aria-pressed\""
-], "Phase 20 language switch behavior");
+  "function updateLanguageSelector(",
+  "data-language-option",
+  "aria-selected",
+  "event.key === \"ArrowDown\"",
+  "event.key === \"Escape\"",
+  "selectLanguageFromSelector"
+], "Phase 20 language selector behavior");
 
 includesAll(app, [
   "if (!canShowFeature(\"ai.concierge\", { audience: \"guest\" })) return \"\";",
@@ -244,6 +296,14 @@ includesAll(app, [
 assertLocaleKeys(locales, [
   "basic_brand_title",
   "nav_offers",
+  "nav_restaurants",
+  "nav_contact",
+  "footer_navigation_label",
+  "footer_about_link",
+  "footer_help_center_link",
+  "footer_for_restaurants_link",
+  "cookie_page_title",
+  "cookie_page_body",
   "nav_partner",
   "nav_admin",
   "signup_nav_button",
@@ -264,6 +324,26 @@ assertLocaleKeys(locales, [
   "reserve_button"
 ], "Phase 20 public guest localization");
 
+assert(!indexHtml.includes('id="adminNav"'), "Super Admin entry must not appear in the unauthenticated public header.");
+assert(!indexHtml.includes('id="restaurantNav"'), "Partner entry must not appear in the primary public header.");
+assert(!indexHtml.includes('id="contactNav"'), "Contact must not appear in the primary public header.");
+assert(indexHtml.includes("id=\"restaurantsNav\""), "Public header must include a consumer restaurant-list navigation link.");
+includesAll(app, [
+  "document.querySelector(\"#restaurantsNav\").textContent = t(\"nav_restaurants\", \"Restaurants\")",
+  "history.pushState(null, \"\", \"/offers\")",
+  "history.pushState(null, \"\", \"/restaurants\")",
+  "function publicFooter()",
+  "footer_about_link",
+  "href: \"/contact\"",
+  "href: \"/help\"",
+  "href: \"/privacy\"",
+  "href: \"/terms\"",
+  "href: \"/cookies\"",
+  "footer_for_restaurants_link",
+  "href: \"/partner\"",
+  "if (state.mode === \"partner\")"
+], "Public chrome internal-entry hardening");
+
 assertLocaleKeys(locales, [
   "signup_title",
   "guest_login_title",
@@ -271,6 +351,12 @@ assertLocaleKeys(locales, [
   "forgot_password_title",
   "reset_password_title",
   "signup_validation_summary_title",
+  "signup_legal_package_prefix",
+  "signup_legal_package_and",
+  "signup_legal_terms_link",
+  "signup_legal_privacy_link",
+  "signup_legal_reservations_link",
+  "signup_legal_reviews_link",
   "signup_terms_consent_prefix",
   "signup_terms_link",
   "signup_privacy_consent_prefix",
@@ -282,6 +368,26 @@ assertLocaleKeys(locales, [
   "profile_saved_toast",
   "preferences_saved_toast"
 ], "Phase 20 auth and account localization");
+
+assertLocaleKeys(locales, [
+  "signup_subtitle_fast",
+  "signup_fast_kicker",
+  "signup_fast_title",
+  "signup_phone_optional",
+  "signup_optional_preferences_note",
+  "signup_check_email_title",
+  "signup_check_email_body",
+  "signup_welcome_title",
+  "signup_welcome_body",
+  "signup_welcome_browse_offers",
+  "signup_welcome_personalize",
+  "signup_welcome_later",
+  "profile_setup_location_title",
+  "profile_setup_food_title",
+  "profile_setup_notifications_title",
+  "account_tab_account_privacy",
+  "account_complete_profile_button"
+], "Simplified signup and optional profile localization");
 
 assertLocaleKeys(locales, [
   "reservation_success_title",
@@ -332,7 +438,9 @@ assertLocaleKeys(locales, [
   "app_error_title",
   "retry_button",
   "loading_label",
-  "skip_to_content"
+  "skip_to_content",
+  "language_selector_label",
+  "language_selector_menu_label"
 ], "Phase 20 admin, route, loading, and error localization");
 
 assert(locales.hu.reservation_status_declined.includes("Elutas"), "Hungarian declined status should be translated.");

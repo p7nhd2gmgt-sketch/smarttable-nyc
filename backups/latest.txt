@@ -1,3 +1,0 @@
-﻿createdAt=2026-06-15T18:29:17
-reason=production-mvp
-archive=C:\Users\budai\Documents\Codex\2026-06-15\szia\outputs\restaurant-booking\backups\smarttable-20260615-182914-production-mvp.zip

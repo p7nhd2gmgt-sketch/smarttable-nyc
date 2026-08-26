@@ -2,6 +2,8 @@
 
 ## Apply migrations
 
+For production safety, read `docs/SUPABASE_PRODUCTION_INITIALIZATION.md` before applying migrations. Do not run destructive reset commands against production.
+
 ```powershell
 supabase login
 supabase link --project-ref <your-project-ref>

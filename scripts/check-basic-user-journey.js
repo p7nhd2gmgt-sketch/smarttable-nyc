@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { TEST_ACCOUNTS } from "./test-account-credentials.mjs";
 
 process.env.SUPABASE_URL = "";
 process.env.SUPABASE_ANON_KEY = "";
@@ -156,7 +157,8 @@ async function assertPublicGuestExperience(appSource, stylesSource) {
 
   assertIncludes(appSource, [
     "function renderGuest(",
-    "guestHeroSearchPanel()",
+    "headerSearchPanelMarkup()",
+    "headerOfferSearchForm",
     "function filterBar()",
     "function restaurantCard(",
     "data-restaurant-slug",
@@ -264,11 +266,11 @@ async function assertGuestAccountJourney(publicOffer) {
 }
 
 async function assertPartnerJourney(publicOffer, appSource) {
-  const guestDenied = await loginAs("guest@smarttable.com", "guest123");
+  const guestDenied = await loginAs(TEST_ACCOUNTS.guest.email, TEST_ACCOUNTS.guest.password);
   const deniedPartner = await rawApi("GET", "/partner/profile", {}, guestDenied.headers);
   assert.equal(deniedPartner.status, 403, "Unauthorized users must not access partner routes.");
 
-  const partner = await loginAs("owner@hudsonhearth.com", "restaurant123");
+  const partner = await loginAs(TEST_ACCOUNTS.partner.email, TEST_ACCOUNTS.partner.password);
   const profile = await api("GET", "/partner/profile", {}, partner.headers);
   assert.ok(profile.restaurant?.id, "Partner dashboard must load the partner restaurant profile.");
 
@@ -335,15 +337,15 @@ async function assertPartnerJourney(publicOffer, appSource) {
 }
 
 async function assertAdminAndSuperAdminJourney(appSource) {
-  const guest = await loginAs("guest@smarttable.com", "guest123");
+  const guest = await loginAs(TEST_ACCOUNTS.guest.email, TEST_ACCOUNTS.guest.password);
   const guestAdminDenied = await rawApi("GET", "/admin/stats", {}, guest.headers);
   assert.equal(guestAdminDenied.status, 403, "Guests must not access admin routes.");
 
-  const partner = await loginAs("owner@hudsonhearth.com", "restaurant123");
+  const partner = await loginAs(TEST_ACCOUNTS.partner.email, TEST_ACCOUNTS.partner.password);
   const partnerAdminDenied = await rawApi("GET", "/admin/restaurants", {}, partner.headers);
   assert.equal(partnerAdminDenied.status, 403, "Partners must not access admin routes.");
 
-  const admin = await loginAs("ops@smarttable.com", "admin123");
+  const admin = await loginAs(TEST_ACCOUNTS.admin.email, TEST_ACCOUNTS.admin.password);
   const stats = await api("GET", "/admin/stats", {}, admin.headers);
   assert.ok(stats.stats, "Admin dashboard must load.");
   const restaurants = await api("GET", "/admin/restaurants", {}, admin.headers);
@@ -360,7 +362,7 @@ async function assertAdminAndSuperAdminJourney(appSource) {
   const regularAdminPatch = await rawApi("PATCH", "/admin/settings/platform-mode", { platform_mode: "ai_concierge" }, admin.headers);
   assert.equal(regularAdminPatch.status, 403, "Regular admin direct URL/API access to Super Admin-only controls must be rejected.");
 
-  const superAdmin = await loginAs("admin@smarttable.com", "admin123");
+  const superAdmin = await loginAs(TEST_ACCOUNTS.superadmin.email, TEST_ACCOUNTS.superadmin.password);
   const superSettings = await api("GET", "/admin/settings/platform-mode", {}, superAdmin.headers);
   assert.equal(superSettings.can_edit, true, "Super Admin must be able to manage platform mode where implemented.");
   assert.equal(superSettings.platform_mode, "basic", "BASIC must remain the default/current platform mode during this QA.");

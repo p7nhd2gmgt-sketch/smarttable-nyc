@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { TEST_ACCOUNTS } from "./test-account-credentials.mjs";
 
 process.env.RESEND_API_KEY = "";
 
@@ -114,10 +115,24 @@ async function createReservationForGuest(offer, guest, overrides = {}) {
   }, guest.headers);
 }
 
-const partner = await loginAs("owner@hudsonhearth.com", "restaurant123");
-const admin = await loginAs("admin@smarttable.com", "admin123");
+const partner = await loginAs(TEST_ACCOUNTS.partner.email, TEST_ACCOUNTS.partner.password);
+const admin = await loginAs(TEST_ACCOUNTS.superadmin.email, TEST_ACCOUNTS.superadmin.password);
 const partnerProfile = await api("GET", "/partner/profile", {}, partner.headers);
-const offers = await api("GET", "/public/offers?lang=en");
+const defaultOffers = await api("GET", "/public/offers?lang=en");
+assert(
+  !defaultOffers.offers.some((offer) => offer.slug === "smarttable-test-bistro" || offer.restaurant_name === "SmartTable Test Bistro"),
+  "SmartTable Test Bistro must be hidden from public offers unless test_mode is explicitly enabled."
+);
+const offers = await api("GET", "/public/offers?lang=en&test_mode=true");
+const testBistroOffers = offers.offers.filter((offer) => offer.slug === "smarttable-test-bistro" || offer.restaurant_name === "SmartTable Test Bistro");
+assert(testBistroOffers.length >= 3, "SmartTable Test Bistro must expose all three active test offers through the public API.");
+assert(testBistroOffers.every((offer) => offer.is_test_restaurant === true), "SmartTable Test Bistro public offers must be marked as test restaurant offers.");
+assert(testBistroOffers.every((offer) => Number(offer.available_tables || 0) >= 10), "SmartTable Test Bistro test offers must expose at least 10 available test slots.");
+assert(testBistroOffers.every((offer) => offer.district === "Manhattan"), "SmartTable Test Bistro must use the pilot-safe Manhattan test location.");
+assert(testBistroOffers.every((offer) => String(offer.address || "").includes("Pilot Test Avenue")), "SmartTable Test Bistro must use an obviously fictional test address.");
+assert(testBistroOffers.some((offer) => offer.offer_title === "Early Dinner Special" || offer.title === "Early Dinner Special"), "SmartTable Test Bistro must include the Early Dinner Special offer.");
+assert(testBistroOffers.some((offer) => offer.offer_title === "Weekend Lunch" || offer.title === "Weekend Lunch"), "SmartTable Test Bistro must include the Weekend Lunch offer.");
+assert(testBistroOffers.some((offer) => offer.offer_title === "Last-Minute Table" || offer.title === "Last-Minute Table"), "SmartTable Test Bistro must include the Last-Minute Table offer.");
 const ownOffer = offers.offers.find((offer) => offer.restaurant_id === partnerProfile.restaurant.id);
 assert(ownOffer, "Partner restaurant must have an active public offer.");
 const adminOffers = await api("GET", "/admin/offers", {}, admin.headers);
@@ -125,7 +140,9 @@ const otherOfferSeed = adminOffers.offers.find((offer) => offer.restaurant_id !=
 assert(otherOfferSeed, "Demo data must include another restaurant offer for ownership checks.");
 await api("PATCH", "/admin/restaurants", {
   id: otherOfferSeed.restaurant_id,
-  status: "approved"
+  status: "active",
+  primary_timezone: "America/New_York",
+  activate_confirmed: true
 }, admin.headers);
 const patchedOtherOffer = await api("PATCH", "/admin/offers", {
   id: otherOfferSeed.id || otherOfferSeed.offer_id,
@@ -145,6 +162,130 @@ const otherOffer = {
 };
 
 const guest = await createGuest();
+const testGuest = await createGuest({ email: uniqueEmail("smarttable-test-bistro") });
+const testOffer = testBistroOffers.find((offer) => Number(offer.max_party_size || 0) >= 2) || testBistroOffers[0];
+const testReservation = await createReservationForGuest(testOffer, testGuest);
+assert(testReservation.reservation?.reservation_id, "SmartTable Test Bistro reservation must be created through the standard reservation endpoint.");
+assert.equal(testReservation.reservation.status, "pending", "SmartTable Test Bistro reservations must start pending partner approval.");
+assert.equal(testReservation.reservation.is_test_reservation, true, "SmartTable Test Bistro reservations must be clearly marked as test reservations.");
+assert.equal(testReservation.reservation.test_record, true, "SmartTable Test Bistro reservations must expose test_record for diagnostics.");
+assert(testReservation.email_delivery, "SmartTable Test Bistro reservations must use the existing reservation email flow.");
+
+const duplicateTestReservation = await rawApi("POST", "/reservations", {
+  offer_id: testOffer.offer_id,
+  reservation_date: testOffer.reservation_date || testOffer.offer_date,
+  reservation_time: testOffer.start_time || testOffer.offer_time,
+  party_size: 2,
+  guest_name: testGuest.profile.full_name,
+  guest_email: testGuest.profile.email,
+  guest_phone: testGuest.payload.phone
+}, testGuest.headers);
+assert.equal(duplicateTestReservation.status, 409, "Duplicate SmartTable Test Bistro submissions must be blocked.");
+
+const testPartnerPending = await api("GET", `/partner/reservations?restaurant_id=${encodeURIComponent(testOffer.restaurant_id)}&status=pending&search=${encodeURIComponent(testReservation.reservation.reference)}`, {}, partner.headers);
+assert(
+  testPartnerPending.reservations.some((row) => row.reservation_id === testReservation.reservation.reservation_id && row.is_test_reservation === true),
+  "The assigned partner must be able to view pending SmartTable Test Bistro test reservations."
+);
+
+const acceptedTestReservation = await api("PATCH", "/partner/reservations", {
+  id: testReservation.reservation.reservation_id,
+  restaurant_id: testOffer.restaurant_id,
+  status: "accepted"
+}, partner.headers);
+assert.equal(acceptedTestReservation.reservation.status, "accepted", "Partner must be able to accept a SmartTable Test Bistro pending reservation.");
+assert.equal(acceptedTestReservation.reservation.is_test_reservation, true, "Accepted SmartTable Test Bistro reservation must remain marked as test.");
+
+const testGuestReservations = await api("GET", "/guest/reservations", {}, testGuest.headers);
+assert(
+  testGuestReservations.reservations.some((row) => row.reservation_id === testReservation.reservation.reservation_id && row.status === "accepted" && row.is_test_reservation === true),
+  "Guest account must show accepted SmartTable Test Bistro test reservation status."
+);
+
+const standardGuest = await createGuest({ email: uniqueEmail("standard-reservation") });
+const standardReservationPayload = {
+  reservation_type: "standard",
+  restaurant_id: partnerProfile.restaurant.id,
+  reservation_date: ownOffer.reservation_date || ownOffer.offer_date,
+  reservation_time: "22:45",
+  party_size: 2,
+  notes: "Standard reservation lifecycle test.",
+  guest_name: standardGuest.profile.full_name,
+  guest_email: standardGuest.profile.email,
+  guest_phone: standardGuest.payload.phone,
+  guest_language: standardGuest.payload.preferred_language || "en"
+};
+const standardReservation = await api("POST", "/reservations", standardReservationPayload, standardGuest.headers);
+assert(standardReservation.reservation?.reservation_id, "Standard restaurant reservation must be created without an offer.");
+assert.equal(standardReservation.reservation.offer_id || null, null, "Standard restaurant reservations must not attach a discount offer id.");
+assert.equal(standardReservation.reservation.reservation_type, "standard", "Standard restaurant reservations must expose reservation_type=standard.");
+assert.equal(standardReservation.reservation.status, "pending", "Standard restaurant reservations must start pending partner approval.");
+const duplicateStandardReservation = await rawApi("POST", "/reservations", standardReservationPayload, standardGuest.headers);
+assert.equal(duplicateStandardReservation.status, 409, "Duplicate standard restaurant reservation requests must be blocked.");
+const partnerStandardPending = await api("GET", `/partner/reservations?status=pending&search=${encodeURIComponent(standardReservation.reservation.reference)}`, {}, partner.headers);
+assert(
+  partnerStandardPending.reservations.some((row) => row.reservation_id === standardReservation.reservation.reservation_id && row.restaurant_id === partnerProfile.restaurant.id),
+  "Partner reservation list must include standard restaurant reservation requests for their restaurant."
+);
+const acceptedStandardReservation = await api("PATCH", "/partner/reservations", {
+  id: standardReservation.reservation.reservation_id,
+  restaurant_id: partnerProfile.restaurant.id,
+  status: "accepted"
+}, partner.headers);
+assert.equal(acceptedStandardReservation.reservation.status, "accepted", "Partner must be able to accept a standard restaurant reservation.");
+
+const finalSlotOffer = await api("POST", "/partner/offers", {
+  title_en: "Final-slot concurrency guard",
+  description_en: "Controlled one-table offer for reservation race protection.",
+  offer_date: testOffer.reservation_date || testOffer.offer_date,
+  start_time: "21:30",
+  end_time: "22:30",
+  discount_type: "percent",
+  discount_value: 10,
+  available_tables: 1,
+  max_party_size: 2,
+  status: "active",
+  valid_days: ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+}, partner.headers);
+assert(finalSlotOffer.offer?.id, "Partner must be able to create a final-slot offer for concurrency testing.");
+
+const finalSlotPublicOffer = {
+  ...finalSlotOffer.offer,
+  offer_id: finalSlotOffer.offer.id,
+  restaurant_id: finalSlotOffer.offer.restaurant_id,
+  reservation_date: finalSlotOffer.offer.offer_date,
+  offer_date: finalSlotOffer.offer.offer_date,
+  start_time: finalSlotOffer.offer.start_time,
+  offer_time: finalSlotOffer.offer.offer_time || finalSlotOffer.offer.start_time
+};
+const finalSlotGuests = await Promise.all([
+  createGuest({ email: uniqueEmail("final-slot-a") }),
+  createGuest({ email: uniqueEmail("final-slot-b") })
+]);
+const finalSlotAttempts = await Promise.all(finalSlotGuests.map((raceGuest, index) => rawApi("POST", "/reservations", {
+  offer_id: finalSlotPublicOffer.offer_id,
+  reservation_date: finalSlotPublicOffer.reservation_date,
+  reservation_time: finalSlotPublicOffer.start_time || finalSlotPublicOffer.offer_time,
+  party_size: 2,
+  guest_name: raceGuest.profile.full_name,
+  guest_email: raceGuest.profile.email,
+  guest_phone: raceGuest.payload.phone,
+  notes: `Final-slot race attempt ${index + 1}.`
+}, raceGuest.headers)));
+const finalSlotSuccesses = finalSlotAttempts.filter((result) => result.status === 201);
+const finalSlotFailures = finalSlotAttempts.filter((result) => result.status === 409);
+assert.equal(finalSlotSuccesses.length, 1, "Only one concurrent final-slot reservation may succeed.");
+assert.equal(finalSlotFailures.length, 1, "The second concurrent final-slot reservation must receive an availability conflict.");
+assert(
+  /availability|sold|capacity|active reservation|matching/i.test(`${finalSlotFailures[0].body?.code || ""} ${finalSlotFailures[0].body?.error || ""}`),
+  "The failed final-slot attempt must return a clear availability or duplicate error."
+);
+const finalSlotPartnerOffers = await api("GET", "/partner/offers", {}, partner.headers);
+const finalSlotStoredOffer = finalSlotPartnerOffers.offers.find((offer) => offer.id === finalSlotPublicOffer.offer_id || offer.offer_id === finalSlotPublicOffer.offer_id);
+assert(finalSlotStoredOffer, "The final-slot offer must remain inspectable by the partner.");
+assert.equal(Number(finalSlotStoredOffer.reserved_tables), 1, "Final-slot concurrency must reserve exactly one table.");
+assert(Number(finalSlotStoredOffer.available_tables) >= Number(finalSlotStoredOffer.reserved_tables), "Final-slot capacity must never become negative.");
+
 const created = await createReservationForGuest(ownOffer, guest);
 const reservation = created.reservation;
 assert(reservation?.reservation_id, "Reservation creation must return a reservation id.");

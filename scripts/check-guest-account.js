@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { handleApiRequest } from "../src/app-core.js";
+import { TEST_ACCOUNTS } from "./test-account-credentials.mjs";
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -43,6 +44,8 @@ function validSignupPayload(overrides = {}) {
     postal_code: "10014",
     preferred_neighborhoods: ["West Village", "SoHo"],
     travel_distance_miles: "5",
+    travel_distance_value: "5",
+    travel_distance_unit: "miles",
     transportation_method: "Walking",
     transportation_methods: ["Walking", "Public transportation"],
     cuisines: ["American", "Italian"],
@@ -51,7 +54,7 @@ function validSignupPayload(overrides = {}) {
     allergy_notes: "",
     drink_preferences: ["Wine", "Coffee"],
     dining_experiences: ["Casual dining", "Quiet atmosphere"],
-    companions: ["Partner"],
+    companions: ["Single / Solo"],
     party_size: "2",
     preferred_days: ["Friday", "Saturday"],
     preferred_time_windows: ["Early dinner", "Dinner"],
@@ -67,6 +70,8 @@ function validSignupPayload(overrides = {}) {
     consider_no_discount_match: "Sometimes",
     notification_preferences: ["Reservation status updates", "Reservation reminders"],
     notification_channels: ["Email"],
+    sms_country_code: "+1",
+    sms_phone_number: "",
     notification_frequency: "Immediately",
     event_recommendations_interest: "No",
     future_calendar_interest: "No",
@@ -135,6 +140,8 @@ async function assertAccountAndPreferences() {
     postal_code: "10011",
     preferred_dining_areas: ["Chelsea", "West Village"],
     max_travel_distance_miles: 4,
+    max_travel_distance_value: 4,
+    travel_distance_unit: "miles",
     transportation_method: "Walking",
     selected_language: "hu"
   }, guest.headers);
@@ -142,14 +149,21 @@ async function assertAccountAndPreferences() {
 
   const prefs = await api("GET", "/guest/preferences", {}, guest.headers);
   assert(prefs.profile?.preferences?.cuisines?.length, "Preferences must load.");
-  const invalidPrefs = await apiRaw("PATCH", "/guest/preferences", { cuisines: [] }, guest.headers);
-  assert(invalidPrefs.status === 400, "Required preference fields cannot be empty.");
+  const partialPrefs = await apiRaw("PATCH", "/guest/preferences", { cuisines: [], preferred_neighborhoods: ["No preference"] }, guest.headers);
+  assert(partialPrefs.status === 200, "Optional preference fields can be left empty after account creation.");
+  const invalidPrefs = await apiRaw("PATCH", "/guest/preferences", { cuisines: ["Other"], custom_cuisine: "" }, guest.headers);
+  assert(invalidPrefs.status === 400, "Other cuisine must require a custom cuisine value.");
   const updatedPrefs = await api("PATCH", "/guest/preferences", {
+    cuisines: ["American", "Other"],
+    custom_cuisine: "Georgian",
+    companions: ["Solo"],
     discount_levels: ["20%", "30%"],
     event_recommendations_interest: "No",
     future_calendar_interest: "No"
   }, guest.headers);
   assert(updatedPrefs.profile?.preferences?.minimumInterestingDiscount === 20, "Minimum interesting discount must recalculate.");
+  assert(updatedPrefs.profile?.preferences?.custom_cuisine === "Georgian", "Custom cuisine must be saved with preferences.");
+  assert(updatedPrefs.profile?.preferences?.companions?.includes("Solo"), "Solo companion value must be saved and displayed.");
 
   const privacy = await api("GET", "/guest/privacy", {}, guest.headers);
   assert(privacy.consent?.terms_accepted && privacy.consent?.privacy_accepted, "Consent records must display.");
@@ -252,11 +266,15 @@ async function assertFavoritesReservationsNotifications() {
   assert(Array.isArray(readAll.notifications), "Mark all notifications read must work.");
   const settings = await api("PATCH", "/guest/preferences", {
     notification_preferences: ["Reservation status updates", "Reservation reminders", "Weekend recommendations"],
-    notification_channels: ["Email"],
+    notification_channels: ["Email", "SMS"],
+    sms_country_code: "+1",
+    sms_phone_number: "2125550199",
+    sms_consent: true,
     notification_frequency: "Weekly summary",
     marketing_consent: false
   }, guest.headers);
   assert(settings.profile?.preferences?.notification_frequency === "Weekly summary", "Notification settings must save.");
+  assert(settings.profile?.preferences?.consents?.sms === true, "SMS opt-in must be stored when a valid number and consent are provided.");
   assert(settings.profile?.preferences?.consents?.marketing === false, "Marketing consent must remain optional.");
 }
 
@@ -264,27 +282,72 @@ async function assertPrivacySecurity() {
   const guest = await createGuest();
   const privacy = await api("GET", "/guest/privacy", {}, guest.headers);
   assert(privacy.consent?.terms_version && privacy.consent?.privacy_policy_version, "Privacy page must show legal consent versions.");
-  assert(privacy.export_scope?.includes("Profile") && privacy.export_scope?.includes("Consent records"), "Privacy page must describe the personal data export scope.");
+  assert(privacy.legal?.documents?.length >= 6, "Privacy page must expose all required legal document records.");
+  assert(privacy.legal.documents.some((item) => item.document_type === "terms_of_service" && item.mandatory === true), "Terms of Service must be mandatory.");
+  assert(privacy.legal.documents.some((item) => item.document_type === "privacy_policy" && item.mandatory === true), "Privacy Policy must be mandatory.");
+  assert(privacy.legal.documents.some((item) => item.document_type === "marketing_consent" && item.withdrawable === true), "Marketing consent must be independently withdrawable.");
+  assert(privacy.legal.documents.some((item) => item.document_type === "location_personalization_consent" && item.withdrawable === true), "Location and personalization consent must be independently withdrawable.");
+  assert(privacy.export_scope?.includes("Profile") && privacy.export_scope?.includes("Legal consent history"), "Privacy page must describe the personal data export scope.");
+  const personalization = await api("POST", "/guest/privacy", {
+    action: "set_optional_consent",
+    document_type: "location_personalization_consent",
+    accepted: true
+  }, guest.headers);
+  assert(personalization.consent?.status === "accepted", "Optional personalization consent must create an accepted legal consent event.");
+  assert((await apiRaw("POST", "/guest/privacy", {
+    action: "set_optional_consent",
+    document_type: "terms_of_service",
+    accepted: false
+  }, guest.headers)).status === 400, "Mandatory Terms consent must not be withdrawable through the optional consent endpoint.");
   const exportRequest = await api("POST", "/guest/privacy", { action: "export", message: "Test export request." }, guest.headers);
-  assert(exportRequest.request?.status === "received", "Data export request must work.");
-  assert(exportRequest.export?.generated === false, "Export must be labeled as a request workflow until a real file is generated.");
+  assert(exportRequest.request?.status === "completed", "Data export request must create a completed export when the file exists.");
+  assert(exportRequest.export?.generated === true && exportRequest.export?.download_url, "Export must produce a real downloadable JSON package.");
   assert(exportRequest.export?.excluded?.includes("Password hashes"), "Data export must explicitly exclude password hashes and security metadata.");
+  const downloadUrl = new URL(exportRequest.export.download_url);
+  const downloadPath = downloadUrl.pathname.replace(/^\/api/, "") + downloadUrl.search;
+  const downloadResponse = await apiRaw("GET", downloadPath, {}, {});
+  assert(downloadResponse.status === 200 && downloadResponse.body?.data?.profile?.email === guest.payload.email, "Signed data export download must return the current guest package.");
+  assert((await apiRaw("POST", "/guest/privacy", { action: "export", message: "Duplicate export request." }, guest.headers)).status === 429, "Repeated export requests must be blocked during cooldown.");
+  const adminLogin = await api("POST", "/auth/login", { email: TEST_ACCOUNTS.superadmin.email, password: TEST_ACCOUNTS.superadmin.password });
+  const adminHeaders = authHeaders(adminLogin.access_token);
+  const privacyAdmin = await api("GET", "/privacy/requests", {}, adminHeaders);
+  assert(typeof privacyAdmin.data_export_cleanup?.expired_cleaned === "number", "Admin privacy requests must run safe expired data export cleanup.");
+  const legalAdmin = await api("GET", "/admin/legal-documents", {}, adminHeaders);
+  assert(legalAdmin.documents?.some((item) => item.document_type === "terms_of_service"), "Admin legal endpoint must list legal document versions.");
+  const draftVersion = `test-${Date.now()}`;
+  const draft = await api("POST", "/admin/legal-documents", {
+    document_type: "cookie_policy",
+    language: "en",
+    version: draftVersion,
+    title: "Cookie Policy Test",
+    content: "Test legal version content.",
+    publish_current: false
+  }, adminHeaders);
+  assert(draft.document?.status === "draft", "Admin must be able to create a draft legal document version.");
+  const published = await api("PATCH", "/admin/legal-documents", { id: draft.document.id, action: "publish", is_current: true }, adminHeaders);
+  assert(published.document?.status === "published" && published.document?.is_current === true, "Admin must be able to publish and mark a legal document current.");
 
   assert((await apiRaw("POST", "/guest/privacy", { action: "delete_account", current_password: "wrong", confirmation_phrase: "DELETE MY ACCOUNT" }, guest.headers)).status === 401, "Account deletion must require reauthentication.");
   assert((await apiRaw("POST", "/guest/privacy", { action: "delete_account", current_password: guest.payload.password, confirmation_phrase: "delete" }, guest.headers)).status === 400, "Account deletion must require the confirmation phrase.");
 
   const passwordGuest = await createGuest();
-  await api("POST", "/auth/security", {
+  const passwordChanged = await api("POST", "/auth/security", {
     action: "change_password",
     current_password: passwordGuest.payload.password,
     new_password: "Changed!12345",
     confirm_password: "Changed!12345"
   }, passwordGuest.headers);
+  assert(passwordChanged.changed === true, "Password change must report success only after the password update completes.");
+  assert(["accepted", "failed", "not_attempted"].includes(passwordChanged.email_notification_status), "Password change must report a safe email notification status.");
+  assert(passwordChanged.security_event_logged === true, "Password change must create a guest security event.");
+  assert(passwordChanged.email_delivery === null || typeof passwordChanged.email_delivery === "object", "Password change must summarize security email delivery without exposing private content.");
   assert((await apiRaw("POST", "/auth/login", { email: passwordGuest.payload.email, password: passwordGuest.payload.password })).status === 401, "Password change must invalidate old password.");
   const newLogin = await api("POST", "/auth/login", { email: passwordGuest.payload.email, password: "Changed!12345" });
   assert(newLogin.access_token, "Changed password must allow login.");
   const signOutAll = await api("POST", "/auth/security", { action: "sign_out_all" }, passwordGuest.headers);
   assert(signOutAll.sign_out_current === true, "Sign out all sessions must ask the client to clear the current session.");
+  assert(signOutAll.signed_out_all === true, "Sign out all sessions must report successful server-side revocation.");
+  assert(signOutAll.security_event_logged === true, "Sign out all sessions must create a guest security event.");
 
   const deletionGuest = await createGuest();
   const deleted = await api("POST", "/guest/privacy", {
@@ -304,15 +367,17 @@ async function assertModeAndFrontendWiring() {
   const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
 
   assert(app.includes('guestAccountTabs()'), "Guest account navigation must be centralized.");
-  for (const tab of ["overview", "reservations", "favorites", "profile", "preferences", "notifications", "reviews", "security"]) {
+  for (const tab of ["overview", "reservations", "favorites", "preferences", "notifications", "account"]) {
     assert(app.includes(`["${tab}"`) || app.includes(`'${tab}'`), `Guest account must include ${tab} tab.`);
   }
-  assert(app.includes('"/account/reviews": "reviews"') && app.includes('"/account/security": "security"'), "Guest account routes must expose Reviews and Security pages.");
-  assert(app.includes("accountReviewsPanel()") && app.includes("accountSecurityPanel()"), "Guest account must render Reviews and Security panels.");
+  assert(app.includes('"/account/privacy": "account"') && app.includes('"/account/security": "account"'), "Guest account routes must map privacy and security to Account & Privacy.");
+  assert(app.includes("accountAndPrivacyPanel()") && app.includes("accountSecurityPanel()"), "Guest account must render Account & Privacy with the existing security panel.");
+  assert(app.includes("legalDocumentStatusCard") && app.includes("legalConsentHistoryList") && app.includes("data-toggle-legal-consent"), "Guest security UI must render legal document cards, history, and optional consent controls.");
+  assert(app.includes("legalDocumentsAdminPanel") && app.includes('"/admin/legal-documents"'), "Admin UI must expose legal document version controls.");
   assert(app.includes("account_pending_requests") && app.includes("account_accepted_reservations") && app.includes("account_fresh_offers"), "Guest account overview must show pending, accepted, favorite, and fresh offer summaries.");
   assert(app.includes('canShowFeature("ai.concierge", { audience: "guest"'), "AI account features must use feature registry checks.");
-  assert(app.includes('const showAiPreferenceFields = canShowFeature("ai.concierge", { audience: "guest" })'), "BASIC mode must hide AI preference/calendar fields.");
-  assert(app.includes('type="hidden" name="future_calendar_interest"'), "Hidden AI preference values must be preserved when BASIC mode hides them.");
+  assert(app.includes("profile_setup_location_title") && app.includes("profile_setup_food_title") && app.includes("profile_setup_notifications_title"), "Optional profile setup must be grouped into Location, Food, and Notifications.");
+  assert(app.includes("profileCompletionFromClient") && app.includes("25"), "Profile completion must use meaningful optional profile sections.");
   const requiredAnalyticsEvents = [
     "login_success",
     "login_failed",
@@ -343,13 +408,17 @@ async function assertModeAndFrontendWiring() {
   assert(app.includes("state.postLoginRedirect = \"/account\""), "Protected account route must preserve intended destination before login.");
   assert(app.includes("favorite_unavailable_state"), "Disabled or unavailable restaurants must have a safe favorites state.");
   assert(app.includes("isFeedbackEligible") && app.includes("feedback_submitted"), "Completed feedback CTA must be guarded by eligibility state.");
-  assert(app.includes("return !isBasicMode() && canShowFeature(\"ai.concierge\""), "BASIC mode must hide demo-only feedback and AI account CTAs.");
+  assert(app.includes("/review/verified?reservation_id="), "BASIC verified reviews must use the reservation-bound review route instead of demo-only rewards.");
+  assert(!app.includes("data-feedback-reservation)}`;\n      window.location.href = `/guest/rewards/photo-upload"), "Reservation feedback CTA must not open the legacy rewards upload route.");
   assert(app.includes("account_preferences_update_anytime"), "Preference page must explain that guests can update preferences at any time.");
   assert(app.includes("loadingSkeleton()") && app.includes("loading_label"), "Account system must include an accessible localized loading state.");
   assert(app.includes("empty-state"), "Account system must include empty states.");
   assert(app.includes("role=\"alert\""), "Account error states must be announced to assistive technology.");
   assert(app.includes("success-state") && app.includes("aria-live"), "Account success states must be announced politely.");
   assert(app.includes("confirm(t(\"cancel_reservation_confirm\"") && app.includes("confirm(t(\"delete_account_confirm_dialog\""), "Risky account actions must use confirmation dialogs.");
+  assert(app.includes("signOutAllSessionsModal()") && app.includes("data-confirm-signout-all") && app.includes("signOutAllError"), "Global session revocation must use an in-app confirmation modal with error state.");
+  assert(app.includes('scope: "all"') && app.includes('skipServer: true'), "Client must only clear local auth after server-side all-session revocation succeeds.");
+  assert(app.includes("signout_current_session_explainer") && app.includes("signout_all_sessions_explainer"), "Session management must explain current-session and all-session behavior.");
   assert(app.includes("setAttribute(\"role\", \"menu\")") && app.includes("role=\"menuitem\"") && app.includes("account_menu_label"), "Account menu must be keyboard and screen-reader friendly.");
   assert(app.includes("async function setLanguage") && app.includes("persistLanguagePreference"), "Language switching must persist for logged-in users.");
   assert(css.includes("@media (max-width: 860px)") && css.includes(".account-tabs") && css.includes(".consent-status-grid"), "Account UI must include responsive layout styles.");
@@ -362,9 +431,25 @@ async function assertLocales() {
     "notification_settings_title",
     "personal_data_export_title",
     "request_data_export_button",
+    "data_export_download_note",
+    "download_data_export_button",
+    "legal_consent_history_title",
+    "accepted_version_label",
+    "current_version_label",
+    "view_accepted_version_button",
+    "legal_documents_admin_title",
     "delete_account_button",
     "delete_confirmation_phrase_label",
     "password_changed_toast",
+    "session_security_body",
+    "signout_current_session_explainer",
+    "signout_all_sessions_explainer",
+    "signout_current_loading",
+    "signout_all_loading",
+    "signout_all_confirm_title",
+    "signout_all_confirm_body",
+    "signout_all_confirm_button",
+    "signout_all_failed",
     "account_deleted_toast",
     "account_menu_label",
     "reservation_cancelled_notification_title",
@@ -372,6 +457,19 @@ async function assertLocales() {
     "reservation_cancelled_notification_cta",
     "account_tab_reviews",
     "account_tab_security",
+    "account_tab_account_privacy",
+    "account_complete_profile_button",
+    "profile_setup_location_title",
+    "profile_no_neighborhood_preference",
+    "profile_setup_food_title",
+    "profile_setup_notifications_title",
+    "push_channel_label",
+    "push_sms_distinction_note",
+    "signup_welcome_title",
+    "signup_welcome_body",
+    "signup_welcome_browse_offers",
+    "signup_welcome_personalize",
+    "signup_welcome_later",
     "account_pending_requests",
     "account_accepted_reservations",
     "account_upcoming_reservations",
@@ -407,6 +505,11 @@ async function assertLocales() {
     "route_plan_created",
     "photo_upload_failed_error",
     "google_maps_load_failed_error"
+    ,"signup_custom_cuisine"
+    ,"signup_sms_country_code"
+    ,"signup_sms_phone_number"
+    ,"signup_sms_not_sending_note"
+    ,"option_single_solo"
   ];
   for (const locale of ["en", "es", "hu"]) {
     const messages = JSON.parse(await readFile(new URL(`../public/locales/${locale}.json`, import.meta.url), "utf8"));

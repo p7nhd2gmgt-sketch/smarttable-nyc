@@ -18,6 +18,11 @@ function includesAny(source, tokens, label) {
   assert(tokens.some((token) => source.includes(token)), `${label} is missing one of: ${tokens.join(", ")}.`);
 }
 
+function offerFormTemplates(source) {
+  const matches = [...source.matchAll(/<form class="mini-form offer-form" id="offerForm">([\s\S]*?)<\/form>/g)];
+  return matches.map((match) => match[1] || "");
+}
+
 function parseLocale(source, label) {
   try {
     return JSON.parse(source);
@@ -66,8 +71,16 @@ const locales = {
 
 includesAll(app, [
   "function renderGuest(",
-  "layoutHero(guestHeroSearchPanel())",
-  "function guestHeroSearchPanel()",
+  "layoutHero(\"\", { variant: \"home\" })",
+  "function homepageHeroActions()",
+  "data-home-find-table",
+  "event.stopPropagation();",
+  "openHeaderSearch();",
+  "document.querySelector(\".topbar\")?.scrollIntoView({ behavior: reduceMotion ? \"auto\" : \"smooth\", block: \"start\" })",
+  "data-home-browse-restaurants",
+  "history.pushState(null, \"\", \"/restaurants\")",
+  "function headerSearchPanelMarkup()",
+  "id=\"headerOfferSearchForm\"",
   "offers_title",
   "filterBar()",
   "listView(restaurants)",
@@ -85,21 +98,32 @@ includesAll(app, [
 
 includesAll(app, [
   "function restaurantCard(",
+  "compact-restaurant-card",
+  "restaurant-discount-range",
+  "restaurantOfferAggregate(restaurant)",
+  "restaurantTileAvailabilityLabel(aggregate)",
+  "async function loadPublicRestaurants()",
+  "const testDataQuery = boolValue(includeTestData) ? \"&include_test_data=true\" : \"\";",
+  "api(`/public/restaurants?lang=${encodeURIComponent(state.lang)}${testDataQuery}`)",
   "function listView(restaurants)",
   "id=\"guest-restaurants\"",
-  "restaurant-grid grouped-grid",
+  "restaurant-grid grouped-grid compact-restaurant-grid",
   "offers_empty",
+  "function restaurantDetailPage(",
+  "data-restaurant-detail-page",
+  "guestModals({ includeRestaurantDetail: false })",
   "function restaurantDetailModal()",
   "role=\"dialog\"",
   "aria-modal=\"true\"",
   "restaurantDetailTitle"
-], "Restaurant list, empty state, and detail modal");
+], "Compact restaurant list, empty state, detail page, and detail modal");
 
 includesAll(app, [
   "function offerIsPublicVisible(",
   "isDisallowedStatus(offer.status || offer.offer_status || offer.deal_status)",
   "isPastOffer(offer)",
-  "Number(offer.available_tables ?? offer.available_seats ?? 0) < 1",
+  "availableTables <= reservedTables",
+  "Number(offer.available_seats ?? 0) < 1",
   "OFFER_INACTIVE: \"reservation_error_offer_inactive\"",
   "OFFER_EXPIRED: \"reservation_error_offer_expired\"",
   "OFFER_SOLD_OUT: \"reservation_error_offer_sold_out\""
@@ -113,7 +137,10 @@ includesAll(appCore, [
 
 includesAll(app, [
   "function reservationModal()",
-  "data-reserve=\"${escapeAttr(offer.offer_id)}\"",
+  "data-reserve=\"${escapeAttr(offer?.offer_id || \"\")}\"",
+  "name=\"reservation_type\"",
+  "value=\"${escapeAttr(isStandardReservation ? \"standard\" : \"discount_offer\")}\"",
+  "name=\"restaurant_id\"",
   "name=\"reservation_date\" type=\"date\"",
   "name=\"reservation_time\" type=\"time\"",
   "name=\"party_size\" type=\"number\"",
@@ -141,6 +168,26 @@ includesAll(app, [
   "completed: [\"reservation_status_completed\", \"Completed\"]",
   "statusBadge(reservation.status, reservationStatusLabel(reservation.status))"
 ], "Guest-safe reservation status labels");
+
+includesAll(app, [
+  "function primaryOfferContentFields(",
+  "name=\"content_language\"",
+  "textInput(\"title_primary\"",
+  "textArea(\"description_primary\"",
+  "function offerPayloadFromForm(",
+  "data[`title_${language}`] = title",
+  "data[`description_${language}`] = description",
+  "function localizedContentField("
+], "Single-source offer content authoring");
+
+const partnerOfferForms = offerFormTemplates(app);
+assert(partnerOfferForms.length >= 2, "Partner dashboards must render the BASIC and advanced offer forms.");
+for (const template of partnerOfferForms) {
+  assert(template.includes("primaryOfferContentFields(restaurant)"), "Partner offer forms must use one primary title/description block.");
+  for (const legacyField of ["title_en", "title_es", "title_hu", "description_en", "description_es", "description_hu"]) {
+    assert(!template.includes(`name=\"${legacyField}\"`) && !template.includes(`textInput(\"${legacyField}\"`) && !template.includes(`textArea(\"${legacyField}\"`), `Partner offer form must not require ${legacyField}.`);
+  }
+}
 
 includesAll(app, [
   "confirm(t(\"cancel_reservation_confirm\"",
@@ -181,8 +228,18 @@ includesAll(app, [
   "function isSuperAdmin()",
   "platform_mode_super_admin_only",
   "data-view-as-partner",
+  "data-view-as-guest",
   "function viewAsPartner(",
-  "\"/admin/impersonate-partner\""
+  "function viewAsAccount(",
+  "restaurant_onboarding_step_partner",
+  "restaurant_onboarding_step_capacity",
+  "restaurant_table_allocation_note",
+  "function restaurantDetailPanel(",
+  "data-restaurant-access-action",
+  "partner_access_mode",
+  "partner.invitation_id || partner.id",
+  "\"/admin/impersonate-account\"",
+  "\"/api/admin/impersonation/end\""
 ], "Super Admin-only controls");
 
 includesAll(indexHtml, [
@@ -257,6 +314,13 @@ for (const [locale, messages] of Object.entries(locales)) {
   for (const key of [
     "offers_title",
     "offers_empty",
+    "restaurant_no_active_offers_label",
+    "restaurant_no_active_offers",
+    "restaurant_discount_single",
+    "restaurant_discount_range",
+    "restaurant_tile_open_label",
+    "restaurants_back_link",
+    "remove_favorite_accessible_label",
     "reservation_success_title",
     "reservation_success_body",
     "reservation_success_body_email_unconfirmed",
@@ -275,6 +339,46 @@ for (const [locale, messages] of Object.entries(locales)) {
     "skip_to_content"
   ]) {
     assert(String(messages[key] || "").trim(), `${locale}.json must define ${key}.`);
+  }
+  for (const key of [
+    "content_language_english",
+    "content_language_spanish",
+    "content_language_hungarian",
+    "offer_content_language_note",
+    "offer_primary_title_label",
+    "offer_primary_description_label"
+  ]) {
+    assert(String(messages[key] || "").trim(), `${locale}.json must define ${key}.`);
+  }
+}
+
+const expectedHomepageHero = {
+  en: {
+    homepage_hero_kicker: "SMARTTABLE",
+    homepage_hero_title: "Book great restaurants for less",
+    homepage_hero_subtitle: "Discover discounted restaurant tables during selected times and send your reservation request directly to the restaurant.",
+    homepage_hero_primary_cta: "Find a Table",
+    homepage_hero_secondary_cta: "Browse Restaurants"
+  },
+  es: {
+    homepage_hero_kicker: "SMARTTABLE",
+    homepage_hero_title: "Reserva excelentes restaurantes por menos",
+    homepage_hero_subtitle: "Descubre mesas con descuento en horarios seleccionados y env\u00eda tu solicitud de reserva directamente al restaurante.",
+    homepage_hero_primary_cta: "Buscar una mesa",
+    homepage_hero_secondary_cta: "Ver restaurantes"
+  },
+  hu: {
+    homepage_hero_kicker: "SMARTTABLE",
+    homepage_hero_title: "Foglalj nagyszer\u0171 \u00e9ttermekbe kedvez\u0151bb \u00e1ron",
+    homepage_hero_subtitle: "Fedezz fel kedvezm\u00e9nyes \u00e9ttermi asztalokat kiv\u00e1lasztott id\u0151pontokban, \u00e9s k\u00fcldd el foglal\u00e1si k\u00e9relmedet k\u00f6zvetlen\u00fcl az \u00e9tteremnek.",
+    homepage_hero_primary_cta: "Asztalt keresek",
+    homepage_hero_secondary_cta: "\u00c9ttermek b\u00f6ng\u00e9sz\u00e9se"
+  }
+};
+
+for (const [locale, expectedMessages] of Object.entries(expectedHomepageHero)) {
+  for (const [key, expectedValue] of Object.entries(expectedMessages)) {
+    assert(locales[locale][key] === expectedValue, `${locale}.json must define ${key} as ${expectedValue}.`);
   }
 }
 

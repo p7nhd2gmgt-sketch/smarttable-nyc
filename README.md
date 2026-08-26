@@ -1,4 +1,4 @@
-# Smarttable.com
+# SmartTable
 
 Production-ready MVP for discounted restaurant reservations.
 
@@ -15,7 +15,7 @@ Production-ready MVP for discounted restaurant reservations.
 - Reservation status tracking
 - Confirmation/status emails through Resend
 - Vercel API entry point
-- SEO files for `smarttable.com`
+- SEO files for `smarttablenyc.com`
 
 ## Local start
 
@@ -43,7 +43,8 @@ Copy `.env.example` into your host environment:
 
 ```text
 PORT=4173
-PUBLIC_BASE_URL=https://smarttable.com
+SMARTTABLE_ENV=development
+PUBLIC_BASE_URL=https://smarttablenyc.com
 SUPABASE_URL=
 SUPABASE_ANON_KEY=
 SUPABASE_SERVICE_ROLE_KEY=
@@ -51,6 +52,7 @@ EMAIL_FROM=SmartTable <reservations@mail.smarttablenyc.com>
 EMAIL_REPLY_TO=
 RESEND_API_KEY=
 RESEND_WEBHOOK_SECRET=
+EMAIL_RECIPIENT_ALLOWLIST=
 EMAIL_TEMPLATE_VERSION=2026-07-19
 EMAIL_RETRY_LIMIT=3
 EMAIL_WEBHOOK_TOLERANCE_SECONDS=300
@@ -62,16 +64,26 @@ backend email service is initialized. Existing shell or hosting environment
 variables take precedence, so production secrets should still be configured in
 the host environment.
 
+Set `SMARTTABLE_ENV=production` in production. In production, SmartTable fails
+safely instead of falling back to demo storage if Supabase, Resend, sender, or
+public base URL configuration is missing.
+
 Transactional email is sent through the backend Resend adapter. If `RESEND_API_KEY`
 or a verified `EMAIL_FROM` sender is missing, SmartTable records the email attempt
 as failed and does not show delivery as successful.
 Transactional emails are idempotent by type/reservation/recipient where applicable,
 so refreshes or repeated partner clicks do not create duplicate provider sends.
-When `RESEND_WEBHOOK_SECRET` is configured, provider delivery events can update
-`email_logs` from accepted/sent to delivered, bounced, or failed. Without the
-webhook secret, diagnostics truthfully report provider acceptance only.
+In preview and development deployments with a real `RESEND_API_KEY`, set
+`EMAIL_RECIPIENT_ALLOWLIST` to the explicit test inboxes allowed to receive real
+mail. Without that allowlist, non-production real sending is blocked.
+Production also blocks reserved `.example` TLD recipients before contacting
+Resend.
 
-## Email diagnostics and Resend webhooks
+Resend webhook delivery tracking is deferred for BASIC launch. Without
+`RESEND_WEBHOOK_SECRET`, diagnostics truthfully report provider acceptance only
+and do not claim delivered status.
+
+## Email diagnostics and deferred Resend webhooks
 
 Super Admins can inspect email delivery health through:
 
@@ -87,13 +99,13 @@ status, attempt count, safe errors, and retry actions when a queued message is
 retryable. They never expose `RESEND_API_KEY`, `RESEND_WEBHOOK_SECRET`, reset
 tokens, passwords, or email body content.
 
-Production Resend webhook endpoint:
+Deferred production Resend webhook endpoint:
 
 ```text
 https://smarttablenyc.com/api/webhooks/resend
 ```
 
-Configure these Resend events:
+When webhook delivery tracking is intentionally enabled later, configure these Resend events:
 
 ```text
 email.sent
@@ -123,7 +135,7 @@ SQL migrations are in:
 supabase/migrations/
 ```
 
-See [supabase/README.md](supabase/README.md).
+See [supabase/README.md](supabase/README.md) and [docs/SUPABASE_PRODUCTION_INITIALIZATION.md](docs/SUPABASE_PRODUCTION_INITIALIZATION.md).
 
 ## Architecture readiness
 

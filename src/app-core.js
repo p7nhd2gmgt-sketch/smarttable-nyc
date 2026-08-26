@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import writeXlsxFile from "write-excel-file/node";
 import {
   OFFER_ERROR_MESSAGES,
   availableSeatsForOffer,
@@ -10,7 +11,13 @@ import {
   offerReservationError
 } from "./offer-validity.js";
 import { createEmailService, isEmailAccepted } from "./email-service.js";
+import { DEFAULT_MARKET_CODE, defaultMarket, publicMarketConfig, resolveMarketContext } from "./market-config.js";
+import { createPushService } from "./push-service.js";
+import { createSmsService } from "./sms-service.js";
+import { createVoiceService } from "./voice-service.js";
 import { createReservationProvider, reservationProviderCatalog } from "./reservation-providers.js";
+import { strictSecurityHeaders } from "./security-headers.js";
+import { getRoleTestCredentials } from "./test-account-credentials.js";
 import {
   ALLOWED_DAYS,
   ALLOWED_OFFER_STATUSES,
@@ -32,34 +39,376 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const DEMO_SETTINGS_FILE = path.join(__dirname, "..", "data", "app-settings.json");
 
-const SUPABASE_URL = (process.env.SUPABASE_URL || "").replace(/\/$/, "");
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || "";
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
-const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || "https://smarttable.com").replace(/\/$/, "");
-const EMAIL_FROM = process.env.EMAIL_FROM || "SmartTable <reservations@mail.smarttablenyc.com>";
-const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
-const ADMIN_NOTIFICATION_EMAIL = process.env.ADMIN_NOTIFICATION_EMAIL || "admin@smarttable.com";
+function envClean(value = "") {
+  let cleaned = String(value ?? "").trim();
+  if ((cleaned.startsWith('"') && cleaned.endsWith('"')) || (cleaned.startsWith("'") && cleaned.endsWith("'"))) {
+    cleaned = cleaned.slice(1, -1).trim();
+  }
+  return cleaned;
+}
+
+function normalizeRuntimeEnvironment(value = "") {
+  const normalized = envClean(value).toLowerCase();
+  if (["prod", "production"].includes(normalized)) return "production";
+  if (["preview", "staging", "stage"].includes(normalized)) return normalized === "stage" ? "staging" : normalized;
+  return "development";
+}
+
+function detectRuntimeEnvironment(env = process.env) {
+  const explicitEnvironment = normalizeRuntimeEnvironment(env.SMARTTABLE_ENV || env.APP_ENV || "");
+  const vercelEnvironment = normalizeRuntimeEnvironment(env.VERCEL_ENV || "");
+  const nodeEnvironment = normalizeRuntimeEnvironment(env.NODE_ENV || "");
+  if (vercelEnvironment === "production") return "production";
+  if (explicitEnvironment === "staging") return "staging";
+  if (vercelEnvironment === "preview" || vercelEnvironment === "staging") return vercelEnvironment;
+  if (nodeEnvironment === "production" && env.VERCEL) return "production";
+  return explicitEnvironment || normalizeRuntimeEnvironment(env.VERCEL_ENV || env.NODE_ENV || "development");
+}
+
+function normalizeBaseUrl(value = "") {
+  return envClean(value).replace(/\/+$/, "");
+}
+
+function canonicalPublicBaseUrl(value = "") {
+  const normalized = normalizeBaseUrl(value);
+  if (!normalized) return "";
+  try {
+    const parsed = new URL(normalized);
+    if (parsed.hostname.toLowerCase() === "smarttablenyc.com") {
+      parsed.hostname = "www.smarttablenyc.com";
+      return parsed.toString().replace(/\/+$/, "");
+    }
+  } catch {
+    return normalized;
+  }
+  return normalized;
+}
+
+function envFirst(names = [], preferred = null) {
+  const values = names
+    .map((name) => envClean(process.env[name] || ""))
+    .filter(Boolean);
+  if (!values.length) return "";
+  if (typeof preferred === "function") {
+    const preferredValue = values.find((value) => preferred(value));
+    if (preferredValue) return preferredValue;
+  }
+  return values[0];
+}
+
+function envFlag(value = "", fallback = false) {
+  const normalized = envClean(value).toLowerCase();
+  if (!normalized) return fallback;
+  return ["1", "true", "yes", "on"].includes(normalized);
+}
+
+function looksLikeSupabaseUrl(value = "") {
+  return /^https:\/\/[^/]+\.supabase\.co\/?$/.test(normalizeBaseUrl(value));
+}
+
+function looksLikeJwt(value = "") {
+  return /^eyJ/.test(envClean(value));
+}
+
+function isValidHttpUrl(value = "") {
+  try {
+    const url = new URL(value);
+    return ["http:", "https:"].includes(url.protocol);
+  } catch {
+    return false;
+  }
+}
+
+function isLocalBaseUrl(value = "") {
+  try {
+    const hostname = new URL(value).hostname.toLowerCase();
+    return ["localhost", "127.0.0.1", "::1", "[::1]"].includes(hostname) || hostname.endsWith(".localhost");
+  } catch {
+    return true;
+  }
+}
+
+function isDeprecatedPublicBaseDomain(value = "") {
+  try {
+    const hostname = new URL(value).hostname.toLowerCase();
+    return hostname === "smarttable.com" || hostname === "www.smarttable.com";
+  } catch {
+    return false;
+  }
+}
+
+function parseEmailAllowlist(value = "") {
+  return envClean(value)
+    .split(/[,\s]+/)
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+const RUNTIME_ENVIRONMENT = detectRuntimeEnvironment(process.env);
+const IS_PRODUCTION_RUNTIME = RUNTIME_ENVIRONMENT === "production";
+const LOGIN_DIAGNOSTICS_ENABLED = !IS_PRODUCTION_RUNTIME && envFlag(process.env.SMARTTABLE_ENABLE_LOGIN_DIAGNOSTICS || "", false);
+const SUPABASE_URL = normalizeBaseUrl(envFirst(["SUPABASE_URL", "NEXT_PUBLIC_SUPABASE_URL", "VITE_SUPABASE_URL"], looksLikeSupabaseUrl));
+const SUPABASE_ANON_KEY = envFirst(["SUPABASE_ANON_KEY", "NEXT_PUBLIC_SUPABASE_ANON_KEY", "VITE_SUPABASE_ANON_KEY"], looksLikeJwt);
+const SUPABASE_SERVICE_ROLE_KEY = envFirst(["SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_SERVICE_KEY", "SUPABASE_SERVICE_ROLE", "SERVICE_ROLE_KEY"], looksLikeJwt);
+const RAW_PUBLIC_BASE_URL = normalizeBaseUrl(process.env.PUBLIC_BASE_URL || process.env.PUBLIC_SITE_URL || "");
+const PUBLIC_BASE_URL = canonicalPublicBaseUrl(RAW_PUBLIC_BASE_URL) || "https://www.smarttablenyc.com";
+const AUTH_CALLBACK_PATH = "/auth/callback";
+const AUTH_CALLBACK_URL = `${PUBLIC_BASE_URL}${AUTH_CALLBACK_PATH}`;
+const EXPECTED_TRANSACTIONAL_SENDER_NAME = "SmartTable";
+const EXPECTED_TRANSACTIONAL_SENDER_EMAIL = "reservations@mail.smarttablenyc.com";
+const DEFAULT_EMAIL_FROM = `${EXPECTED_TRANSACTIONAL_SENDER_NAME} <${EXPECTED_TRANSACTIONAL_SENDER_EMAIL}>`;
+const RAW_EMAIL_FROM = envClean(process.env.EMAIL_FROM || "");
+const EMAIL_FROM = RAW_EMAIL_FROM || DEFAULT_EMAIL_FROM;
+const RESEND_API_KEY = envClean(process.env.RESEND_API_KEY || "");
+const ADMIN_NOTIFICATION_EMAIL = envClean(process.env.ADMIN_NOTIFICATION_EMAIL || "");
 const SUPABASE_STORAGE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET || "smarttable-media";
+const FOOD_FEED_STORAGE_BUCKET = process.env.FOOD_FEED_STORAGE_BUCKET || "food-feed-videos";
 const GOOGLE_MAPS_API_KEY = process.env.VITE_GOOGLE_MAPS_API_KEY || process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY || process.env.GOOGLE_MAPS_API_KEY || "";
 const IMPERSONATION_SECRET = process.env.IMPERSONATION_SECRET || SUPABASE_SERVICE_ROLE_KEY || "smarttable-dev-secret";
 const TERMS_VERSION = process.env.TERMS_VERSION || "2026-07-17";
 const PRIVACY_POLICY_VERSION = process.env.PRIVACY_POLICY_VERSION || "2026-07-17";
+const LEGAL_DOCUMENT_VERSION = process.env.LEGAL_DOCUMENT_VERSION || TERMS_VERSION;
+const DATA_EXPORT_LINK_TTL_MS = Math.max(60 * 60 * 1000, Number(process.env.DATA_EXPORT_LINK_TTL_MS || 7 * 24 * 60 * 60 * 1000));
+const DATA_EXPORT_COOLDOWN_MS = Math.max(60 * 60 * 1000, Number(process.env.DATA_EXPORT_COOLDOWN_MS || 24 * 60 * 60 * 1000));
 const EMAIL_TEMPLATE_VERSION = process.env.EMAIL_TEMPLATE_VERSION || "2026-07-19";
+const COMMUNICATION_CONSENT_VERSION = process.env.COMMUNICATION_CONSENT_VERSION || LEGAL_DOCUMENT_VERSION || EMAIL_TEMPLATE_VERSION;
+const MESSAGE_CAMPAIGN_TEMPLATE_VERSION = process.env.MESSAGE_CAMPAIGN_TEMPLATE_VERSION || EMAIL_TEMPLATE_VERSION;
+const PARTNER_CAMPAIGN_QUEUE_BATCH_LIMIT = Math.max(1, Number(process.env.PARTNER_CAMPAIGN_QUEUE_BATCH_LIMIT || 50));
+const BUSINESS_MAILING_ADDRESS = envClean(process.env.BUSINESS_MAILING_ADDRESS || "SmartTable business mailing address pending legal review");
+const CAMPAIGN_TEMPLATE_VARIABLE_ALLOWLIST = new Set([
+  "restaurant_name",
+  "guest_name",
+  "first_name",
+  "offer_title",
+  "discount",
+  "reservation_date",
+  "reservation_time",
+  "party_size",
+  "reference",
+  "city",
+  "market",
+  "preferences_url",
+  "unsubscribe_url",
+  "marketplace_url",
+  "support_email"
+]);
+const SMS_PROVIDER = envClean(process.env.SMS_PROVIDER || "twilio").toLowerCase();
+const TWILIO_ACCOUNT_SID = envClean(process.env.TWILIO_ACCOUNT_SID || "");
+const TWILIO_AUTH_TOKEN = envClean(process.env.TWILIO_AUTH_TOKEN || "");
+const TWILIO_MESSAGING_SERVICE_SID = envClean(process.env.TWILIO_MESSAGING_SERVICE_SID || "");
+const TWILIO_FROM_NUMBER = envClean(process.env.TWILIO_FROM_NUMBER || "");
+const TWILIO_STATUS_CALLBACK_URL = envClean(process.env.TWILIO_STATUS_CALLBACK_URL || `${PUBLIC_BASE_URL}/api/webhooks/sms/twilio`);
+const SMS_DAILY_SEND_LIMIT = Math.max(1, Number(process.env.SMS_DAILY_SEND_LIMIT || 250));
+const SMS_MONTHLY_SEND_LIMIT = Math.max(1, Number(process.env.SMS_MONTHLY_SEND_LIMIT || 1000));
+const SMS_QUIET_HOURS_START = envClean(process.env.SMS_QUIET_HOURS_START || "21:00");
+const SMS_QUIET_HOURS_END = envClean(process.env.SMS_QUIET_HOURS_END || "09:00");
+const SMS_SEGMENT_COST_CENTS = Math.max(0, Number(process.env.SMS_SEGMENT_COST_CENTS || 1));
+const SMS_TEST_RECIPIENT_ALLOWLIST = envClean(process.env.SMS_TEST_RECIPIENT_ALLOWLIST || "");
+const SMS_CAMPAIGN_QUEUE_BATCH_LIMIT = Math.max(1, Number(process.env.SMS_CAMPAIGN_QUEUE_BATCH_LIMIT || 25));
+const PUSH_PROVIDER = envClean(process.env.PUSH_PROVIDER || "disabled").toLowerCase();
+const VAPID_PUBLIC_KEY = envClean(process.env.VAPID_PUBLIC_KEY || "");
+const VAPID_PRIVATE_KEY = envClean(process.env.VAPID_PRIVATE_KEY || "");
+const VAPID_SUBJECT = envClean(process.env.VAPID_SUBJECT || `mailto:support@smarttablenyc.com`);
+const RESERVATION_ALERT_SMS_FALLBACK_SECONDS = Math.max(15, Number(process.env.RESERVATION_ALERT_SMS_FALLBACK_SECONDS || 60));
+const RESERVATION_ALERT_ESCALATION_SECONDS = Math.max(60, Number(process.env.RESERVATION_ALERT_ESCALATION_SECONDS || 300));
+const RESERVATION_ALERT_POLL_SECONDS = Math.max(3, Number(process.env.RESERVATION_ALERT_POLL_SECONDS || 5));
+const RESERVATION_ALERT_WORKER_SECRET = envClean(process.env.RESERVATION_ALERT_WORKER_SECRET || process.env.CRON_SECRET || "");
+const RESERVATION_ALERT_TEST_LIMIT = Math.max(1, Number(process.env.RESERVATION_ALERT_TEST_LIMIT || 3));
+const RESERVATION_ALERT_TEST_WINDOW_MS = Math.max(60_000, Number(process.env.RESERVATION_ALERT_TEST_WINDOW_MS || 10 * 60 * 1000));
+const RESERVATION_ALERT_SMS_LIMIT = Math.max(1, Number(process.env.RESERVATION_ALERT_SMS_LIMIT || 20));
+const RESERVATION_ALERT_SMS_WINDOW_MS = Math.max(60_000, Number(process.env.RESERVATION_ALERT_SMS_WINDOW_MS || 5 * 60 * 1000));
+const RESERVATION_ALERT_SMS_MAX_ATTEMPTS = Math.max(1, Number(process.env.RESERVATION_ALERT_SMS_MAX_ATTEMPTS || 3));
+const RESERVATION_ALERT_PUSH_MAX_ATTEMPTS = Math.max(1, Number(process.env.RESERVATION_ALERT_PUSH_MAX_ATTEMPTS || 3));
+const VOICE_PROVIDER = envClean(process.env.VOICE_PROVIDER || "disabled").toLowerCase();
+const TWILIO_VOICE_FROM_NUMBER = envClean(process.env.TWILIO_VOICE_FROM_NUMBER || TWILIO_FROM_NUMBER || "");
+const TWILIO_VOICE_STATUS_CALLBACK_URL = envClean(process.env.TWILIO_VOICE_STATUS_CALLBACK_URL || `${PUBLIC_BASE_URL}/api/webhooks/voice/twilio`);
+const RESERVATION_ALERT_VOICE_DELAY_SECONDS = Math.max(60, Number(process.env.RESERVATION_ALERT_VOICE_DELAY_SECONDS || 480));
+const RESERVATION_ALERT_VOICE_LIMIT = Math.max(1, Number(process.env.RESERVATION_ALERT_VOICE_LIMIT || 10));
+const RESERVATION_ALERT_VOICE_WINDOW_MS = Math.max(60_000, Number(process.env.RESERVATION_ALERT_VOICE_WINDOW_MS || 10 * 60 * 1000));
+const RESERVATION_ALERT_VOICE_MAX_ATTEMPTS = Math.max(1, Number(process.env.RESERVATION_ALERT_VOICE_MAX_ATTEMPTS || 2));
 const EMAIL_RETRY_LIMIT = Math.max(1, Number(process.env.EMAIL_RETRY_LIMIT || 3));
 const EMAIL_QUEUE_MAX_ATTEMPTS = Math.max(1, Number(process.env.EMAIL_QUEUE_MAX_ATTEMPTS || EMAIL_RETRY_LIMIT || 3));
 const EMAIL_REPLY_TO = process.env.EMAIL_REPLY_TO || "";
 const RESEND_WEBHOOK_SECRET = process.env.RESEND_WEBHOOK_SECRET || "";
 const EMAIL_WEBHOOK_TOLERANCE_SECONDS = Math.max(60, Number(process.env.EMAIL_WEBHOOK_TOLERANCE_SECONDS || 300));
+const STRIPE_SECRET_KEY = envClean(process.env.STRIPE_SECRET_KEY || "");
+const STRIPE_WEBHOOK_SECRET = envClean(process.env.STRIPE_WEBHOOK_SECRET || "");
+const STRIPE_API_VERSION = envClean(process.env.STRIPE_API_VERSION || "2025-06-30.basil");
+const STRIPE_WEBHOOK_TOLERANCE_SECONDS = Math.max(60, Number(process.env.STRIPE_WEBHOOK_TOLERANCE_SECONDS || 300));
+const STRIPE_ENABLE_ACH = envFlag(process.env.STRIPE_ENABLE_ACH, true);
+const STRIPE_ALLOW_PROMOTION_CODES = envFlag(process.env.STRIPE_ALLOW_PROMOTION_CODES, true);
+const STRIPE_LIVE_BILLING_ENABLED = envFlag(process.env.STRIPE_LIVE_BILLING_ENABLED ?? process.env.BILLING_LIVE_ENABLED, false);
+const STRIPE_BASIC_MONTHLY_PRICE_ID = envClean(process.env.STRIPE_BASIC_MONTHLY_PRICE_ID || "");
+const STRIPE_PROFESSIONAL_MONTHLY_PRICE_ID = envClean(process.env.STRIPE_PROFESSIONAL_MONTHLY_PRICE_ID || "");
+const STRIPE_ENTERPRISE_MONTHLY_PRICE_ID = envClean(process.env.STRIPE_ENTERPRISE_MONTHLY_PRICE_ID || "");
+const STRIPE_VIDEO_STANDARD_PRICE_ID = envClean(process.env.STRIPE_VIDEO_STANDARD_PRICE_ID || "");
+const STRIPE_VIDEO_PREMIUM_PRICE_ID = envClean(process.env.STRIPE_VIDEO_PREMIUM_PRICE_ID || "");
+const STRIPE_PUBLISHABLE_KEY = envClean(process.env.STRIPE_PUBLISHABLE_KEY || "");
+const STRIPE_PORTAL_CONFIGURATION_ID = envClean(process.env.STRIPE_PORTAL_CONFIGURATION_ID || "");
+const STRIPE_ENTERPRISE_SELF_SERVICE_ENABLED = envFlag(process.env.STRIPE_SELF_SERVICE_ENTERPRISE_ENABLED ?? process.env.STRIPE_ENTERPRISE_SELF_SERVICE_ENABLED, false);
+const STRIPE_TRIAL_PERIOD_DAYS = Math.max(0, Math.min(365, Math.round(Number(process.env.BILLING_DEFAULT_TRIAL_DAYS ?? process.env.STRIPE_TRIAL_PERIOD_DAYS ?? 0))));
+const BILLING_PAYMENT_GRACE_PERIOD_DAYS = Math.max(0, Math.round(Number(process.env.BILLING_GRACE_PERIOD_DAYS ?? process.env.BILLING_PAYMENT_GRACE_PERIOD_DAYS ?? 7)));
+const BILLING_OVERRIDE_MAX_DAYS = Math.max(1, Math.min(365, Math.round(Number(process.env.BILLING_OVERRIDE_MAX_DAYS || 90))));
+const BILLING_ENFORCEMENT_MODE = ["strict", "warn", "off"].includes(envClean(process.env.BILLING_ENFORCEMENT_MODE).toLowerCase())
+  ? envClean(process.env.BILLING_ENFORCEMENT_MODE).toLowerCase()
+  : "warn";
 const EMAIL_QUEUE_RETRY_DELAYS_MS = [60_000, 5 * 60_000, 30 * 60_000];
+const EMAIL_RECIPIENT_ALLOWLIST = parseEmailAllowlist(process.env.EMAIL_RECIPIENT_ALLOWLIST || process.env.EMAIL_ALLOWED_RECIPIENTS || "");
+const SUPABASE_REQUEST_TIMEOUT_MS = Math.max(1000, Number(process.env.SUPABASE_REQUEST_TIMEOUT_MS || 8000));
+const API_RATE_LIMIT_WINDOW_MS = Math.max(1000, Number(process.env.API_RATE_LIMIT_WINDOW_MS || 60_000));
+const API_MUTATION_RATE_LIMIT = Math.max(1, Number(process.env.API_MUTATION_RATE_LIMIT || (IS_PRODUCTION_RUNTIME ? 180 : 2000)));
+const AUTH_MUTATION_RATE_LIMIT = Math.max(1, Number(process.env.AUTH_MUTATION_RATE_LIMIT || (IS_PRODUCTION_RUNTIME ? 60 : 2000)));
+const MAX_JSON_BODY_BYTES = Math.max(16 * 1024, Number(process.env.MAX_JSON_BODY_BYTES || 256 * 1024));
+const APPLICATION_VERSION = envClean(process.env.npm_package_version || process.env.SMARTTABLE_VERSION || "");
+const APPLICATION_COMMIT = envClean(process.env.VERCEL_GIT_COMMIT_SHA || process.env.GIT_COMMIT_SHA || "").slice(0, 40);
+const APPLICATION_BUILD_ID = envClean(process.env.SMARTTABLE_BUILD_ID || process.env.VERCEL_DEPLOYMENT_ID || APPLICATION_COMMIT || APPLICATION_VERSION || "");
+const DEFAULT_MARKET = defaultMarket();
 
 const supabaseConfigured = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY && SUPABASE_SERVICE_ROLE_KEY);
+const stripeSecretMode = STRIPE_SECRET_KEY.startsWith("sk_live_")
+  ? "live"
+  : STRIPE_SECRET_KEY.startsWith("sk_test_")
+    ? "test"
+    : STRIPE_SECRET_KEY
+      ? "invalid"
+      : "missing";
+const stripeLiveModeActive = stripeSecretMode === "live" && STRIPE_LIVE_BILLING_ENABLED && IS_PRODUCTION_RUNTIME;
+const stripeConfigured = stripeSecretMode === "test" || stripeLiveModeActive;
 const emailService = createEmailService({
   provider: "resend",
   resendApiKey: RESEND_API_KEY,
   defaultFrom: EMAIL_FROM,
   defaultReplyTo: EMAIL_REPLY_TO,
+  environment: RUNTIME_ENVIRONMENT,
+  enforceRecipientAllowlist: !IS_PRODUCTION_RUNTIME && Boolean(RESEND_API_KEY),
+  recipientAllowlist: EMAIL_RECIPIENT_ALLOWLIST,
   fetchImpl: fetch
 });
+const smsService = createSmsService({
+  provider: SMS_PROVIDER,
+  twilioAccountSid: TWILIO_ACCOUNT_SID,
+  twilioAuthToken: TWILIO_AUTH_TOKEN,
+  twilioMessagingServiceSid: TWILIO_MESSAGING_SERVICE_SID,
+  twilioFromNumber: TWILIO_FROM_NUMBER,
+  statusCallbackUrl: TWILIO_STATUS_CALLBACK_URL,
+  environment: RUNTIME_ENVIRONMENT,
+  fetchImpl: fetch
+});
+const voiceService = createVoiceService({
+  provider: VOICE_PROVIDER,
+  twilioAccountSid: TWILIO_ACCOUNT_SID,
+  twilioAuthToken: TWILIO_AUTH_TOKEN,
+  twilioFromNumber: TWILIO_VOICE_FROM_NUMBER,
+  statusCallbackUrl: TWILIO_VOICE_STATUS_CALLBACK_URL,
+  environment: RUNTIME_ENVIRONMENT,
+  fetchImpl: fetch
+});
+const pushService = createPushService({
+  provider: PUSH_PROVIDER,
+  vapidPublicKey: VAPID_PUBLIC_KEY,
+  vapidPrivateKey: VAPID_PRIVATE_KEY,
+  vapidSubject: VAPID_SUBJECT,
+  environment: RUNTIME_ENVIRONMENT,
+  fetchImpl: fetch
+});
+
+function productionConfigurationIssues() {
+  if (!IS_PRODUCTION_RUNTIME) return [];
+  const issues = [];
+  if (!supabaseConfigured) issues.push("SUPABASE_CONFIGURATION_MISSING");
+  if (!RAW_PUBLIC_BASE_URL) issues.push("PUBLIC_BASE_URL_MISSING");
+  if (RAW_PUBLIC_BASE_URL && !isValidHttpUrl(RAW_PUBLIC_BASE_URL)) issues.push("PUBLIC_BASE_URL_INVALID");
+  if (RAW_PUBLIC_BASE_URL && isLocalBaseUrl(RAW_PUBLIC_BASE_URL)) issues.push("PUBLIC_BASE_URL_LOCALHOST");
+  if (RAW_PUBLIC_BASE_URL && isDeprecatedPublicBaseDomain(RAW_PUBLIC_BASE_URL)) issues.push("PUBLIC_BASE_URL_DEPRECATED_DOMAIN");
+  if (!RAW_EMAIL_FROM) issues.push("EMAIL_FROM_MISSING");
+  if (RAW_EMAIL_FROM) {
+    const sender = parseSenderAddress(RAW_EMAIL_FROM);
+    if (sender.email !== EXPECTED_TRANSACTIONAL_SENDER_EMAIL || (sender.name && sender.name !== EXPECTED_TRANSACTIONAL_SENDER_NAME)) {
+      issues.push("EMAIL_FROM_UNEXPECTED_SENDER");
+    }
+  }
+  if (!RESEND_API_KEY) issues.push("RESEND_API_KEY_MISSING");
+  return issues;
+}
+
+function productionConfigurationReady() {
+  return productionConfigurationIssues().length === 0;
+}
+
+function deploymentDataMode() {
+  if (IS_PRODUCTION_RUNTIME && !productionConfigurationReady()) return "configuration_error";
+  return supabaseConfigured ? "supabase" : "demo";
+}
+
+function logSafeServerEvent(eventType, metadata = {}) {
+  const safeMetadata = {
+    event: String(eventType || "server_event"),
+    timestamp: new Date().toISOString(),
+    environment: RUNTIME_ENVIRONMENT,
+    ...metadata
+  };
+  for (const key of Object.keys(safeMetadata)) {
+    if (/secret|token|password|key|authorization/i.test(key)) {
+      delete safeMetadata[key];
+    }
+  }
+  console.error(JSON.stringify(safeMetadata));
+}
+
+async function checkDatabaseReachable() {
+  if (!supabaseConfigured) return false;
+  try {
+    await supabaseFetch("/rest/v1/restaurants?select=id&limit=1", {
+      service: true,
+      timeoutMs: Math.min(SUPABASE_REQUEST_TIMEOUT_MS, 2500)
+    });
+    return true;
+  } catch (error) {
+    logSafeServerEvent("database_health_check_failed", {
+      status: error.status || 500,
+      code: error.code || "DATABASE_UNREACHABLE"
+    });
+    return false;
+  }
+}
+
+async function runtimeHealthPayload() {
+  const issues = productionConfigurationIssues();
+  const databaseReachable = await checkDatabaseReachable();
+  const pushStatus = pushService.getStatus();
+  const ok = issues.length === 0 && (!IS_PRODUCTION_RUNTIME || databaseReachable);
+  const supabaseHostname = (() => {
+    try {
+      return SUPABASE_URL ? new URL(SUPABASE_URL).hostname : null;
+    } catch {
+      return null;
+    }
+  })();
+  return {
+    ok,
+    status: ok ? "ok" : "degraded",
+    environment: RUNTIME_ENVIRONMENT,
+    runtime_mode: RUNTIME_ENVIRONMENT,
+    mode: deploymentDataMode(),
+    platform_mode_default: defaultPlatformSettings.platform_mode,
+    version: APPLICATION_VERSION || null,
+    commit: APPLICATION_COMMIT || null,
+    build_id: APPLICATION_BUILD_ID || null,
+    login_diagnostics_enabled: LOGIN_DIAGNOSTICS_ENABLED,
+    public_base_url_configured: Boolean(RAW_PUBLIC_BASE_URL),
+    public_base_url_uses_localhost: Boolean(PUBLIC_BASE_URL && isLocalBaseUrl(PUBLIC_BASE_URL)),
+    supabase_configured: supabaseConfigured,
+    supabase_url_hostname: supabaseHostname,
+    supabase_project_ref: supabaseHostname ? supabaseHostname.split(".")[0] : null,
+    database_reachable: databaseReachable,
+    email_configured: emailService.configured,
+    resend_webhook_configured: Boolean(RESEND_WEBHOOK_SECRET),
+    push_configured: Boolean(pushStatus.enabled),
+    sms_configured: Boolean(smsService.configured),
+    webhook_status: RESEND_WEBHOOK_SECRET ? "configured" : "deferred",
+    production_configuration_issues: issues
+  };
+}
 
 const allowedReservationStatuses = new Set(ALLOWED_RESERVATION_STATUSES);
 const bookingSources = new Set(BOOKING_SOURCES);
@@ -74,11 +423,47 @@ const reservationStatusTransitions = {
   accepted: new Set(["cancelled", "completed", "no_show"]),
   waiting_external_confirmation: new Set(["accepted", "rejected", "cancelled"])
 };
+const POST_VISIT_WORKFLOW_VERSION = "verified_post_visit_v1";
+const postVisitActionTokens = new Set([
+  "arrived",
+  "on_the_way",
+  "cannot_attend",
+  "finished",
+  "still_at_restaurant",
+  "did_not_attend",
+  "open_review"
+]);
+const stateChangingPostVisitActions = new Set([
+  "arrived",
+  "on_the_way",
+  "cannot_attend",
+  "finished",
+  "still_at_restaurant",
+  "did_not_attend"
+]);
+const postVisitTokenTtlHours = {
+  arrived: 24,
+  on_the_way: 24,
+  cannot_attend: 24,
+  finished: 72,
+  still_at_restaurant: 72,
+  did_not_attend: 72,
+  open_review: 14 * 24
+};
 const allowedSignupAnalyticsEvents = new Set([
   "signup_started",
+  "signup_validation_failed",
+  "signup_submitted",
+  "signup_succeeded",
   "signup_step_completed",
   "signup_abandoned",
   "signup_completed",
+  "confirmation_email_sent",
+  "confirmation_email_resent",
+  "email_confirmed",
+  "profile_setup_started",
+  "profile_setup_skipped",
+  "profile_setup_completed",
   "preference_selected",
   "terms_accepted",
   "privacy_accepted",
@@ -99,6 +484,8 @@ const allowedSignupAnalyticsEvents = new Set([
   "account_deletion_requested",
   "account_deleted"
 ]);
+const apiRateLimitBuckets = new Map();
+const reservationAlertRateLimitBuckets = new Map();
 const allowedSignupAnalyticsProperties = new Set([
   "step_index",
   "step_key",
@@ -138,6 +525,79 @@ const defaultPlatformSettings = DEFAULT_PLATFORM_SETTINGS;
 
 const platformFeatureRegistry = PLATFORM_FEATURE_REGISTRY;
 
+const legalDocumentDefinitions = [
+  {
+    type: "terms_of_service",
+    mandatory: true,
+    titles: {
+      en: "Terms of Service",
+      es: "Términos de servicio",
+      hu: "Általános Szerződési Feltételek"
+    },
+    path: "/terms"
+  },
+  {
+    type: "privacy_policy",
+    mandatory: true,
+    titles: {
+      en: "Privacy Policy",
+      es: "Política de privacidad",
+      hu: "Adatvédelmi szabályzat"
+    },
+    path: "/privacy"
+  },
+  {
+    type: "cookie_policy",
+    mandatory: false,
+    titles: {
+      en: "Cookie Policy",
+      es: "Política de cookies",
+      hu: "Cookie-szabályzat"
+    },
+    path: "/privacy",
+    section: "cookies"
+  },
+  {
+    type: "guest_platform_rules",
+    mandatory: false,
+    titles: {
+      en: "Guest Platform Rules",
+      es: "Reglas de la plataforma para invitados",
+      hu: "Vendégplatform szabályai"
+    },
+    path: "/terms",
+    section: "guest-rules"
+  },
+  {
+    type: "marketing_consent",
+    mandatory: false,
+    optionalToggle: true,
+    titles: {
+      en: "Marketing Consent",
+      es: "Consentimiento de marketing",
+      hu: "Marketing-hozzájárulás"
+    },
+    path: "/privacy",
+    section: "marketing"
+  },
+  {
+    type: "location_personalization_consent",
+    mandatory: false,
+    optionalToggle: true,
+    titles: {
+      en: "Location and Personalization Consent",
+      es: "Consentimiento de ubicación y personalización",
+      hu: "Helyadat- és személyre szabási hozzájárulás"
+    },
+    path: "/privacy",
+    section: "personalization"
+  }
+];
+
+const legalDocumentTypes = new Set(legalDocumentDefinitions.map((item) => item.type));
+const optionalLegalConsentTypes = new Set(legalDocumentDefinitions.filter((item) => item.optionalToggle).map((item) => item.type));
+const mandatoryLegalConsentTypes = new Set(legalDocumentDefinitions.filter((item) => item.mandatory).map((item) => item.type));
+
 function isFeatureWorking(featureKey) {
   return platformFeatureRegistry[featureKey]?.status === "working";
 }
@@ -167,6 +627,7 @@ const demo = {
   siteContent: [],
   emailEvents: [],
   restaurantFollowers: [],
+  foodFeedFavorites: [],
   restaurantReviews: [],
   adminNotifications: [],
   guestNotifications: [],
@@ -182,6 +643,7 @@ const demo = {
   marketingCampaigns: [],
   emailLogs: [],
   emailQueue: [],
+  guestAuthEvents: [],
   notificationLogs: [],
   emailRateLimits: [],
   integrationConnections: [],
@@ -196,10 +658,38 @@ const demo = {
   subscriptions: [],
   invoices: [],
   paymentEvents: [],
+  videoServiceOrders: [],
   appErrorLogs: [],
   adminAlerts: [],
+  reservationAlerts: [],
+  reservationAlertDeliveries: [],
+  reservationAlertAcknowledgements: [],
+  partnerDeviceSubscriptions: [],
+  restaurantNotificationPreferences: [],
+  restaurantNotificationSmsRecipients: [],
   privacyRequests: [],
   guestConsents: [],
+  communicationPreferences: [],
+  communicationConsents: [],
+  suppressionList: [],
+  messageCampaigns: [],
+  messageRecipients: [],
+  smsCampaigns: [],
+  smsRecipients: [],
+  smsDeliveryLogs: [],
+  smsProviderEvents: [],
+  systemMessageCampaigns: [],
+  systemMessageRecipients: [],
+  notifications: [],
+  restaurantUsers: [],
+  partnerInvitations: [],
+  restaurantDiningAreas: [],
+  restaurantTables: [],
+  restaurantCapacityOverrides: [],
+  restaurantStatusHistory: [],
+  legalDocuments: [],
+  userLegalConsents: [],
+  dataExportRequests: [],
   consumptionUploads: [],
   photoRewardSubmissions: [],
   loyaltyAccounts: [],
@@ -1542,8 +2032,8 @@ const defaultSiteContent = [
   },
   {
     key: "footer_text",
-    value_en: "Smarttable.com serves New York restaurants and guests with discounted reservation technology.",
-    value_es: "Smarttable.com conecta restaurantes y clientes de Nueva York con tecnologia de reservas con descuento.",
+    value_en: "SmartTable serves New York restaurants and guests with discounted reservation technology.",
+    value_es: "SmartTable conecta restaurantes y clientes de Nueva York con tecnologia de reservas con descuento.",
     content_type: "textarea",
     group_name: "footer"
   },
@@ -1656,13 +2146,15 @@ const defaultSiteContent = [
     key: "email_password_changed_subject",
     value_en: "Your SmartTable password was changed",
     value_es: "Tu contrasena de SmartTable fue cambiada",
+    value_hu: "Megv\u00e1ltozott a SmartTable-jelszavad",
     content_type: "text",
     group_name: "email"
   },
   {
     key: "email_password_changed_body",
-    value_en: "Hi {{guest_name}}, your SmartTable password was changed successfully. If you did not make this change, contact SmartTable support immediately.",
-    value_es: "Hola {{guest_name}}, tu contrasena de SmartTable se cambio correctamente. Si no hiciste este cambio, contacta al soporte de SmartTable de inmediato.",
+    value_en: "Hi {{firstName}},\n\nYour SmartTable account password was changed successfully.\n\nTime: {{localizedDateTime}}\nDevice/browser: {{userAgentSummary}}\nApproximate IP address: {{maskedIp}}\n\nIf you changed your password, no further action is needed.\n\nIf you did not start this change:\n1. change your password again immediately,\n2. sign out of all active sessions,\n3. contact SmartTable support.\n\nSmartTable will never ask for your password by email.",
+    value_es: "Hola {{firstName}},\n\nLa contrasena de tu cuenta SmartTable se cambio correctamente.\n\nHora: {{localizedDateTime}}\nDispositivo/navegador: {{userAgentSummary}}\nDireccion IP aproximada: {{maskedIp}}\n\nSi cambiaste tu contrasena, no tienes que hacer nada mas.\n\nSi no iniciaste este cambio:\n1. cambia tu contrasena otra vez de inmediato,\n2. cierra todas las sesiones activas,\n3. contacta al soporte de SmartTable.\n\nSmartTable nunca te pedira tu contrasena por email.",
+    value_hu: "Szia {{firstName}},\n\nA SmartTable-fi\u00f3kod jelszav\u00e1t sikeresen megv\u00e1ltoztatt\u00e1k.\n\nId\u0151pont: {{localizedDateTime}}\nEszk\u00f6z/b\u00f6ng\u00e9sz\u0151: {{userAgentSummary}}\nHozz\u00e1vet\u0151leges IP-c\u00edm: {{maskedIp}}\n\nHa te v\u00e1ltoztattad meg a jelszavadat, nincs tov\u00e1bbi teend\u0151d.\n\nHa nem te kezdem\u00e9nyezted ezt a m\u00f3dos\u00edt\u00e1st:\n1. azonnal v\u00e1ltoztasd meg ism\u00e9t a jelszavadat,\n2. z\u00e1rd le az \u00f6sszes akt\u00edv munkamenetet,\n3. vedd fel a kapcsolatot a SmartTable \u00fcgyf\u00e9lszolg\u00e1lat\u00e1val.\n\nA SmartTable soha nem k\u00e9ri el e-mailben a jelszavadat.",
     content_type: "textarea",
     group_name: "email"
   },
@@ -1670,6 +2162,30 @@ const defaultSiteContent = [
     key: "email_cta_my_account",
     value_en: "Open my account",
     value_es: "Abrir mi cuenta",
+    content_type: "text",
+    group_name: "email"
+  },
+  {
+    key: "email_data_export_ready_subject",
+    value_en: "Your SmartTable data export is ready",
+    value_es: "Tu exportacion de datos de SmartTable esta lista",
+    value_hu: "Elkeszult a SmartTable adatexportod",
+    content_type: "text",
+    group_name: "email"
+  },
+  {
+    key: "email_data_export_ready_body",
+    value_en: "Hi {{firstName}}, your SmartTable personal data export is ready. This secure link expires on {{expiresAt}}. Download it here: {{downloadUrl}}",
+    value_es: "Hola {{firstName}}, tu exportacion de datos personales de SmartTable esta lista. Este enlace seguro vence el {{expiresAt}}. Descargala aqui: {{downloadUrl}}",
+    value_hu: "Szia {{firstName}}, elkeszult a SmartTable szemelyes adatexportod. A biztonsagos link ekkor jar le: {{expiresAt}}. Itt toltheted le: {{downloadUrl}}",
+    content_type: "textarea",
+    group_name: "email"
+  },
+  {
+    key: "email_cta_download_export",
+    value_en: "Download export",
+    value_es: "Descargar exportacion",
+    value_hu: "Export letoltese",
     content_type: "text",
     group_name: "email"
   },
@@ -2585,8 +3101,8 @@ const defaultHungarianContent = {
   email_password_reset_subject: "SmartTable jelsz\u00f3 vissza\u00e1ll\u00edt\u00e1sa",
   email_password_reset_body: "Ha SmartTable jelsz\u00f3-vissza\u00e1ll\u00edt\u00e1st k\u00e9rt\u00e9l, haszn\u00e1ld ezt a linket: {{reset_url}}. Ha nem te k\u00e9rted, hagyd figyelmen k\u00edv\u00fcl ezt az \u00fczenetet.",
   email_cta_reset_password: "Jelsz\u00f3 vissza\u00e1ll\u00edt\u00e1sa",
-  email_password_changed_subject: "A SmartTable jelszavad megv\u00e1ltozott",
-  email_password_changed_body: "Szia {{guest_name}}, a SmartTable jelszavad sikeresen megv\u00e1ltozott. Ha nem te v\u00e9gezted ezt a m\u00f3dos\u00edt\u00e1st, azonnal vedd fel a kapcsolatot a SmartTable \u00fcgyf\u00e9lszolg\u00e1lattal.",
+  email_password_changed_subject: "Megv\u00e1ltozott a SmartTable-jelszavad",
+  email_password_changed_body: "Szia {{firstName}},\n\nA SmartTable-fi\u00f3kod jelszav\u00e1t sikeresen megv\u00e1ltoztatt\u00e1k.\n\nId\u0151pont: {{localizedDateTime}}\nEszk\u00f6z/b\u00f6ng\u00e9sz\u0151: {{userAgentSummary}}\nHozz\u00e1vet\u0151leges IP-c\u00edm: {{maskedIp}}\n\nHa te v\u00e1ltoztattad meg a jelszavadat, nincs tov\u00e1bbi teend\u0151d.\n\nHa nem te kezdem\u00e9nyezted ezt a m\u00f3dos\u00edt\u00e1st:\n1. azonnal v\u00e1ltoztasd meg ism\u00e9t a jelszavadat,\n2. z\u00e1rd le az \u00f6sszes akt\u00edv munkamenetet,\n3. vedd fel a kapcsolatot a SmartTable \u00fcgyf\u00e9lszolg\u00e1lat\u00e1val.\n\nA SmartTable soha nem k\u00e9ri el e-mailben a jelszavadat.",
   email_cta_my_account: "Fi\u00f3kom megnyit\u00e1sa",
   hero_kicker: "SmartTable AI",
   hero_title: "AI Revenue Operating System \u00e9ttermeknek",
@@ -2689,17 +3205,49 @@ function nowIso() {
 function json(status, body, extraHeaders = {}) {
   return {
     status,
-    headers: {
+    headers: strictSecurityHeaders({
       "content-type": "application/json; charset=utf-8",
       "cache-control": "no-store",
       ...extraHeaders
-    },
+    }),
     body
+  };
+}
+
+function textResponse(status, body, extraHeaders = {}) {
+  return {
+    status,
+    headers: strictSecurityHeaders({
+      "content-type": "text/plain; charset=utf-8",
+      "cache-control": "no-store",
+      ...extraHeaders
+    }),
+    body: String(body ?? "")
+  };
+}
+
+function fileResponse(status, body, filename, contentType) {
+  const safeName = clean(filename).replace(/[^a-zA-Z0-9._-]/g, "-") || "smarttable-report.txt";
+  const binary = Buffer.isBuffer(body) || body instanceof Uint8Array;
+  const normalizedBody = binary ? Buffer.from(body) : String(body ?? "");
+  return {
+    status,
+    headers: strictSecurityHeaders({
+      "content-type": contentType,
+      "content-disposition": `attachment; filename="${safeName}"`,
+      "cache-control": "no-store",
+      "content-length": String(binary ? normalizedBody.length : Buffer.byteLength(normalizedBody, "utf8"))
+    }),
+    body: normalizedBody
   };
 }
 
 function clean(value) {
   return String(value ?? "").trim();
+}
+
+function looksLikeUuid(value) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(clean(value));
 }
 
 function nullableClean(value) {
@@ -2737,6 +3285,7 @@ function dateStartOfMonth(date = new Date()) {
 function normalizeRole(role) {
   const value = clean(role || "guest");
   if (value === "restaurant" || value === "restaurant_partner") return "partner";
+  if (value === "superadmin") return "super_admin";
   return value;
 }
 
@@ -2748,6 +3297,58 @@ function roleMatches(profileRole, roles) {
   const normalized = normalizeRole(profileRole);
   if (normalized === "super_admin" && roles.some((role) => normalizeRole(role) === "admin")) return true;
   return roles.some((role) => normalizeRole(role) === normalized);
+}
+
+function isSuperAdminProfile(profile = {}) {
+  return normalizeRole(profile.role) === "super_admin";
+}
+
+function isAdminProfile(profile = {}) {
+  return roleMatches(profile.role, ["admin"]);
+}
+
+function normalizeRestaurantUserRole(role) {
+  const value = clean(role || "owner");
+  if (value === "staff") return "reservation_staff";
+  if (value === "viewer") return "read_only";
+  return ["owner", "manager", "reservation_staff", "marketing_staff", "read_only"].includes(value) ? value : "owner";
+}
+
+function effectivePartnerInvitationStatus(invitation = {}) {
+  const status = clean(invitation.status || invitation.invitation_status || "pending");
+  if (status === "pending" && invitation.expires_at && new Date(invitation.expires_at) <= new Date()) return "expired";
+  return ["pending", "accepted", "expired", "revoked"].includes(status) ? status : "pending";
+}
+
+function partnerAdminListRows(profileRows = [], invitationRows = []) {
+  const byKey = new Map();
+  const keyFor = (row = {}) => `${lower(row.email)}|${clean(row.restaurant_id)}`;
+  for (const row of profileRows || []) {
+    const key = keyFor(row);
+    if (!key.startsWith("|")) byKey.set(key, clientProfile(row));
+  }
+  for (const invitation of invitationRows || []) {
+    const status = effectivePartnerInvitationStatus(invitation);
+    const key = keyFor(invitation);
+    if (key.startsWith("|")) continue;
+    const existing = byKey.get(key);
+    const invitationView = {
+      id: existing?.id || invitation.id,
+      invitation_id: invitation.id,
+      email: invitation.email,
+      full_name: invitation.full_name || existing?.full_name || invitation.email,
+      role: "partner",
+      restaurant_id: invitation.restaurant_id,
+      restaurant_role: normalizeRestaurantUserRole(invitation.restaurant_role || existing?.restaurant_role || "owner"),
+      invitation_status: status,
+      status: existing?.status || status,
+      invited_at: invitation.invited_at || existing?.invited_at,
+      expires_at: invitation.expires_at || existing?.expires_at,
+      is_test_data: invitation.is_test_data === true || existing?.is_test_data === true
+    };
+    byKey.set(key, clientProfile({ ...(existing || {}), ...invitationView }));
+  }
+  return Array.from(byKey.values());
 }
 
 function normalizeReservationStatus(status) {
@@ -2875,12 +3476,31 @@ function normalizeBookingStatus(value, fallbackStatus = "pending") {
   return bookingStatusFromReservationStatus(fallbackStatus);
 }
 
+function normalizeReservationType(value = "", offerId = "") {
+  const normalized = String(value || "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+  if (["standard", "regular", "traditional", "normal", "restaurant"].includes(normalized)) return "standard";
+  if (["discount", "discount_offer", "offer", "smarttable_offer"].includes(normalized)) return "discount_offer";
+  return clean(offerId) ? "discount_offer" : "discount_offer";
+}
+
+function isStandardReservation(row = {}) {
+  return normalizeReservationType(row.reservation_type || row.type, row.offer_id) === "standard" || (!clean(row.offer_id) && clean(row.restaurant_id));
+}
+
+function standardReservationLabel(lang = "en") {
+  const language = normalizeLanguage(lang);
+  if (language === "hu") return "Norm\u00e1l asztalfoglal\u00e1s";
+  if (language === "es") return "Reserva est\u00e1ndar";
+  return "Standard reservation";
+}
+
 function decorateReservationRow(row = {}) {
   const status = normalizeReservationStatus(row.status);
   const bookingSource = normalizeBookingSource(row.booking_source || row.source || row.reservation_source || "SMARTTABLE");
   return {
     ...row,
     status,
+    reservation_type: normalizeReservationType(row.reservation_type, row.offer_id),
     booking_source: bookingSource,
     booking_status: normalizeBookingStatus(row.booking_status, status)
   };
@@ -2945,6 +3565,9 @@ function template(value, context) {
 function emailContext(row) {
   const bookingId = row.reservation_id || row.id || "";
   const rewardsUrl = `${PUBLIC_BASE_URL}/guest/rewards/photo-upload?bookingId=${encodeURIComponent(bookingId)}`;
+  const reviewUrl = clean(row.verified_review_url || row.review_url) || (bookingId ? verifiedReviewReservationUrl(bookingId) : rewardsUrl);
+  const lang = normalizeLanguage(row.guest_language || row.language || row.lang || "en");
+  const standardReservation = isStandardReservation(row);
   return {
     reference: row.reference,
     booking_id: bookingId,
@@ -2957,8 +3580,9 @@ function emailContext(row) {
     guest_email: row.guest_email,
     guest_phone: row.guest_phone,
     notes: row.notes || "none",
-    offer_title: row.offer_title || row.offer_name || "",
-    discount: row.discount_percent || row.discount_value || "",
+    offer_title: row.offer_title || row.offer_name || (standardReservation ? standardReservationLabel(lang) : ""),
+    discount: standardReservation ? "" : row.discount_percent || row.discount_value || "",
+    reservation_type: standardReservation ? "standard" : "discount_offer",
     party_size: row.party_size || "",
     status: normalizeReservationStatus(row.status),
     reservation_date: row.reservation_date || row.offer_date,
@@ -2967,16 +3591,354 @@ function emailContext(row) {
     cancelled_by_label: row.cancelled_by_label || "SmartTable",
     dashboard_url: `${PUBLIC_BASE_URL}/partner/reservations?reservation=${encodeURIComponent(row.reference)}`,
     rewards_url: rewardsUrl,
-    rate_url: rewardsUrl,
-    photo_upload_url: rewardsUrl,
-    ordered_items_url: rewardsUrl
+    rate_url: reviewUrl,
+    photo_upload_url: reviewUrl,
+    ordered_items_url: reviewUrl
   };
+}
+
+function addHoursIso(hours = 1, from = new Date()) {
+  return new Date(from.getTime() + Math.max(1, Number(hours) || 1) * 60 * 60 * 1000).toISOString();
+}
+
+function postVisitActionLabel(action = "") {
+  const labels = {
+    arrived: "I arrived",
+    on_the_way: "I am still on my way",
+    cannot_attend: "I cannot attend",
+    finished: "We finished our visit",
+    still_at_restaurant: "We are still at the restaurant",
+    did_not_attend: "We did not attend",
+    open_review: "Rate your visit"
+  };
+  return labels[clean(action)] || "Post-visit action";
+}
+
+function postVisitTokenHash(token = "") {
+  return crypto.createHash("sha256").update(clean(token)).digest("hex");
+}
+
+function newPostVisitToken() {
+  return crypto.randomBytes(32).toString("base64url");
+}
+
+function verifiedReviewUrl(token = "") {
+  return `${PUBLIC_BASE_URL}/review/verified?token=${encodeURIComponent(token)}`;
+}
+
+function verifiedReviewReservationUrl(reservationId = "") {
+  return `${PUBLIC_BASE_URL}/review/verified?reservation_id=${encodeURIComponent(clean(reservationId))}`;
+}
+
+function postVisitActionUrl(token = "") {
+  return `${PUBLIC_BASE_URL}/post-visit/action?token=${encodeURIComponent(token)}`;
+}
+
+function expectedVisitDurationMinutes(row = {}) {
+  const existing = integerInRange(row.expected_visit_duration_minutes, 15, 720);
+  if (existing) return existing;
+  const partySize = numberOr(row.party_size, 2);
+  if (partySize <= 2) return 90;
+  if (partySize <= 4) return 120;
+  return 150;
+}
+
+function clientReservationVisitContext(row = {}) {
+  return {
+    reservation_id: row.reservation_id || row.id,
+    reference: row.reference,
+    restaurant_id: row.restaurant_id,
+    restaurant_name: row.restaurant_name,
+    offer_title: row.offer_title || "",
+    reservation_date: row.reservation_date || row.offer_date,
+    reservation_time: row.reservation_time || row.offer_time,
+    party_size: row.party_size,
+    status: normalizeReservationStatus(row.status),
+    arrival_status: clean(row.arrival_status || "not_requested"),
+    arrived_at: row.arrived_at || null,
+    arrival_source: row.arrival_source || null,
+    visit_status: clean(row.visit_status || "scheduled"),
+    visit_started_at: row.visit_started_at || null,
+    visit_completed_at: row.visit_completed_at || null,
+    completion_source: row.completion_source || null,
+    expected_visit_duration_minutes: expectedVisitDurationMinutes(row),
+    review_eligible_at: row.review_eligible_at || null,
+    review_invitation_sent_at: row.review_invitation_sent_at || null,
+    review_submitted_at: row.review_submitted_at || null,
+    verified_visit: Boolean(row.verified_visit),
+    verified_review_submitted: Boolean(row.verified_review_submitted || row.review_submitted_at)
+  };
+}
+
+function reviewEligibility(row = {}, profile = null) {
+  const status = normalizeReservationStatus(row.status);
+  const visitStatus = clean(row.visit_status || "scheduled");
+  const reservationDate = clean(row.reservation_date || row.offer_date);
+  const reservationTime = clean(row.reservation_time || row.offer_time || "23:59");
+  const reservationTimePassed = reservationDate ? new Date(`${reservationDate}T${reservationTime}`).getTime() <= Date.now() : true;
+  const statusCompleted = status === "completed";
+  const reservationPassed = Boolean(statusCompleted || row.visit_completed_at || (row.verified_visit && visitStatus === "completed") || reservationTimePassed);
+  const ownReservation = !profile
+    || clean(row.guest_id) === clean(profile.id)
+    || lower(row.guest_email) === lower(profile.email);
+  const alreadySubmitted = Boolean(row.review_submitted_at || row.verified_review_submitted || row.feedback_submitted);
+  const excluded = ["cancelled", "rejected", "no_show"].includes(status) || ["cancelled", "no_show"].includes(visitStatus);
+  const attendanceConfirmed = Boolean(row.verified_visit)
+    || ["arrived"].includes(clean(row.arrival_status))
+    || ["completed"].includes(visitStatus)
+    || statusCompleted
+    || Boolean(row.visit_completed_at);
+  const eligible = Boolean(ownReservation && reservationPassed && !excluded && attendanceConfirmed && !alreadySubmitted);
+  return {
+    eligible,
+    own_reservation: ownReservation,
+    reservation_passed: reservationPassed,
+    attendance_confirmed: attendanceConfirmed,
+    already_submitted: alreadySubmitted,
+    excluded,
+    reason: eligible
+      ? "eligible"
+      : !ownReservation
+        ? "not_your_reservation"
+        : alreadySubmitted
+          ? "review_already_submitted"
+          : excluded
+            ? "reservation_not_eligible"
+            : !reservationPassed
+              ? "reservation_not_finished"
+              : "attendance_not_confirmed"
+  };
+}
+
+function postVisitLifecyclePatch(action = "", source = "guest", row = {}) {
+  const now = nowIso();
+  const expected = expectedVisitDurationMinutes(row);
+  const patch = {
+    expected_visit_duration_minutes: expected,
+    post_visit_workflow_version: POST_VISIT_WORKFLOW_VERSION
+  };
+  if (action === "arrived") {
+    Object.assign(patch, {
+      arrival_status: "arrived",
+      arrived_at: row.arrived_at || now,
+      arrival_source: source,
+      visit_status: row.visit_status === "completed" ? "completed" : "checked_in",
+      visit_started_at: row.visit_started_at || now,
+      verified_visit: true
+    });
+  }
+  if (action === "on_the_way") {
+    Object.assign(patch, {
+      arrival_status: "on_the_way",
+      arrival_source: source
+    });
+  }
+  if (action === "cannot_attend") {
+    Object.assign(patch, {
+      arrival_status: "cannot_attend",
+      arrival_source: source,
+      visit_status: "cancelled",
+      verified_visit: false
+    });
+  }
+  if (action === "finished") {
+    Object.assign(patch, {
+      arrival_status: row.arrival_status === "arrived" ? row.arrival_status : "arrived",
+      arrived_at: row.arrived_at || now,
+      arrival_source: row.arrival_source || source,
+      visit_status: "completed",
+      visit_started_at: row.visit_started_at || row.arrived_at || now,
+      visit_completed_at: row.visit_completed_at || now,
+      completion_source: source,
+      verified_visit: true,
+      review_eligible_at: row.review_eligible_at || now
+    });
+  }
+  if (action === "still_at_restaurant") {
+    Object.assign(patch, {
+      arrival_status: row.arrival_status === "arrived" ? row.arrival_status : "arrived",
+      arrived_at: row.arrived_at || now,
+      arrival_source: row.arrival_source || source,
+      visit_status: "in_progress",
+      visit_started_at: row.visit_started_at || row.arrived_at || now,
+      completion_source: source,
+      verified_visit: true
+    });
+  }
+  if (action === "did_not_attend") {
+    Object.assign(patch, {
+      arrival_status: "no_show",
+      arrival_source: source,
+      visit_status: "no_show",
+      completion_source: source,
+      verified_visit: false
+    });
+  }
+  return patch;
+}
+
+async function refreshReservationOverview(id = "") {
+  const reservationId = clean(id);
+  if (!reservationId) return null;
+  if (!supabaseConfigured) {
+    ensureDemo();
+    return reservationOverviewRows().find((item) => item.reservation_id === reservationId) || null;
+  }
+  const rows = await supabaseFetch(`/rest/v1/reservation_overview?select=*&reservation_id=eq.${encodeURIComponent(reservationId)}&limit=1`, { service: true }).catch(() => []);
+  return rows?.[0] || null;
+}
+
+async function patchReservationVisitState(id = "", patch = {}) {
+  const reservationId = clean(id);
+  if (!reservationId) return null;
+  if (!supabaseConfigured) {
+    ensureDemo();
+    const reservation = demo.reservations.find((item) => item.id === reservationId);
+    if (!reservation) return null;
+    Object.assign(reservation, patch, { updated_at: nowIso() });
+    return refreshReservationOverview(reservationId);
+  }
+  const payload = await filterSupabaseTablePayload("reservations", { ...patch, updated_at: nowIso() });
+  await supabaseFetch(`/rest/v1/reservations?id=eq.${encodeURIComponent(reservationId)}`, {
+    method: "PATCH",
+    service: true,
+    headers: { Prefer: "return=minimal" },
+    body: payload
+  });
+  return refreshReservationOverview(reservationId);
+}
+
+function postVisitNotificationType(eventType = "") {
+  const value = clean(eventType || "reservation_confirmation");
+  if ([
+    "reservation_confirmation",
+    "arrival_check_in",
+    "visit_in_progress",
+    "completion_question",
+    "review_invitation",
+    "review_confirmation",
+    "review_reminder"
+  ].includes(value)) return value;
+  if (["guest_arrived", "guest_on_the_way", "guest_cannot_attend"].includes(value)) return "arrival_check_in";
+  if (["guest_finished", "guest_still_at_restaurant", "guest_did_not_attend"].includes(value)) return "completion_question";
+  if (value === "review_invitation_ready") return "review_invitation";
+  if (value === "review_submitted") return "review_confirmation";
+  return "reservation_confirmation";
+}
+
+function postVisitNotificationChannel(channel = "") {
+  const value = clean(channel || "dashboard");
+  if (value === "in_app") return "dashboard";
+  return ["dashboard", "email", "sms", "push"].includes(value) ? value : "dashboard";
+}
+
+async function createPostVisitNotificationEvent(row = {}, eventType = "reservation_confirmation", channel = "dashboard", metadata = {}) {
+  const reservationId = clean(row.reservation_id || row.id);
+  if (!reservationId) return null;
+  const notificationType = postVisitNotificationType(eventType);
+  const notificationChannel = postVisitNotificationChannel(channel);
+  const event = {
+    reservation_id: reservationId,
+    restaurant_id: row.restaurant_id,
+    guest_id: nullableClean(row.guest_id),
+    notification_type: notificationType,
+    channel: notificationChannel,
+    status: "queued",
+    idempotency_key: hashEmailValue(`post-visit:${eventType}:${notificationChannel}:${reservationId}`),
+    scheduled_for: nowIso(),
+    metadata: sanitizeAuditMetadata({ ...metadata, source_event_type: eventType })
+  };
+  if (!supabaseConfigured) {
+    ensureDemo();
+    demo.notificationLogs.unshift({
+      id: crypto.randomUUID(),
+      restaurant_id: event.restaurant_id,
+      notification_type: event.notification_type,
+      channel: event.channel,
+      status: event.status,
+      metadata: event.metadata,
+      created_at: nowIso()
+    });
+    return event;
+  }
+  const exists = await supabaseTableExists("post_visit_notification_events").catch(() => false);
+  if (!exists) return null;
+  const rows = await supabaseFetch("/rest/v1/post_visit_notification_events?select=*", {
+    method: "POST",
+    service: true,
+    headers: { Prefer: "return=representation,resolution=ignore-duplicates" },
+    body: await filterSupabaseTablePayload("post_visit_notification_events", event)
+  }).catch(() => null);
+  return rows?.[0] || event;
+}
+
+async function createPostVisitActionToken(row = {}, action = "open_review", options = {}) {
+  const normalizedAction = clean(action);
+  if (!postVisitActionTokens.has(normalizedAction)) {
+    const error = new Error("Unsupported post-visit action.");
+    error.status = 400;
+    error.code = "INVALID_POST_VISIT_ACTION";
+    throw error;
+  }
+  const token = newPostVisitToken();
+  const expiresAt = addHoursIso(options.ttlHours || postVisitTokenTtlHours[normalizedAction] || 24);
+  const payload = {
+    reservation_id: row.reservation_id || row.id,
+    restaurant_id: row.restaurant_id,
+    guest_user_id: nullableClean(row.guest_id),
+    action: normalizedAction,
+    token_hash: postVisitTokenHash(token),
+    expires_at: expiresAt,
+    metadata: sanitizeAuditMetadata(options.metadata || {})
+  };
+  if (!supabaseConfigured) {
+    ensureDemo();
+    demo.postVisitActionTokens = demo.postVisitActionTokens || [];
+    demo.postVisitActionTokens.push({ id: crypto.randomUUID(), ...payload, used_at: null, created_at: nowIso() });
+    return { token, expires_at: expiresAt };
+  }
+  const exists = await supabaseTableExists("post_visit_action_tokens").catch(() => false);
+  if (!exists) return { token: "", expires_at: expiresAt };
+  await supabaseFetch("/rest/v1/post_visit_action_tokens", {
+    method: "POST",
+    service: true,
+    headers: { Prefer: "return=minimal" },
+    body: await filterSupabaseTablePayload("post_visit_action_tokens", payload)
+  });
+  return { token, expires_at: expiresAt };
+}
+
+async function lookupPostVisitActionToken(token = "") {
+  const tokenHash = postVisitTokenHash(token);
+  if (!tokenHash) return null;
+  if (!supabaseConfigured) {
+    ensureDemo();
+    return (demo.postVisitActionTokens || []).find((item) => item.token_hash === tokenHash) || null;
+  }
+  const exists = await supabaseTableExists("post_visit_action_tokens").catch(() => false);
+  if (!exists) return null;
+  const rows = await supabaseFetch(`/rest/v1/post_visit_action_tokens?select=*&token_hash=eq.${encodeURIComponent(tokenHash)}&limit=1`, { service: true }).catch(() => []);
+  return rows?.[0] || null;
+}
+
+async function markPostVisitTokenUsed(tokenRow = {}) {
+  if (!tokenRow?.id || tokenRow.used_at) return;
+  if (!supabaseConfigured) {
+    tokenRow.used_at = nowIso();
+    return;
+  }
+  await supabaseFetch(`/rest/v1/post_visit_action_tokens?id=eq.${encodeURIComponent(tokenRow.id)}`, {
+    method: "PATCH",
+    service: true,
+    headers: { Prefer: "return=minimal" },
+    body: { used_at: nowIso() }
+  }).catch(() => null);
 }
 
 function localizedField(item, base, lang = "en") {
   if (!item) return "";
   const suffix = `_${normalizeLanguage(lang)}`;
-  return clean(item[`${base}${suffix}`]) || clean(item[`${base}_en`]) || clean(item[base]);
+  return clean(item[`${base}${suffix}`]) || clean(item[`${base}_en`]) || clean(item[`${base}_es`]) || clean(item[`${base}_hu`]) || clean(item[base]);
 }
 
 function arrayFrom(value) {
@@ -3014,24 +3976,152 @@ function ensureDemo() {
   const guestId = "00000000-0000-4000-8000-000000000003";
   const restaurantId = "10000000-0000-4000-8000-000000000001";
   const secondRestaurantId = "10000000-0000-4000-8000-000000000002";
+  const testRestaurantId = "10000000-0000-4000-8000-000000000123";
   const offerId = "20000000-0000-4000-8000-000000000001";
   const secondOfferId = "20000000-0000-4000-8000-000000000002";
+  const testEarlyOfferId = "20000000-0000-4000-8000-000000000123";
+  const testWeekendOfferId = "20000000-0000-4000-8000-000000000124";
+  const testLastMinuteOfferId = "20000000-0000-4000-8000-000000000125";
   const demoBookingId = "30000000-0000-4000-8000-000000001042";
   const demoFeedbackBookingId = "30000000-0000-4000-8000-000000001043";
+  const superAdminAccount = getRoleTestCredentials("superadmin");
+  const adminAccount = getRoleTestCredentials("admin");
+  const partnerAccount = getRoleTestCredentials("partner");
+  const guestAccount = getRoleTestCredentials("guest");
 
   demo.users = [
-    { id: adminId, email: "admin@smarttable.com", password: "admin123" },
-    { id: regularAdminId, email: "ops@smarttable.com", password: "admin123" },
-    { id: partnerUserId, email: "owner@hudsonhearth.com", password: "restaurant123" },
-    { id: guestId, email: "guest@smarttable.com", password: "guest123" }
+    { id: adminId, email: superAdminAccount.email, password: superAdminAccount.password, is_test_data: true },
+    { id: regularAdminId, email: adminAccount.email, password: adminAccount.password, is_test_data: true },
+    { id: partnerUserId, email: partnerAccount.email, password: partnerAccount.password, is_test_data: true },
+    { id: guestId, email: guestAccount.email, password: guestAccount.password, is_test_data: true }
   ];
 
   demo.profiles = [
-    { id: adminId, email: "admin@smarttable.com", full_name: "Smarttable Admin", role: "super_admin", restaurant_id: null, preferred_language: "en" },
-    { id: regularAdminId, email: "ops@smarttable.com", full_name: "Smarttable Operations Admin", role: "admin", restaurant_id: null, preferred_language: "en" },
-    { id: partnerUserId, email: "owner@hudsonhearth.com", full_name: "Hudson Hearth Owner", role: "partner", restaurant_id: restaurantId, preferred_language: "en" },
-    { id: guestId, email: "guest@smarttable.com", full_name: "Guest User", role: "guest", restaurant_id: null, preferred_language: "hu" }
+    { id: adminId, email: superAdminAccount.email, full_name: "Smarttable Admin", role: "super_admin", restaurant_id: null, preferred_language: "en", is_test_data: true, status: "active" },
+    { id: regularAdminId, email: adminAccount.email, full_name: "Smarttable Operations Admin", role: "admin", restaurant_id: null, preferred_language: "en", is_test_data: true, status: "active" },
+    { id: partnerUserId, email: partnerAccount.email, full_name: "Hudson Hearth Owner", role: "partner", restaurant_id: restaurantId, preferred_language: "en", is_test_data: true, status: "active" },
+    { id: guestId, email: guestAccount.email, full_name: "Guest User", role: "guest", restaurant_id: null, preferred_language: "hu", is_test_data: true, status: "active" }
   ];
+
+  demo.restaurantUsers = [
+    {
+      id: "50000000-0000-4000-8000-000000000001",
+      restaurant_id: restaurantId,
+      user_id: partnerUserId,
+      email: partnerAccount.email,
+      full_name: "Hudson Hearth Owner",
+      role: "owner",
+      status: "active",
+      is_test_data: true,
+      created_at: nowIso(),
+      updated_at: nowIso()
+    },
+    {
+      id: "50000000-0000-4000-8000-000000000123",
+      restaurant_id: testRestaurantId,
+      user_id: partnerUserId,
+      email: partnerAccount.email,
+      full_name: "Hudson Hearth Owner",
+      role: "owner",
+      status: "active",
+      is_test_data: true,
+      created_at: nowIso(),
+      updated_at: nowIso()
+    }
+  ];
+
+  demo.restaurantDiningAreas = [
+    {
+      id: "51000000-0000-4000-8000-000000000001",
+      restaurant_id: restaurantId,
+      name: "Main dining room",
+      code: "main-dining-room",
+      description: "Primary indoor seating.",
+      capacity: 64,
+      status: "active",
+      sort_order: 1,
+      is_test_data: true,
+      metadata: {},
+      created_at: nowIso(),
+      updated_at: nowIso()
+    },
+    {
+      id: "51000000-0000-4000-8000-000000000123",
+      restaurant_id: testRestaurantId,
+      name: "Test dining room",
+      code: "test-dining-room",
+      description: "Demo seating area for SmartTable workflow testing.",
+      capacity: 48,
+      status: "active",
+      sort_order: 1,
+      is_test_data: true,
+      metadata: {},
+      created_at: nowIso(),
+      updated_at: nowIso()
+    }
+  ];
+
+  demo.restaurantTables = [
+    {
+      id: "52000000-0000-4000-8000-000000000001",
+      restaurant_id: restaurantId,
+      dining_area_id: "51000000-0000-4000-8000-000000000001",
+      table_identifier: "H1",
+      display_name: "H1",
+      min_capacity: 2,
+      max_capacity: 4,
+      is_combinable: true,
+      combinable_with: ["H2"],
+      is_accessible: true,
+      seating_type: "indoor",
+      status: "active",
+      has_reservations: false,
+      is_test_data: true,
+      metadata: {},
+      created_at: nowIso(),
+      updated_at: nowIso()
+    },
+    {
+      id: "52000000-0000-4000-8000-000000000123",
+      restaurant_id: testRestaurantId,
+      dining_area_id: "51000000-0000-4000-8000-000000000123",
+      table_identifier: "T1",
+      display_name: "T1",
+      min_capacity: 2,
+      max_capacity: 4,
+      is_combinable: true,
+      combinable_with: ["T2"],
+      is_accessible: true,
+      seating_type: "indoor",
+      status: "active",
+      has_reservations: false,
+      is_test_data: true,
+      metadata: {},
+      created_at: nowIso(),
+      updated_at: nowIso()
+    },
+    {
+      id: "52000000-0000-4000-8000-000000000124",
+      restaurant_id: testRestaurantId,
+      dining_area_id: "51000000-0000-4000-8000-000000000123",
+      table_identifier: "T2",
+      display_name: "T2",
+      min_capacity: 2,
+      max_capacity: 6,
+      is_combinable: true,
+      combinable_with: ["T1"],
+      is_accessible: false,
+      seating_type: "indoor",
+      status: "active",
+      has_reservations: false,
+      is_test_data: true,
+      metadata: {},
+      created_at: nowIso(),
+      updated_at: nowIso()
+    }
+  ];
+
+  demo.restaurantCapacityOverrides = [];
 
   demo.restaurants = [
     {
@@ -3155,6 +4245,90 @@ function ensureDemo() {
       views_count: 0,
       created_at: nowIso(),
       updated_at: nowIso()
+    },
+    {
+      id: testRestaurantId,
+      owner_user_id: partnerUserId,
+      slug: "smarttable-test-bistro",
+      name: "SmartTable Test Bistro",
+      legal_name: "SmartTable Test Bistro",
+      contact_email: "reservations@smarttable.test",
+      email: "reservations@smarttable.test",
+      phone: "+1 212 555 0123",
+      address: "123 Pilot Test Avenue, New York, NY 10001",
+      district: "Manhattan",
+      cuisine: "Modern American",
+      cuisine_type: "Modern American",
+      restaurant_type: "Test / Demo restaurant",
+      website: "https://smarttablenyc.com",
+      instagram: "",
+      facebook: "",
+      tiktok: "",
+      google_maps_url: "https://maps.google.com/?q=123+Pilot+Test+Avenue+New+York+NY+10001",
+      google_place_id: null,
+      latitude: 40.7505,
+      longitude: -73.9934,
+      opening_hours: "Mon-Thu 5:00 PM - 10:00 PM; Fri 5:00 PM - 11:00 PM; Sat 12:00 PM - 11:00 PM; Sun 12:00 PM - 9:00 PM",
+      opening_hours_json: {
+        mon: [["17:00", "22:00"]],
+        tue: [["17:00", "22:00"]],
+        wed: [["17:00", "22:00"]],
+        thu: [["17:00", "22:00"]],
+        fri: [["17:00", "23:00"]],
+        sat: [["12:00", "23:00"]],
+        sun: [["12:00", "21:00"]]
+      },
+      description: "A SmartTable demonstration restaurant created for testing the complete guest reservation journey. No real reservation is created outside the SmartTable test environment.",
+      description_en: "A SmartTable demonstration restaurant created for testing the complete guest reservation journey. No real reservation is created outside the SmartTable test environment.",
+      description_es: "Un restaurante de demostración de SmartTable creado para probar el proceso completo de reservas de huéspedes. No se crea ninguna reserva real fuera del entorno de prueba de SmartTable.",
+      description_hu: "A SmartTable teljes vendégfoglalási folyamatának tesztelésére létrehozott bemutató étterem. A tesztkörnyezeten kívül nem jön létre valódi foglalás.",
+      cover_image: "/assets/restaurant-hero.png",
+      card_image: "/assets/restaurant-hero.png",
+      icon_image: "/assets/restaurant-hero.png",
+      logo_url: "/assets/restaurant-hero.png",
+      hero_image_url: "/assets/restaurant-hero.png",
+      menu_pdf_url: "",
+      price_range: "$$",
+      dress_code: "Casual",
+      outdoor_seating: true,
+      parking_available: false,
+      kids_friendly: true,
+      pet_friendly: false,
+      wheelchair_accessible: true,
+      payment_methods: ["Visa", "Mastercard", "Amex"],
+      chef_name: "SmartTable Test Kitchen",
+      year_opened: 2026,
+      capacity: 80,
+      private_room_available: false,
+      gallery_images: ["/assets/restaurant-hero.png"],
+      billing_plan: "free",
+      monthly_fee: 0,
+      fee_per_booking: 0,
+      billing_status: "active",
+      status: "approved",
+      visible_on_guest_site: true,
+      is_test_restaurant: true,
+      accepts_reservation_requests: true,
+      reservation_provider: "internal_test",
+      primary_timezone: "America/New_York",
+      timezone: "America/New_York",
+      booking_interval_minutes: 30,
+      minimum_advance_minutes: 30,
+      maximum_booking_window_days: 30,
+      min_party_size: 1,
+      max_party_size: 8,
+      auto_confirmation: false,
+      partner_approval_required: true,
+      sort_order: 3,
+      ai_discount_enabled: false,
+      min_discount_percent: 15,
+      max_discount_percent: 30,
+      target_margin_percent: 65,
+      average_service_minutes: 75,
+      rating: 4.9,
+      views_count: 0,
+      created_at: nowIso(),
+      updated_at: nowIso()
     }
   ];
 
@@ -3171,10 +4345,44 @@ function ensureDemo() {
     if (start.getTime() <= date.getTime()) start.setDate(start.getDate() + 1);
     return localIsoDate(start);
   };
+  const offerDateForNextDay = (allowed, hour, minute = 0) => {
+    const dayKeys = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+    const allowedSet = new Set(allowed);
+    const now = new Date();
+    for (let offset = 0; offset < 14; offset += 1) {
+      const candidate = new Date(now);
+      candidate.setDate(now.getDate() + offset);
+      candidate.setHours(hour, minute, 0, 0);
+      if (!allowedSet.has(dayKeys[candidate.getDay()])) continue;
+      if (candidate.getTime() <= now.getTime()) continue;
+      return localIsoDate(candidate);
+    }
+    return offerDateForLocalTime(hour, minute);
+  };
+  const lastMinuteWindow = () => {
+    const now = new Date();
+    const start = new Date(now);
+    start.setMinutes(Math.ceil((start.getMinutes() + 60) / 30) * 30, 0, 0);
+    if (start.getHours() >= 21) {
+      start.setDate(start.getDate() + 1);
+      start.setHours(17, 0, 0, 0);
+    }
+    const end = new Date(start);
+    end.setMinutes(start.getMinutes() + 90);
+    const time = (date) => `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+    return {
+      date: localIsoDate(start),
+      start: time(start),
+      end: time(end)
+    };
+  };
   const today = localIsoDate(new Date());
   const yesterday = localIsoDate(new Date(Date.now() - 24 * 60 * 60 * 1000));
   const earlyOfferDate = offerDateForLocalTime(18, 0);
   const lateOfferDate = offerDateForLocalTime(20, 30);
+  const testEarlyOfferDate = offerDateForNextDay(["mon", "tue", "wed", "thu"], 17, 0);
+  const testWeekendOfferDate = offerDateForNextDay(["sat", "sun"], 12, 0);
+  const testLastMinute = lastMinuteWindow();
   const demoGuestPreferences = {
     cuisines: ["American", "Italian", "Hungarian"],
     food_interests: ["Steak", "Pasta", "Desserts"],
@@ -3234,7 +4442,7 @@ function ensureDemo() {
   demo.guests = [{
     id: "60000000-0000-4000-8000-000000000003",
     user_id: guestId,
-    email: "guest@smarttable.com",
+    email: guestAccount.email,
     full_name: "Guest User",
     phone: "+1 212 555 0103",
     first_name: "Guest",
@@ -3254,7 +4462,7 @@ function ensureDemo() {
   demo.guestProfiles = [{
     id: "61000000-0000-4000-8000-000000000003",
     guest_id: demo.guests[0].id,
-    profile_key: aiProfileKey("guest@smarttable.com"),
+    profile_key: aiProfileKey(guestAccount.email),
     preferences: demoGuestPreferences,
     dietary_restrictions: demoGuestPreferences.dietary_needs,
     favorite_cuisines: demoGuestPreferences.cuisines,
@@ -3319,6 +4527,118 @@ function ensureDemo() {
       reserved_seats: 0,
       discount_percent: 30,
       status: "active",
+      created_at: nowIso(),
+      updated_at: nowIso()
+    },
+    {
+      id: testEarlyOfferId,
+      restaurant_id: testRestaurantId,
+      title_en: "Early Dinner Special",
+      title_es: "Cena temprana especial",
+      title_hu: "Korai vacsoraajánlat",
+      description_en: "Twenty percent off an early dinner test table from Monday through Thursday.",
+      description_es: "Veinte por ciento de descuento en una mesa de prueba para cena temprana de lunes a jueves.",
+      description_hu: "Húsz százalék kedvezmény korai tesztvacsora-asztalra hétfőtől csütörtökig.",
+      discount_type: "percent",
+      discount_value: 20,
+      valid_days: ["mon", "tue", "wed", "thu"],
+      offer_date: testEarlyOfferDate,
+      offer_time: "17:00",
+      start_time: "17:00",
+      end_time: "18:30",
+      available_tables: 10,
+      reserved_tables: 0,
+      min_party_size: 2,
+      max_party_size: 6,
+      structured_conditions: {
+        min_party_size: 2,
+        max_party_size: 6,
+        custom_terms: {
+          test_record: "No real reservation is created outside the SmartTable test environment."
+        }
+      },
+      offer_image: "/assets/restaurant-hero.png",
+      seat_count: 60,
+      reserved_seats: 0,
+      discount_percent: 20,
+      is_test_offer: true,
+      status: "active",
+      source: "internal_test_seed",
+      created_at: nowIso(),
+      updated_at: nowIso()
+    },
+    {
+      id: testWeekendOfferId,
+      restaurant_id: testRestaurantId,
+      title_en: "Weekend Lunch",
+      title_es: "Almuerzo de fin de semana",
+      title_hu: "Hétvégi ebéd",
+      description_en: "Fifteen percent off a weekend lunch test reservation.",
+      description_es: "Quince por ciento de descuento en una reserva de prueba para almuerzo de fin de semana.",
+      description_hu: "Tizenöt százalék kedvezmény hétvégi tesztebéd-foglalásra.",
+      discount_type: "percent",
+      discount_value: 15,
+      valid_days: ["sat", "sun"],
+      offer_date: testWeekendOfferDate,
+      offer_time: "12:00",
+      start_time: "12:00",
+      end_time: "15:00",
+      available_tables: 10,
+      reserved_tables: 0,
+      min_party_size: 1,
+      max_party_size: 8,
+      structured_conditions: {
+        min_party_size: 1,
+        max_party_size: 8,
+        custom_terms: {
+          test_record: "No real reservation is created outside the SmartTable test environment."
+        }
+      },
+      offer_image: "/assets/restaurant-hero.png",
+      seat_count: 80,
+      reserved_seats: 0,
+      discount_percent: 15,
+      is_test_offer: true,
+      status: "active",
+      source: "internal_test_seed",
+      created_at: nowIso(),
+      updated_at: nowIso()
+    },
+    {
+      id: testLastMinuteOfferId,
+      restaurant_id: testRestaurantId,
+      title_en: "Last-Minute Table",
+      title_es: "Mesa de último minuto",
+      title_hu: "Utolsó pillanatos asztal",
+      description_en: "Thirty percent off a configurable same-day SmartTable test slot.",
+      description_es: "Treinta por ciento de descuento en un turno de prueba configurable para el mismo día.",
+      description_hu: "Harminc százalék kedvezmény konfigurálható, aznapi SmartTable tesztidősávra.",
+      discount_type: "percent",
+      discount_value: 30,
+      valid_days: ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+      offer_date: testLastMinute.date,
+      offer_time: testLastMinute.start,
+      start_time: testLastMinute.start,
+      end_time: testLastMinute.end,
+      available_tables: 10,
+      reserved_tables: 0,
+      min_party_size: 1,
+      max_party_size: 8,
+      structured_conditions: {
+        min_party_size: 1,
+        max_party_size: 8,
+        same_day_test_availability: true,
+        custom_terms: {
+          test_record: "No real reservation is created outside the SmartTable test environment."
+        }
+      },
+      offer_image: "/assets/restaurant-hero.png",
+      seat_count: 80,
+      reserved_seats: 0,
+      discount_percent: 30,
+      is_test_offer: true,
+      status: "active",
+      source: "internal_test_seed",
       created_at: nowIso(),
       updated_at: nowIso()
     }
@@ -3444,6 +4764,56 @@ function ensureDemo() {
   ];
 
   demo.siteContent = mergeContentRows(defaultSiteContent);
+  demo.legalDocuments = defaultLegalDocuments();
+  demo.userLegalConsents = legalConsentRowsFromSignup({
+    payload: {
+      email: guestAccount.email,
+      preferredLanguage: "hu",
+      preferences: demoGuestPreferences
+    },
+    guestId: demo.guests[0].id,
+    userId: guestId,
+    source: "demo_seed"
+  }).map((row) => ({ id: crypto.randomUUID(), ...row, created_at: row.created_at || nowIso(), updated_at: row.updated_at || nowIso() }));
+  demo.restaurantFollowers = [{
+    id: "62000000-0000-4000-8000-000000000003",
+    restaurant_id: restaurantId,
+    guest_email: guestAccount.email,
+    guest_name: "Guest User",
+    user_id: guestId,
+    notification_enabled: true,
+    created_at: nowIso(),
+    updated_at: nowIso()
+  }];
+  demo.communicationPreferences = [{
+    user_id: guestId,
+    transactional_email_enabled: true,
+    marketing_email_enabled: true,
+    transactional_sms_enabled: false,
+    marketing_sms_enabled: false,
+    in_app_enabled: true,
+    preferred_language: "hu",
+    timezone: "America/New_York",
+    updated_at: nowIso()
+  }];
+  demo.communicationConsents = [{
+    id: crypto.randomUUID(),
+    user_id: guestId,
+    channel: "email",
+    consent_type: "marketing",
+    status: "granted",
+    source: "demo_seed",
+    consent_text_version: COMMUNICATION_CONSENT_VERSION,
+    ip_address: "local",
+    user_agent: "Demo seed",
+    granted_at: nowIso(),
+    revoked_at: null,
+    created_at: nowIso()
+  }];
+  demo.suppressionList = [];
+  demo.messageCampaigns = [];
+  demo.messageRecipients = [];
+  demo.dataExportRequests = [];
   demo.featureStatus = featureStatusRows();
   demo.featureFlags = featureStatusRows().map((item) => ({
     key: item.key,
@@ -3455,44 +4825,18 @@ function ensureDemo() {
     owner: item.key.includes("ai") ? "ai" : item.key.includes("billing") ? "billing" : "operations",
     updated_at: nowIso()
   }));
-  demo.billingPlans = [
-    {
-      id: "90000000-0000-4000-8000-000000000001",
-      key: "free",
-      name: "Free",
-      monthly_price: 0,
-      per_booking_fee: 0,
-      stripe_price_id: null,
-      features: { offers: 3, ai_recommendations: "demo" },
-      status: "active"
-    },
-    {
-      id: "90000000-0000-4000-8000-000000000002",
-      key: "growth_monthly",
-      name: "Growth Monthly",
-      monthly_price: 199,
-      per_booking_fee: 0,
-      stripe_price_id: "requires_stripe_price",
-      features: { offers: "unlimited", ai_recommendations: "approval_flow", email_campaigns: true },
-      status: "active"
-    },
-    {
-      id: "90000000-0000-4000-8000-000000000003",
-      key: "per_booking",
-      name: "Per Booking",
-      monthly_price: 0,
-      per_booking_fee: 2.5,
-      stripe_price_id: "requires_stripe_price",
-      features: { offers: "unlimited", ai_recommendations: "approval_flow" },
-      status: "active"
-    }
-  ];
+  demo.billingPlans = fixedMonthlySubscriptionPlanDefinitions();
   demo.subscriptions = [
     {
       id: "91000000-0000-4000-8000-000000000001",
       restaurant_id: restaurantId,
-      billing_plan_id: demo.billingPlans[1].id,
+      billing_plan_id: demo.billingPlans.find((plan) => plan.internal_name === "basic")?.id,
+      plan_id: demo.billingPlans.find((plan) => plan.internal_name === "basic")?.id,
+      internal_plan: "basic",
       status: "active",
+      subscription_status: "active",
+      billing_interval: "monthly",
+      stripe_price_id: STRIPE_BASIC_MONTHLY_PRICE_ID || "price_test_basic_monthly",
       stripe_customer_id: "requires_stripe_customer",
       stripe_subscription_id: "requires_stripe_subscription",
       current_period_start: today,
@@ -3563,7 +4907,7 @@ function ensureDemo() {
     {
       id: crypto.randomUUID(),
       guest_id: demo.guests[0]?.id,
-      guest_email: "guest@smarttable.com",
+      guest_email: guestAccount.email,
       user_id: guestId,
       consent_type: "terms",
       status: "granted",
@@ -3577,7 +4921,7 @@ function ensureDemo() {
     {
       id: crypto.randomUUID(),
       guest_id: demo.guests[0]?.id,
-      guest_email: "guest@smarttable.com",
+      guest_email: guestAccount.email,
       user_id: guestId,
       consent_type: "privacy",
       status: "granted",
@@ -3614,6 +4958,7 @@ function ensureDemo() {
   demo.marketingCampaigns = [];
   demo.emailLogs = [];
   demo.notificationLogs = [];
+  demo.guestAuthEvents = [];
   demo.photoRewardSubmissions = demo.consumptionUploads;
   demo.loyaltyAccounts = [{
     id: "50000000-0000-4000-8000-000000001042",
@@ -3679,7 +5024,17 @@ function profileFromSignedToken(token, kind = "impersonate") {
     if (providedBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(providedBuffer, expectedBuffer)) return null;
     const payload = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
     if (payload.exp && payload.exp < Date.now()) return null;
-    return clientProfile(payload);
+    return clientProfile({
+      ...payload,
+      impersonation: payload.impersonation_session_id
+        ? {
+          session_id: payload.impersonation_session_id,
+          actor_user_id: payload.impersonated_by || "",
+          mode: payload.impersonation_mode || "read",
+          reason: payload.impersonation_reason || ""
+        }
+        : null
+    });
   } catch {
     return null;
   }
@@ -3687,7 +5042,20 @@ function profileFromSignedToken(token, kind = "impersonate") {
 
 function authToken(headers = {}) {
   const value = headers.authorization || headers.Authorization || "";
-  return value.startsWith("Bearer ") ? value.slice(7) : "";
+  if (!value.startsWith("Bearer ")) return "";
+  const token = value.slice(7).trim();
+  if (!isPlausibleAuthToken(token)) return "";
+  return token;
+}
+
+function isPlausibleAuthToken(token = "") {
+  const value = clean(token);
+  if (!value || value.length > 4096) return false;
+  if (/[\s"'<>]/.test(value)) return false;
+  if (value.startsWith("demo.")) return /^[A-Za-z0-9_-]+\.?[A-Za-z0-9_-]*$/.test(value.slice(5));
+  if (value.startsWith("impersonate.")) return /^impersonate\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(value);
+  if (looksLikeJwt(value)) return /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(value);
+  return false;
 }
 
 async function supabaseFetch(path, options = {}) {
@@ -3696,16 +5064,33 @@ async function supabaseFetch(path, options = {}) {
   const service = options.service !== false;
   const key = service ? SUPABASE_SERVICE_ROLE_KEY : SUPABASE_ANON_KEY;
   const token = options.token || key;
-  const response = await fetch(`${SUPABASE_URL}${path}`, {
-    method: options.method || "GET",
-    headers: {
-      apikey: key,
-      authorization: `Bearer ${token}`,
-      "content-type": "application/json",
-      ...(options.headers || {})
-    },
-    body: options.body === undefined ? undefined : JSON.stringify(options.body)
-  });
+  const requestHeaders = {
+    apikey: key,
+    "content-type": "application/json",
+    ...(options.headers || {})
+  };
+  if (token && looksLikeJwt(token)) {
+    requestHeaders.authorization = `Bearer ${token}`;
+  }
+  const timeoutMs = Math.max(500, Number(options.timeoutMs || SUPABASE_REQUEST_TIMEOUT_MS));
+  const controller = options.signal ? null : new AbortController();
+  const timeout = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+  let response;
+  try {
+    response = await fetch(`${SUPABASE_URL}${path}`, {
+      method: options.method || "GET",
+      headers: requestHeaders,
+      body: options.body === undefined ? undefined : JSON.stringify(options.body),
+      signal: options.signal || controller?.signal
+    });
+  } catch (error) {
+    const timeoutError = new Error(error.name === "AbortError" ? "Upstream request timed out." : "Upstream service is unavailable.");
+    timeoutError.status = error.name === "AbortError" ? 504 : 502;
+    timeoutError.code = error.name === "AbortError" ? "UPSTREAM_TIMEOUT" : "UPSTREAM_UNAVAILABLE";
+    throw timeoutError;
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
 
   const raw = await response.text();
   let payload = null;
@@ -3721,11 +5106,55 @@ async function supabaseFetch(path, options = {}) {
     const message = payload?.message || payload?.error_description || payload?.error || raw || "Supabase request failed.";
     const error = new Error(message);
     error.status = response.status;
+    error.code = payload?.error_code || payload?.code || payload?.error || "SUPABASE_REQUEST_FAILED";
     error.detail = payload;
     throw error;
   }
 
   return payload;
+}
+
+let supabaseOpenApiSchemaPromise = null;
+
+function openApiDefinitions(spec = {}) {
+  return spec.definitions || spec.components?.schemas || {};
+}
+
+function openApiTableDefinition(definitions = {}, tableName = "") {
+  return Object.entries(definitions)
+    .find(([key]) => key === tableName || key.endsWith(`.${tableName}`))?.[1] || null;
+}
+
+async function supabaseOpenApiSchema() {
+  if (!supabaseConfigured) return null;
+  if (!supabaseOpenApiSchemaPromise) {
+    supabaseOpenApiSchemaPromise = supabaseFetch("/rest/v1/", {
+      service: true,
+      headers: { Accept: "application/openapi+json" }
+    }).catch((error) => {
+      console.error("[supabase-schema] Schema cache read failed:", error.message);
+      return null;
+    });
+  }
+  return supabaseOpenApiSchemaPromise;
+}
+
+async function supabaseTableColumns(tableName = "") {
+  const schema = await supabaseOpenApiSchema();
+  const definition = openApiTableDefinition(openApiDefinitions(schema || {}), tableName);
+  const properties = definition?.properties || {};
+  return new Set(Object.keys(properties));
+}
+
+async function filterSupabaseTablePayload(tableName = "", payload = {}) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return payload;
+  const columns = await supabaseTableColumns(tableName);
+  if (!columns.size) return payload;
+  return Object.fromEntries(Object.entries(payload).filter(([key]) => columns.has(key)));
+}
+
+async function supabaseTableExists(tableName = "") {
+  return (await supabaseTableColumns(tableName)).size > 0;
 }
 
 async function getSupabaseProfile(token) {
@@ -3742,6 +5171,47 @@ async function getSupabaseProfile(token) {
     }),
     email_verified: Boolean(user.email_confirmed_at)
   });
+}
+
+function accountSetupIncompleteError(reason = "PROFILE_MISSING") {
+  const error = new Error("Account setup is incomplete. Please contact SmartTable support.");
+  error.status = 409;
+  error.code = "ACCOUNT_SETUP_INCOMPLETE";
+  error.setupReason = reason;
+  return error;
+}
+
+function authServiceUnavailableError() {
+  const error = new Error("Sign in is temporarily unavailable. Please try again.");
+  error.status = 503;
+  error.code = "AUTH_SERVICE_UNAVAILABLE";
+  return error;
+}
+
+async function getSupabaseLoginProfile(token) {
+  const user = await supabaseFetch("/auth/v1/user", { service: false, token });
+  const encodedId = encodeURIComponent(user.id);
+  const rows = await supabaseFetch(`/rest/v1/profiles?select=*&id=eq.${encodedId}&limit=1`, { service: true });
+  const row = rows?.[0];
+  const setupIncomplete = (reason) => {
+    const error = accountSetupIncompleteError(reason);
+    error.authUser = user;
+    throw error;
+  };
+  if (!row?.id) setupIncomplete("PROFILE_MISSING");
+  const profile = clientProfile({
+    ...row,
+    email_verified: Boolean(user.email_confirmed_at)
+  });
+  if (normalizeRole(profile.role) === "guest") {
+    const guests = await supabaseFetch(`/rest/v1/guests?select=id,status&user_id=eq.${encodedId}&limit=1`, { service: true });
+    const guest = guests?.[0];
+    if (!guest?.id) setupIncomplete("GUEST_RECORD_MISSING");
+    if (clean(guest.status).toLowerCase() === "deleted") setupIncomplete("GUEST_ACCOUNT_DELETED");
+    const guestProfiles = await supabaseFetch(`/rest/v1/guest_profiles?select=id&guest_id=eq.${encodeURIComponent(guest.id)}&limit=1`, { service: true });
+    if (!guestProfiles?.[0]?.id) setupIncomplete("GUEST_PREFERENCES_MISSING");
+  }
+  return profile;
 }
 
 async function requireProfile(headers, roles = []) {
@@ -3863,13 +5333,15 @@ function publicOfferWithAvailability(row = {}, sourceOffer = row) {
   };
 }
 
-function hasDuplicateActiveReservation(rows = [], { offerId, guestEmail, reservationDate, reservationTime }) {
+function hasDuplicateActiveReservation(rows = [], { offerId, restaurantId, reservationType, guestEmail, reservationDate, reservationTime }) {
   const activeStatuses = new Set(["pending", "accepted", "confirmed", "waiting_external_confirmation"]);
   return rows.some((row) => (
-    clean(row.offer_id) === clean(offerId)
+    (clean(offerId)
+      ? clean(row.offer_id) === clean(offerId)
+      : clean(row.restaurant_id) === clean(restaurantId) && normalizeReservationType(row.reservation_type, row.offer_id) === normalizeReservationType(reservationType, offerId))
     && lower(row.guest_email) === lower(guestEmail)
     && clean(row.reservation_date) === clean(reservationDate)
-    && clean(row.reservation_time) === clean(reservationTime)
+    && normalizeReservationTime(row.reservation_time) === normalizeReservationTime(reservationTime)
     && activeStatuses.has(normalizeReservationStatus(row.status || row.booking_status))
   ));
 }
@@ -3917,6 +5389,308 @@ function reservationRowMatchesFilters(row = {}, filters = {}) {
   return true;
 }
 
+function isIsoDate(value = "") {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(clean(value))) return false;
+  const date = new Date(`${clean(value)}T00:00:00Z`);
+  return !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === clean(value);
+}
+
+function normalizeReservationTime(value = "") {
+  const match = clean(value).match(/^([01]\d|2[0-3]):([0-5]\d)(?::[0-5]\d)?$/);
+  return match ? `${match[1]}:${match[2]}` : "";
+}
+
+function restaurantAllowsStandardReservations(restaurant = {}) {
+  return restaurant
+    && clean(restaurant.status) === "approved"
+    && restaurant.visible_on_guest_site !== false
+    && restaurant.accepts_reservation_requests !== false;
+}
+
+function standardReservationPartyBounds(restaurant = {}) {
+  return {
+    min: Math.max(1, Math.trunc(numberOr(restaurant.min_party_size || restaurant.restaurant_min_party_size, 1))),
+    max: Math.max(1, Math.trunc(numberOr(restaurant.max_party_size || restaurant.restaurant_max_party_size, 8)))
+  };
+}
+
+function standardReservationCapacityLimit(restaurant = {}) {
+  const values = [
+    restaurant.restaurant_total_capacity,
+    restaurant.table_capacity,
+    restaurant.capacity
+  ].map((item) => Math.trunc(numberOr(item, 0))).filter((item) => item > 0);
+  return values.length ? Math.max(...values) : 0;
+}
+
+function standardReservationAvailability(restaurant = {}, activeRows = [], partySize = 1) {
+  const capacityLimit = standardReservationCapacityLimit(restaurant);
+  if (!capacityLimit) return { available: true, capacity_limit: null, reserved_seats: null };
+  const reservedSeats = (activeRows || []).reduce((sum, row) => sum + Math.max(0, numberOr(row.party_size, 0)), 0);
+  return {
+    available: reservedSeats + Math.max(1, partySize) <= capacityLimit,
+    capacity_limit: capacityLimit,
+    reserved_seats: reservedSeats
+  };
+}
+
+function standardReservationOverviewRow(reservation = {}, restaurant = {}) {
+  return decorateReservationRow({
+    reservation_id: reservation.id || reservation.reservation_id,
+    reference: reservation.reference,
+    restaurant_id: reservation.restaurant_id,
+    restaurant_name: restaurant.name || restaurant.restaurant_name || "Restaurant",
+    restaurant_email: restaurant.email || restaurant.contact_email || restaurant.restaurant_email || "",
+    restaurant_phone: restaurant.phone || restaurant.restaurant_phone || "",
+    restaurant_address: restaurant.address || restaurant.restaurant_address || "",
+    restaurant_cuisine: restaurant.cuisine_type || restaurant.cuisine || restaurant.restaurant_cuisine || "",
+    restaurant_neighborhood: restaurant.district || restaurant.neighborhood || restaurant.restaurant_neighborhood || "",
+    restaurant_status: restaurant.status || restaurant.restaurant_status || "",
+    offer_id: null,
+    offer_title: standardReservationLabel(reservation.guest_language || restaurant.preferred_language || "en"),
+    offer_date: reservation.reservation_date,
+    offer_time: reservation.reservation_time,
+    reservation_date: reservation.reservation_date,
+    reservation_time: reservation.reservation_time,
+    discount_type: null,
+    discount_value: null,
+    discount_percent: null,
+    party_size: reservation.party_size,
+    guest_id: reservation.guest_id || null,
+    guest_name: reservation.guest_name,
+    guest_email: reservation.guest_email,
+    guest_phone: reservation.guest_phone,
+    guest_language: reservation.guest_language || "en",
+    restaurant_language: restaurant.preferred_language || "en",
+    notes: reservation.notes || "",
+    partner_notes: reservation.partner_notes || "",
+    reservation_type: "standard",
+    status: reservation.status || "pending",
+    source: reservation.source || "smarttable",
+    booking_source: reservation.booking_source || "SMARTTABLE",
+    booking_status: reservation.booking_status || "pending",
+    is_test_reservation: Boolean(reservation.is_test_reservation || reservation.test_record || restaurant.is_test_restaurant),
+    test_record: Boolean(reservation.test_record || reservation.is_test_reservation || restaurant.is_test_restaurant),
+    created_at: reservation.created_at || nowIso(),
+    updated_at: reservation.updated_at || nowIso()
+  });
+}
+
+function standardReservationValidation({ restaurant, reservationDate, reservationTime, partySize }) {
+  if (!restaurantAllowsStandardReservations(restaurant)) {
+    return { code: "STANDARD_RESERVATION_UNAVAILABLE", error: "This restaurant is not accepting standard reservation requests." };
+  }
+  if (!isIsoDate(reservationDate)) return { code: "INVALID_RESERVATION_DATE", error: "Choose a valid reservation date." };
+  if (!normalizeReservationTime(reservationTime)) return { code: "INVALID_RESERVATION_TIME", error: "Choose a valid reservation time." };
+  const today = new Date();
+  const todayKey = today.toISOString().slice(0, 10);
+  if (reservationDate < todayKey) return { code: "INVALID_RESERVATION_DATE", error: "Reservation date cannot be in the past." };
+  const maxWindow = Math.max(1, Math.trunc(numberOr(restaurant.maximum_booking_window_days, 30)));
+  const maxDate = new Date();
+  maxDate.setDate(maxDate.getDate() + maxWindow);
+  if (reservationDate > maxDate.toISOString().slice(0, 10)) {
+    return { code: "STANDARD_RESERVATION_WINDOW_EXCEEDED", error: "This date is outside the restaurant booking window." };
+  }
+  const bounds = standardReservationPartyBounds(restaurant);
+  if (!Number.isInteger(partySize) || partySize < bounds.min || partySize > bounds.max) {
+    return { code: "STANDARD_RESERVATION_PARTY_SIZE_INVALID", error: `Party size must be between ${bounds.min} and ${bounds.max}.` };
+  }
+  return null;
+}
+
+async function generateSupabaseReservationReference() {
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    const reference = `ST-${Math.floor(10000 + Math.random() * 90000)}`;
+    const rows = await supabaseFetch(`/rest/v1/reservations?select=id&reference=eq.${encodeURIComponent(reference)}&limit=1`, { service: true }).catch(() => []);
+    if (!rows?.length) return reference;
+  }
+  return `ST-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
+}
+
+async function createStandardReservation(body, headers, context = {}) {
+  const restaurantId = clean(body.restaurant_id || body.restaurantId);
+  const partySize = context.partySize;
+  const guest = context.guest || {};
+  const guestLanguage = context.guestLanguage || normalizeLanguage(body.guest_language || body.language || body.lang || "en");
+  const notes = context.notes ?? clean(body.notes);
+  const reservationDate = clean(body.reservation_date);
+  const reservationTime = normalizeReservationTime(body.reservation_time);
+  if (!restaurantId || !guest.name || !guest.email || !guest.phone || !Number.isInteger(partySize) || partySize < 1) {
+    return json(400, { code: "STANDARD_RESERVATION_REQUIRED_FIELDS", error: "Restaurant, guest contact details, date, time, and party size are required." });
+  }
+
+  if (!supabaseConfigured) {
+    ensureDemo();
+    const restaurant = demo.restaurants.find((item) => item.id === restaurantId);
+    const validationError = standardReservationValidation({ restaurant, reservationDate, reservationTime, partySize });
+    if (validationError) return json(validationError.code === "STANDARD_RESERVATION_UNAVAILABLE" ? 409 : 400, validationError);
+    const activeRows = demo.reservations.filter((row) => clean(row.restaurant_id) === restaurantId && clean(row.reservation_date) === reservationDate && clean(row.reservation_time) === reservationTime);
+    if (!standardReservationAvailability(restaurant, activeRows, partySize).available) {
+      return json(409, { code: "STANDARD_RESERVATION_SOLD_OUT", error: "No standard reservation capacity is available for this time." });
+    }
+    if (hasDuplicateActiveReservation(activeRows, { restaurantId, reservationType: "standard", guestEmail: guest.email, reservationDate, reservationTime })) {
+      return json(409, { code: "DUPLICATE_RESERVATION", error: "A matching active reservation request already exists." });
+    }
+    const token = authToken(headers);
+    const profile = profileFromDemoToken(token);
+    const isTestReservation = Boolean(restaurant.is_test_restaurant);
+    const reservation = {
+      id: crypto.randomUUID(),
+      reference: `ST-${Math.floor(10000 + Math.random() * 90000)}`,
+      offer_id: null,
+      restaurant_id: restaurant.id,
+      guest_id: profile?.id || null,
+      guest_name: guest.name,
+      guest_email: guest.email,
+      guest_phone: guest.phone,
+      party_size: partySize,
+      reservation_date: reservationDate,
+      reservation_time: reservationTime,
+      guest_language: guestLanguage,
+      notes,
+      status: "pending",
+      source: "smarttable",
+      booking_source: "SMARTTABLE",
+      booking_status: "pending",
+      reservation_type: "standard",
+      is_test_reservation: isTestReservation,
+      test_record: isTestReservation,
+      metadata: isTestReservation ? { is_test_reservation: true, reservation_type: "standard", reservation_provider: restaurant.reservation_provider || "internal_test" } : { reservation_type: "standard" },
+      created_at: nowIso(),
+      updated_at: nowIso()
+    };
+    demo.reservations.unshift(reservation);
+    demo.aiInteractionEvents.unshift({
+      id: crypto.randomUUID(),
+      profile_key: aiProfileKey(body.profile_key || guest.email || profile?.id),
+      user_id: profile?.id || null,
+      event_type: "standard_reservation_requested",
+      restaurant_id: restaurant.id,
+      offer_id: null,
+      reservation_id: reservation.id,
+      metadata: {
+        party_size: partySize,
+        reservation_type: "standard",
+        reservation_date: reservation.reservation_date,
+        reservation_time: reservation.reservation_time
+      },
+      created_at: nowIso()
+    });
+    const row = reservationOverviewRows().find((item) => item.reservation_id === reservation.id) || standardReservationOverviewRow(reservation, restaurant);
+    const alertPreferences = await getRestaurantNotificationPreferences(row.restaurant_id);
+    const emailTargets = alertPreferences.email_enabled === false ? ["guest", "admin"] : undefined;
+    const emails = await sendReservationCreatedEmails(row, emailTargets ? { targets: emailTargets } : {});
+    const reservationAlert = await createReservationAlertForReservation(row, { preferences: alertPreferences, emails }).catch((error) => {
+      logSafeServerEvent("reservation_alert_creation_failed", {
+        restaurant_id: row.restaurant_id,
+        reservation_id: row.reservation_id,
+        code: error.code || "RESERVATION_ALERT_FAILED"
+      });
+      return null;
+    });
+    return json(201, {
+      reservation: row,
+      emails,
+      email_delivery: emailDeliverySummary(emails),
+      reservation_alert: reservationAlert ? clientReservationAlert(reservationAlert) : null
+    });
+  }
+
+  const reservationColumns = await supabaseTableColumns("reservations");
+  if (!reservationColumns.has("reservation_type")) {
+    return json(503, { code: "STANDARD_RESERVATION_SCHEMA_MISSING", error: "Standard reservations are not available until the schema update is applied." });
+  }
+  const restaurantRows = await supabaseFetch(`/rest/v1/restaurants?select=*&id=eq.${encodeURIComponent(restaurantId)}&limit=1`, { service: true }).catch(() => []);
+  const restaurant = restaurantRows?.[0];
+  const validationError = standardReservationValidation({ restaurant, reservationDate, reservationTime, partySize });
+  if (validationError) return json(validationError.code === "STANDARD_RESERVATION_UNAVAILABLE" ? 409 : 400, validationError);
+  const activeRows = await supabaseFetch(`/rest/v1/reservations?select=id,restaurant_id,reservation_type,guest_email,reservation_date,reservation_time,party_size,status,booking_status&restaurant_id=eq.${encodeURIComponent(restaurantId)}&reservation_date=eq.${encodeURIComponent(reservationDate)}&reservation_time=eq.${encodeURIComponent(reservationTime)}&status=in.(pending,accepted,confirmed,waiting_external_confirmation)&limit=500`, { service: true }).catch(() => []);
+  if (!standardReservationAvailability(restaurant, activeRows || [], partySize).available) {
+    return json(409, { code: "STANDARD_RESERVATION_SOLD_OUT", error: "No standard reservation capacity is available for this time." });
+  }
+  if (hasDuplicateActiveReservation(activeRows || [], { restaurantId, reservationType: "standard", guestEmail: guest.email, reservationDate, reservationTime })) {
+    return json(409, { code: "DUPLICATE_RESERVATION", error: "A matching active reservation request already exists." });
+  }
+  const token = authToken(headers);
+  let profile = null;
+  if (token) {
+    profile = await getSupabaseProfile(token).catch(() => null);
+  }
+  const isTestReservation = Boolean(restaurant.is_test_restaurant);
+  const payload = await filterSupabaseTablePayload("reservations", {
+    reference: await generateSupabaseReservationReference(),
+    offer_id: null,
+    restaurant_id: restaurant.id,
+    guest_id: profile?.id || null,
+    guest_name: guest.name,
+    guest_email: guest.email,
+    guest_phone: guest.phone,
+    party_size: partySize,
+    reservation_date: reservationDate,
+    reservation_time: reservationTime,
+    guest_language: guestLanguage,
+    notes,
+    status: "pending",
+    source: "smarttable",
+    booking_source: "SMARTTABLE",
+    booking_status: "pending",
+    reservation_type: "standard",
+    is_test_reservation: isTestReservation,
+    test_record: isTestReservation,
+    metadata: isTestReservation ? { is_test_reservation: true, reservation_type: "standard", reservation_provider: restaurant.reservation_provider || "internal_test" } : { reservation_type: "standard" }
+  });
+  const insertedRows = await supabaseFetch("/rest/v1/reservations?select=*", {
+    method: "POST",
+    service: true,
+    headers: { Prefer: "return=representation" },
+    body: payload
+  }).catch((error) => {
+    if (String(error?.message || "").includes("null value in column \"offer_id\"")) {
+      error.code = "STANDARD_RESERVATION_SCHEMA_MISSING";
+      error.message = "Standard reservations require the nullable offer_id schema update.";
+    }
+    throw error;
+  });
+  const inserted = insertedRows?.[0];
+  let reservationRow = await refreshReservationOverview(inserted?.id);
+  reservationRow = decorateReservationRow(reservationRow || standardReservationOverviewRow(inserted, restaurant));
+  await supabaseFetch("/rest/v1/ai_interaction_events", {
+    method: "POST",
+    service: true,
+    headers: { Prefer: "return=minimal" },
+    body: {
+      profile_key: aiProfileKey(body.profile_key || guest.email),
+      event_type: "standard_reservation_requested",
+      restaurant_id: reservationRow.restaurant_id,
+      offer_id: null,
+      reservation_id: reservationRow.reservation_id,
+      metadata: {
+        party_size: partySize,
+        reservation_type: "standard",
+        reservation_date: reservationRow.reservation_date,
+        reservation_time: reservationRow.reservation_time
+      }
+    }
+  }).catch(() => null);
+  const alertPreferences = await getRestaurantNotificationPreferences(reservationRow.restaurant_id);
+  const emailTargets = alertPreferences.email_enabled === false ? ["guest", "admin"] : undefined;
+  const emails = await sendReservationCreatedEmails(reservationRow, emailTargets ? { targets: emailTargets } : {});
+  const reservationAlert = await createReservationAlertForReservation(reservationRow, { preferences: alertPreferences, emails }).catch((error) => {
+    logSafeServerEvent("reservation_alert_creation_failed", {
+      restaurant_id: reservationRow.restaurant_id,
+      reservation_id: reservationRow.reservation_id,
+      code: error.code || "RESERVATION_ALERT_FAILED"
+    });
+    return null;
+  });
+  return json(201, {
+    reservation: reservationRow,
+    emails,
+    email_delivery: emailDeliverySummary(emails),
+    reservation_alert: reservationAlert ? clientReservationAlert(reservationAlert) : null
+  });
+}
+
 function publicOfferRows(lang = "en") {
   ensureDemo();
   return demo.offers
@@ -3924,6 +5698,7 @@ function publicOfferRows(lang = "en") {
     .map((offer) => {
       const restaurant = demo.restaurants.find((item) => item.id === offer.restaurant_id);
       if (!restaurant || restaurant.status !== "approved") return null;
+      if (restaurant.visible_on_guest_site === false || restaurant.accepts_reservation_requests === false) return null;
       const sourceOffer = offerWithRestaurantContext(offer, restaurant);
       const validity = evaluateOfferValidity(sourceOffer, { partySize: 1 });
       if (!validity.bookable) return null;
@@ -3931,6 +5706,7 @@ function publicOfferRows(lang = "en") {
         offer_id: offer.id,
         restaurant_id: restaurant.id,
         restaurant_name: restaurant.name,
+        slug: restaurant.slug || "",
         district: restaurant.district,
         address: restaurant.address,
         cuisine: restaurant.cuisine_type || restaurant.cuisine,
@@ -3971,6 +5747,18 @@ function publicOfferRows(lang = "en") {
         max_discount_percent: numberOr(restaurant.max_discount_percent, 30),
         target_margin_percent: numberOr(restaurant.target_margin_percent, 65),
         average_service_minutes: numberOr(restaurant.average_service_minutes, 75),
+        visible_on_guest_site: restaurant.visible_on_guest_site !== false,
+        is_test_restaurant: Boolean(restaurant.is_test_restaurant),
+        test_badge: restaurant.is_test_restaurant ? "Test restaurant - no real reservation" : "",
+        accepts_reservation_requests: restaurant.accepts_reservation_requests !== false,
+        reservation_provider: restaurant.reservation_provider || "smarttable",
+        booking_interval_minutes: numberOr(restaurant.booking_interval_minutes, 30),
+        minimum_advance_minutes: numberOr(restaurant.minimum_advance_minutes, 0),
+        maximum_booking_window_days: numberOr(restaurant.maximum_booking_window_days, 30),
+        restaurant_min_party_size: numberOr(restaurant.min_party_size, 1),
+        restaurant_max_party_size: numberOr(restaurant.max_party_size, 8),
+        auto_confirmation: Boolean(restaurant.auto_confirmation),
+        partner_approval_required: restaurant.partner_approval_required !== false,
         ...reviewSummaryForRestaurant(restaurant.id),
         favorites_count: followerStatsForRestaurant(restaurant.id).total,
         card_image: restaurant.card_image || restaurant.hero_image_url || restaurant.cover_image || "/assets/restaurant-hero.png",
@@ -3992,6 +5780,7 @@ function publicOfferRows(lang = "en") {
         discount_type: offer.discount_type || "percent",
         discount_value: numberOr(offer.discount_value, offer.discount_percent),
         discount_percent: numberOr(offer.discount_percent, offer.discount_value),
+        is_test_offer: Boolean(offer.is_test_offer || restaurant.is_test_restaurant),
         minimum_spend: offer.minimum_spend ?? null,
         applies_to_drinks: offer.applies_to_drinks ?? true,
         time_limit_minutes: offer.time_limit_minutes ?? null,
@@ -4036,6 +5825,55 @@ function sanitizePublicOfferRow(row = {}) {
     "api_key"
   ]);
   return Object.fromEntries(Object.entries(row).filter(([key]) => !blocked.has(key)));
+}
+
+function publicQueryIncludesTestData(query = new URLSearchParams()) {
+  return boolValue(query.get("test_mode")) || boolValue(query.get("include_test_data")) || boolValue(query.get("includeTestData"));
+}
+
+function isPublicTestDataRow(row = {}) {
+  if (
+    boolValue(row.is_test_data) ||
+    boolValue(row.is_test_restaurant) ||
+    boolValue(row.is_test_offer) ||
+    boolValue(row.is_test_reservation) ||
+    boolValue(row.test_record)
+  ) {
+    return true;
+  }
+  if (isGeneratedPublicQaContentRow(row)) return true;
+  return lower(row.reservation_provider || row.restaurant_reservation_provider || row.provider) === "internal_test";
+}
+
+function isGeneratedPublicQaContentRow(row = {}) {
+  const haystack = [
+    row.offer_title,
+    row.title,
+    row.title_en,
+    row.title_es,
+    row.title_hu,
+    row.offer_description,
+    row.offer_description_en,
+    row.offer_description_es,
+    row.offer_description_hu,
+    row.written_review,
+    row.comment,
+    row.review_text,
+    row.short_review,
+    row.moderation_reason,
+    row.description,
+    row.description_en,
+    row.description_es,
+    row.description_hu
+  ].map((value) => lower(value)).filter(Boolean).join(" ");
+  return /verified\s+review\s+photo\s+qa/.test(haystack) ||
+    /safe\s+production\s+qa/.test(haystack) ||
+    /smarttable\s+qa/.test(haystack);
+}
+
+function filterPublicTestDataRows(rows = [], includeTestData = false) {
+  if (includeTestData) return rows;
+  return (rows || []).filter((row) => !isPublicTestDataRow(row));
 }
 
 function average(values) {
@@ -4227,6 +6065,7 @@ function publicRestaurantCard(restaurant, lang = "en") {
   return {
     restaurant_id: restaurant.id,
     restaurant_name: restaurant.name,
+    slug: restaurant.slug || "",
     district: restaurant.district,
     address: restaurant.address,
     cuisine: restaurant.cuisine_type || restaurant.cuisine,
@@ -4261,6 +6100,18 @@ function publicRestaurantCard(restaurant, lang = "en") {
     longitude: restaurant.longitude,
     sort_order: restaurant.sort_order,
     restaurant_created_at: restaurant.created_at,
+    visible_on_guest_site: restaurant.visible_on_guest_site !== false,
+    is_test_restaurant: Boolean(restaurant.is_test_restaurant),
+    test_badge: restaurant.is_test_restaurant ? "Test restaurant - no real reservation" : "",
+    accepts_reservation_requests: restaurant.accepts_reservation_requests !== false,
+    reservation_provider: restaurant.reservation_provider || "smarttable",
+    booking_interval_minutes: numberOr(restaurant.booking_interval_minutes, 30),
+    minimum_advance_minutes: numberOr(restaurant.minimum_advance_minutes, 0),
+    maximum_booking_window_days: numberOr(restaurant.maximum_booking_window_days, 30),
+    restaurant_min_party_size: numberOr(restaurant.min_party_size, 1),
+    restaurant_max_party_size: numberOr(restaurant.max_party_size, 8),
+    auto_confirmation: Boolean(restaurant.auto_confirmation),
+    partner_approval_required: restaurant.partner_approval_required !== false,
     card_image: restaurant.card_image || restaurant.hero_image_url || restaurant.cover_image || "/assets/restaurant-hero.png",
     icon_image: restaurant.icon_image || restaurant.logo_url || restaurant.card_image || restaurant.cover_image || "/assets/restaurant-hero.png",
     offer_count: offers.length,
@@ -4345,47 +6196,270 @@ function guestConsentRows(payload, guestId = null, userId = null) {
     user_id: userId,
     language: payload.preferredLanguage
   };
+  const defaults = {
+    terms_accepted: null,
+    terms_version: null,
+    terms_accepted_at: null,
+    privacy_accepted: null,
+    privacy_policy_version: null,
+    privacy_accepted_at: null,
+    marketing_consent: null,
+    marketing_consent_timestamp: null,
+    accepted_at: null,
+    revoked_at: null
+  };
+  const consentRow = (row) => ({
+    ...base,
+    ...defaults,
+    ...row
+  });
   return [
-    {
-      ...base,
+    consentRow({
       consent_type: "terms_conditions",
       status: "granted",
       terms_accepted: true,
       terms_version: TERMS_VERSION,
       terms_accepted_at: acceptedAt,
       accepted_at: acceptedAt
-    },
-    {
-      ...base,
+    }),
+    consentRow({
       consent_type: "privacy_policy",
       status: "granted",
       privacy_accepted: true,
       privacy_policy_version: PRIVACY_POLICY_VERSION,
       privacy_accepted_at: acceptedAt,
       accepted_at: acceptedAt
-    },
-    {
-      ...base,
+    }),
+    consentRow({
       consent_type: "marketing",
       status: payload.preferences.consents.marketing ? "granted" : "revoked",
       marketing_consent: payload.preferences.consents.marketing,
       marketing_consent_timestamp: marketingAcceptedAt,
       accepted_at: marketingAcceptedAt,
       revoked_at: payload.preferences.consents.marketing ? null : acceptedAt
+    })
+  ];
+}
+
+function legalDocumentTitle(type, lang = "en") {
+  const definition = legalDocumentDefinitions.find((item) => item.type === type);
+  const language = normalizeLanguage(lang);
+  return definition?.titles?.[language] || definition?.titles?.en || clean(type).replace(/_/g, " ");
+}
+
+function legalDocumentUrl(type, version = LEGAL_DOCUMENT_VERSION, lang = "en") {
+  const definition = legalDocumentDefinitions.find((item) => item.type === type) || {};
+  const url = new URL(definition.path || "/terms", PUBLIC_BASE_URL);
+  url.searchParams.set("version", version || LEGAL_DOCUMENT_VERSION);
+  url.searchParams.set("lang", normalizeLanguage(lang));
+  if (definition.section) url.searchParams.set("section", definition.section);
+  return `${url.pathname}${url.search}`;
+}
+
+function defaultLegalDocuments() {
+  const publishedAt = nowIso();
+  return legalDocumentDefinitions.flatMap((definition) => ["en", "es", "hu"].map((language) => ({
+    id: crypto.randomUUID(),
+    document_type: definition.type,
+    version: definition.type === "privacy_policy" ? PRIVACY_POLICY_VERSION : TERMS_VERSION,
+    language,
+    title: legalDocumentTitle(definition.type, language),
+    content: `${legalDocumentTitle(definition.type, language)} version ${definition.type === "privacy_policy" ? PRIVACY_POLICY_VERSION : TERMS_VERSION}.`,
+    content_url: legalDocumentUrl(definition.type, definition.type === "privacy_policy" ? PRIVACY_POLICY_VERSION : TERMS_VERSION, language),
+    status: "published",
+    published_at: publishedAt,
+    effective_at: publishedAt,
+    is_current: true,
+    created_at: publishedAt,
+    updated_at: publishedAt
+  })));
+}
+
+function legalConsentRowsFromSignup({ payload, guestId = null, userId = null, source = "guest_signup" }) {
+  const acceptedAt = payload.preferences?.consents?.accepted_at || nowIso();
+  const language = normalizeLanguage(payload.preferredLanguage || payload.preferences?.consents?.language || "en");
+  const base = {
+    user_id: userId,
+    guest_email: lower(payload.email),
+    language,
+    source,
+    ip_hash: null,
+    user_agent: "",
+    metadata: { guest_id: guestId },
+    created_at: acceptedAt,
+    updated_at: acceptedAt
+  };
+  const rows = [
+    {
+      ...base,
+      document_type: "terms_of_service",
+      document_version: TERMS_VERSION,
+      status: "accepted",
+      accepted_at: acceptedAt,
+      withdrawn_at: null
+    },
+    {
+      ...base,
+      document_type: "privacy_policy",
+      document_version: PRIVACY_POLICY_VERSION,
+      status: "accepted",
+      accepted_at: acceptedAt,
+      withdrawn_at: null
     }
   ];
+  const marketingAccepted = Boolean(payload.preferences?.consents?.marketing);
+  const marketingAt = payload.preferences?.consents?.marketing_accepted_at || (marketingAccepted ? acceptedAt : null);
+  rows.push({
+    ...base,
+    document_type: "marketing_consent",
+    document_version: LEGAL_DOCUMENT_VERSION,
+    status: marketingAccepted ? "accepted" : "withdrawn",
+    accepted_at: marketingAt,
+    withdrawn_at: marketingAccepted ? null : acceptedAt
+  });
+  const personalizationAccepted = Boolean(payload.preferences?.consents?.location_personalization || payload.preferences?.consents?.personalization);
+  rows.push({
+    ...base,
+    document_type: "location_personalization_consent",
+    document_version: LEGAL_DOCUMENT_VERSION,
+    status: personalizationAccepted ? "accepted" : "withdrawn",
+    accepted_at: personalizationAccepted ? acceptedAt : null,
+    withdrawn_at: personalizationAccepted ? null : acceptedAt
+  });
+  return rows;
+}
+
+function normalizeLegalConsentStatus(status = "") {
+  const value = clean(status).toLowerCase();
+  if (value === "granted") return "accepted";
+  if (value === "revoked") return "withdrawn";
+  if (["accepted", "withdrawn", "superseded"].includes(value)) return value;
+  return "";
+}
+
+function latestLegalConsent(consents = [], type) {
+  return [...consents]
+    .filter((item) => clean(item.document_type) === type)
+    .sort((a, b) => new Date(b.created_at || b.accepted_at || b.withdrawn_at || 0) - new Date(a.created_at || a.accepted_at || a.withdrawn_at || 0))[0] || null;
+}
+
+function legalConsentHistory(consents = [], docs = []) {
+  return [...consents]
+    .filter((item) => legalDocumentTypes.has(clean(item.document_type)))
+    .sort((a, b) => new Date(b.created_at || b.accepted_at || b.withdrawn_at || 0) - new Date(a.created_at || a.accepted_at || a.withdrawn_at || 0))
+    .map((item) => {
+      const type = clean(item.document_type);
+      const language = normalizeLanguage(item.language || "en");
+      const version = clean(item.document_version || item.version || "");
+      const document = docs.find((doc) => doc.document_type === type && doc.version === version && normalizeLanguage(doc.language) === language)
+        || docs.find((doc) => doc.document_type === type && doc.version === version)
+        || docs.find((doc) => doc.document_type === type);
+      return {
+        id: item.id || null,
+        document_type: type,
+        document_name: legalDocumentTitle(type, language),
+        document_version: version,
+        language,
+        status: normalizeLegalConsentStatus(item.status) || "accepted",
+        accepted_at: item.accepted_at || null,
+        withdrawn_at: item.withdrawn_at || null,
+        created_at: item.created_at || item.accepted_at || item.withdrawn_at || null,
+        source: item.source || "",
+        content_url: document?.content_url || legalDocumentUrl(type, version || LEGAL_DOCUMENT_VERSION, language)
+      };
+    });
+}
+
+function legalSummaryDocuments({ legalConsents = [], oldConsents = [], docs = [], lang = "en", guestProfile = {} } = {}) {
+  const language = normalizeLanguage(lang);
+  const currentDocs = legalDocumentDefinitions.map((definition) => {
+    const doc = docs.find((item) => item.document_type === definition.type && normalizeLanguage(item.language) === language && item.is_current !== false && clean(item.status || "published") === "published")
+      || docs.find((item) => item.document_type === definition.type && normalizeLanguage(item.language) === "en" && item.is_current !== false && clean(item.status || "published") === "published")
+      || docs.find((item) => item.document_type === definition.type)
+      || {
+        document_type: definition.type,
+        version: definition.type === "privacy_policy" ? PRIVACY_POLICY_VERSION : LEGAL_DOCUMENT_VERSION,
+        language,
+        title: legalDocumentTitle(definition.type, language),
+        content_url: legalDocumentUrl(definition.type, definition.type === "privacy_policy" ? PRIVACY_POLICY_VERSION : LEGAL_DOCUMENT_VERSION, language),
+        status: "published",
+        is_current: true
+      };
+    const latest = latestLegalConsent(legalConsents, definition.type);
+    const legacy = definition.type === "terms_of_service"
+      ? latestConsent(oldConsents, "terms_conditions")
+      : definition.type === "privacy_policy"
+        ? latestConsent(oldConsents, "privacy_policy")
+        : definition.type === "marketing_consent"
+          ? latestConsent(oldConsents, "marketing")
+          : null;
+    const preferences = guestProfile?.preferences || {};
+    const status = normalizeLegalConsentStatus(latest?.status)
+      || (legacy?.status ? normalizeLegalConsentStatus(legacy.status) : "")
+      || (definition.type === "marketing_consent" ? (preferences.consents?.marketing ? "accepted" : "withdrawn") : "");
+    const acceptedAt = latest?.accepted_at
+      || (definition.type === "terms_of_service" ? legacy?.terms_accepted_at || legacy?.accepted_at : null)
+      || (definition.type === "privacy_policy" ? legacy?.privacy_accepted_at || legacy?.accepted_at : null)
+      || (definition.type === "marketing_consent" ? legacy?.marketing_consent_timestamp || legacy?.accepted_at || preferences.consents?.marketing_accepted_at : null);
+    const withdrawnAt = latest?.withdrawn_at
+      || (definition.type === "marketing_consent" && (legacy?.status === "revoked" || legacy?.status === "withdrawn") ? legacy?.revoked_at || legacy?.created_at : null);
+    const acceptedVersion = latest?.document_version
+      || (definition.type === "terms_of_service" ? legacy?.terms_version : null)
+      || (definition.type === "privacy_policy" ? legacy?.privacy_policy_version || legacy?.privacy_version : null)
+      || doc.version;
+    const currentVersion = doc.version || acceptedVersion || LEGAL_DOCUMENT_VERSION;
+    const acceptedLanguage = normalizeLanguage(latest?.language || legacy?.language || language);
+    const acceptedDoc = docs.find((item) =>
+      item.document_type === definition.type
+      && item.version === acceptedVersion
+      && normalizeLanguage(item.language) === acceptedLanguage
+    ) || docs.find((item) =>
+      item.document_type === definition.type
+      && item.version === acceptedVersion
+    );
+    return {
+      document_type: definition.type,
+      title: doc.title || legalDocumentTitle(definition.type, language),
+      current_version: currentVersion,
+      accepted_version: acceptedVersion || null,
+      language: normalizeLanguage(doc.language || language),
+      accepted_language: acceptedLanguage,
+      current_url: doc.content_url || legalDocumentUrl(definition.type, currentVersion, language),
+      accepted_url: acceptedDoc?.content_url || legalDocumentUrl(definition.type, acceptedVersion || currentVersion, acceptedLanguage),
+      mandatory: Boolean(definition.mandatory),
+      optional: !definition.mandatory,
+      withdrawable: Boolean(definition.optionalToggle),
+      status: status || "missing",
+      accepted: status === "accepted",
+      accepted_at: acceptedAt || null,
+      withdrawn_at: withdrawnAt || null,
+      requires_reacceptance: Boolean(definition.mandatory && status === "accepted" && acceptedVersion && currentVersion && acceptedVersion !== currentVersion)
+    };
+  });
+  return currentDocs;
 }
 
 function guestSignupProfileFields(payload) {
   return {
     first_name: payload.firstName,
     last_name: payload.lastName,
+    country: payload.preferences.location.country,
+    country_code: payload.preferences.location.country_code,
     city: payload.preferences.location.city,
     region: payload.preferences.location.region,
+    state_region: payload.preferences.location.state_region,
+    city_normalized: payload.preferences.location.city_normalized,
     postal_code: payload.preferences.location.postal_code,
     preferred_dining_areas: payload.preferences.preferred_neighborhoods,
+    max_travel_distance_value: payload.preferences.location.travel_distance_value,
+    travel_distance_unit: payload.preferences.location.travel_distance_unit,
     max_travel_distance_miles: payload.preferences.location.max_travel_distance_miles,
     transportation_method: payload.preferences.location.transportation_method,
+    sms_country_code: payload.preferences.sms_country_code,
+    sms_phone_number: payload.preferences.sms_phone_number,
+    sms_notifications_opted_in: payload.preferences.consents.sms_opted_in,
+    sms_consent_at: payload.preferences.consents.sms_consent_at,
+    onboarding_preferences_completed_at: payload.accountCreationPhase ? null : nowIso(),
     selected_language: payload.preferredLanguage
   };
 }
@@ -4393,6 +6467,7 @@ function guestSignupProfileFields(payload) {
 function guestPreferenceColumns(preferences = {}) {
   return {
     cuisine_preferences: arrayFrom(preferences.cuisines),
+    custom_cuisine: clean(preferences.custom_cuisine),
     food_preferences: arrayFrom(preferences.food_categories),
     drink_preferences: arrayFrom(preferences.drink_preferences),
     dietary_needs: arrayFrom(preferences.dietary_needs),
@@ -4416,6 +6491,13 @@ function guestPreferenceColumns(preferences = {}) {
     new_restaurant_interest: clean(preferences.new_restaurant_recommendations),
     new_menu_item_interest: clean(preferences.new_menu_item_recommendations),
     notification_preferences: arrayFrom(preferences.notification_preferences),
+    notification_channels: arrayFrom(preferences.notification_channels),
+    notification_channel_details: {
+      sms: preferences.sms || null,
+      sms_opted_in: Boolean(preferences.consents?.sms_opted_in)
+    },
+    location_preferences: preferences.location || {},
+    onboarding_progress: preferences.onboarding_progress || {},
     notification_frequency: clean(preferences.notification_frequency),
     event_recommendation_interest: clean(preferences.event_recommendations_interest),
     future_calendar_interest: clean(preferences.future_calendar_interest)
@@ -4457,13 +6539,34 @@ async function analyticsEvent(method, body) {
     return json(201, { mode: "demo", event: row });
   }
 
-  const rows = await supabaseFetch("/rest/v1/analytics_events?select=*", {
-    method: "POST",
-    service: true,
-    headers: { Prefer: "return=representation" },
-    body: (({ id, ...payload }) => payload)(row)
-  });
-  return json(201, { mode: "supabase", event: rows?.[0] });
+  let rows;
+  try {
+    rows = await supabaseFetch("/rest/v1/analytics_events?select=*", {
+      method: "POST",
+      service: true,
+      headers: { Prefer: "return=representation" },
+      body: {
+        event_type: row.event_type,
+        profile_key: row.profile_key,
+        user_id: null,
+        metadata: row.properties,
+        created_at: row.created_at
+      }
+    });
+  } catch (error) {
+    if (error.code !== "PGRST204") throw error;
+    rows = await supabaseFetch("/rest/v1/analytics_events?select=*", {
+      method: "POST",
+      service: true,
+      headers: { Prefer: "return=representation" },
+      body: (({ id, ...payload }) => payload)(row)
+    });
+  }
+  const saved = rows?.[0] ? {
+    ...rows[0],
+    properties: rows[0].properties || rows[0].metadata || row.properties
+  } : null;
+  return json(201, { mode: "supabase", event: saved });
 }
 
 function normalizeGuestPreferencePatch(existing = {}, body = {}, preferredLanguage = "en") {
@@ -4471,21 +6574,59 @@ function normalizeGuestPreferencePatch(existing = {}, body = {}, preferredLangua
   const arrayFields = [
     "cuisines", "food_categories", "drink_preferences", "dietary_needs", "atmospheres", "dining_experiences",
     "companions", "preferred_days", "preferred_time_windows", "discount_levels", "selection_priorities",
-    "favorite_restaurants", "excluded_categories", "notification_preferences", "preferred_neighborhoods"
+    "favorite_restaurants", "excluded_categories", "notification_preferences", "notification_channels", "preferred_neighborhoods"
   ];
   const textFields = [
-    "allergy_notes", "party_size", "booking_lead_time", "dining_duration", "spending_range",
+    "allergy_notes", "custom_cuisine", "party_size", "booking_lead_time", "dining_duration", "spending_range",
     "consider_no_discount_match", "discovery_preference", "new_restaurant_recommendations",
     "new_menu_item_recommendations", "notification_frequency", "event_recommendations_interest",
-    "future_calendar_interest"
+    "future_calendar_interest", "sms_country_code", "sms_phone_number"
   ];
   for (const field of arrayFields) {
     if (body[field] !== undefined) merged[field] = arrayFrom(body[field]);
+  }
+  if (body.companions !== undefined) {
+    merged.companions = arrayFrom(body.companions).map((item) => /^(alone|single\s*\/\s*solo)$/i.test(clean(item)) ? "Single / Solo" : item);
+  }
+  if (body.preferred_neighborhoods !== undefined && arrayFrom(body.preferred_neighborhoods).some((item) => clean(item).toLowerCase() === "no preference")) {
+    merged.preferred_neighborhoods = ["No preference"];
   }
   for (const field of textFields) {
     if (body[field] !== undefined) merged[field] = clean(body[field]);
   }
   if (body.location && typeof body.location === "object") merged.location = { ...(merged.location || {}), ...body.location };
+  const flatLocation = {
+    country: clean(body.country || body.country_code),
+    country_code: clean(body.country_code || body.country),
+    state: clean(body.state || body.region || body.state_region),
+    state_region: clean(body.state_region || body.region || body.state),
+    region: clean(body.region || body.state_region || body.state),
+    city: clean(body.city),
+    city_normalized: clean(body.city_normalized || body.city),
+    postal_code: clean(body.postal_code || body.zip),
+    max_travel_distance_value: Math.max(0, numberOr(body.max_travel_distance_value || body.travel_distance_value, 0)),
+    travel_distance_unit: clean(body.travel_distance_unit),
+    max_travel_distance_miles: Math.max(0, numberOr(body.max_travel_distance_miles || body.travel_distance_miles, 0)),
+    transportation_method: clean(body.transportation_method)
+  };
+  if (Object.values(flatLocation).some(Boolean)) {
+    merged.location = {
+      ...(merged.location || {}),
+      ...Object.fromEntries(Object.entries(flatLocation).filter(([, value]) => Boolean(value)))
+    };
+  }
+  const smsDestination = normalizePhoneE164(`${merged.sms_country_code || ""}${merged.sms_phone_number || ""}`);
+  if (body.sms_consent !== undefined) {
+    const smsSelected = arrayFrom(merged.notification_channels).includes("SMS");
+    const sms = boolValue(body.sms_consent) && smsSelected && isValidE164Phone(smsDestination);
+    merged.consents = {
+      ...(merged.consents || {}),
+      sms,
+      sms_opted_in: sms,
+      sms_consent_at: sms ? nowIso() : null,
+      language: normalizeLanguage(body.preferred_language || preferredLanguage)
+    };
+  }
   if (body.marketing_consent !== undefined) {
     const marketing = boolValue(body.marketing_consent);
     merged.consents = {
@@ -4501,36 +6642,10 @@ function normalizeGuestPreferencePatch(existing = {}, body = {}, preferredLangua
 }
 
 function validateGuestPreferenceProfile(preferences = {}) {
-  const requiredArrays = [
-    "cuisines",
-    "food_categories",
-    "drink_preferences",
-    "dietary_needs",
-    "dining_experiences",
-    "companions",
-    "preferred_days",
-    "preferred_time_windows",
-    "discount_levels",
-    "selection_priorities",
-    "excluded_categories"
-  ];
-  const requiredText = [
-    "party_size",
-    "booking_lead_time",
-    "dining_duration",
-    "spending_range",
-    "consider_no_discount_match",
-    "discovery_preference",
-    "new_restaurant_recommendations",
-    "new_menu_item_recommendations",
-    "event_recommendations_interest",
-    "future_calendar_interest"
-  ];
-  for (const field of requiredArrays) {
-    if (!arrayFrom(preferences[field]).length) return `${field} is required.`;
-  }
-  for (const field of requiredText) {
-    if (!clean(preferences[field])) return `${field} is required.`;
+  if (arrayFrom(preferences.cuisines).includes("Other") && !clean(preferences.custom_cuisine)) return "custom_cuisine is required.";
+  if (arrayFrom(preferences.notification_channels).includes("SMS")) {
+    const smsDestination = normalizePhoneE164(`${preferences.sms_country_code || ""}${preferences.sms_phone_number || ""}`);
+    if (!preferences.consents?.sms || !isValidE164Phone(smsDestination)) return "Valid SMS phone number and consent are required.";
   }
   return "";
 }
@@ -5089,7 +7204,7 @@ function reservationOverviewRows() {
       restaurant_neighborhood: restaurant?.district || restaurant?.neighborhood || "",
       restaurant_status: restaurant?.status || "",
       offer_id: reservation.offer_id,
-      offer_title: localizedField(offer, "title", "en"),
+      offer_title: localizedField(offer, "title", "en") || (normalizeReservationType(reservation.reservation_type, reservation.offer_id) === "standard" ? standardReservationLabel("en") : ""),
       offer_date: reservation.reservation_date || offer?.offer_date || reservation.created_at.slice(0, 10),
       offer_time: reservation.reservation_time || offer?.start_time || offer?.offer_time || "",
       reservation_date: reservation.reservation_date || offer?.offer_date || reservation.created_at.slice(0, 10),
@@ -5107,18 +7222,36 @@ function reservationOverviewRows() {
       notes: reservation.notes,
       partner_notes: reservation.partner_notes || "",
       confirmation_details: reservation.partner_notes || "",
+      reservation_type: normalizeReservationType(reservation.reservation_type, reservation.offer_id),
       accepted_at: reservation.accepted_at || null,
       rejected_at: reservation.rejected_at || null,
       cancelled_at: reservation.cancelled_at || null,
       completed_at: reservation.completed_at || null,
       no_show_at: reservation.no_show_at || null,
+      arrival_status: reservation.arrival_status || "not_requested",
+      arrived_at: reservation.arrived_at || null,
+      arrival_source: reservation.arrival_source || null,
+      visit_status: reservation.visit_status || "scheduled",
+      visit_started_at: reservation.visit_started_at || null,
+      visit_completed_at: reservation.visit_completed_at || null,
+      completion_source: reservation.completion_source || null,
+      expected_visit_duration_minutes: reservation.expected_visit_duration_minutes || null,
+      review_eligible_at: reservation.review_eligible_at || null,
+      review_invitation_sent_at: reservation.review_invitation_sent_at || null,
+      review_submitted_at: reservation.review_submitted_at || null,
+      verified_visit: Boolean(reservation.verified_visit),
+      post_visit_workflow_version: reservation.post_visit_workflow_version || "",
       status_changed_at: reservation.status_changed_at || null,
       status_changed_by: reservation.status_changed_by || null,
       cancelled_by_label: reservation.cancelled_by_label || "",
-      feedback_submitted: demo.consumptionUploads.some((item) => item.reservation_id === reservation.id),
+      feedback_submitted: demo.consumptionUploads.some((item) => item.reservation_id === reservation.id)
+        || demo.restaurantReviews.some((item) => item.reservation_id === reservation.id),
+      verified_review_submitted: demo.restaurantReviews.some((item) => item.reservation_id === reservation.id && item.verified_visit),
       source: reservation.source || "smarttable",
       booking_source: reservation.booking_source || "SMARTTABLE",
       booking_status: reservation.booking_status || bookingStatusFromReservationStatus(reservation.status),
+      is_test_reservation: Boolean(reservation.is_test_reservation || reservation.test_record || restaurant?.is_test_restaurant || offer?.is_test_offer),
+      test_record: Boolean(reservation.test_record || reservation.is_test_reservation || restaurant?.is_test_restaurant || offer?.is_test_offer),
       status: reservation.status,
       created_at: reservation.created_at,
       updated_at: reservation.updated_at
@@ -5140,7 +7273,8 @@ function emailLogMetadata(result = {}, context = {}) {
     accepted: Boolean(result.accepted),
     status: result.status || "failed",
     error_code: result.errorCode || null,
-    error_message: result.errorMessage || null
+    error_message: result.errorMessage || null,
+    provider_response: result.providerResponse || null
   };
 }
 
@@ -5221,7 +7355,7 @@ function maskEmailQueueForAdmin(row = {}) {
   };
 }
 
-const EMAIL_DIAGNOSTIC_STATUSES = new Set(["pending", "queued", "sent", "delivered", "failed", "bounced", "complained", "cancelled"]);
+const EMAIL_DIAGNOSTIC_STATUSES = new Set(["pending", "queued", "sending", "sent", "delayed", "delivered", "failed", "bounced", "complained", "cancelled"]);
 
 function emailDiagnosticStatus(row = {}) {
   return normalizeEmailQueueStatus(row.status || row.delivery_status || row.delivery || "pending");
@@ -5251,10 +7385,11 @@ function parseEmailDiagnosticFilters(query = new URLSearchParams()) {
       if (EMAIL_DIAGNOSTIC_STATUSES.has(status)) statuses.add(status);
     }
   }
-  for (const status of ["queued", "sent", "delivered", "failed", "bounced", "complained"]) {
+  for (const status of ["queued", "sending", "sent", "delayed", "delivered", "failed", "bounced", "complained"]) {
     if (boolValue(query.get(status))) statuses.add(status);
   }
-  const limit = Math.min(Math.max(1, Math.trunc(numberOr(query.get("limit"), 50))), 250);
+  const rawLimit = clean(query.get("limit"));
+  const limit = Math.min(Math.max(1, Math.trunc(rawLimit ? numberOr(rawLimit, 50) : 50)), 250);
   return {
     email_type: clean(query.get("email_type") || query.get("type")),
     recipient_type: lower(query.get("recipient_type") || query.get("recipientType")),
@@ -5306,6 +7441,216 @@ function headerValue(headers = {}, name = "") {
   return Array.isArray(value) ? clean(value[0]) : clean(value);
 }
 
+function clientIpAddress(headers = {}) {
+  const forwarded = headerValue(headers, "x-forwarded-for").split(",")[0];
+  return clean(forwarded || headerValue(headers, "x-real-ip") || headerValue(headers, "cf-connecting-ip") || "local").slice(0, 80);
+}
+
+function requestIdFromHeaders(headers = {}) {
+  return clean(
+    headerValue(headers, "x-request-id")
+    || headerValue(headers, "x-vercel-id")
+    || headerValue(headers, "cf-ray")
+    || crypto.randomUUID()
+  ).slice(0, 120);
+}
+
+function isReadOnlyImpersonationToken(headers = {}) {
+  const token = authToken(headers);
+  if (!token.startsWith("impersonate.")) return false;
+  const profile = profileFromSignedToken(token, "impersonate");
+  return clean(profile?.impersonation?.mode || profile?.impersonation_mode || "read") !== "write";
+}
+
+function readOnlyImpersonationError(method = "GET", pathname = "") {
+  const error = new Error("View-as mode is read-only. Confirm write mode before making changes.");
+  error.status = 403;
+  error.code = "IMPERSONATION_READ_ONLY";
+  error.details = { method, pathname };
+  return error;
+}
+
+function maskedIpAddress(value = "") {
+  const ip = clean(value);
+  if (!ip || ip === "local") return ip || "unknown";
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) {
+    const parts = ip.split(".");
+    return `${parts[0]}.${parts[1]}.${parts[2]}.*`;
+  }
+  if (ip.includes(":")) {
+    const parts = ip.split(":").filter(Boolean);
+    return `${parts.slice(0, 3).join(":") || "ipv6"}::`;
+  }
+  return "masked";
+}
+
+function summarizeUserAgent(value = "") {
+  const ua = clean(value).slice(0, 240);
+  if (!ua) return "Unknown browser";
+  const browser = /Edg\//.test(ua) ? "Edge"
+    : /Firefox\//.test(ua) ? "Firefox"
+      : /Chrome\//.test(ua) ? "Chrome"
+        : /Safari\//.test(ua) ? "Safari"
+          : "Browser";
+  const platform = /Windows/i.test(ua) ? "Windows"
+    : /iPhone|iPad|iPod/i.test(ua) ? "iOS"
+      : /Android/i.test(ua) ? "Android"
+        : /Mac OS X|Macintosh/i.test(ua) ? "macOS"
+          : /Linux/i.test(ua) ? "Linux"
+            : "Unknown device";
+  return `${browser} on ${platform}`;
+}
+
+function localeForLanguage(lang = "en") {
+  const language = normalizeLanguage(lang);
+  if (language === "hu") return "hu-HU";
+  if (language === "es") return "es-ES";
+  return "en-US";
+}
+
+function localizedSecurityDateTime(date = new Date(), lang = "en") {
+  try {
+    return new Intl.DateTimeFormat(localeForLanguage(lang), {
+      year: "numeric",
+      month: "long",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+      timeZoneName: "short",
+      timeZone: "America/New_York"
+    }).format(date);
+  } catch {
+    return date.toISOString();
+  }
+}
+
+function allowedOriginHosts(headers = {}) {
+  const hosts = new Set();
+  const add = (value = "") => {
+    try {
+      const url = new URL(value);
+      if (url.hostname) hosts.add(url.hostname.toLowerCase());
+    } catch {
+      // Ignore malformed configuration values.
+    }
+  };
+  add(PUBLIC_BASE_URL);
+  if (PUBLIC_BASE_URL.includes("smarttablenyc.com")) {
+    add("https://www.smarttablenyc.com");
+    add("https://smarttablenyc.com");
+  }
+  if (!IS_PRODUCTION_RUNTIME) {
+    const requestHost = lower(headerValue(headers, "host")).replace(/:\d+$/, "");
+    if (requestHost) hosts.add(requestHost);
+    hosts.add("localhost");
+    hosts.add("127.0.0.1");
+    hosts.add("::1");
+  }
+  return hosts;
+}
+
+function requestOriginHost(value = "") {
+  try {
+    const parsed = new URL(value);
+    return parsed.hostname.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function csrfOriginError(method, pathname, headers = {}) {
+  if (["GET", "HEAD", "OPTIONS"].includes(method)) return null;
+  if (pathname === "/webhooks/resend") return null;
+  if (pathname === "/webhooks/stripe") return null;
+  if (pathname === "/webhooks/sms/twilio") return null;
+  if (pathname === "/webhooks/voice/twilio") return null;
+  const origin = headerValue(headers, "origin");
+  const referer = headerValue(headers, "referer");
+  const presented = origin || referer;
+  if (!presented) return null;
+  const host = requestOriginHost(presented);
+  if (!host || !allowedOriginHosts(headers).has(host)) {
+    return {
+      error: "Request origin is not allowed.",
+      code: "CSRF_ORIGIN_FORBIDDEN"
+    };
+  }
+  return null;
+}
+
+function rateLimitKey(method, pathname, headers = {}) {
+  const ip = clientIpAddress(headers);
+  const bucket = pathname.startsWith("/auth/") ? "auth" : "api";
+  return `${bucket}:${method}:${pathname}:${ip}`;
+}
+
+function mutationRateLimit(method, pathname, headers = {}) {
+  if (["GET", "HEAD", "OPTIONS"].includes(method)) return null;
+  if (pathname === "/webhooks/resend") return null;
+  if (pathname === "/webhooks/stripe") return null;
+  if (pathname === "/webhooks/sms/twilio") return null;
+  if (pathname === "/webhooks/voice/twilio") return null;
+  const now = Date.now();
+  const key = rateLimitKey(method, pathname, headers);
+  const limit = pathname.startsWith("/auth/") ? AUTH_MUTATION_RATE_LIMIT : API_MUTATION_RATE_LIMIT;
+  const windowStart = now - API_RATE_LIMIT_WINDOW_MS;
+  const attempts = (apiRateLimitBuckets.get(key) || []).filter((timestamp) => timestamp > windowStart);
+  if (attempts.length >= limit) {
+    const retryAfterSeconds = Math.max(1, Math.ceil((attempts[0] + API_RATE_LIMIT_WINDOW_MS - now) / 1000));
+    apiRateLimitBuckets.set(key, attempts);
+    return {
+      retryAfterSeconds,
+      error: "Too many requests. Please wait before trying again.",
+      code: "RATE_LIMITED"
+    };
+  }
+  attempts.push(now);
+  apiRateLimitBuckets.set(key, attempts);
+  if (apiRateLimitBuckets.size > 5000) {
+    for (const [bucketKey, timestamps] of apiRateLimitBuckets.entries()) {
+      const fresh = timestamps.filter((timestamp) => timestamp > windowStart);
+      if (fresh.length) apiRateLimitBuckets.set(bucketKey, fresh);
+      else apiRateLimitBuckets.delete(bucketKey);
+    }
+  }
+  return null;
+}
+
+function scopedRateLimit(bucketMap, key = "", options = {}) {
+  const bucketKey = clean(key);
+  if (!bucketKey) return null;
+  const now = Date.now();
+  const limit = Math.max(1, Number(options.limit || 1));
+  const windowMs = Math.max(1000, Number(options.windowMs || 60_000));
+  const windowStart = now - windowMs;
+  const attempts = (bucketMap.get(bucketKey) || []).filter((timestamp) => timestamp > windowStart);
+  if (attempts.length >= limit) {
+    const retryAfterSeconds = Math.max(1, Math.ceil((attempts[0] + windowMs - now) / 1000));
+    bucketMap.set(bucketKey, attempts);
+    return {
+      retryAfterSeconds,
+      error: "Too many reservation alert attempts. Please wait before trying again.",
+      code: "RESERVATION_ALERT_RATE_LIMITED"
+    };
+  }
+  attempts.push(now);
+  bucketMap.set(bucketKey, attempts);
+  if (bucketMap.size > 5000) {
+    for (const [bucket, timestamps] of bucketMap.entries()) {
+      const fresh = timestamps.filter((timestamp) => timestamp > windowStart);
+      if (fresh.length) bucketMap.set(bucket, fresh);
+      else bucketMap.delete(bucket);
+    }
+  }
+  return null;
+}
+
+function requestPayloadTooLarge(body = {}) {
+  const raw = typeof body === "string" ? body : body?.__rawBody;
+  if (!raw) return false;
+  return Buffer.byteLength(String(raw), "utf8") > MAX_JSON_BODY_BYTES;
+}
+
 function rawWebhookBody(body = {}) {
   if (typeof body === "string") return body;
   if (body?.__rawBody) return String(body.__rawBody);
@@ -5349,13 +7694,17 @@ function verifyResendWebhookSignature(headers = {}, body = {}) {
     const expected = crypto.createHmac("sha256", secretBytes).update(signedContent).digest("base64");
     const received = svixSignature
       .split(/\s+/)
-      .map((part) => part.includes(",") ? part.split(",").at(-1) : part)
+      .map((part) => {
+        const pieces = part.split(",").map(clean).filter(Boolean);
+        return pieces.length > 1 ? pieces.at(-1) : pieces[0];
+      })
       .map(clean)
       .filter(Boolean);
     if (received.some((signature) => safeEqualString(signature, expected))) return { ok: true, scheme: "svix" };
     return { ok: false, reason: "WEBHOOK_SIGNATURE_MISMATCH" };
   }
 
+  if (IS_PRODUCTION_RUNTIME) return { ok: false, reason: "WEBHOOK_SIGNATURE_MISSING" };
   const hmacSignature = headerValue(headers, "x-resend-signature") || headerValue(headers, "x-smarttable-signature");
   if (!hmacSignature) return { ok: false, reason: "WEBHOOK_SIGNATURE_MISSING" };
   const expected = crypto.createHmac("sha256", RESEND_WEBHOOK_SECRET).update(raw).digest("hex");
@@ -5372,13 +7721,63 @@ function mapProviderEmailEventStatus(eventType = "", data = {}) {
   if (type.includes("bounced") || status === "bounced") return "bounced";
   if (type.includes("complained") || type.includes("complaint") || status === "complained") return "complained";
   if (type.includes("failed") || status === "failed") return "failed";
-  if (type.includes("deferred") || status === "deferred") return "queued";
+  if (type.includes("delivery_delayed") || type.includes("delayed") || type.includes("deferred") || status === "delayed" || status === "deferred") return "delayed";
   if (type.includes("sent") || status === "sent") return "sent";
   return "queued";
 }
 
+const EMAIL_STATUS_RANK = {
+  pending: 0,
+  queued: 1,
+  sending: 2,
+  sent: 3,
+  delayed: 4,
+  delivered: 5,
+  failed: 6,
+  bounced: 7,
+  complained: 8,
+  cancelled: 9
+};
+
+function emailStatusRank(status = "") {
+  const normalized = clean(status).toLowerCase();
+  return EMAIL_STATUS_RANK[normalized] ?? 0;
+}
+
+function shouldApplyProviderStatus(previousStatus = "", nextStatus = "") {
+  const previous = clean(previousStatus).toLowerCase();
+  const next = clean(nextStatus).toLowerCase();
+  if (!previous || previous === next) return true;
+  if (["bounced", "complained", "failed", "cancelled"].includes(previous) && !["bounced", "complained", "failed"].includes(next)) return false;
+  if (previous === "delivered" && ["sent", "queued", "sending", "delayed"].includes(next)) return false;
+  return emailStatusRank(next) >= emailStatusRank(previous);
+}
+
+function providerEventTimestamp(payload = {}, data = {}) {
+  const value = clean(data.created_at || data.timestamp || payload.created_at || payload.timestamp);
+  const parsed = value ? new Date(value) : null;
+  return parsed && !Number.isNaN(parsed.getTime()) ? parsed.toISOString() : nowIso();
+}
+
+function sanitizeProviderEventDetails(data = {}) {
+  const raw = data.error || data.reason || data.bounce || data.complaint || data.status || data.delivery_status || null;
+  if (!raw) return null;
+  if (typeof raw === "string") return clean(raw).slice(0, 300);
+  if (typeof raw === "object") {
+    return Object.fromEntries(Object.entries(raw)
+      .filter(([key]) => !/secret|token|password|authorization|api[_-]?key/i.test(key))
+      .slice(0, 12)
+      .map(([key, value]) => [key, typeof value === "string" ? clean(value).slice(0, 180) : value]));
+  }
+  return null;
+}
+
 function emailLogPatchForProviderEvent(row = {}, event = {}) {
   const now = nowIso();
+  const eventAt = event.event_timestamp || now;
+  const nextStatus = shouldApplyProviderStatus(row.status || row.delivery_status, event.status)
+    ? event.status
+    : clean(row.status || row.delivery_status || "sent");
   const previousEvents = Array.isArray(row.metadata?.provider_events) ? row.metadata.provider_events : [];
   const nextEvents = previousEvents.some((item) => item.event_id === event.event_id)
     ? previousEvents
@@ -5386,19 +7785,28 @@ function emailLogPatchForProviderEvent(row = {}, event = {}) {
       event_id: event.event_id,
       event_type: event.event_type,
       status: event.status,
+      event_timestamp: eventAt,
+      provider_message_id: event.provider_message_id,
+      sanitized_error: event.sanitized_error || null,
       received_at: now
     }].slice(-20);
   return {
-    delivery_status: event.status,
-    status: event.status,
-    delivered_at: event.status === "delivered" ? (row.delivered_at || now) : row.delivered_at || null,
-    failed_at: ["failed", "bounced", "complained"].includes(event.status) ? (row.failed_at || now) : row.failed_at || null,
+    delivery_status: nextStatus,
+    status: nextStatus,
+    delivered_at: nextStatus === "delivered" ? (row.delivered_at || eventAt) : row.delivered_at || null,
+    failed_at: ["failed", "bounced", "complained"].includes(nextStatus) ? (row.failed_at || eventAt) : row.failed_at || null,
+    last_error_code: ["failed", "bounced", "complained"].includes(nextStatus) ? clean(event.event_type).toUpperCase().replace(/[^A-Z0-9_]+/g, "_") : row.last_error_code || null,
+    last_error_message: ["failed", "bounced", "complained"].includes(nextStatus) && event.sanitized_error ? JSON.stringify(event.sanitized_error).slice(0, 500) : row.last_error_message || null,
+    error_message: ["failed", "bounced", "complained"].includes(nextStatus) && event.sanitized_error ? JSON.stringify(event.sanitized_error).slice(0, 500) : row.error_message || null,
     updated_at: now,
     metadata: {
       ...(row.metadata || {}),
       provider_events: nextEvents,
       last_provider_event_type: event.event_type,
-      last_provider_event_at: now
+      last_provider_event_status: event.status,
+      last_provider_event_at: eventAt,
+      last_webhook_received_at: now,
+      last_provider_error: event.sanitized_error || null
     }
   };
 }
@@ -5423,14 +7831,14 @@ async function updateEmailLogFromProviderEvent(event = {}) {
     method: "PATCH",
     service: true,
     headers: { Prefer: "return=minimal" },
-    body: emailLogPatchForProviderEvent(row, event)
+    body: await filterSupabaseTablePayload("email_logs", emailLogPatchForProviderEvent(row, event))
   });
   return { updated: true, email_log_id: row.id, status: event.status };
 }
 
 function normalizeEmailDeliveryStatus(result = {}) {
   const status = clean(result.delivery_status || result.status || result.delivery).toLowerCase();
-  if (["pending", "queued", "sent", "delivered", "bounced", "failed", "complained", "cancelled"].includes(status)) return status;
+  if (["pending", "queued", "sending", "sent", "delayed", "delivered", "bounced", "failed", "complained", "cancelled"].includes(status)) return status;
   return isEmailAccepted(result) ? "sent" : "failed";
 }
 
@@ -5482,6 +7890,7 @@ function normalizeEmailDeliveryContext(message = {}, context = {}) {
     reservation_id: clean(context.reservation_id || context.reservationId),
     guest_id: clean(context.guest_id || context.guestId),
     campaign_id: clean(context.campaign_id || context.campaignId),
+    message_campaign_id: clean(context.message_campaign_id || context.messageCampaignId),
     locale,
     template_version: clean(context.template_version || context.templateVersion || EMAIL_TEMPLATE_VERSION),
     idempotency_key: emailIdempotencyKey(message, context)
@@ -5506,7 +7915,7 @@ function emailLogStatus(row = {}) {
 function emailSendDecision(existingLog = null) {
   if (!existingLog) return { shouldSend: true, reason: "new" };
   const status = emailLogStatus(existingLog);
-  if (["queued", "sent", "delivered"].includes(status)) {
+  if (["queued", "sending", "sent", "delayed", "delivered"].includes(status)) {
     return { shouldSend: false, reason: "already_accepted" };
   }
   const errorCode = emailLogLastErrorCode(existingLog);
@@ -5521,7 +7930,7 @@ function emailSendDecision(existingLog = null) {
 
 function normalizeEmailQueueStatus(value = "") {
   const status = clean(value).toLowerCase();
-  return ["pending", "queued", "sent", "delivered", "bounced", "failed", "complained", "cancelled"].includes(status)
+  return ["pending", "queued", "sending", "sent", "delayed", "delivered", "bounced", "failed", "complained", "cancelled"].includes(status)
     ? status
     : "queued";
 }
@@ -5584,6 +7993,7 @@ function emailQueueRow(message = {}, context = {}, existingLog = null) {
     restaurant_id: context.restaurant_id || null,
     reservation_id: context.reservation_id || null,
     campaign_id: context.campaign_id || null,
+    message_campaign_id: context.message_campaign_id || null,
     provider: "resend",
     provider_message_id: existingLog?.provider_message_id || existingLog?.provider_id || null,
     status: "queued",
@@ -5635,7 +8045,7 @@ async function createEmailQueueRecord(message = {}, context = {}, existingLog = 
       method: "POST",
       service: true,
       headers: { Prefer: "return=representation" },
-      body: row
+      body: await filterSupabaseTablePayload("email_queue", row)
     });
     return rows?.[0] || row;
   } catch (error) {
@@ -5664,7 +8074,7 @@ async function patchEmailQueueRecord(queueRecord = {}, patch = {}) {
       method: "PATCH",
       service: true,
       headers: { Prefer: "return=minimal" },
-      body: payload
+      body: await filterSupabaseTablePayload("email_queue", payload)
     });
     return { ...queueRecord, ...payload };
   } catch (error) {
@@ -5715,6 +8125,7 @@ async function processEmailQueueRecord(queueRecord = {}, message = null, context
     restaurant_id: queueRecord.restaurant_id,
     reservation_id: queueRecord.reservation_id,
     campaign_id: queueRecord.campaign_id,
+    message_campaign_id: queueRecord.message_campaign_id,
     locale: queueRecord.locale,
     template_version: queueRecord.template_version,
     idempotency_key: queueRecord.idempotency_key
@@ -5743,7 +8154,7 @@ async function processEmailQueueRecord(queueRecord = {}, message = null, context
     return { result, logRecord, queueRecord: nextQueue };
   }
   await patchEmailQueueRecord(queueRecord, {
-    status: "queued",
+    status: "sending",
     last_attempt_at: nowIso()
   });
   const result = await emailService.sendEmail(queuedMessage);
@@ -5754,29 +8165,41 @@ async function processEmailQueueRecord(queueRecord = {}, message = null, context
 
 async function updateEmailQueueFromProviderEvent(event = {}) {
   if (!event.provider_message_id) return { updated: false, reason: "MISSING_PROVIDER_MESSAGE_ID" };
-  const patch = {
-    status: event.status,
-    delivered_at: event.status === "delivered" ? nowIso() : undefined,
-    failed_at: ["failed", "bounced", "complained"].includes(event.status) ? nowIso() : undefined,
-    provider_message_id: event.provider_message_id
-  };
   if (!supabaseConfigured) {
     ensureDemo();
     const row = demo.emailQueue.find((item) => item.provider_message_id === event.provider_message_id);
     if (!row) return { updated: false, reason: "EMAIL_QUEUE_NOT_FOUND" };
+    const status = shouldApplyProviderStatus(row.status, event.status) ? event.status : row.status;
+    const patch = {
+      status,
+      delivered_at: status === "delivered" ? (row.delivered_at || event.event_timestamp || nowIso()) : row.delivered_at || null,
+      failed_at: ["failed", "bounced", "complained"].includes(status) ? (row.failed_at || event.event_timestamp || nowIso()) : row.failed_at || null,
+      last_error_code: ["failed", "bounced", "complained"].includes(status) ? clean(event.event_type).toUpperCase().replace(/[^A-Z0-9_]+/g, "_") : row.last_error_code || null,
+      last_error_message: ["failed", "bounced", "complained"].includes(status) && event.sanitized_error ? JSON.stringify(event.sanitized_error).slice(0, 500) : row.last_error_message || null,
+      provider_message_id: event.provider_message_id
+    };
     Object.assign(row, patch, { updated_at: nowIso() });
-    return { updated: true, email_queue_id: row.id, status: event.status };
+    return { updated: true, email_queue_id: row.id, status };
   }
   const rows = await supabaseFetch(`/rest/v1/email_queue?select=*&provider_message_id=eq.${encodeURIComponent(event.provider_message_id)}&limit=1`, { service: true }).catch(() => []);
   const row = rows?.[0];
   if (!row) return { updated: false, reason: "EMAIL_QUEUE_NOT_FOUND" };
+  const status = shouldApplyProviderStatus(row.status, event.status) ? event.status : row.status;
+  const patch = {
+    status,
+    delivered_at: status === "delivered" ? (row.delivered_at || event.event_timestamp || nowIso()) : undefined,
+    failed_at: ["failed", "bounced", "complained"].includes(status) ? (row.failed_at || event.event_timestamp || nowIso()) : undefined,
+    last_error_code: ["failed", "bounced", "complained"].includes(status) ? clean(event.event_type).toUpperCase().replace(/[^A-Z0-9_]+/g, "_") : undefined,
+    last_error_message: ["failed", "bounced", "complained"].includes(status) && event.sanitized_error ? JSON.stringify(event.sanitized_error).slice(0, 500) : undefined,
+    provider_message_id: event.provider_message_id
+  };
   await patchEmailQueueRecord(row, patch);
-  return { updated: true, email_queue_id: row.id, status: event.status };
+  return { updated: true, email_queue_id: row.id, status };
 }
 
 function resultFromExistingEmailLog(message = {}, context = {}, existingLog = {}, decision = {}) {
   const status = emailLogStatus(existingLog);
-  const accepted = ["queued", "sent", "delivered"].includes(status);
+  const accepted = ["queued", "sending", "sent", "delayed", "delivered"].includes(status);
   const errorCode = emailLogLastErrorCode(existingLog) || (decision.reason === "retry_limit_reached" ? "EMAIL_RETRY_LIMIT_REACHED" : null);
   const errorMessage = clean(existingLog.last_error_message || existingLog.error_message || existingLog.metadata?.error_message) ||
     (decision.reason === "already_accepted"
@@ -5835,6 +8258,7 @@ function emailLogPayload(result = {}, context = {}, existingLog = null) {
     restaurant_id: context.restaurant_id || null,
     guest_id: context.guest_id || null,
     campaign_id: context.campaign_id || null,
+    message_campaign_id: context.message_campaign_id || null,
     recipient_user_id: context.recipient_user_id || null,
     email_type: context.email_type || context.event_type || "email",
     event_type: context.event_type || context.email_type || "email",
@@ -5882,7 +8306,7 @@ async function recordEmailDelivery(result = {}, context = {}, existingLog = null
       method: "POST",
       service: true,
       headers: { Prefer: "return=minimal" },
-      body: legacyEmailEventPayload(result, context)
+      body: await filterSupabaseTablePayload("email_events", legacyEmailEventPayload(result, context))
       });
     } catch (error) {
       console.error("[email-log] Legacy email event write failed:", error.message);
@@ -5893,14 +8317,14 @@ async function recordEmailDelivery(result = {}, context = {}, existingLog = null
           method: "PATCH",
           service: true,
           headers: { Prefer: "return=minimal" },
-          body: payload
+          body: await filterSupabaseTablePayload("email_logs", payload)
         });
       } else {
         await supabaseFetch("/rest/v1/email_logs", {
           method: "POST",
           service: true,
           headers: { Prefer: "return=minimal" },
-          body: payload
+          body: await filterSupabaseTablePayload("email_logs", payload)
         });
       }
     } catch (error) {
@@ -6069,6 +8493,42 @@ function emailDeliverySummary(results = []) {
   };
 }
 
+function emailDeliveryResult(result = null, provider = "other") {
+  if (!result) {
+    return {
+      attempted: false,
+      accepted: null,
+      provider,
+      messageId: null,
+      errorCode: null,
+      errorMessage: null
+    };
+  }
+  return {
+    attempted: true,
+    accepted: isEmailAccepted(result) ? true : false,
+    provider: result.provider || provider,
+    messageId: result.messageId || result.provider_id || null,
+    errorCode: result.errorCode || null,
+    errorMessage: result.errorMessage ? "Email provider did not accept the message." : null,
+    status: result.status || null,
+    verifiedRejection: Boolean(!isEmailAccepted(result) && isPermanentEmailFailure(result.errorCode || result.status || "")),
+    eventType: result.event_type || result.email_type || null
+  };
+}
+
+function supabaseConfirmationEmailResult({ required = false, requested = false } = {}) {
+  return {
+    attempted: Boolean(required || requested),
+    accepted: requested ? null : false,
+    provider: "supabase",
+    messageId: null,
+    errorCode: requested ? null : (required ? "AUTH_CONFIRMATION_NOT_REQUESTED" : null),
+    errorMessage: null,
+    status: requested ? "requested" : (required ? "failed" : "not_required")
+  };
+}
+
 function emailHtmlEscape(value) {
   return String(value ?? "")
     .replace(/&/g, "&amp;")
@@ -6097,18 +8557,3311 @@ function appEmailHtml(subject, body, cta = null, options = {}) {
   const footerHtml = footer
     ? `<p style="margin-top:24px;color:#68746f;font-size:13px;line-height:1.5">${emailHtmlEscape(footer)}</p>`
     : "";
-  return `${preheaderHtml}<div style="font-family:Inter,Arial,sans-serif;color:#173d33;line-height:1.55;max-width:640px;margin:0 auto;padding:24px"><p style="font-weight:800;color:#0f735d;margin:0 0 18px">${emailHtmlEscape(brand)}</p><h2 style="font-size:24px;line-height:1.25;margin:0 0 16px">${emailHtmlEscape(subject)}</h2>${paragraphs}${button}${footerHtml}</div>`;
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="supported-color-schemes" content="light dark">
+  <style>
+    @media (prefers-color-scheme: dark) {
+      .smarttable-email { background:#10261f !important; color:#e8f5ef !important; }
+      .smarttable-card { background:#173d33 !important; color:#e8f5ef !important; border-color:#2f6354 !important; }
+      .smarttable-muted { color:#bed3cb !important; }
+    }
+    @media screen and (max-width: 520px) {
+      .smarttable-card { padding:20px !important; }
+      .smarttable-title { font-size:22px !important; }
+    }
+  </style>
+</head>
+<body class="smarttable-email" style="margin:0;padding:0;background:#f4fbf8;color:#173d33">
+${preheaderHtml}
+<div style="display:none;max-height:0;overflow:hidden;color:transparent;opacity:0">SmartTable transactional email</div>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;background:#f4fbf8">
+  <tr>
+    <td align="center" style="padding:24px 12px">
+      <table class="smarttable-card" role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;max-width:640px;background:#ffffff;border:1px solid #d8ebe4;border-radius:12px;color:#173d33">
+        <tr>
+          <td style="padding:28px;font-family:Inter,Arial,sans-serif;line-height:1.55">
+            <p aria-label="SmartTable logo" style="font-weight:900;letter-spacing:0;margin:0 0 18px;color:#0f735d;font-size:18px">${emailHtmlEscape(brand)}</p>
+            <h1 class="smarttable-title" style="font-size:24px;line-height:1.25;margin:0 0 16px;font-weight:800">${emailHtmlEscape(subject)}</h1>
+            <div style="font-size:15px">${paragraphs}${button}${footerHtml}</div>
+            <p class="smarttable-muted" style="margin-top:28px;color:#68746f;font-size:12px;line-height:1.5">SmartTable sends transactional account and reservation emails only when needed to operate your account or reservation request.</p>
+          </td>
+        </tr>
+      </table>
+    </td>
+  </tr>
+</table>
+</body>
+</html>`;
+}
+
+function normalizeCommunicationChannel(value = "email") {
+  const channel = clean(value).toLowerCase().replace(/[\s-]+/g, "_");
+  return ["email", "sms", "in_app", "push"].includes(channel) ? channel : "email";
+}
+
+function normalizeConsentType(value = "marketing") {
+  const type = clean(value).toLowerCase().replace(/[\s-]+/g, "_");
+  return type === "transactional" ? "transactional" : "marketing";
+}
+
+function normalizeCommunicationConsentStatus(value = "revoked") {
+  const status = clean(value).toLowerCase();
+  return status === "granted" || status === "accepted" ? "granted" : "revoked";
+}
+
+function normalizePhoneE164(value = "", defaultCountry = "US") {
+  const raw = clean(value);
+  if (!raw) return "";
+  if (raw.startsWith("+")) {
+    const digits = raw.slice(1).replace(/\D/g, "");
+    return digits.length >= 8 && digits.length <= 15 ? `+${digits}` : "";
+  }
+  const digits = raw.replace(/\D/g, "");
+  if (defaultCountry === "US" && digits.length === 10) return `+1${digits}`;
+  if (defaultCountry === "US" && digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
+  return digits.length >= 8 && digits.length <= 15 ? `+${digits}` : "";
+}
+
+function isValidE164Phone(value = "") {
+  return /^\+[1-9]\d{7,14}$/.test(clean(value));
+}
+
+function hashPhoneValue(value = "") {
+  return crypto.createHash("sha256").update(normalizePhoneE164(value)).digest("hex");
+}
+
+function phoneLast4(value = "") {
+  return normalizePhoneE164(value).replace(/\D/g, "").slice(-4);
+}
+
+function maskPhoneValue(value = "") {
+  const last4 = phoneLast4(value);
+  return last4 ? `***-***-${last4}` : "";
+}
+
+function normalizeAlertStatus(value = "queued") {
+  const status = clean(value).toLowerCase();
+  return ["queued", "sent", "delivered", "acknowledged", "failed", "escalated"].includes(status) ? status : "queued";
+}
+
+function normalizePermissionStatus(value = "unknown") {
+  const status = clean(value).toLowerCase();
+  return ["granted", "denied", "prompt", "unknown"].includes(status) ? status : "unknown";
+}
+
+function normalizeDeviceType(value = "") {
+  const type = clean(value).toLowerCase().replace(/[^a-z0-9_-]+/g, "_").slice(0, 40);
+  return type || "browser";
+}
+
+function normalizeDeviceName(value = "") {
+  return clean(value).replace(/[<>]/g, "").slice(0, 80) || "Restaurant device";
+}
+
+function endpointHash(endpoint = "") {
+  return hashEmailValue(`push-endpoint:${clean(endpoint)}`);
+}
+
+function notificationLanguage(value = "") {
+  const language = normalizeLanguage(value || "en");
+  return ["en", "es", "hu"].includes(language) ? language : "en";
+}
+
+function defaultRestaurantNotificationPreferences(restaurantId = "") {
+  return {
+    restaurant_id: clean(restaurantId),
+    dashboard_popup_enabled: true,
+    sound_enabled: true,
+    push_enabled: true,
+    email_enabled: true,
+    sms_fallback_enabled: false,
+    primary_sms_number: "",
+    escalation_sms_number: "",
+    sms_fallback_delay_seconds: RESERVATION_ALERT_SMS_FALLBACK_SECONDS,
+    sms_escalation_delay_seconds: RESERVATION_ALERT_ESCALATION_SECONDS,
+    voice_call_enabled: false,
+    voice_call_number: "",
+    voice_call_delay_seconds: RESERVATION_ALERT_VOICE_DELAY_SECONDS,
+    notification_language: "en"
+  };
+}
+
+function clientRestaurantNotificationPreferences(preferences = {}) {
+  return {
+    restaurant_id: preferences.restaurant_id || "",
+    dashboard_popup_enabled: preferences.dashboard_popup_enabled !== false,
+    sound_enabled: preferences.sound_enabled !== false,
+    push_enabled: preferences.push_enabled !== false,
+    email_enabled: preferences.email_enabled !== false,
+    sms_fallback_enabled: Boolean(preferences.sms_fallback_enabled),
+    primary_sms_number: maskPhoneValue(preferences.primary_sms_number || ""),
+    primary_sms_number_configured: Boolean(normalizePhoneE164(preferences.primary_sms_number || "")),
+    escalation_sms_number: maskPhoneValue(preferences.escalation_sms_number || ""),
+    escalation_sms_number_configured: Boolean(normalizePhoneE164(preferences.escalation_sms_number || "")),
+    sms_fallback_delay_seconds: Number(preferences.sms_fallback_delay_seconds || RESERVATION_ALERT_SMS_FALLBACK_SECONDS),
+    sms_escalation_delay_seconds: Number(preferences.sms_escalation_delay_seconds || RESERVATION_ALERT_ESCALATION_SECONDS),
+    voice_call_enabled: Boolean(preferences.voice_call_enabled),
+    voice_call_number: maskPhoneValue(preferences.voice_call_number || ""),
+    voice_call_number_configured: Boolean(normalizePhoneE164(preferences.voice_call_number || "")),
+    voice_call_delay_seconds: Number(preferences.voice_call_delay_seconds || RESERVATION_ALERT_VOICE_DELAY_SECONDS),
+    notification_language: notificationLanguage(preferences.notification_language || "en")
+  };
+}
+
+function normalizeNotificationPreferencePatch(body = {}, restaurantId = "") {
+  const fallback = defaultRestaurantNotificationPreferences(restaurantId);
+  const patch = { restaurant_id: restaurantId };
+  for (const key of ["dashboard_popup_enabled", "sound_enabled", "push_enabled", "email_enabled", "sms_fallback_enabled", "voice_call_enabled"]) {
+    if (body[key] !== undefined) patch[key] = boolValue(body[key]);
+  }
+  if (body.primary_sms_number !== undefined && clean(body.primary_sms_number)) {
+    const phone = normalizePhoneE164(body.primary_sms_number);
+    if (!phone) {
+      const error = new Error("Primary SMS number must be a valid E.164 phone number.");
+      error.status = 400;
+      throw error;
+    }
+    patch.primary_sms_number = phone;
+  }
+  if (body.escalation_sms_number !== undefined && clean(body.escalation_sms_number)) {
+    const phone = normalizePhoneE164(body.escalation_sms_number);
+    if (!phone) {
+      const error = new Error("Escalation SMS number must be a valid E.164 phone number.");
+      error.status = 400;
+      throw error;
+    }
+    patch.escalation_sms_number = phone;
+  }
+  if (body.voice_call_number !== undefined && clean(body.voice_call_number)) {
+    const phone = normalizePhoneE164(body.voice_call_number);
+    if (!phone) {
+      const error = new Error("Voice call number must be a valid E.164 phone number.");
+      error.status = 400;
+      throw error;
+    }
+    patch.voice_call_number = phone;
+  }
+  if (body.sms_fallback_delay_seconds !== undefined) {
+    patch.sms_fallback_delay_seconds = Math.max(15, Math.min(3600, Math.trunc(Number(body.sms_fallback_delay_seconds) || fallback.sms_fallback_delay_seconds)));
+  }
+  if (body.sms_escalation_delay_seconds !== undefined || body.escalation_delay_seconds !== undefined) {
+    patch.sms_escalation_delay_seconds = Math.max(60, Math.min(86400, Math.trunc(Number(body.sms_escalation_delay_seconds || body.escalation_delay_seconds) || fallback.sms_escalation_delay_seconds)));
+  }
+  if (body.voice_call_delay_seconds !== undefined) {
+    patch.voice_call_delay_seconds = Math.max(60, Math.min(86400, Math.trunc(Number(body.voice_call_delay_seconds) || fallback.voice_call_delay_seconds)));
+  }
+  if (body.notification_language !== undefined) patch.notification_language = notificationLanguage(body.notification_language);
+  return patch;
+}
+
+function reservationAlertPayload(row = {}) {
+  const reservationId = row.reservation_id || row.id || "";
+  const restaurantId = row.restaurant_id || "";
+  const standardReservation = isStandardReservation(row);
+  const discountPercent = standardReservation ? null : Number(row.discount_percent || row.discount_value || row.discount || 0);
+  return {
+    reservation_id: reservationId,
+    restaurant_id: restaurantId,
+    restaurant_name: clean(row.restaurant_name || row.name || "Restaurant"),
+    reservation_date: clean(row.reservation_date || row.offer_date),
+    reservation_time: clean(row.reservation_time || row.offer_time || row.start_time),
+    party_size: Number(row.party_size || 0),
+    offer_title: clean(row.offer_title || row.title || row.title_en || (standardReservation ? standardReservationLabel(row.guest_language || "en") : "SmartTable offer")),
+    discount_percent: discountPercent,
+    discount_label: standardReservation ? standardReservationLabel(row.guest_language || "en") : `${discountPercent || 0}% off`,
+    reservation_type: standardReservation ? "standard" : "discount_offer",
+    reference: clean(row.reference || ""),
+    dashboard_url: `${PUBLIC_BASE_URL}/partner/reservations?reservation=${encodeURIComponent(clean(row.reference || reservationId))}`,
+    created_at: clean(row.created_at || nowIso())
+  };
+}
+
+function clientReservationAlert(row = {}) {
+  const payload = row.safe_payload || row.payload || {};
+  const createdAt = row.created_at || payload.created_at || nowIso();
+  return {
+    id: row.id,
+    reservation_id: row.reservation_id || payload.reservation_id,
+    restaurant_id: row.restaurant_id || payload.restaurant_id,
+    status: normalizeAlertStatus(row.status),
+    alert_type: row.alert_type || "new_reservation_request",
+    priority: row.priority || "high",
+    acknowledged_at: row.acknowledged_at || null,
+    created_at: createdAt,
+    waiting_seconds: Math.max(0, Math.round((Date.now() - new Date(createdAt).getTime()) / 1000)),
+    payload: {
+      restaurant_name: payload.restaurant_name || row.restaurant_name || "Restaurant",
+      reservation_date: payload.reservation_date || row.reservation_date || "",
+      reservation_time: payload.reservation_time || row.reservation_time || "",
+      party_size: Number(payload.party_size || row.party_size || 0),
+      offer_title: payload.offer_title || row.offer_title || "SmartTable offer",
+      discount_percent: payload.discount_percent === null ? null : Number(payload.discount_percent || row.discount_percent || 0),
+      discount_label: payload.discount_label || (payload.reservation_type === "standard" ? standardReservationLabel("en") : `${Number(payload.discount_percent || row.discount_percent || 0)}% off`),
+      reservation_type: payload.reservation_type || normalizeReservationType(row.reservation_type, row.offer_id),
+      reference: payload.reference || row.reference || "",
+      dashboard_url: safeInternalApiUrl(payload.dashboard_url || `/partner/reservations?reservation=${encodeURIComponent(payload.reference || row.reference || "")}`)
+    }
+  };
+}
+
+function clientReservationAlertDelivery(row = {}) {
+  return {
+    id: row.id,
+    alert_id: row.alert_id || "",
+    restaurant_id: row.restaurant_id || "",
+    reservation_id: row.reservation_id || "",
+    channel: row.channel || "",
+    provider: row.provider || "",
+    status: normalizeAlertStatus(row.status || "queued"),
+    provider_message_id: clean(row.provider_message_id || "").slice(0, 120),
+    error_code: clean(row.error_code || "").slice(0, 80),
+    error_message_safe: clean(row.error_message_safe || "").slice(0, 240),
+    attempt_number: Number(row.attempt_number || 1),
+    created_at: row.created_at || null,
+    sent_at: row.sent_at || null,
+    delivered_at: row.delivered_at || null,
+    acknowledged_at: row.acknowledged_at || null
+  };
+}
+
+function safeInternalApiUrl(value = "") {
+  const raw = clean(value);
+  if (/^\/(?!\/)/.test(raw)) return raw;
+  try {
+    const parsed = new URL(raw);
+    const base = new URL(PUBLIC_BASE_URL);
+    if (parsed.origin !== base.origin) return `${parsed.pathname}${parsed.search}${parsed.hash}`;
+    return `${parsed.pathname}${parsed.search}${parsed.hash}`;
+  } catch {
+    return "/partner/reservations";
+  }
+}
+
+function normalizeDestination(value = "", channel = "email") {
+  const destination = clean(value);
+  return normalizeCommunicationChannel(channel) === "email" ? lower(destination) : normalizePhoneE164(destination);
+}
+
+function communicationPreferenceDefaults(profile = {}) {
+  return {
+    user_id: clean(profile.id),
+    transactional_email_enabled: true,
+    marketing_email_enabled: false,
+    transactional_sms_enabled: false,
+    marketing_sms_enabled: false,
+    in_app_enabled: true,
+    preferred_language: normalizeLanguage(profile.preferred_language || "en"),
+    timezone: clean(profile.timezone || "America/New_York"),
+    updated_at: nowIso()
+  };
+}
+
+function sanitizeCommunicationPreference(row = {}, profile = {}) {
+  const defaults = communicationPreferenceDefaults(profile);
+  return {
+    user_id: clean(row.user_id || defaults.user_id),
+    transactional_email_enabled: row.transactional_email_enabled !== false,
+    marketing_email_enabled: Boolean(row.marketing_email_enabled),
+    transactional_sms_enabled: Boolean(row.transactional_sms_enabled),
+    marketing_sms_enabled: Boolean(row.marketing_sms_enabled),
+    in_app_enabled: row.in_app_enabled !== false,
+    preferred_language: normalizeLanguage(row.preferred_language || defaults.preferred_language),
+    timezone: clean(row.timezone || defaults.timezone),
+    updated_at: row.updated_at || defaults.updated_at
+  };
+}
+
+function sanitizeCommunicationConsent(row = {}) {
+  return {
+    id: clean(row.id),
+    user_id: clean(row.user_id),
+    channel: normalizeCommunicationChannel(row.channel),
+    consent_type: normalizeConsentType(row.consent_type),
+    status: normalizeCommunicationConsentStatus(row.status),
+    source: clean(row.source || "account_preferences"),
+    consent_text_version: clean(row.consent_text_version || COMMUNICATION_CONSENT_VERSION),
+    granted_at: row.granted_at || null,
+    revoked_at: row.revoked_at || null,
+    created_at: row.created_at || null
+  };
+}
+
+function communicationConsentAuditPayload({ profile, channel, consentType, status, source, headers = {} }) {
+  const normalizedStatus = normalizeCommunicationConsentStatus(status);
+  const now = nowIso();
+  return {
+    id: crypto.randomUUID(),
+    user_id: profile.id,
+    channel: normalizeCommunicationChannel(channel),
+    consent_type: normalizeConsentType(consentType),
+    status: normalizedStatus,
+    source: clean(source || "account_preferences"),
+    consent_text_version: COMMUNICATION_CONSENT_VERSION,
+    ip_address: maskedIpAddress(clientIpAddress(headers)),
+    user_agent: summarizeUserAgent(headerValue(headers, "user-agent")),
+    granted_at: normalizedStatus === "granted" ? now : null,
+    revoked_at: normalizedStatus === "revoked" ? now : null,
+    created_at: now
+  };
+}
+
+async function getCommunicationPreferencesForProfile(profile = {}, { create = true } = {}) {
+  if (!profile?.id) return sanitizeCommunicationPreference({}, profile);
+  if (!supabaseConfigured) {
+    ensureDemo();
+    let row = demo.communicationPreferences.find((item) => item.user_id === profile.id);
+    if (!row && create) {
+      row = communicationPreferenceDefaults(profile);
+      demo.communicationPreferences.unshift(row);
+    }
+    return sanitizeCommunicationPreference(row || {}, profile);
+  }
+  const rows = await supabaseFetch(`/rest/v1/communication_preferences?select=*&user_id=eq.${encodeURIComponent(profile.id)}&limit=1`, { service: true }).catch(() => []);
+  if (rows?.[0] || !create) return sanitizeCommunicationPreference(rows?.[0] || {}, profile);
+  const created = await supabaseFetch("/rest/v1/communication_preferences?on_conflict=user_id&select=*", {
+    method: "POST",
+    service: true,
+    headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+    body: communicationPreferenceDefaults(profile)
+  }).catch(() => []);
+  return sanitizeCommunicationPreference(created?.[0] || {}, profile);
+}
+
+async function getCommunicationConsentHistoryForProfile(profile = {}) {
+  if (!profile?.id) return [];
+  if (!supabaseConfigured) {
+    ensureDemo();
+    return demo.communicationConsents
+      .filter((item) => item.user_id === profile.id)
+      .sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")))
+      .map(sanitizeCommunicationConsent);
+  }
+  const rows = await supabaseFetch(`/rest/v1/communication_consents?select=*&user_id=eq.${encodeURIComponent(profile.id)}&order=created_at.desc&limit=100`, { service: true }).catch(() => []);
+  return (rows || []).map(sanitizeCommunicationConsent);
+}
+
+async function recordCommunicationConsentEvent({ profile, channel = "email", consentType = "marketing", status = "revoked", source = "account_preferences", headers = {} }) {
+  if (!profile?.id) return null;
+  const payload = communicationConsentAuditPayload({ profile, channel, consentType, status, source, headers });
+  if (!supabaseConfigured) {
+    ensureDemo();
+    demo.communicationConsents.unshift(payload);
+    return sanitizeCommunicationConsent(payload);
+  }
+  if (!(await supabaseTableExists("communication_consents"))) return null;
+  const rows = await supabaseFetch("/rest/v1/communication_consents?select=*", {
+    method: "POST",
+    service: true,
+    headers: { Prefer: "return=representation" },
+    body: await filterSupabaseTablePayload("communication_consents", payload)
+  });
+  return sanitizeCommunicationConsent(rows?.[0] || payload);
+}
+
+async function updateCommunicationPreferencesForProfile(profile = {}, body = {}, headers = {}) {
+  const current = await getCommunicationPreferencesForProfile(profile, { create: true });
+  const next = {
+    ...current,
+    transactional_email_enabled: body.transactional_email_enabled === undefined ? current.transactional_email_enabled : boolValue(body.transactional_email_enabled),
+    marketing_email_enabled: body.marketing_email_enabled === undefined ? current.marketing_email_enabled : boolValue(body.marketing_email_enabled),
+    transactional_sms_enabled: body.transactional_sms_enabled === undefined ? current.transactional_sms_enabled : boolValue(body.transactional_sms_enabled),
+    marketing_sms_enabled: body.marketing_sms_enabled === undefined ? current.marketing_sms_enabled : boolValue(body.marketing_sms_enabled),
+    in_app_enabled: body.in_app_enabled === undefined ? current.in_app_enabled : boolValue(body.in_app_enabled),
+    preferred_language: normalizeLanguage(body.preferred_language || body.language || current.preferred_language),
+    timezone: clean(body.timezone || current.timezone || "America/New_York"),
+    updated_at: nowIso()
+  };
+  if (!supabaseConfigured) {
+    ensureDemo();
+    const index = demo.communicationPreferences.findIndex((item) => item.user_id === profile.id);
+    if (index >= 0) demo.communicationPreferences[index] = next;
+    else demo.communicationPreferences.unshift(next);
+  } else if (await supabaseTableExists("communication_preferences")) {
+    await supabaseFetch("/rest/v1/communication_preferences?on_conflict=user_id", {
+      method: "POST",
+      service: true,
+      headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+      body: await filterSupabaseTablePayload("communication_preferences", next)
+    });
+  }
+  const events = [];
+  if (next.marketing_email_enabled !== current.marketing_email_enabled) {
+    events.push(await recordCommunicationConsentEvent({
+      profile,
+      channel: "email",
+      consentType: "marketing",
+      status: next.marketing_email_enabled ? "granted" : "revoked",
+      source: clean(body.source || "account_preferences"),
+      headers
+    }));
+  }
+  if (next.marketing_sms_enabled !== current.marketing_sms_enabled) {
+    events.push(await recordCommunicationConsentEvent({
+      profile,
+      channel: "sms",
+      consentType: "marketing",
+      status: next.marketing_sms_enabled ? "granted" : "revoked",
+      source: clean(body.source || "account_preferences"),
+      headers
+    }));
+  }
+  if (next.transactional_sms_enabled !== current.transactional_sms_enabled) {
+    events.push(await recordCommunicationConsentEvent({
+      profile,
+      channel: "sms",
+      consentType: "transactional",
+      status: next.transactional_sms_enabled ? "granted" : "revoked",
+      source: clean(body.source || "account_preferences"),
+      headers
+    }));
+  }
+  return {
+    preferences: sanitizeCommunicationPreference(next, profile),
+    consent_events: events.filter(Boolean)
+  };
+}
+
+async function guestCommunications(method, body, headers) {
+  const { profile } = await requireProfile(headers, ["guest"]);
+  if (method === "GET") {
+    const [preferences, consents] = await Promise.all([
+      getCommunicationPreferencesForProfile(profile, { create: true }),
+      getCommunicationConsentHistoryForProfile(profile)
+    ]);
+    return json(200, { mode: supabaseConfigured ? "supabase" : "demo", preferences, consents });
+  }
+  if (method !== "PATCH") return json(405, { error: "Method not allowed." });
+  const result = await updateCommunicationPreferencesForProfile(profile, body, headers);
+  return json(200, { mode: supabaseConfigured ? "supabase" : "demo", ...result });
+}
+
+async function isSuppressedDestination(destination = "", channel = "email") {
+  const normalized = normalizeDestination(destination, channel);
+  if (!normalized) return false;
+  if (!supabaseConfigured) {
+    ensureDemo();
+    return demo.suppressionList.some((item) => item.normalized_destination === normalized && normalizeCommunicationChannel(item.channel) === normalizeCommunicationChannel(channel));
+  }
+  const rows = await supabaseFetch(`/rest/v1/suppression_list?select=id&normalized_destination=eq.${encodeURIComponent(normalized)}&channel=eq.${encodeURIComponent(normalizeCommunicationChannel(channel))}&limit=1`, { service: true }).catch(() => []);
+  return Boolean(rows?.[0]);
+}
+
+function latestConsentAllowsMarketing(consents = [], channel = "email") {
+  const normalizedChannel = normalizeCommunicationChannel(channel);
+  const latest = [...(consents || [])]
+    .filter((item) => normalizeCommunicationChannel(item.channel) === normalizedChannel && normalizeConsentType(item.consent_type) === "marketing")
+    .sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")))[0];
+  return latest ? normalizeCommunicationConsentStatus(latest.status) === "granted" : false;
+}
+
+async function marketingAllowedForProfile(profile = {}, destination = "", channel = "email") {
+  const normalizedChannel = normalizeCommunicationChannel(channel);
+  const normalizedDestination = normalizeDestination(destination, normalizedChannel);
+  const validDestination = normalizedChannel === "email"
+    ? isValidSignupEmail(normalizedDestination)
+    : normalizedChannel === "sms"
+      ? isValidE164Phone(normalizedDestination)
+      : Boolean(normalizedDestination);
+  if (!profile?.id || !validDestination) return { allowed: false, reason: "missing_valid_recipient" };
+  if (await isSuppressedDestination(normalizedDestination, normalizedChannel)) return { allowed: false, reason: "suppressed" };
+  const [preferences, consents] = await Promise.all([
+    getCommunicationPreferencesForProfile(profile, { create: false }),
+    getCommunicationConsentHistoryForProfile(profile)
+  ]);
+  const preferenceAllows = normalizedChannel === "email"
+    ? Boolean(preferences.marketing_email_enabled)
+    : normalizedChannel === "sms"
+      ? Boolean(preferences.marketing_sms_enabled)
+      : false;
+  if (!preferenceAllows) return { allowed: false, reason: "marketing_preference_disabled" };
+  if (!latestConsentAllowsMarketing(consents, normalizedChannel)) return { allowed: false, reason: "marketing_consent_missing" };
+  return { allowed: true, reason: "eligible" };
+}
+
+function campaignStatus(value = "draft") {
+  const status = clean(value).toLowerCase().replace(/[\s-]+/g, "_");
+  return ["draft", "scheduled", "queued", "sending", "sent", "cancelled", "failed", "archived"].includes(status) ? status : "draft";
+}
+
+function sanitizeCampaignText(value = "", maxLength = 12000) {
+  return clean(value)
+    .replace(/\u0000/g, "")
+    .replace(/<\s*(script|style|iframe|object|embed|form|input|button|meta|link)[^>]*>[\s\S]*?<\s*\/\s*\1\s*>/gi, "")
+    .replace(/<\s*(script|style|iframe|object|embed|form|input|button|meta|link)[^>]*\/?\s*>/gi, "")
+    .replace(/\son[a-z]+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, "")
+    .replace(/\bjavascript\s*:/gi, "")
+    .replace(/\bdata\s*:\s*text\/html/gi, "")
+    .slice(0, maxLength);
+}
+
+function campaignTemplateVariables(...values) {
+  const names = new Set();
+  for (const value of values) {
+    const text = clean(value);
+    const matches = text.matchAll(/\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}/g);
+    for (const match of matches) names.add(clean(match[1]).toLowerCase());
+  }
+  return [...names];
+}
+
+function disallowedCampaignTemplateVariables(campaign = {}) {
+  const variables = campaignTemplateVariables(
+    campaign.subject_en,
+    campaign.subject_es,
+    campaign.subject_hu,
+    campaign.preheader_en,
+    campaign.preheader_es,
+    campaign.preheader_hu,
+    campaign.title_en,
+    campaign.title_es,
+    campaign.title_hu,
+    campaign.body_en,
+    campaign.body_es,
+    campaign.body_hu
+  );
+  return variables.filter((name) => !CAMPAIGN_TEMPLATE_VARIABLE_ALLOWLIST.has(name));
+}
+
+function validateCampaignTemplateVariables(campaign = {}) {
+  const disallowed = disallowedCampaignTemplateVariables(campaign);
+  if (!disallowed.length) return "";
+  return `Unsupported template variable: ${disallowed.slice(0, 3).join(", ")}.`;
+}
+
+function marketingComplianceFooter(language = "en") {
+  const preferencesUrl = `${PUBLIC_BASE_URL}/account/notifications`;
+  const unsubscribeUrl = `${preferencesUrl}?unsubscribe=marketing`;
+  const footerByLanguage = {
+    en: [
+      `Manage communication preferences: ${preferencesUrl}`,
+      `Unsubscribe from marketing emails: ${unsubscribeUrl}`,
+      `Business mailing address: ${BUSINESS_MAILING_ADDRESS}`
+    ],
+    es: [
+      `Gestiona tus preferencias de comunicacion: ${preferencesUrl}`,
+      `Darte de baja de emails de marketing: ${unsubscribeUrl}`,
+      `Direccion postal comercial: ${BUSINESS_MAILING_ADDRESS}`
+    ],
+    hu: [
+      `Kommunikacios beallitasok kezelese: ${preferencesUrl}`,
+      `Leiratkozas marketing emailekrol: ${unsubscribeUrl}`,
+      `Uzleti levelezesi cim: ${BUSINESS_MAILING_ADDRESS}`
+    ]
+  };
+  return footerByLanguage[normalizeLanguage(language)] || footerByLanguage.en;
+}
+
+function marketingEmailFooterText(language = "en") {
+  return marketingComplianceFooter(language).join("\n");
+}
+
+function campaignPayloadFromBody(body = {}, restaurant = null, profile = {}, mode = "partner") {
+  const audience = jsonFrom(body.audience_definition, {});
+  const channel = normalizeCommunicationChannel(body.channel || "email");
+  const offerId = clean(body.offer_id || audience.offer_id);
+  const audienceSource = clean(body.audience_source || body.source || audience.source).toLowerCase();
+  const offerUrl = audienceSource === "favorite_offer_alert"
+    ? safeCampaignOfferUrl(body.offer_url || audience.offer_url, restaurant || {}, offerId)
+    : "";
+  const payload = {
+    restaurant_id: restaurant?.id || nullableClean(body.restaurant_id),
+    created_by: profile.id,
+    campaign_type: mode === "admin" && !restaurant?.id ? "admin_broadcast" : "partner_marketing",
+    channel: channel === "email" ? "email" : "email",
+    name: sanitizeCampaignText(body.name || body.campaign_name || body.subject_en || "Untitled campaign", 160),
+    subject_en: sanitizeCampaignText(body.subject_en || body.subject || "", 180),
+    subject_es: sanitizeCampaignText(body.subject_es || "", 180),
+    subject_hu: sanitizeCampaignText(body.subject_hu || "", 180),
+    preheader_en: sanitizeCampaignText(body.preheader_en || body.preheader || "", 220),
+    preheader_es: sanitizeCampaignText(body.preheader_es || "", 220),
+    preheader_hu: sanitizeCampaignText(body.preheader_hu || "", 220),
+    body_en: sanitizeCampaignText(body.body_en || body.body || "", 12000),
+    body_es: sanitizeCampaignText(body.body_es || "", 12000),
+    body_hu: sanitizeCampaignText(body.body_hu || "", 12000),
+    audience_definition: {
+      followers: body.audience_followers === undefined ? audience.followers !== false : boolValue(body.audience_followers),
+      reservations: body.audience_reservations === undefined ? audience.reservations !== false : boolValue(body.audience_reservations),
+      restaurant_subscribers: body.audience_subscribers === undefined ? Boolean(audience.restaurant_subscribers) : boolValue(body.audience_subscribers),
+      offer_id: offerId,
+      filters: jsonFrom(body.filters, audience.filters || {}),
+      ...(audienceSource === "favorite_offer_alert" ? {
+        source: "favorite_offer_alert",
+        offer_url: offerUrl
+      } : {})
+    },
+    scheduled_at: nullableClean(body.scheduled_at),
+    status: campaignStatus(body.status || "draft"),
+    template_variable_allowlist: [...CAMPAIGN_TEMPLATE_VARIABLE_ALLOWLIST],
+    xss_sanitized_at: nowIso(),
+    updated_at: nowIso()
+  };
+  if (!payload.name) payload.name = "Untitled campaign";
+  return payload;
+}
+
+function validateCampaignForSending(campaign = {}) {
+  if (!clean(campaign.name)) return "Campaign name is required.";
+  if (!clean(campaign.subject_en || campaign.subject_es || campaign.subject_hu)) return "At least one subject is required.";
+  if (!clean(campaign.body_en || campaign.body_es || campaign.body_hu)) return "At least one body is required.";
+  const variableError = validateCampaignTemplateVariables(campaign);
+  if (variableError) return variableError;
+  return "";
+}
+
+function sanitizeCampaignForClient(campaign = {}, recipients = []) {
+  const recipientRows = Array.isArray(recipients) ? recipients : [];
+  const counts = recipientRows.reduce((acc, row) => {
+    const status = clean(row.status || "queued");
+    acc[status] = (acc[status] || 0) + 1;
+    return acc;
+  }, {});
+  return {
+    id: campaign.id,
+    restaurant_id: campaign.restaurant_id || null,
+    created_by: campaign.created_by || null,
+    campaign_type: campaign.campaign_type || "partner_marketing",
+    channel: campaign.channel || "email",
+    name: campaign.name || "",
+    subject_en: campaign.subject_en || "",
+    subject_es: campaign.subject_es || "",
+    subject_hu: campaign.subject_hu || "",
+    preheader_en: campaign.preheader_en || "",
+    preheader_es: campaign.preheader_es || "",
+    preheader_hu: campaign.preheader_hu || "",
+    body_en: campaign.body_en || "",
+    body_es: campaign.body_es || "",
+    body_hu: campaign.body_hu || "",
+    audience_definition: campaign.audience_definition || {},
+    scheduled_at: campaign.scheduled_at || null,
+    status: campaignStatus(campaign.status),
+    recipient_count: Number(campaign.recipient_count || recipientRows.length || 0),
+    sent_count: Number(campaign.sent_count || counts.sent || 0),
+    delivered_count: Number(campaign.delivered_count || counts.delivered || 0),
+    failed_count: Number(campaign.failed_count || counts.failed || counts.bounced || counts.complained || 0),
+    opened_count: Number(campaign.opened_count || counts.opened || 0),
+    clicked_count: Number(campaign.clicked_count || counts.clicked || 0),
+    created_at: campaign.created_at || null,
+    updated_at: campaign.updated_at || null,
+    recipients: recipientRows.slice(0, 50).map((row) => ({
+      id: row.id,
+      channel: row.channel || "email",
+      destination_hash: row.destination_hash || "",
+      language: normalizeLanguage(row.language || "en"),
+      status: clean(row.status || "queued"),
+      provider_message_id: row.provider_message_id || null,
+      queued_at: row.queued_at || null,
+      sent_at: row.sent_at || null,
+      delivered_at: row.delivered_at || null,
+      failed_at: row.failed_at || null,
+      failure_reason: row.failure_reason || null,
+      opened_at: row.opened_at || null,
+      clicked_at: row.clicked_at || null
+    }))
+  };
+}
+
+function campaignTemplatesForRestaurant(restaurant = {}) {
+  const restaurantName = clean(restaurant.name || "your restaurant");
+  return [
+    {
+      id: "new_offer",
+      name: "New offer announcement",
+      subject_en: `New SmartTable offer at ${restaurantName}`,
+      subject_es: `Nueva oferta de SmartTable en ${restaurantName}`,
+      subject_hu: `Új SmartTable ajánlat itt: ${restaurantName}`,
+      preheader_en: "A new restaurant offer is available for guests who opted in.",
+      preheader_es: "Hay una nueva oferta para los clientes que aceptaron recibir mensajes.",
+      preheader_hu: "Új ajánlat érhető el azoknak a vendégeknek, akik feliratkoztak.",
+      body_en: `A new SmartTable offer is available at ${restaurantName}. Reserve through SmartTable while tables are available.`,
+      body_es: `Hay una nueva oferta de SmartTable en ${restaurantName}. Reserva por SmartTable mientras haya mesas disponibles.`,
+      body_hu: `Új SmartTable ajánlat érhető el itt: ${restaurantName}. Foglalj a SmartTable-en, amíg vannak elérhető asztalok.`
+    },
+    {
+      id: "quiet_window",
+      name: "Quiet window invitation",
+      subject_en: `${restaurantName} has selected SmartTable tables available`,
+      subject_es: `${restaurantName} tiene mesas SmartTable disponibles`,
+      subject_hu: `${restaurantName} SmartTable asztalokat kínál`,
+      preheader_en: "A limited availability note from a restaurant you follow.",
+      preheader_es: "Una nota de disponibilidad limitada de un restaurante que sigues.",
+      preheader_hu: "Korlátozott elérhetőségi értesítés egy általad követett étteremtől.",
+      body_en: `${restaurantName} has selected reservation windows available for opted-in SmartTable guests.`,
+      body_es: `${restaurantName} tiene horarios seleccionados disponibles para clientes SmartTable suscritos.`,
+      body_hu: `${restaurantName} kiválasztott foglalási időpontokat kínál feliratkozott SmartTable vendégeknek.`
+    }
+  ];
+}
+
+function publicRestaurantOfferUrl(restaurant = {}, offer = {}) {
+  const slugOrId = clean(restaurant.slug || restaurant.public_slug || restaurant.id);
+  const path = slugOrId ? `/restaurants/${encodeURIComponent(slugOrId)}` : "/restaurants";
+  const url = new URL(path, PUBLIC_BASE_URL);
+  if (offer?.id) url.searchParams.set("offer", clean(offer.id));
+  return url.toString();
+}
+
+function safeCampaignOfferUrl(value = "", restaurant = {}, offerId = "") {
+  const supplied = safeUrlValue(value);
+  if (supplied) {
+    try {
+      const parsed = new URL(supplied);
+      const base = new URL(PUBLIC_BASE_URL);
+      if (parsed.origin === base.origin && parsed.pathname.startsWith("/restaurants")) return parsed.toString();
+    } catch {
+      // Fall back to the server-generated restaurant URL below.
+    }
+  }
+  if (restaurant?.id) return publicRestaurantOfferUrl(restaurant, offerId ? { id: offerId } : {});
+  return "";
+}
+
+function offerAvailabilityRemaining(offer = {}) {
+  const available = numberOr(offer.available_tables ?? offer.seat_count, 0);
+  const reserved = numberOr(offer.reserved_tables, 0);
+  return Math.max(available - reserved, 0);
+}
+
+function offerIsNotPast(offer = {}) {
+  const offerDate = clean(offer.offer_date || offer.reservation_date);
+  if (!offerDate) return true;
+  return offerDate >= new Date().toISOString().slice(0, 10);
+}
+
+function favoriteOfferCampaignEligibilityError(offer = {}) {
+  const status = clean(offer.status || "active").toLowerCase();
+  if (status !== "active") return "Only active offers can be sent to favorite guests.";
+  if (!offerIsNotPast(offer)) return "Expired offers cannot be sent to favorite guests.";
+  if (offerAvailabilityRemaining(offer) <= 0) return "This offer has no available tables.";
+  return "";
+}
+
+function favoriteOfferCampaignPayload(restaurant = {}, offer = {}, profile = {}) {
+  const restaurantName = clean(restaurant.display_name || restaurant.name || "your restaurant");
+  const offerTitle = localizedField(offer, "title", "en") || clean(offer.offer_title || "SmartTable table offer");
+  const discount = numberOr(offer.discount_value, offer.discount_percent || 0);
+  const discountText = discount ? `${discount}%` : "SmartTable";
+  const dateText = [clean(offer.offer_date), clean(offer.start_time || offer.offer_time), clean(offer.end_time ? `-${offer.end_time}` : "")].filter(Boolean).join(" ");
+  const offerUrl = publicRestaurantOfferUrl(restaurant, offer);
+  const enBody = [
+    `Good news: ${restaurantName} has new SmartTable tables available.`,
+    `${offerTitle}`,
+    discount ? `Discount: ${discountText} off` : "",
+    dateText ? `When: ${dateText}` : "",
+    `Reserve while tables are available: ${offerUrl}`
+  ].filter(Boolean).join("\n\n");
+  const esBody = [
+    `Buenas noticias: ${restaurantName} tiene mesas SmartTable disponibles.`,
+    `${offerTitle}`,
+    discount ? `Descuento: ${discountText}` : "",
+    dateText ? `Horario: ${dateText}` : "",
+    `Reserva mientras haya mesas disponibles: ${offerUrl}`
+  ].filter(Boolean).join("\n\n");
+  const huBody = [
+    `Jó hír: ${restaurantName} új SmartTable asztalokat tett elérhetővé.`,
+    `${offerTitle}`,
+    discount ? `Kedvezmény: ${discountText}` : "",
+    dateText ? `Időpont: ${dateText}` : "",
+    `Foglalj, amíg vannak elérhető asztalok: ${offerUrl}`
+  ].filter(Boolean).join("\n\n");
+  return {
+    restaurant_id: restaurant.id,
+    created_by: profile.id,
+    campaign_type: "partner_marketing",
+    channel: "email",
+    name: sanitizeCampaignText(`Favorite guest alert - ${restaurantName} - ${offerTitle}`, 160),
+    subject_en: sanitizeCampaignText(`New tables available at ${restaurantName}`, 180),
+    subject_es: sanitizeCampaignText(`Nuevas mesas disponibles en ${restaurantName}`, 180),
+    subject_hu: sanitizeCampaignText(`Új asztalok érhetők el itt: ${restaurantName}`, 180),
+    preheader_en: "A restaurant you saved has new SmartTable availability.",
+    preheader_es: "Un restaurante que guardaste tiene nueva disponibilidad SmartTable.",
+    preheader_hu: "Egy kedvenc éttermednél új SmartTable elérhetőség van.",
+    body_en: sanitizeCampaignText(enBody, 12000),
+    body_es: sanitizeCampaignText(esBody, 12000),
+    body_hu: sanitizeCampaignText(huBody, 12000),
+    audience_definition: {
+      followers: true,
+      reservations: false,
+      restaurant_subscribers: false,
+      offer_id: clean(offer.id),
+      source: "favorite_offer_alert",
+      offer_url: offerUrl,
+      filters: {}
+    },
+    scheduled_at: nowIso(),
+    status: "queued",
+    template_variable_allowlist: [...CAMPAIGN_TEMPLATE_VARIABLE_ALLOWLIST],
+    xss_sanitized_at: nowIso(),
+    updated_at: nowIso()
+  };
+}
+
+async function getOfferForFavoriteGuestCampaign(restaurantId = "", offerId = "") {
+  const rid = clean(restaurantId);
+  const id = clean(offerId);
+  if (!rid || !id) return null;
+  if (!supabaseConfigured) {
+    ensureDemo();
+    return demo.offers.find((item) => clean(item.id) === id && clean(item.restaurant_id) === rid) || null;
+  }
+  const rows = await supabaseFetch(`/rest/v1/offers?select=*&id=eq.${encodeURIComponent(id)}&restaurant_id=eq.${encodeURIComponent(rid)}&limit=1`, { service: true }).catch(() => []);
+  return rows?.[0] || null;
+}
+
+async function recentFavoriteOfferCampaign(restaurantId = "", offerId = "") {
+  const rid = clean(restaurantId);
+  const id = clean(offerId);
+  if (!rid || !id) return null;
+  const isRecent = (campaign = {}) => {
+    const createdAt = Date.parse(campaign.created_at || campaign.scheduled_at || 0);
+    return Number.isFinite(createdAt) && Date.now() - createdAt < 24 * 60 * 60 * 1000;
+  };
+  const matches = (campaign = {}) => {
+    const audience = campaign.audience_definition || {};
+    return clean(campaign.restaurant_id) === rid
+      && clean(audience.offer_id) === id
+      && clean(audience.source) === "favorite_offer_alert"
+      && !["cancelled", "archived", "failed"].includes(campaignStatus(campaign.status))
+      && isRecent(campaign);
+  };
+  if (!supabaseConfigured) {
+    ensureDemo();
+    return demo.messageCampaigns.find(matches) || null;
+  }
+  const rows = await supabaseFetch(`/rest/v1/message_campaigns?select=*&restaurant_id=eq.${encodeURIComponent(rid)}&order=created_at.desc&limit=50`, { service: true }).catch(() => []);
+  return (rows || []).find(matches) || null;
+}
+function campaignLocalizedValue(campaign = {}, base = "subject", lang = "en") {
+  const language = normalizeLanguage(lang);
+  return clean(campaign[`${base}_${language}`]) || clean(campaign[`${base}_en`]) || clean(campaign[`${base}_es`]) || clean(campaign[`${base}_hu`]);
+}
+
+function campaignEmailMessage(campaign = {}, recipient = {}, restaurant = {}) {
+  const language = normalizeLanguage(recipient.language || "en");
+  const subject = campaignLocalizedValue(campaign, "subject", language) || `SmartTable update from ${restaurant.name || "your restaurant"}`;
+  const preheader = campaignLocalizedValue(campaign, "preheader", language);
+  const body = campaignLocalizedValue(campaign, "body", language);
+  const preferencesUrl = `${PUBLIC_BASE_URL}/account/notifications`;
+  const audience = campaign.audience_definition || {};
+  const offerAlert = clean(audience.source) === "favorite_offer_alert";
+  const actionUrl = offerAlert && clean(audience.offer_url) ? clean(audience.offer_url) : preferencesUrl;
+  const actionLabel = offerAlert
+    ? ({ en: "View available tables", es: "Ver mesas disponibles", hu: "Elérhető asztalok megtekintése" }[language] || "View available tables")
+    : "Manage or unsubscribe";
+  const footer = marketingEmailFooterText(language);
+  const bodyWithFooter = `${body}\n\n${footer}`;
+  return {
+    to: recipient.email || recipient.destination_email,
+    subject,
+    text: bodyWithFooter,
+    html: appEmailHtml(subject, body, { label: actionLabel, url: actionUrl }, {
+      preheader,
+      footer: `You are receiving this optional marketing message because you opted in to restaurant communications through SmartTable.\n${footer}`
+    })
+  };
+}
+
+async function resolveCampaignProfileByEmail(email = "") {
+  const normalizedEmail = lower(email);
+  if (!normalizedEmail || !isValidSignupEmail(normalizedEmail)) return null;
+  if (!supabaseConfigured) {
+    ensureDemo();
+    return clientProfile(demo.profiles.find((item) => lower(item.email) === normalizedEmail) || null);
+  }
+  const rows = await supabaseFetch(`/rest/v1/profiles?select=*&email=eq.${encodeURIComponent(normalizedEmail)}&limit=1`, { service: true }).catch(() => []);
+  if (rows?.[0]) return clientProfile(rows[0]);
+  const guests = await supabaseFetch(`/rest/v1/guests?select=user_id,email,selected_language&email=eq.${encodeURIComponent(normalizedEmail)}&limit=1`, { service: true }).catch(() => []);
+  const userId = guests?.[0]?.user_id;
+  if (!userId) return null;
+  const profiles = await supabaseFetch(`/rest/v1/profiles?select=*&id=eq.${encodeURIComponent(userId)}&limit=1`, { service: true }).catch(() => []);
+  return clientProfile(profiles?.[0] || { id: userId, email: normalizedEmail, role: "guest", preferred_language: guests?.[0]?.selected_language || "en" });
+}
+
+async function campaignAudienceCandidates(restaurant = {}, audience = {}) {
+  const candidates = new Map();
+  const add = (candidate = {}) => {
+    const email = lower(candidate.email || candidate.guest_email);
+    if (!email || !isValidSignupEmail(email)) return;
+    const key = candidate.user_id || email;
+    const existing = candidates.get(key) || {};
+    candidates.set(key, {
+      ...existing,
+      ...candidate,
+      email,
+      source: [...new Set([...(existing.source ? arrayFrom(existing.source) : []), candidate.source].filter(Boolean))]
+    });
+  };
+
+  if (!supabaseConfigured) {
+    ensureDemo();
+    if (audience.followers !== false) {
+      demo.restaurantFollowers
+        .filter((item) => item.restaurant_id === restaurant.id && item.notification_enabled !== false)
+        .forEach((item) => add({ ...item, email: item.guest_email, source: "favorite" }));
+    }
+    if (audience.reservations !== false) {
+      demo.reservations
+        .filter((item) => item.restaurant_id === restaurant.id && ["accepted", "completed"].includes(normalizeReservationStatus(item.status)))
+        .forEach((item) => add({ user_id: item.guest_id, email: item.guest_email, language: item.guest_language, source: "reservation" }));
+    }
+    return [...candidates.values()];
+  }
+
+  const tasks = [];
+  if (audience.followers !== false) {
+    tasks.push(supabaseFetch(`/rest/v1/restaurant_followers?select=guest_email,guest_name,notification_enabled&restaurant_id=eq.${encodeURIComponent(restaurant.id)}&notification_enabled=eq.true`, { service: true }).catch(() => []));
+  } else {
+    tasks.push(Promise.resolve([]));
+  }
+  if (audience.reservations !== false) {
+    tasks.push(supabaseFetch(`/rest/v1/reservations?select=guest_id,guest_email,guest_name,guest_language,status&restaurant_id=eq.${encodeURIComponent(restaurant.id)}&status=in.(accepted,completed)&limit=1000`, { service: true }).catch(() => []));
+  } else {
+    tasks.push(Promise.resolve([]));
+  }
+  const [followers, reservations] = await Promise.all(tasks);
+  (followers || []).forEach((item) => add({ ...item, email: item.guest_email, source: "favorite" }));
+  (reservations || []).forEach((item) => add({ user_id: item.guest_id, email: item.guest_email, language: item.guest_language, source: "reservation" }));
+  return [...candidates.values()];
+}
+
+async function eligibleCampaignAudience(restaurant = {}, audience = {}) {
+  const candidates = await campaignAudienceCandidates(restaurant, audience);
+  const recipients = [];
+  for (const candidate of candidates) {
+    const resolvedProfile = await resolveCampaignProfileByEmail(candidate.email) || (candidate.user_id ? clientProfile({
+      id: candidate.user_id,
+      email: candidate.email,
+      role: "guest",
+      preferred_language: candidate.language || "en"
+    }) : null);
+    if (!resolvedProfile?.id) continue;
+    const allowed = await marketingAllowedForProfile(resolvedProfile, candidate.email, "email");
+    if (!allowed.allowed) continue;
+    recipients.push({
+      user_id: resolvedProfile.id,
+      email: lower(candidate.email || resolvedProfile.email),
+      language: normalizeLanguage(candidate.language || resolvedProfile.preferred_language || "en"),
+      destination_hash: hashEmailValue(lower(candidate.email || resolvedProfile.email)),
+      source: candidate.source
+    });
+  }
+  return recipients;
+}
+
+async function listMessageCampaignRecipients(campaignId) {
+  const id = clean(campaignId);
+  if (!id) return [];
+  if (!supabaseConfigured) {
+    ensureDemo();
+    return demo.messageRecipients.filter((item) => item.campaign_id === id);
+  }
+  return await supabaseFetch(`/rest/v1/message_recipients?select=*&campaign_id=eq.${encodeURIComponent(id)}&order=queued_at.desc.nullslast`, { service: true }).catch(() => []);
+}
+
+async function updateCampaignCounts(campaign = {}, patch = {}) {
+  if (!campaign?.id) return campaign;
+  const next = { ...campaign, ...patch, updated_at: nowIso() };
+  if (!supabaseConfigured) {
+    ensureDemo();
+    const index = demo.messageCampaigns.findIndex((item) => item.id === campaign.id);
+    if (index >= 0) demo.messageCampaigns[index] = next;
+    return next;
+  }
+  await supabaseFetch(`/rest/v1/message_campaigns?id=eq.${encodeURIComponent(campaign.id)}`, {
+    method: "PATCH",
+    service: true,
+    headers: { Prefer: "return=minimal" },
+    body: { ...patch, updated_at: nowIso() }
+  });
+  return next;
+}
+
+async function saveMessageCampaignRecord(payload = {}, existing = null) {
+  if (!supabaseConfigured) {
+    ensureDemo();
+    if (existing?.id) {
+      const index = demo.messageCampaigns.findIndex((item) => item.id === existing.id);
+      const next = { ...existing, ...payload, updated_at: nowIso() };
+      if (index >= 0) demo.messageCampaigns[index] = next;
+      return next;
+    }
+    const row = { id: crypto.randomUUID(), recipient_count: 0, sent_count: 0, delivered_count: 0, failed_count: 0, opened_count: 0, clicked_count: 0, created_at: nowIso(), ...payload, updated_at: nowIso() };
+    demo.messageCampaigns.unshift(row);
+    return row;
+  }
+  if (existing?.id) {
+    const rows = await supabaseFetch(`/rest/v1/message_campaigns?id=eq.${encodeURIComponent(existing.id)}&select=*`, {
+      method: "PATCH",
+      service: true,
+      headers: { Prefer: "return=representation" },
+      body: payload
+    });
+    return rows?.[0] || { ...existing, ...payload };
+  }
+  const rows = await supabaseFetch("/rest/v1/message_campaigns?select=*", {
+    method: "POST",
+    service: true,
+    headers: { Prefer: "return=representation" },
+    body: payload
+  });
+  return rows?.[0] || payload;
+}
+
+async function getMessageCampaignScoped(id, restaurant = null, profile = {}) {
+  const campaignId = clean(id);
+  if (!campaignId) return null;
+  const canAdmin = roleMatches(profile.role, ["admin"]);
+  if (!supabaseConfigured) {
+    ensureDemo();
+    const row = demo.messageCampaigns.find((item) => item.id === campaignId);
+    if (!row) return null;
+    if (!canAdmin && row.restaurant_id !== restaurant?.id) return null;
+    return row;
+  }
+  const filter = canAdmin
+    ? `id=eq.${encodeURIComponent(campaignId)}`
+    : `id=eq.${encodeURIComponent(campaignId)}&restaurant_id=eq.${encodeURIComponent(restaurant?.id || "")}`;
+  const rows = await supabaseFetch(`/rest/v1/message_campaigns?select=*&${filter}&limit=1`, { service: true }).catch(() => []);
+  return rows?.[0] || null;
+}
+
+async function snapshotCampaignRecipients(campaign = {}, restaurant = {}) {
+  const existing = await listMessageCampaignRecipients(campaign.id);
+  if (existing.length) return existing;
+  const eligible = await eligibleCampaignAudience(restaurant, campaign.audience_definition || {});
+  const now = nowIso();
+  const rows = eligible.map((recipient) => ({
+    id: crypto.randomUUID(),
+    campaign_id: campaign.id,
+    user_id: recipient.user_id,
+    channel: "email",
+    destination_hash: recipient.destination_hash,
+    destination_email: recipient.email,
+    language: recipient.language,
+    status: "queued",
+    provider_message_id: null,
+    queued_at: now,
+    sent_at: null,
+    delivered_at: null,
+    failed_at: null,
+    failure_reason: null,
+    opened_at: null,
+    clicked_at: null
+  }));
+  if (!supabaseConfigured) {
+    ensureDemo();
+    demo.messageRecipients.unshift(...rows);
+  } else if (rows.length) {
+    await supabaseFetch("/rest/v1/message_recipients", {
+      method: "POST",
+      service: true,
+      headers: { Prefer: "return=minimal" },
+      body: rows.map(({ destination_email, ...row }) => row)
+    });
+  }
+  await updateCampaignCounts(campaign, { recipient_count: rows.length });
+  return rows;
+}
+
+async function queueCampaignRecipientEmails(campaign = {}, recipients = [], restaurant = {}) {
+  const queued = [];
+  for (const recipient of recipients.slice(0, PARTNER_CAMPAIGN_QUEUE_BATCH_LIMIT)) {
+    const email = recipient.email || recipient.destination_email;
+    if (!email || !isValidSignupEmail(email)) continue;
+    const message = campaignEmailMessage(campaign, { ...recipient, email }, restaurant);
+    const queueRecord = await createEmailQueueRecord(message, {
+      email_type: "partner_marketing_campaign",
+      event_type: "partner_marketing_campaign",
+      recipient_user_id: recipient.user_id,
+      restaurant_id: campaign.restaurant_id || restaurant.id,
+      message_campaign_id: campaign.id,
+      locale: recipient.language,
+      template_version: MESSAGE_CAMPAIGN_TEMPLATE_VERSION,
+      idempotency_key: hashEmailValue(`message-campaign:${campaign.id}:${recipient.destination_hash}`)
+    });
+    queued.push(queueRecord);
+  }
+  return queued;
+}
+
+async function restaurantForCampaign(campaign = {}) {
+  const restaurantId = clean(campaign.restaurant_id);
+  if (!restaurantId) return null;
+  if (!supabaseConfigured) {
+    ensureDemo();
+    return demo.restaurants.find((item) => item.id === restaurantId) || null;
+  }
+  const rows = await supabaseFetch(`/rest/v1/restaurants?select=*&id=eq.${encodeURIComponent(restaurantId)}&limit=1`, { service: true }).catch(() => []);
+  return rows?.[0] || null;
+}
+
+async function listScheduledMessageCampaigns({ limit = 20, restaurant = null } = {}) {
+  const cappedLimit = Math.min(Math.max(1, Number(limit || 20)), 100);
+  const now = nowIso();
+  if (!supabaseConfigured) {
+    ensureDemo();
+    return demo.messageCampaigns
+      .filter((item) =>
+        campaignStatus(item.status) === "scheduled" &&
+        item.scheduled_at &&
+        item.scheduled_at <= now &&
+        (!restaurant?.id || item.restaurant_id === restaurant.id)
+      )
+      .sort((a, b) => String(a.scheduled_at || "").localeCompare(String(b.scheduled_at || "")))
+      .slice(0, cappedLimit);
+  }
+  const restaurantFilter = restaurant?.id ? `&restaurant_id=eq.${encodeURIComponent(restaurant.id)}` : "";
+  return await supabaseFetch(`/rest/v1/message_campaigns?select=*&status=eq.scheduled&scheduled_at=lte.${encodeURIComponent(now)}${restaurantFilter}&order=scheduled_at.asc&limit=${cappedLimit}`, { service: true }).catch(() => []);
+}
+
+async function processScheduledMessageCampaigns({ limit = 20, restaurant = null } = {}) {
+  const campaigns = await listScheduledMessageCampaigns({ limit, restaurant });
+  const processed = [];
+  for (const campaign of campaigns) {
+    const scopedRestaurant = restaurant || await restaurantForCampaign(campaign);
+    if (!scopedRestaurant?.id) {
+      const failed = await updateCampaignCounts(campaign, { status: "failed", failed_count: Number(campaign.failed_count || 0) + 1 });
+      processed.push({ campaign_id: campaign.id, status: failed.status, queued_count: 0, error: "RESTAURANT_NOT_FOUND" });
+      continue;
+    }
+    const recipients = await snapshotCampaignRecipients(campaign, scopedRestaurant);
+    const queued = await queueCampaignRecipientEmails(campaign, recipients, scopedRestaurant);
+    const next = await updateCampaignCounts(campaign, {
+      status: "queued",
+      recipient_count: recipients.length,
+      sent_count: Number(campaign.sent_count || 0)
+    });
+    processed.push({
+      campaign_id: campaign.id,
+      status: next.status,
+      recipient_count: recipients.length,
+      queued_count: queued.length,
+      raw_recipients_exposed: false
+    });
+  }
+  return processed;
+}
+
+async function messageCampaigns(method, body, headers, query, mode = "partner") {
+  const { profile } = await requireProfile(headers, mode === "admin" ? ["admin"] : ["partner", "admin"]);
+  const isAdminMode = mode === "admin";
+  const restaurant = isAdminMode && !clean(body.restaurant_id || query.get("restaurant_id"))
+    ? null
+    : await getPartnerRestaurant(profile, query, body);
+
+  if (method === "GET") {
+    const templates = campaignTemplatesForRestaurant(restaurant || {});
+    if (!supabaseConfigured) {
+      ensureDemo();
+      const campaigns = demo.messageCampaigns
+        .filter((item) => isAdminMode ? true : item.restaurant_id === restaurant?.id)
+        .sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
+      return json(200, {
+        mode: "demo",
+        templates,
+        campaigns: campaigns.map((campaign) => sanitizeCampaignForClient(campaign, demo.messageRecipients.filter((item) => item.campaign_id === campaign.id)))
+      });
+    }
+    const restaurantFilter = restaurant?.id && !isAdminMode ? `&restaurant_id=eq.${encodeURIComponent(restaurant.id)}` : restaurant?.id ? `&restaurant_id=eq.${encodeURIComponent(restaurant.id)}` : "";
+    const campaigns = await supabaseFetch(`/rest/v1/message_campaigns?select=*&order=created_at.desc${restaurantFilter}&limit=100`, { service: true }).catch(() => []);
+    const recipientLists = await Promise.all((campaigns || []).map((campaign) => listMessageCampaignRecipients(campaign.id)));
+    return json(200, {
+      mode: "supabase",
+      templates,
+      campaigns: (campaigns || []).map((campaign, index) => sanitizeCampaignForClient(campaign, recipientLists[index] || []))
+    });
+  }
+
+  if (method !== "POST" && method !== "PATCH") return json(405, { error: "Method not allowed." });
+  const action = clean(body.action || "save_draft");
+
+  if (action === "process_scheduled") {
+    const processed = await processScheduledMessageCampaigns({
+      limit: body.limit || 20,
+      restaurant: isAdminMode && !restaurant?.id ? null : restaurant
+    });
+    await createAuditLog({
+      profile,
+      action: "message_campaigns_process_scheduled",
+      entityType: "message_campaign",
+      entityId: restaurant?.id || "global",
+      metadata: { processed_count: processed.length, restaurant_id: restaurant?.id || null }
+    });
+    return json(200, { processed, raw_recipients_exposed: false });
+  }
+
+  if (action === "estimate_audience") {
+    if (!restaurant?.id) return json(400, { error: "A restaurant-scoped audience is required for campaign estimates." });
+    const payload = campaignPayloadFromBody(body, restaurant, profile, mode);
+    const recipients = await eligibleCampaignAudience(restaurant, payload.audience_definition || {});
+    return json(200, {
+      audience_count: recipients.length,
+      recipient_count: recipients.length,
+      destination_hashes: recipients.slice(0, 25).map((item) => item.destination_hash.slice(0, 16)),
+      raw_recipients_exposed: false
+    });
+  }
+
+  if (action === "test_email") {
+    const to = lower(body.test_email || body.recipient_email || body.email);
+    if (!to || !isValidSignupEmail(to)) return json(400, { error: "Enter a valid test recipient email." });
+    const payload = campaignPayloadFromBody(body, restaurant, profile, mode);
+    const validation = validateCampaignForSending(payload);
+    if (validation) return json(400, { error: validation });
+    const message = campaignEmailMessage(payload, { email: to, language: normalizeLanguage(body.language || profile.preferred_language || "en") }, restaurant || { name: "SmartTable" });
+    const result = await sendEmail(message, {
+      email_type: "partner_campaign_test",
+      event_type: "partner_campaign_test",
+      recipient_user_id: null,
+      restaurant_id: restaurant?.id || null,
+      locale: normalizeLanguage(body.language || profile.preferred_language || "en"),
+      template_version: MESSAGE_CAMPAIGN_TEMPLATE_VERSION,
+      idempotency_key: hashEmailValue(`campaign-test:${profile.id}:${to}:${Math.floor(Date.now() / 60000)}`)
+    });
+    await createAuditLog({
+      profile,
+      action: "message_campaign_test_email",
+      entityType: "message_campaign",
+      entityId: restaurant?.id || "test",
+      metadata: {
+        restaurant_id: restaurant?.id || null,
+        accepted: isEmailAccepted(result),
+        provider: result.provider,
+        recipient_hash: hashEmailValue(to).slice(0, 16)
+      }
+    });
+    return json(isEmailAccepted(result) ? 200 : 502, {
+      accepted: isEmailAccepted(result),
+      provider: result.provider,
+      message_id: result.messageId || result.provider_id || null,
+      status: result.status,
+      error: isEmailAccepted(result) ? null : "Test email was not accepted by the provider."
+    });
+  }
+
+  if (action === "notify_favorite_guests_for_offer") {
+    if (!restaurant?.id) return json(400, { error: "A restaurant-scoped offer is required." });
+    requireRestaurantAccessRole(restaurant, ["owner", "manager", "marketing_staff"]);
+    const offer = await getOfferForFavoriteGuestCampaign(restaurant.id, body.offer_id || body.id);
+    if (!offer?.id) return json(404, { error: "Offer not found." });
+    const eligibilityError = favoriteOfferCampaignEligibilityError(offer);
+    if (eligibilityError) return json(409, { error: eligibilityError });
+    const duplicate = await recentFavoriteOfferCampaign(restaurant.id, offer.id);
+    if (duplicate?.id) {
+      await createAuditLog({
+        profile,
+        action: "message_campaign_offer_followers_duplicate_prevented",
+        entityType: "message_campaign",
+        entityId: duplicate.id,
+        metadata: {
+          restaurant_id: restaurant.id,
+          offer_id: offer.id
+        }
+      });
+      return json(200, {
+        duplicate_prevented: true,
+        campaign: sanitizeCampaignForClient(duplicate, await listMessageCampaignRecipients(duplicate.id)),
+        queued_count: 0,
+        raw_recipients_exposed: false
+      });
+    }
+    const campaign = await saveMessageCampaignRecord(favoriteOfferCampaignPayload(restaurant, offer, profile));
+    const recipients = await snapshotCampaignRecipients(campaign, restaurant);
+    const queued = await queueCampaignRecipientEmails(campaign, recipients, restaurant);
+    const next = await updateCampaignCounts(campaign, {
+      status: "queued",
+      recipient_count: recipients.length,
+      recipient_snapshot_at: campaign.recipient_snapshot_at || nowIso(),
+      recipient_snapshot_hash: hashEmailValue(`${campaign.id}:${recipients.map((item) => item.destination_hash).sort().join(",")}`)
+    });
+    await createAuditLog({
+      profile,
+      action: "message_campaign_offer_followers_queued",
+      entityType: "message_campaign",
+      entityId: next.id,
+      metadata: {
+        restaurant_id: restaurant.id,
+        offer_id: offer.id,
+        recipient_count: recipients.length,
+        queued_count: queued.length
+      }
+    });
+    return json(200, {
+      campaign: sanitizeCampaignForClient(next, recipients),
+      queued_count: queued.length,
+      raw_recipients_exposed: false
+    });
+  }
+
+  const existing = body.id ? await getMessageCampaignScoped(body.id, restaurant, profile) : null;
+  if (body.id && !existing) return json(404, { error: "Campaign not found." });
+
+  if (action === "cancel") {
+    if (!existing) return json(404, { error: "Campaign not found." });
+    if (!["scheduled", "queued", "draft"].includes(campaignStatus(existing.status))) return json(409, { error: "Only draft, scheduled, or queued campaigns can be cancelled." });
+    const next = await updateCampaignCounts(existing, { status: "cancelled", cancelled_at: nowIso() });
+    await createAuditLog({
+      profile,
+      action: "message_campaign_cancelled",
+      entityType: "message_campaign",
+      entityId: next.id,
+      metadata: { restaurant_id: next.restaurant_id || restaurant?.id || null, previous_status: existing.status }
+    });
+    return json(200, { campaign: sanitizeCampaignForClient(next, await listMessageCampaignRecipients(next.id)) });
+  }
+
+  if (action === "archive") {
+    if (!existing) return json(404, { error: "Campaign not found." });
+    const next = await updateCampaignCounts(existing, { status: "archived", archived_at: nowIso() });
+    await createAuditLog({
+      profile,
+      action: "message_campaign_archived",
+      entityType: "message_campaign",
+      entityId: next.id,
+      metadata: { restaurant_id: next.restaurant_id || restaurant?.id || null, previous_status: existing.status }
+    });
+    return json(200, { campaign: sanitizeCampaignForClient(next, await listMessageCampaignRecipients(next.id)) });
+  }
+
+  if (action === "clone") {
+    if (!existing) return json(404, { error: "Campaign not found." });
+    const { id, created_at, updated_at, recipient_count, sent_count, delivered_count, failed_count, opened_count, clicked_count, ...copy } = existing;
+    const cloned = await saveMessageCampaignRecord({
+      ...copy,
+      name: `${existing.name || "Campaign"} copy`,
+      status: "draft",
+      scheduled_at: null,
+      recipient_count: 0,
+      sent_count: 0,
+      delivered_count: 0,
+      failed_count: 0,
+      opened_count: 0,
+      clicked_count: 0,
+      created_at: nowIso(),
+      updated_at: nowIso()
+    });
+    await createAuditLog({
+      profile,
+      action: "message_campaign_cloned",
+      entityType: "message_campaign",
+      entityId: cloned.id,
+      metadata: { source_campaign_id: existing.id, restaurant_id: cloned.restaurant_id || restaurant?.id || null }
+    });
+    return json(201, { campaign: sanitizeCampaignForClient(cloned, []) });
+  }
+
+  const payload = campaignPayloadFromBody(body, restaurant, profile, mode);
+  if (action === "save_draft") payload.status = "draft";
+  if (action === "schedule") {
+    if (!payload.scheduled_at) return json(400, { error: "A scheduled send time is required." });
+    payload.status = "scheduled";
+  }
+  if (action === "send_now") {
+    payload.status = "queued";
+    payload.scheduled_at = nowIso();
+  }
+  if (["schedule", "send_now"].includes(action)) {
+    const validation = validateCampaignForSending(payload);
+    if (validation) return json(400, { error: validation });
+    if (!restaurant?.id && payload.campaign_type !== "admin_broadcast") return json(400, { error: "Campaign requires a restaurant scope." });
+  }
+  if (action === "save_draft") {
+    const variableError = validateCampaignTemplateVariables(payload);
+    if (variableError) return json(400, { error: variableError });
+  }
+
+  const campaign = await saveMessageCampaignRecord(payload, existing);
+  if (["schedule", "send_now"].includes(action)) {
+    if (!restaurant?.id) return json(400, { error: "Broad admin broadcasts require a reviewed recipient policy before sending." });
+    const recipients = await snapshotCampaignRecipients(campaign, restaurant);
+    const queued = action === "send_now" ? await queueCampaignRecipientEmails(campaign, recipients, restaurant) : [];
+    const next = await updateCampaignCounts(campaign, {
+      status: action === "send_now" ? "queued" : "scheduled",
+      recipient_count: recipients.length,
+      recipient_snapshot_at: campaign.recipient_snapshot_at || nowIso(),
+      recipient_snapshot_hash: hashEmailValue(`${campaign.id}:${recipients.map((item) => item.destination_hash).sort().join(",")}`)
+    });
+    await createAuditLog({
+      profile,
+      action: action === "send_now" ? "message_campaign_queued" : "message_campaign_scheduled",
+      entityType: "message_campaign",
+      entityId: next.id,
+      metadata: {
+        restaurant_id: next.restaurant_id || restaurant?.id || null,
+        recipient_count: recipients.length,
+        queued_count: queued.length
+      }
+    });
+    return json(200, {
+      campaign: sanitizeCampaignForClient(next, recipients),
+      queued_count: queued.length,
+      raw_recipients_exposed: false
+    });
+  }
+  await createAuditLog({
+    profile,
+    action: existing ? "message_campaign_updated" : "message_campaign_created",
+    entityType: "message_campaign",
+    entityId: campaign.id,
+    metadata: { restaurant_id: campaign.restaurant_id || restaurant?.id || null, status: campaign.status }
+  });
+  return json(existing ? 200 : 201, { campaign: sanitizeCampaignForClient(campaign, await listMessageCampaignRecipients(campaign.id)) });
+}
+
+function parseHourMinute(value = "") {
+  const match = clean(value).match(/^(\d{1,2}):(\d{2})$/);
+  if (!match) return null;
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  if (!Number.isInteger(hour) || !Number.isInteger(minute) || hour < 0 || hour > 23 || minute < 0 || minute > 59) return null;
+  return hour * 60 + minute;
+}
+
+function localMinutesForTimezone(timezone = "America/New_York", date = new Date()) {
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23",
+      timeZone: clean(timezone || "America/New_York")
+    }).formatToParts(date);
+    const hour = Number(parts.find((part) => part.type === "hour")?.value || 0);
+    const minute = Number(parts.find((part) => part.type === "minute")?.value || 0);
+    return hour * 60 + minute;
+  } catch {
+    const fallback = new Date(date);
+    return fallback.getUTCHours() * 60 + fallback.getUTCMinutes();
+  }
+}
+
+function smsQuietHoursDecision(timezone = "America/New_York", at = new Date()) {
+  const start = parseHourMinute(SMS_QUIET_HOURS_START) ?? 21 * 60;
+  const end = parseHourMinute(SMS_QUIET_HOURS_END) ?? 9 * 60;
+  const current = localMinutesForTimezone(timezone, at);
+  const quiet = start <= end ? current >= start && current < end : current >= start || current < end;
+  return {
+    quiet,
+    timezone: clean(timezone || "America/New_York"),
+    quiet_hours_start: SMS_QUIET_HOURS_START,
+    quiet_hours_end: SMS_QUIET_HOURS_END
+  };
+}
+
+function estimateSmsSegments(message = "") {
+  const body = clean(message);
+  if (!body) return 0;
+  const gsmLike = /^[\u000A\u000D\u0020-\u007E\u00A3\u00A5\u00E8\u00E9\u00F9\u00EC\u00F2\u00C7\u00D8\u00F8\u00C5\u00E5\u0394_\u03A6\u0393\u039B\u03A9\u03A0\u03A8\u03A3\u0398\u039E\u00C6\u00E6\u00DF\u00C9]*$/.test(body);
+  const singleLimit = gsmLike ? 160 : 70;
+  const concatLimit = gsmLike ? 153 : 67;
+  return body.length <= singleLimit ? 1 : Math.ceil(body.length / concatLimit);
+}
+
+function smsCostEstimateCents(segmentCount = 0) {
+  return Math.max(0, Math.trunc(Number(segmentCount || 0) * SMS_SEGMENT_COST_CENTS));
+}
+
+function smsCampaignStatus(value = "draft") {
+  const status = clean(value).toLowerCase().replace(/[\s-]+/g, "_");
+  return ["draft", "scheduled", "queued", "sending", "sent", "cancelled", "failed", "archived"].includes(status) ? status : "draft";
+}
+
+function sanitizeSmsStatus(value = "queued") {
+  const status = clean(value).toLowerCase().replace(/[\s-]+/g, "_");
+  if (["accepted", "sending"].includes(status)) return "sent";
+  if (["delivery_delayed", "delayed"].includes(status)) return "delayed";
+  if (["undelivered", "bounced"].includes(status)) return "failed";
+  return ["queued", "sent", "delivered", "delayed", "failed", "undelivered", "opted_out", "cancelled"].includes(status) ? status : "queued";
+}
+
+function smsLocalizedBody(campaign = {}, lang = "en") {
+  const language = normalizeLanguage(lang);
+  return clean(campaign[`body_${language}`]) || clean(campaign.body_en || campaign.body_es || campaign.body_hu || "");
+}
+
+function smsMessageBody(campaign = {}, recipient = {}, restaurant = {}) {
+  const restaurantName = clean(restaurant.name || "SmartTable");
+  const body = smsLocalizedBody(campaign, recipient.language || "en");
+  const prefix = `SmartTable - ${restaurantName}: `;
+  const preferences = `${PUBLIC_BASE_URL}/account/notifications`;
+  return `${prefix}${body}\nReply STOP to opt out. Help: ${preferences}`.slice(0, 1400);
+}
+
+function smsCampaignPayloadFromBody(body = {}, restaurant = null, profile = {}, mode = "partner") {
+  const audience = jsonFrom(body.audience_definition, {});
+  const payload = {
+    restaurant_id: restaurant?.id || nullableClean(body.restaurant_id),
+    created_by: profile.id,
+    name: sanitizeCampaignText(body.name || body.campaign_name || "Untitled SMS campaign", 160),
+    body_en: sanitizeCampaignText(body.body_en || body.body || "", 900),
+    body_es: sanitizeCampaignText(body.body_es || "", 900),
+    body_hu: sanitizeCampaignText(body.body_hu || "", 900),
+    audience_definition: {
+      followers: body.audience_followers === undefined ? audience.followers !== false : boolValue(body.audience_followers),
+      reservations: body.audience_reservations === undefined ? audience.reservations !== false : boolValue(body.audience_reservations),
+      restaurant_subscribers: body.audience_subscribers === undefined ? Boolean(audience.restaurant_subscribers) : boolValue(body.audience_subscribers),
+      offer_id: clean(body.offer_id || audience.offer_id),
+      filters: jsonFrom(body.filters, audience.filters || {})
+    },
+    scheduled_at: nullableClean(body.scheduled_at),
+    status: smsCampaignStatus(body.status || "draft"),
+    template_variable_allowlist: [...CAMPAIGN_TEMPLATE_VARIABLE_ALLOWLIST],
+    xss_sanitized_at: nowIso(),
+    updated_at: nowIso()
+  };
+  const segments = Math.max(estimateSmsSegments(payload.body_en), estimateSmsSegments(payload.body_es), estimateSmsSegments(payload.body_hu));
+  payload.segment_count_estimate = segments;
+  payload.cost_estimate_cents = smsCostEstimateCents(segments);
+  if (!payload.name) payload.name = "Untitled SMS campaign";
+  return payload;
+}
+
+function validateSmsCampaignForSending(campaign = {}) {
+  if (!clean(campaign.name)) return "SMS campaign name is required.";
+  if (!clean(campaign.body_en || campaign.body_es || campaign.body_hu)) return "At least one SMS body is required.";
+  if (Math.max(clean(campaign.body_en).length, clean(campaign.body_es).length, clean(campaign.body_hu).length) > 900) {
+    return "SMS body is too long.";
+  }
+  const variableError = validateCampaignTemplateVariables(campaign);
+  if (variableError) return variableError;
+  return "";
+}
+
+function smsTestAllowlist() {
+  return SMS_TEST_RECIPIENT_ALLOWLIST
+    .split(/[,\s]+/)
+    .map((item) => normalizePhoneE164(item))
+    .filter(Boolean);
+}
+
+function sanitizeSmsCampaignForClient(campaign = {}, recipients = []) {
+  const rows = Array.isArray(recipients) ? recipients : [];
+  const counts = rows.reduce((acc, row) => {
+    const status = sanitizeSmsStatus(row.status || "queued");
+    acc[status] = (acc[status] || 0) + 1;
+    return acc;
+  }, {});
+  return {
+    id: campaign.id,
+    restaurant_id: campaign.restaurant_id || null,
+    created_by: campaign.created_by || null,
+    name: campaign.name || "",
+    body_en: campaign.body_en || "",
+    body_es: campaign.body_es || "",
+    body_hu: campaign.body_hu || "",
+    audience_definition: campaign.audience_definition || {},
+    scheduled_at: campaign.scheduled_at || null,
+    status: smsCampaignStatus(campaign.status),
+    recipient_count: Number(campaign.recipient_count || rows.length || 0),
+    sent_count: Number(campaign.sent_count || counts.sent || 0),
+    delivered_count: Number(campaign.delivered_count || counts.delivered || 0),
+    failed_count: Number(campaign.failed_count || counts.failed || counts.undelivered || 0),
+    segment_count_estimate: Number(campaign.segment_count_estimate || 0),
+    cost_estimate_cents: Number(campaign.cost_estimate_cents || 0),
+    created_at: campaign.created_at || null,
+    updated_at: campaign.updated_at || null,
+    recipients: rows.slice(0, 50).map((row) => ({
+      id: row.id,
+      destination_hash: clean(row.destination_hash || "").slice(0, 24),
+      phone_last4: row.phone_last4 || "",
+      language: normalizeLanguage(row.language || "en"),
+      timezone: clean(row.timezone || "America/New_York"),
+      status: sanitizeSmsStatus(row.status || "queued"),
+      provider_message_id: row.provider_message_id || null,
+      segment_count: Number(row.segment_count || 0),
+      cost_estimate_cents: Number(row.cost_estimate_cents || 0),
+      queued_at: row.queued_at || null,
+      sent_at: row.sent_at || null,
+      delivered_at: row.delivered_at || null,
+      failed_at: row.failed_at || null,
+      failure_reason: row.failure_reason || null
+    }))
+  };
+}
+
+async function listSmsCampaignRecipients(campaignId) {
+  const id = clean(campaignId);
+  if (!id) return [];
+  if (!supabaseConfigured) {
+    ensureDemo();
+    return demo.smsRecipients.filter((item) => item.campaign_id === id);
+  }
+  return await supabaseFetch(`/rest/v1/sms_recipients?select=*&campaign_id=eq.${encodeURIComponent(id)}&order=queued_at.desc.nullslast`, { service: true }).catch(() => []);
+}
+
+async function updateSmsCampaignCounts(campaign = {}, patch = {}) {
+  if (!campaign?.id) return campaign;
+  const next = { ...campaign, ...patch, updated_at: nowIso() };
+  if (!supabaseConfigured) {
+    ensureDemo();
+    const index = demo.smsCampaigns.findIndex((item) => item.id === campaign.id);
+    if (index >= 0) demo.smsCampaigns[index] = next;
+    return next;
+  }
+  await supabaseFetch(`/rest/v1/sms_campaigns?id=eq.${encodeURIComponent(campaign.id)}`, {
+    method: "PATCH",
+    service: true,
+    headers: { Prefer: "return=minimal" },
+    body: { ...patch, updated_at: nowIso() }
+  });
+  return next;
+}
+
+async function saveSmsCampaignRecord(payload = {}, existing = null) {
+  if (!supabaseConfigured) {
+    ensureDemo();
+    if (existing?.id) {
+      const index = demo.smsCampaigns.findIndex((item) => item.id === existing.id);
+      const next = { ...existing, ...payload, updated_at: nowIso() };
+      if (index >= 0) demo.smsCampaigns[index] = next;
+      return next;
+    }
+    const row = {
+      id: crypto.randomUUID(),
+      recipient_count: 0,
+      sent_count: 0,
+      delivered_count: 0,
+      failed_count: 0,
+      created_at: nowIso(),
+      ...payload,
+      updated_at: nowIso()
+    };
+    demo.smsCampaigns.unshift(row);
+    return row;
+  }
+  if (existing?.id) {
+    const rows = await supabaseFetch(`/rest/v1/sms_campaigns?id=eq.${encodeURIComponent(existing.id)}&select=*`, {
+      method: "PATCH",
+      service: true,
+      headers: { Prefer: "return=representation" },
+      body: payload
+    });
+    return rows?.[0] || { ...existing, ...payload };
+  }
+  const rows = await supabaseFetch("/rest/v1/sms_campaigns?select=*", {
+    method: "POST",
+    service: true,
+    headers: { Prefer: "return=representation" },
+    body: payload
+  });
+  return rows?.[0] || payload;
+}
+
+async function getSmsCampaignScoped(id, restaurant = null, profile = {}) {
+  const campaignId = clean(id);
+  if (!campaignId) return null;
+  const canAdmin = roleMatches(profile.role, ["admin"]);
+  if (!supabaseConfigured) {
+    ensureDemo();
+    const row = demo.smsCampaigns.find((item) => item.id === campaignId);
+    if (!row) return null;
+    if (!canAdmin && row.restaurant_id !== restaurant?.id) return null;
+    return row;
+  }
+  const filter = canAdmin
+    ? `id=eq.${encodeURIComponent(campaignId)}`
+    : `id=eq.${encodeURIComponent(campaignId)}&restaurant_id=eq.${encodeURIComponent(restaurant?.id || "")}`;
+  const rows = await supabaseFetch(`/rest/v1/sms_campaigns?select=*&${filter}&limit=1`, { service: true }).catch(() => []);
+  return rows?.[0] || null;
+}
+
+async function phoneForCampaignCandidate(candidate = {}) {
+  const direct = normalizePhoneE164(candidate.phone || candidate.guest_phone || candidate.phone_number);
+  if (direct) return direct;
+  const email = lower(candidate.email || candidate.guest_email);
+  const userId = clean(candidate.user_id);
+  if (!supabaseConfigured) {
+    ensureDemo();
+    const guest = demo.guests.find((item) => (userId && item.user_id === userId) || (email && lower(item.email) === email));
+    return normalizePhoneE164(guest?.phone || "");
+  }
+  const filters = userId
+    ? `user_id=eq.${encodeURIComponent(userId)}`
+    : email
+      ? `email=eq.${encodeURIComponent(email)}`
+      : "";
+  if (!filters) return "";
+  const rows = await supabaseFetch(`/rest/v1/guests?select=phone,user_id,email&${filters}&limit=1`, { service: true }).catch(() => []);
+  return normalizePhoneE164(rows?.[0]?.phone || "");
+}
+
+async function smsAudienceCandidates(restaurant = {}, audience = {}) {
+  const candidates = await campaignAudienceCandidates(restaurant, audience);
+  const enriched = [];
+  for (const candidate of candidates) {
+    const phone = await phoneForCampaignCandidate(candidate);
+    if (!phone) continue;
+    enriched.push({ ...candidate, phone });
+  }
+  return enriched;
+}
+
+async function eligibleSmsAudience(restaurant = {}, audience = {}) {
+  const candidates = await smsAudienceCandidates(restaurant, audience);
+  const recipients = [];
+  for (const candidate of candidates) {
+    const resolvedProfile = await resolveCampaignProfileByEmail(candidate.email) || (candidate.user_id ? clientProfile({
+      id: candidate.user_id,
+      email: candidate.email,
+      role: "guest",
+      preferred_language: candidate.language || "en"
+    }) : null);
+    if (!resolvedProfile?.id) continue;
+    const phone = normalizePhoneE164(candidate.phone);
+    const allowed = await marketingAllowedForProfile(resolvedProfile, phone, "sms");
+    if (!allowed.allowed) continue;
+    const preferences = await getCommunicationPreferencesForProfile(resolvedProfile, { create: false });
+    const timezone = clean(preferences.timezone || candidate.timezone || "America/New_York");
+    const quiet = smsQuietHoursDecision(timezone);
+    recipients.push({
+      user_id: resolvedProfile.id,
+      phone,
+      phone_last4: phoneLast4(phone),
+      language: normalizeLanguage(candidate.language || resolvedProfile.preferred_language || preferences.preferred_language || "en"),
+      timezone,
+      destination_hash: hashPhoneValue(phone),
+      source: candidate.source,
+      quiet_now: quiet.quiet
+    });
+  }
+  return recipients.slice(0, SMS_MONTHLY_SEND_LIMIT);
+}
+
+async function snapshotSmsCampaignRecipients(campaign = {}, restaurant = {}) {
+  const existing = await listSmsCampaignRecipients(campaign.id);
+  if (existing.length) return existing;
+  const eligible = await eligibleSmsAudience(restaurant, campaign.audience_definition || {});
+  const now = nowIso();
+  const rows = eligible.slice(0, SMS_DAILY_SEND_LIMIT).map((recipient) => {
+    const body = smsMessageBody(campaign, recipient, restaurant);
+    const segmentCount = estimateSmsSegments(body);
+    return {
+      id: crypto.randomUUID(),
+      campaign_id: campaign.id,
+      user_id: recipient.user_id,
+      channel: "sms",
+      destination_hash: recipient.destination_hash,
+      phone: recipient.phone,
+      phone_last4: recipient.phone_last4,
+      language: recipient.language,
+      timezone: recipient.timezone,
+      status: recipient.quiet_now ? "delayed" : "queued",
+      provider_message_id: null,
+      segment_count: segmentCount,
+      cost_estimate_cents: smsCostEstimateCents(segmentCount),
+      queued_at: now,
+      sent_at: null,
+      delivered_at: null,
+      failed_at: null,
+      failure_reason: recipient.quiet_now ? "QUIET_HOURS" : null
+    };
+  });
+  if (!supabaseConfigured) {
+    ensureDemo();
+    demo.smsRecipients.unshift(...rows);
+  } else if (rows.length) {
+    await supabaseFetch("/rest/v1/sms_recipients", {
+      method: "POST",
+      service: true,
+      headers: { Prefer: "return=minimal" },
+      body: rows.map(({ phone, ...row }) => row)
+    });
+  }
+  await updateSmsCampaignCounts(campaign, {
+    recipient_count: rows.length,
+    segment_count_estimate: rows.reduce((sum, row) => sum + Number(row.segment_count || 0), 0),
+    cost_estimate_cents: rows.reduce((sum, row) => sum + Number(row.cost_estimate_cents || 0), 0)
+  });
+  return rows;
+}
+
+async function phoneForSmsRecipient(recipient = {}) {
+  const direct = normalizePhoneE164(recipient.phone);
+  if (direct) return direct;
+  if (!recipient.user_id) return "";
+  if (!supabaseConfigured) {
+    ensureDemo();
+    const guest = demo.guests.find((item) => item.user_id === recipient.user_id);
+    return normalizePhoneE164(guest?.phone || "");
+  }
+  const rows = await supabaseFetch(`/rest/v1/guests?select=phone&user_id=eq.${encodeURIComponent(recipient.user_id)}&limit=1`, { service: true }).catch(() => []);
+  return normalizePhoneE164(rows?.[0]?.phone || "");
+}
+
+async function findSmsDeliveryLog(key = "") {
+  const idempotencyKey = clean(key);
+  if (!idempotencyKey) return null;
+  if (!supabaseConfigured) {
+    ensureDemo();
+    return demo.smsDeliveryLogs.find((item) => item.idempotency_key === idempotencyKey) || null;
+  }
+  const rows = await supabaseFetch(`/rest/v1/sms_delivery_logs?select=*&idempotency_key=eq.${encodeURIComponent(idempotencyKey)}&limit=1`, { service: true }).catch(() => []);
+  return rows?.[0] || null;
+}
+
+async function recordSmsDelivery(result = {}, context = {}, existing = null) {
+  const now = nowIso();
+  const status = sanitizeSmsStatus(result.status || (result.accepted ? "sent" : "failed"));
+  const payload = {
+    sms_type: clean(context.sms_type || "sms"),
+    recipient_user_id: context.recipient_user_id || null,
+    restaurant_id: context.restaurant_id || null,
+    sms_campaign_id: context.sms_campaign_id || null,
+    provider: clean(result.provider || SMS_PROVIDER || "twilio"),
+    provider_message_id: result.messageId || result.provider_message_id || null,
+    status,
+    attempt_count: Number(existing?.attempt_count || 0) + 1,
+    segment_count: Number(context.segment_count || 0),
+    cost_estimate_cents: Number(context.cost_estimate_cents || 0),
+    locale: normalizeLanguage(context.locale || "en"),
+    template_version: clean(context.template_version || MESSAGE_CAMPAIGN_TEMPLATE_VERSION),
+    idempotency_key: clean(context.idempotency_key),
+    last_error_code: result.errorCode || null,
+    last_error_message: result.errorMessage ? clean(result.errorMessage).slice(0, 240) : null,
+    sent_at: result.accepted ? now : existing?.sent_at || null,
+    delivered_at: status === "delivered" ? now : existing?.delivered_at || null,
+    failed_at: result.accepted ? existing?.failed_at || null : now,
+    updated_at: now
+  };
+  if (!payload.idempotency_key) payload.idempotency_key = hashEmailValue(`${payload.sms_type}:${payload.recipient_user_id}:${payload.sms_campaign_id}:${now.slice(0, 16)}`);
+  if (!supabaseConfigured) {
+    ensureDemo();
+    if (existing?.id) {
+      const index = demo.smsDeliveryLogs.findIndex((item) => item.id === existing.id);
+      const next = { ...existing, ...payload };
+      if (index >= 0) demo.smsDeliveryLogs[index] = next;
+      return next;
+    }
+    const row = { id: crypto.randomUUID(), created_at: now, ...payload };
+    demo.smsDeliveryLogs.unshift(row);
+    return row;
+  }
+  if (existing?.id) {
+    const rows = await supabaseFetch(`/rest/v1/sms_delivery_logs?id=eq.${encodeURIComponent(existing.id)}&select=*`, {
+      method: "PATCH",
+      service: true,
+      headers: { Prefer: "return=representation" },
+      body: payload
+    });
+    return rows?.[0] || { ...existing, ...payload };
+  }
+  const rows = await supabaseFetch("/rest/v1/sms_delivery_logs?select=*", {
+    method: "POST",
+    service: true,
+    headers: { Prefer: "return=representation" },
+    body: payload
+  });
+  return rows?.[0] || payload;
+}
+
+async function updateSmsRecipient(recipient = {}, patch = {}) {
+  const next = { ...recipient, ...patch, updated_at: nowIso() };
+  if (!recipient?.id) return next;
+  if (!supabaseConfigured) {
+    ensureDemo();
+    const index = demo.smsRecipients.findIndex((item) => item.id === recipient.id);
+    if (index >= 0) demo.smsRecipients[index] = next;
+    return next;
+  }
+  await supabaseFetch(`/rest/v1/sms_recipients?id=eq.${encodeURIComponent(recipient.id)}`, {
+    method: "PATCH",
+    service: true,
+    headers: { Prefer: "return=minimal" },
+    body: patch
+  }).catch(() => null);
+  return next;
+}
+
+async function sendSmsForRecipient(campaign = {}, recipient = {}, restaurant = {}) {
+  const phone = await phoneForSmsRecipient(recipient);
+  const idempotencyKey = hashEmailValue(`sms-campaign:${campaign.id}:${recipient.destination_hash}`);
+  const existingLog = await findSmsDeliveryLog(idempotencyKey);
+  if (existingLog && ["sent", "delivered"].includes(sanitizeSmsStatus(existingLog.status))) return { skipped: true, reason: "duplicate", log: existingLog };
+  if (existingLog && sanitizeSmsStatus(existingLog.status) === "failed" && Number(existingLog.attempt_count || 0) >= 3) {
+    await updateSmsRecipient(recipient, { status: "failed", failed_at: recipient.failed_at || nowIso(), failure_reason: "SMS_RETRY_LIMIT_REACHED", dead_lettered_at: recipient.dead_lettered_at || nowIso(), locked_at: null, locked_by: null });
+    return { skipped: true, reason: "retry_limit_reached", log: existingLog };
+  }
+  recipient = await updateSmsRecipient(recipient, {
+    locked_at: nowIso(),
+    locked_by: "sms_campaign_worker",
+    attempt_count: Number(recipient.attempt_count || existingLog?.attempt_count || 0) + 1
+  });
+  if (!phone || await isSuppressedDestination(phone, "sms")) {
+    const result = { accepted: false, provider: SMS_PROVIDER, status: "failed", errorCode: "SMS_RECIPIENT_SUPPRESSED", errorMessage: "Recipient is missing or suppressed." };
+    const log = await recordSmsDelivery(result, {
+      sms_type: "partner_sms_campaign",
+      recipient_user_id: recipient.user_id,
+      restaurant_id: campaign.restaurant_id || restaurant.id,
+      sms_campaign_id: campaign.id,
+      segment_count: recipient.segment_count,
+      cost_estimate_cents: recipient.cost_estimate_cents,
+      locale: recipient.language,
+      idempotency_key: idempotencyKey
+    }, existingLog);
+    await updateSmsRecipient(recipient, { status: "failed", failed_at: nowIso(), failure_reason: result.errorCode, locked_at: null, locked_by: null });
+    return { result, log };
+  }
+  const quiet = smsQuietHoursDecision(recipient.timezone || "America/New_York");
+  if (quiet.quiet) {
+    await updateSmsRecipient(recipient, { status: "delayed", failure_reason: "QUIET_HOURS", next_retry_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(), locked_at: null, locked_by: null });
+    return { skipped: true, reason: "quiet_hours" };
+  }
+  const body = smsMessageBody(campaign, { ...recipient, phone }, restaurant);
+  const result = await smsService.sendSms({ to: phone, body, idempotencyKey });
+  const status = result.accepted ? "sent" : "failed";
+  const log = await recordSmsDelivery(result, {
+    sms_type: "partner_sms_campaign",
+    recipient_user_id: recipient.user_id,
+    restaurant_id: campaign.restaurant_id || restaurant.id,
+    sms_campaign_id: campaign.id,
+    segment_count: estimateSmsSegments(body),
+    cost_estimate_cents: smsCostEstimateCents(estimateSmsSegments(body)),
+    locale: recipient.language,
+    idempotency_key: idempotencyKey
+  }, existingLog);
+  await updateSmsRecipient(recipient, {
+    status,
+    provider_message_id: result.messageId || null,
+    sent_at: result.accepted ? nowIso() : null,
+    failed_at: result.accepted ? null : nowIso(),
+    failure_reason: result.accepted ? null : result.errorCode || "SMS_SEND_FAILED",
+    dead_lettered_at: !result.accepted && Number(log?.attempt_count || 0) >= 3 ? nowIso() : null,
+    next_retry_at: !result.accepted && Number(log?.attempt_count || 0) < 3 ? new Date(Date.now() + 5 * 60 * 1000).toISOString() : null,
+    locked_at: null,
+    locked_by: null
+  });
+  return { result, log };
+}
+
+async function processSmsCampaignRecipients(campaign = {}, restaurant = {}) {
+  const recipients = await listSmsCampaignRecipients(campaign.id);
+  const queued = recipients.filter((row) => ["queued"].includes(sanitizeSmsStatus(row.status))).slice(0, SMS_CAMPAIGN_QUEUE_BATCH_LIMIT);
+  const sent = [];
+  for (const recipient of queued) {
+    sent.push(await sendSmsForRecipient(campaign, recipient, restaurant));
+  }
+  const refreshed = await listSmsCampaignRecipients(campaign.id);
+  const counts = refreshed.reduce((acc, row) => {
+    const status = sanitizeSmsStatus(row.status);
+    acc[status] = (acc[status] || 0) + 1;
+    return acc;
+  }, {});
+  await updateSmsCampaignCounts(campaign, {
+    status: refreshed.length && (counts.queued || counts.delayed) ? "sending" : "sent",
+    sent_count: counts.sent || counts.delivered || 0,
+    delivered_count: counts.delivered || 0,
+    failed_count: counts.failed || counts.undelivered || 0
+  });
+  return sent;
+}
+
+async function partnerSmsCampaigns(method, body, headers, query) {
+  const { profile } = await requireProfile(headers, ["partner", "admin"]);
+  const restaurant = await getPartnerRestaurant(profile, query, body);
+  if (method === "GET") {
+    if (!supabaseConfigured) {
+      ensureDemo();
+      const campaigns = demo.smsCampaigns
+        .filter((item) => item.restaurant_id === restaurant.id)
+        .sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
+      return json(200, {
+        mode: "demo",
+        provider: smsService.diagnostics(),
+        campaigns: campaigns.map((campaign) => sanitizeSmsCampaignForClient(campaign, demo.smsRecipients.filter((item) => item.campaign_id === campaign.id))),
+        raw_phone_lists_exposed: false,
+        limits: { daily: SMS_DAILY_SEND_LIMIT, monthly: SMS_MONTHLY_SEND_LIMIT }
+      });
+    }
+    const campaigns = await supabaseFetch(`/rest/v1/sms_campaigns?select=*&restaurant_id=eq.${encodeURIComponent(restaurant.id)}&order=created_at.desc&limit=100`, { service: true }).catch(() => []);
+    const recipients = await Promise.all((campaigns || []).map((campaign) => listSmsCampaignRecipients(campaign.id)));
+    return json(200, {
+      mode: "supabase",
+      provider: smsService.diagnostics(),
+      campaigns: (campaigns || []).map((campaign, index) => sanitizeSmsCampaignForClient(campaign, recipients[index] || [])),
+      raw_phone_lists_exposed: false,
+      limits: { daily: SMS_DAILY_SEND_LIMIT, monthly: SMS_MONTHLY_SEND_LIMIT }
+    });
+  }
+  if (method !== "POST" && method !== "PATCH") return json(405, { error: "Method not allowed." });
+  const action = clean(body.action || "save_draft");
+  if (action === "estimate_audience") {
+    const payload = smsCampaignPayloadFromBody(body, restaurant, profile);
+    const recipients = await eligibleSmsAudience(restaurant, payload.audience_definition || {});
+    const segmentCount = recipients.reduce((sum, recipient) => sum + estimateSmsSegments(smsMessageBody(payload, recipient, restaurant)), 0);
+    return json(200, {
+      audience_count: recipients.length,
+      recipient_count: recipients.length,
+      segment_count_estimate: segmentCount,
+      cost_estimate_cents: smsCostEstimateCents(segmentCount),
+      quiet_hour_delayed_count: recipients.filter((item) => item.quiet_now).length,
+      destination_hashes: recipients.slice(0, 25).map((item) => item.destination_hash.slice(0, 16)),
+      raw_phone_lists_exposed: false
+    });
+  }
+  if (action === "test_sms") {
+    const to = normalizePhoneE164(body.test_phone || body.phone || body.to);
+    if (!isValidE164Phone(to)) return json(400, { error: "Enter a valid E.164 test phone number." });
+    const allowlist = smsTestAllowlist();
+    if (!IS_PRODUCTION_RUNTIME && allowlist.length && !allowlist.includes(to)) return json(403, { error: "This test recipient is not in the SMS allowlist." });
+    const payload = smsCampaignPayloadFromBody(body, restaurant, profile);
+    const validation = validateSmsCampaignForSending(payload);
+    if (validation) return json(400, { error: validation });
+    const message = smsMessageBody(payload, { language: normalizeLanguage(body.language || profile.preferred_language || "en") }, restaurant);
+    const idempotencyKey = hashEmailValue(`sms-test:${profile.id}:${to}:${Math.floor(Date.now() / 60000)}`);
+    const result = await smsService.sendSms({ to, body: message, idempotencyKey });
+    await recordSmsDelivery(result, {
+      sms_type: "partner_sms_test",
+      recipient_user_id: null,
+      restaurant_id: restaurant.id,
+      sms_campaign_id: null,
+      segment_count: estimateSmsSegments(message),
+      cost_estimate_cents: smsCostEstimateCents(estimateSmsSegments(message)),
+      locale: normalizeLanguage(body.language || profile.preferred_language || "en"),
+      idempotency_key: idempotencyKey
+    });
+    await createAuditLog({
+      profile,
+      action: "sms_campaign_test_send",
+      entityType: "sms_campaign",
+      entityId: restaurant.id,
+      metadata: {
+        restaurant_id: restaurant.id,
+        accepted: Boolean(result.accepted),
+        provider: result.provider,
+        recipient_hash: hashPhoneValue(to).slice(0, 16)
+      }
+    });
+    return json(result.accepted ? 200 : 502, {
+      accepted: Boolean(result.accepted),
+      provider: result.provider,
+      message_id: result.messageId || null,
+      status: result.status,
+      error: result.accepted ? null : "Test SMS was not accepted by the provider."
+    });
+  }
+  const existing = body.id ? await getSmsCampaignScoped(body.id, restaurant, profile) : null;
+  if (body.id && !existing) return json(404, { error: "SMS campaign not found." });
+  if (action === "cancel") {
+    if (!existing) return json(404, { error: "SMS campaign not found." });
+    if (!["draft", "scheduled", "queued", "sending"].includes(smsCampaignStatus(existing.status))) return json(409, { error: "Only draft, scheduled, queued, or sending campaigns can be cancelled." });
+    const next = await updateSmsCampaignCounts(existing, { status: "cancelled", cancelled_at: nowIso() });
+    await createAuditLog({
+      profile,
+      action: "sms_campaign_cancelled",
+      entityType: "sms_campaign",
+      entityId: next.id,
+      metadata: { restaurant_id: next.restaurant_id || restaurant.id, previous_status: existing.status }
+    });
+    return json(200, { campaign: sanitizeSmsCampaignForClient(next, await listSmsCampaignRecipients(next.id)) });
+  }
+  if (action === "clone") {
+    if (!existing) return json(404, { error: "SMS campaign not found." });
+    const { id, created_at, updated_at, recipient_count, sent_count, delivered_count, failed_count, ...copy } = existing;
+    const cloned = await saveSmsCampaignRecord({
+      ...copy,
+      name: `${existing.name || "SMS campaign"} copy`,
+      status: "draft",
+      scheduled_at: null,
+      recipient_count: 0,
+      sent_count: 0,
+      delivered_count: 0,
+      failed_count: 0,
+      created_at: nowIso(),
+      updated_at: nowIso()
+    });
+    await createAuditLog({
+      profile,
+      action: "sms_campaign_cloned",
+      entityType: "sms_campaign",
+      entityId: cloned.id,
+      metadata: { source_campaign_id: existing.id, restaurant_id: cloned.restaurant_id || restaurant.id }
+    });
+    return json(201, { campaign: sanitizeSmsCampaignForClient(cloned, []) });
+  }
+  if (action === "retry_failed") {
+    if (!existing) return json(404, { error: "SMS campaign not found." });
+    const recipients = await listSmsCampaignRecipients(existing.id);
+    const retryable = recipients.filter((row) => ["failed", "delayed"].includes(sanitizeSmsStatus(row.status)));
+    for (const recipient of retryable) {
+      if (clean(recipient.failure_reason) === "SMS_RETRY_LIMIT_REACHED") continue;
+      await updateSmsRecipient(recipient, {
+        status: "queued",
+        failed_at: null,
+        failure_reason: null
+      });
+    }
+    const sent = await processSmsCampaignRecipients(existing, restaurant);
+    const next = await getSmsCampaignScoped(existing.id, restaurant, profile) || existing;
+    await createAuditLog({
+      profile,
+      action: "sms_campaign_retry_failed",
+      entityType: "sms_campaign",
+      entityId: existing.id,
+      metadata: { restaurant_id: existing.restaurant_id || restaurant.id, retry_count: retryable.length, sent_attempts: sent.length }
+    });
+    return json(200, {
+      campaign: sanitizeSmsCampaignForClient(next, await listSmsCampaignRecipients(existing.id)),
+      retry_count: retryable.length,
+      sent_attempts: sent.length,
+      raw_phone_lists_exposed: false
+    });
+  }
+  const payload = smsCampaignPayloadFromBody(body, restaurant, profile);
+  if (action === "save_draft") payload.status = "draft";
+  if (action === "schedule") {
+    if (!payload.scheduled_at) return json(400, { error: "A scheduled send time is required." });
+    payload.status = "scheduled";
+  }
+  if (action === "send_now") {
+    payload.status = "queued";
+    payload.scheduled_at = nowIso();
+  }
+  if (["schedule", "send_now"].includes(action)) {
+    const validation = validateSmsCampaignForSending(payload);
+    if (validation) return json(400, { error: validation });
+  }
+  if (action === "save_draft") {
+    const variableError = validateCampaignTemplateVariables(payload);
+    if (variableError) return json(400, { error: variableError });
+  }
+  const campaign = await saveSmsCampaignRecord(payload, existing);
+  if (["schedule", "send_now"].includes(action)) {
+    const recipients = await snapshotSmsCampaignRecipients(campaign, restaurant);
+    const sent = action === "send_now" ? await processSmsCampaignRecipients(campaign, restaurant) : [];
+    const next = action === "send_now"
+      ? (await getSmsCampaignScoped(campaign.id, restaurant, profile) || campaign)
+      : await updateSmsCampaignCounts(campaign, {
+          status: "scheduled",
+          recipient_count: recipients.length,
+          recipient_snapshot_at: campaign.recipient_snapshot_at || nowIso(),
+          recipient_snapshot_hash: hashEmailValue(`${campaign.id}:${recipients.map((item) => item.destination_hash).sort().join(",")}`)
+        });
+    await createAuditLog({
+      profile,
+      action: action === "send_now" ? "sms_campaign_sent_or_queued" : "sms_campaign_scheduled",
+      entityType: "sms_campaign",
+      entityId: campaign.id,
+      metadata: {
+        restaurant_id: campaign.restaurant_id || restaurant.id,
+        recipient_count: recipients.length,
+        sent_attempts: sent.length
+      }
+    });
+    return json(200, {
+      campaign: sanitizeSmsCampaignForClient(next, await listSmsCampaignRecipients(campaign.id)),
+      sent_attempts: sent.length,
+      raw_phone_lists_exposed: false
+    });
+  }
+  await createAuditLog({
+    profile,
+    action: existing ? "sms_campaign_updated" : "sms_campaign_created",
+    entityType: "sms_campaign",
+    entityId: campaign.id,
+    metadata: { restaurant_id: campaign.restaurant_id || restaurant.id, status: campaign.status }
+  });
+  return json(existing ? 200 : 201, { campaign: sanitizeSmsCampaignForClient(campaign, await listSmsCampaignRecipients(campaign.id)) });
+}
+
+function twilioEventId(payload = {}) {
+  return clean(payload.EventSid || payload.SmsSid || payload.MessageSid || payload.SmsMessageSid || `${payload.MessageStatus || payload.SmsStatus || "event"}:${payload.To || ""}:${payload.From || ""}:${payload.Timestamp || nowIso()}`);
+}
+
+function verifyTwilioWebhookSignature(headers = {}, payload = {}, callbackUrl = TWILIO_STATUS_CALLBACK_URL) {
+  if (!TWILIO_AUTH_TOKEN) return !IS_PRODUCTION_RUNTIME;
+  const signature = headerValue(headers, "x-twilio-signature");
+  if (!signature) return false;
+  const webhookUrl = clean(callbackUrl);
+  if (!webhookUrl) return false;
+  const signedData = Object.keys(payload || {})
+    .filter((key) => key !== "__rawBody")
+    .sort()
+    .reduce((acc, key) => `${acc}${key}${payload[key] ?? ""}`, webhookUrl);
+  const expected = crypto.createHmac("sha1", TWILIO_AUTH_TOKEN).update(signedData).digest("base64");
+  const providedBuffer = Buffer.from(signature);
+  const expectedBuffer = Buffer.from(expected);
+  return providedBuffer.length === expectedBuffer.length && crypto.timingSafeEqual(providedBuffer, expectedBuffer);
+}
+
+async function recordSmsProviderEvent(payload = {}, relatedLog = null) {
+  const providerMessageId = clean(payload.MessageSid || payload.SmsSid || payload.SmsMessageSid || payload.provider_message_id);
+  const status = sanitizeSmsStatus(payload.MessageStatus || payload.SmsStatus || payload.status || "queued");
+  const row = {
+    id: crypto.randomUUID(),
+    provider: "twilio",
+    provider_event_id: twilioEventId(payload),
+    provider_message_id: providerMessageId || null,
+    event_type: clean(payload.EventType || payload.MessageStatus || payload.SmsStatus || payload.Body || "sms_event").slice(0, 80),
+    event_timestamp: nowIso(),
+    normalized_from_hash: payload.From ? hashPhoneValue(payload.From) : null,
+    normalized_to_hash: payload.To ? hashPhoneValue(payload.To) : null,
+    status,
+    related_sms_log_id: relatedLog?.id || null,
+    related_campaign_id: relatedLog?.sms_campaign_id || null,
+    sanitized_payload: {
+      message_sid_present: Boolean(providerMessageId),
+      status,
+      error_code: clean(payload.ErrorCode || payload.error_code || ""),
+      account_sid_present: Boolean(payload.AccountSid),
+      from_hash: payload.From ? hashPhoneValue(payload.From).slice(0, 16) : null,
+      to_hash: payload.To ? hashPhoneValue(payload.To).slice(0, 16) : null
+    },
+    created_at: nowIso()
+  };
+  if (!supabaseConfigured) {
+    ensureDemo();
+    const duplicate = demo.smsProviderEvents.find((item) => item.provider_event_id === row.provider_event_id);
+    if (!duplicate) demo.smsProviderEvents.unshift(row);
+    return duplicate || row;
+  }
+  await supabaseFetch("/rest/v1/sms_provider_events?on_conflict=provider,provider_event_id", {
+    method: "POST",
+    service: true,
+    headers: { Prefer: "resolution=ignore-duplicates,return=minimal" },
+    body: row
+  }).catch(() => null);
+  return row;
+}
+
+async function findSmsDeliveryLogByProviderMessageId(providerMessageId = "") {
+  const id = clean(providerMessageId);
+  if (!id) return null;
+  if (!supabaseConfigured) {
+    ensureDemo();
+    return demo.smsDeliveryLogs.find((item) => item.provider_message_id === id) || null;
+  }
+  const rows = await supabaseFetch(`/rest/v1/sms_delivery_logs?select=*&provider_message_id=eq.${encodeURIComponent(id)}&limit=1`, { service: true }).catch(() => []);
+  return rows?.[0] || null;
+}
+
+async function updateSmsStatusFromProvider(providerMessageId = "", status = "sent", errorMessage = "") {
+  const log = await findSmsDeliveryLogByProviderMessageId(providerMessageId);
+  if (!log) return null;
+  const normalized = sanitizeSmsStatus(status);
+  const patch = {
+    status: normalized,
+    delivered_at: normalized === "delivered" ? nowIso() : log.delivered_at || null,
+    failed_at: ["failed", "undelivered"].includes(normalized) ? nowIso() : log.failed_at || null,
+    last_error_message: errorMessage ? clean(errorMessage).slice(0, 240) : log.last_error_message || null,
+    updated_at: nowIso()
+  };
+  if (!supabaseConfigured) {
+    const index = demo.smsDeliveryLogs.findIndex((item) => item.id === log.id);
+    const next = { ...log, ...patch };
+    if (index >= 0) demo.smsDeliveryLogs[index] = next;
+    return next;
+  }
+  const rows = await supabaseFetch(`/rest/v1/sms_delivery_logs?id=eq.${encodeURIComponent(log.id)}&select=*`, {
+    method: "PATCH",
+    service: true,
+    headers: { Prefer: "return=representation" },
+    body: patch
+  }).catch(() => []);
+  return rows?.[0] || { ...log, ...patch };
+}
+
+async function addSmsSuppression(phone = "", reason = "user_stop") {
+  const normalized = normalizePhoneE164(phone);
+  if (!normalized) return null;
+  const row = {
+    id: crypto.randomUUID(),
+    normalized_destination: normalized,
+    channel: "sms",
+    reason,
+    source: "twilio_webhook",
+    created_at: nowIso()
+  };
+  if (!supabaseConfigured) {
+    ensureDemo();
+    if (!demo.suppressionList.some((item) => item.normalized_destination === normalized && item.channel === "sms")) {
+      demo.suppressionList.unshift(row);
+    }
+    return row;
+  }
+  await supabaseFetch("/rest/v1/suppression_list?on_conflict=normalized_destination,channel", {
+    method: "POST",
+    service: true,
+    headers: { Prefer: "resolution=ignore-duplicates,return=minimal" },
+    body: row
+  }).catch(() => null);
+  return row;
+}
+
+async function smsProviderWebhook(method, body, headers) {
+  if (method !== "POST") return textResponse(405, "Method not allowed.");
+  if (!verifyTwilioWebhookSignature(headers, body)) {
+    return textResponse(401, "Invalid signature.");
+  }
+  const providerMessageId = clean(body.MessageSid || body.SmsSid || body.SmsMessageSid);
+  const inboundBody = clean(body.Body).toUpperCase();
+  const from = normalizePhoneE164(body.From);
+  const isStop = ["STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END", "QUIT"].includes(inboundBody);
+  const isHelp = inboundBody === "HELP";
+  const log = providerMessageId ? await updateSmsStatusFromProvider(providerMessageId, body.MessageStatus || body.SmsStatus || "sent", body.ErrorMessage || body.ErrorCode || "") : null;
+  await recordSmsProviderEvent(body, log);
+  if (isStop && from) {
+    await addSmsSuppression(from, "user_stop");
+    return textResponse(200, "<Response><Message>You have been unsubscribed from SmartTable SMS messages. Reply HELP for help.</Message></Response>", {
+      "content-type": "text/xml; charset=utf-8"
+    });
+  }
+  if (isHelp) {
+    return textResponse(200, "<Response><Message>SmartTable SMS support: manage preferences in your SmartTable account or contact support@smarttablenyc.com. Reply STOP to opt out.</Message></Response>", {
+      "content-type": "text/xml; charset=utf-8"
+    });
+  }
+  return textResponse(200, "<Response></Response>", { "content-type": "text/xml; charset=utf-8" });
+}
+
+function normalizeVoiceDeliveryStatus(value = "queued") {
+  const status = clean(value).toLowerCase();
+  if (["completed"].includes(status)) return "delivered";
+  if (["busy", "failed", "no-answer", "canceled", "cancelled"].includes(status)) return "failed";
+  if (["initiated", "ringing", "in-progress", "answered"].includes(status)) return "sent";
+  return "queued";
+}
+
+async function findVoiceAlertDeliveryByProviderMessageId(providerMessageId = "") {
+  const id = clean(providerMessageId);
+  if (!id) return null;
+  if (!supabaseConfigured) {
+    ensureDemo();
+    return demo.reservationAlertDeliveries.find((item) => item.channel === "voice" && item.provider_message_id === id) || null;
+  }
+  const rows = await supabaseFetch(`/rest/v1/reservation_alert_deliveries?select=*&channel=eq.voice&provider_message_id=eq.${encodeURIComponent(id)}&limit=1`, { service: true }).catch(() => []);
+  return rows?.[0] || null;
+}
+
+async function updateVoiceAlertDeliveryFromProvider(providerMessageId = "", providerStatus = "queued") {
+  const delivery = await findVoiceAlertDeliveryByProviderMessageId(providerMessageId);
+  if (!delivery) return null;
+  const status = normalizeVoiceDeliveryStatus(providerStatus);
+  const patch = {
+    status,
+    sent_at: status === "sent" ? (delivery.sent_at || nowIso()) : delivery.sent_at || null,
+    delivered_at: status === "delivered" ? nowIso() : delivery.delivered_at || null,
+    error_code: status === "failed" ? "VOICE_PROVIDER_DELIVERY_FAILED" : null,
+    error_message_safe: status === "failed" ? "Voice provider could not complete the alert call." : null,
+    metadata: {
+      ...(delivery.metadata && typeof delivery.metadata === "object" ? delivery.metadata : {}),
+      provider_call_status: clean(providerStatus).toLowerCase().slice(0, 40),
+      provider_status_received_at: nowIso()
+    },
+    updated_at: nowIso()
+  };
+  if (!supabaseConfigured) {
+    Object.assign(delivery, patch);
+    return delivery;
+  }
+  const rows = await supabaseFetch(`/rest/v1/reservation_alert_deliveries?id=eq.${encodeURIComponent(delivery.id)}&select=*`, {
+    method: "PATCH",
+    service: true,
+    headers: { Prefer: "return=representation" },
+    body: await filterSupabaseTablePayload("reservation_alert_deliveries", patch)
+  }).catch(() => []);
+  return rows?.[0] || { ...delivery, ...patch };
+}
+
+async function voiceProviderWebhook(method, body, headers) {
+  if (method !== "POST") return textResponse(405, "Method not allowed.");
+  if (!verifyTwilioWebhookSignature(headers, body, TWILIO_VOICE_STATUS_CALLBACK_URL)) {
+    return textResponse(401, "Invalid signature.");
+  }
+  const providerMessageId = clean(body.CallSid);
+  if (!providerMessageId) return textResponse(400, "Call identifier is required.");
+  await updateVoiceAlertDeliveryFromProvider(providerMessageId, body.CallStatus || "queued");
+  return textResponse(200, "<Response></Response>", { "content-type": "text/xml; charset=utf-8" });
+}
+
+function normalizeSystemMessageCategory(value = "service_announcement") {
+  const category = clean(value).toLowerCase().replace(/[\s-]+/g, "_");
+  return [
+    "service_announcement",
+    "planned_maintenance",
+    "outage",
+    "security_alert",
+    "legal_update",
+    "product_update",
+    "marketing_announcement",
+    "partner_announcement",
+    "emergency_notice"
+  ].includes(category) ? category : "service_announcement";
+}
+
+function normalizeSystemChannels(value = []) {
+  const channels = Array.isArray(value) ? value : arrayFrom(value);
+  const filtered = channels.map(normalizeCommunicationChannel).filter((channel) => ["in_app", "email", "sms"].includes(channel));
+  return [...new Set(filtered.length ? filtered : ["in_app"])];
+}
+
+function systemCampaignPayloadFromBody(body = {}, profile = {}) {
+  const audience = jsonFrom(body.audience_definition, {});
+  const languageFilter = clean(body.audience_language || audience.language || "");
+  return {
+    created_by: profile.id,
+    category: normalizeSystemMessageCategory(body.category),
+    channels: normalizeSystemChannels(body.channels || body.channel || ["in_app"]),
+    name: sanitizeCampaignText(body.name || body.title_en || "Untitled system message", 160),
+    title_en: sanitizeCampaignText(body.title_en || body.title || "", 180),
+    title_es: sanitizeCampaignText(body.title_es || "", 180),
+    title_hu: sanitizeCampaignText(body.title_hu || "", 180),
+    subject_en: sanitizeCampaignText(body.subject_en || body.title_en || body.title || "", 180),
+    subject_es: sanitizeCampaignText(body.subject_es || body.title_es || "", 180),
+    subject_hu: sanitizeCampaignText(body.subject_hu || body.title_hu || "", 180),
+    preheader_en: sanitizeCampaignText(body.preheader_en || "", 220),
+    preheader_es: sanitizeCampaignText(body.preheader_es || "", 220),
+    preheader_hu: sanitizeCampaignText(body.preheader_hu || "", 220),
+    body_en: sanitizeCampaignText(body.body_en || body.body || "", 12000),
+    body_es: sanitizeCampaignText(body.body_es || "", 12000),
+    body_hu: sanitizeCampaignText(body.body_hu || "", 12000),
+    audience_definition: {
+      role: clean(body.audience_role || audience.role || "all"),
+      language: languageFilter ? normalizeLanguage(languageFilter) : "",
+      city: clean(body.audience_city || audience.city || ""),
+      restaurant_id: clean(body.audience_restaurant_id || audience.restaurant_id || body.restaurant_id),
+      test_only: boolValue(body.audience_test_only ?? audience.test_only),
+      manually_selected_user_ids: arrayFrom(body.manual_user_ids || audience.manually_selected_user_ids || [])
+    },
+    scheduled_at: nullableClean(body.scheduled_at),
+    status: campaignStatus(body.status || "draft"),
+    template_variable_allowlist: [...CAMPAIGN_TEMPLATE_VARIABLE_ALLOWLIST],
+    xss_sanitized_at: nowIso(),
+    updated_at: nowIso()
+  };
+}
+
+function validateSystemCampaignForSending(campaign = {}) {
+  if (!clean(campaign.name)) return "Message name is required.";
+  if (!clean(campaign.title_en || campaign.title_es || campaign.title_hu || campaign.subject_en || campaign.subject_es || campaign.subject_hu)) return "A title or subject is required.";
+  if (!clean(campaign.body_en || campaign.body_es || campaign.body_hu)) return "A message body is required.";
+  const variableError = validateCampaignTemplateVariables(campaign);
+  if (variableError) return variableError;
+  return "";
+}
+
+function sanitizeSystemCampaignForClient(campaign = {}, recipients = []) {
+  const rows = Array.isArray(recipients) ? recipients : [];
+  return {
+    id: campaign.id,
+    category: normalizeSystemMessageCategory(campaign.category),
+    channels: normalizeSystemChannels(campaign.channels),
+    name: campaign.name || "",
+    title_en: campaign.title_en || "",
+    title_es: campaign.title_es || "",
+    title_hu: campaign.title_hu || "",
+    subject_en: campaign.subject_en || "",
+    subject_es: campaign.subject_es || "",
+    subject_hu: campaign.subject_hu || "",
+    preheader_en: campaign.preheader_en || "",
+    preheader_es: campaign.preheader_es || "",
+    preheader_hu: campaign.preheader_hu || "",
+    body_en: campaign.body_en || "",
+    body_es: campaign.body_es || "",
+    body_hu: campaign.body_hu || "",
+    audience_definition: campaign.audience_definition || {},
+    scheduled_at: campaign.scheduled_at || null,
+    status: campaignStatus(campaign.status),
+    recipient_count: Number(campaign.recipient_count || rows.length || 0),
+    sent_count: Number(campaign.sent_count || 0),
+    delivered_count: Number(campaign.delivered_count || 0),
+    failed_count: Number(campaign.failed_count || 0),
+    read_count: Number(campaign.read_count || 0),
+    created_at: campaign.created_at || null,
+    updated_at: campaign.updated_at || null,
+    recipients: rows.slice(0, 50).map((row) => ({
+      id: row.id,
+      user_id: row.user_id || null,
+      channel: normalizeCommunicationChannel(row.channel),
+      destination_hash: clean(row.destination_hash || "").slice(0, 24),
+      language: normalizeLanguage(row.language || "en"),
+      status: clean(row.status || "queued"),
+      provider_message_id: row.provider_message_id || null,
+      notification_id: row.notification_id || null,
+      queued_at: row.queued_at || null,
+      sent_at: row.sent_at || null,
+      delivered_at: row.delivered_at || null,
+      read_at: row.read_at || null,
+      failed_at: row.failed_at || null,
+      failure_reason: row.failure_reason || null
+    }))
+  };
+}
+
+async function restaurantIdsBySubscriptionStatuses(statuses = []) {
+  const normalizedStatuses = [...new Set((statuses || []).map(normalizeStripeSubscriptionStatus).filter(Boolean))];
+  if (!normalizedStatuses.length) return new Set();
+  if (!supabaseConfigured) {
+    ensureDemo();
+    return new Set(demo.subscriptions
+      .filter((subscription) => normalizedStatuses.includes(normalizeStripeSubscriptionStatus(subscription.status)))
+      .map((subscription) => clean(subscription.restaurant_id))
+      .filter(Boolean));
+  }
+  const filter = normalizedStatuses.map((status) => status.replace(/[^a-z_]/g, "")).filter(Boolean).join(",");
+  if (!filter) return new Set();
+  const rows = await supabaseFetch(`/rest/v1/restaurant_subscriptions?select=restaurant_id,status&status=in.(${filter})`, { service: true }).catch(() => []);
+  return new Set((rows || [])
+    .filter((subscription) => normalizedStatuses.includes(normalizeStripeSubscriptionStatus(subscription.status)))
+    .map((subscription) => clean(subscription.restaurant_id))
+    .filter(Boolean));
+}
+
+async function systemMessageAudience(audience = {}) {
+  const targetRole = clean(audience.role || "all");
+  const subscriptionAudienceMap = {
+    active_partners: ["active"],
+    trialing_partners: ["trialing"],
+    past_due_partners: ["past_due"],
+    canceled_partners: ["canceled"]
+  };
+  const subscriptionRestaurantIds = subscriptionAudienceMap[targetRole]
+    ? await restaurantIdsBySubscriptionStatuses(subscriptionAudienceMap[targetRole])
+    : null;
+  if (!supabaseConfigured) {
+    ensureDemo();
+    return demo.profiles.filter((profile) => {
+      const role = normalizeRole(profile.role);
+      if (targetRole === "guests" && role !== "guest") return false;
+      if (targetRole === "partners" && role !== "partner") return false;
+      if (subscriptionRestaurantIds && !(role === "partner" && subscriptionRestaurantIds.has(clean(profile.restaurant_id)))) return false;
+      if (targetRole === "admins" && !roleMatches(role, ["admin"])) return false;
+      if (audience.language && normalizeLanguage(profile.preferred_language || "en") !== normalizeLanguage(audience.language)) return false;
+      if (audience.manually_selected_user_ids?.length && !audience.manually_selected_user_ids.includes(profile.id)) return false;
+      return true;
+    });
+  }
+  const rows = await supabaseFetch("/rest/v1/profiles?select=id,email,full_name,role,restaurant_id,preferred_language,city,status,created_at&limit=2000", { service: true }).catch(() => []);
+  return (rows || []).filter((profile) => {
+    const role = normalizeRole(profile.role);
+    if (targetRole === "guests" && role !== "guest") return false;
+    if (targetRole === "partners" && role !== "partner") return false;
+    if (subscriptionRestaurantIds && !(role === "partner" && subscriptionRestaurantIds.has(clean(profile.restaurant_id)))) return false;
+    if (targetRole === "admins" && !roleMatches(role, ["admin"])) return false;
+    if (audience.language && normalizeLanguage(profile.preferred_language || "en") !== normalizeLanguage(audience.language)) return false;
+    if (audience.city && lower(profile.city) !== lower(audience.city)) return false;
+    if (audience.restaurant_id && clean(profile.restaurant_id) !== clean(audience.restaurant_id)) return false;
+    if (audience.manually_selected_user_ids?.length && !audience.manually_selected_user_ids.includes(profile.id)) return false;
+    return true;
+  });
+}
+
+async function listSystemMessageRecipients(campaignId) {
+  const id = clean(campaignId);
+  if (!id) return [];
+  if (!supabaseConfigured) {
+    ensureDemo();
+    return demo.systemMessageRecipients.filter((item) => item.campaign_id === id);
+  }
+  return await supabaseFetch(`/rest/v1/system_message_recipients?select=*&campaign_id=eq.${encodeURIComponent(id)}&order=queued_at.desc.nullslast`, { service: true }).catch(() => []);
+}
+
+async function saveSystemCampaignRecord(payload = {}, existing = null) {
+  if (!supabaseConfigured) {
+    ensureDemo();
+    if (existing?.id) {
+      const index = demo.systemMessageCampaigns.findIndex((item) => item.id === existing.id);
+      const next = { ...existing, ...payload, updated_at: nowIso() };
+      if (index >= 0) demo.systemMessageCampaigns[index] = next;
+      return next;
+    }
+    const row = { id: crypto.randomUUID(), recipient_count: 0, sent_count: 0, delivered_count: 0, failed_count: 0, read_count: 0, created_at: nowIso(), ...payload, updated_at: nowIso() };
+    demo.systemMessageCampaigns.unshift(row);
+    return row;
+  }
+  if (existing?.id) {
+    const rows = await supabaseFetch(`/rest/v1/system_message_campaigns?id=eq.${encodeURIComponent(existing.id)}&select=*`, {
+      method: "PATCH",
+      service: true,
+      headers: { Prefer: "return=representation" },
+      body: payload
+    });
+    return rows?.[0] || { ...existing, ...payload };
+  }
+  const rows = await supabaseFetch("/rest/v1/system_message_campaigns?select=*", {
+    method: "POST",
+    service: true,
+    headers: { Prefer: "return=representation" },
+    body: payload
+  });
+  return rows?.[0] || payload;
+}
+
+async function updateSystemCampaign(campaign = {}, patch = {}) {
+  const next = { ...campaign, ...patch, updated_at: nowIso() };
+  if (!supabaseConfigured) {
+    ensureDemo();
+    const index = demo.systemMessageCampaigns.findIndex((item) => item.id === campaign.id);
+    if (index >= 0) demo.systemMessageCampaigns[index] = next;
+    return next;
+  }
+  await supabaseFetch(`/rest/v1/system_message_campaigns?id=eq.${encodeURIComponent(campaign.id)}`, {
+    method: "PATCH",
+    service: true,
+    headers: { Prefer: "return=minimal" },
+    body: { ...patch, updated_at: nowIso() }
+  });
+  return next;
+}
+
+async function getSystemCampaignScoped(id) {
+  const campaignId = clean(id);
+  if (!campaignId) return null;
+  if (!supabaseConfigured) {
+    ensureDemo();
+    return demo.systemMessageCampaigns.find((item) => item.id === campaignId) || null;
+  }
+  const rows = await supabaseFetch(`/rest/v1/system_message_campaigns?select=*&id=eq.${encodeURIComponent(campaignId)}&limit=1`, { service: true }).catch(() => []);
+  return rows?.[0] || null;
+}
+
+function notificationLocalizedValue(campaign = {}, base = "title", lang = "en") {
+  return campaignLocalizedValue(campaign, base, lang) || clean(campaign[`${base}_en`] || campaign[base] || "");
+}
+
+async function createUserNotification({ userId, category, title, body, actionUrl = "", severity = "info", expiresAt = null, sourceCampaignId = null, nonDismissible = false } = {}) {
+  const notification = {
+    id: crypto.randomUUID(),
+    user_id: userId,
+    category: clean(category || "system"),
+    title: clean(title).slice(0, 240),
+    body: clean(body).slice(0, 2000),
+    action_url: safeInternalActionUrl(actionUrl),
+    severity: ["info", "success", "warning", "critical"].includes(clean(severity)) ? clean(severity) : "info",
+    read_at: null,
+    dismissed_at: null,
+    expires_at: expiresAt || null,
+    non_dismissible: Boolean(nonDismissible),
+    source_campaign_id: sourceCampaignId || null,
+    created_at: nowIso()
+  };
+  if (!supabaseConfigured) {
+    ensureDemo();
+    demo.notifications.unshift(notification);
+    return notification;
+  }
+  const rows = await supabaseFetch("/rest/v1/notifications?select=*", {
+    method: "POST",
+    service: true,
+    headers: { Prefer: "return=representation" },
+    body: notification
+  });
+  return rows?.[0] || notification;
+}
+
+async function snapshotSystemRecipients(campaign = {}) {
+  const existing = await listSystemMessageRecipients(campaign.id);
+  if (existing.length) return existing;
+  const users = await systemMessageAudience(campaign.audience_definition || {});
+  const now = nowIso();
+  const rows = [];
+  for (const user of users) {
+    for (const channel of normalizeSystemChannels(campaign.channels)) {
+      let destinationHash = null;
+      let includeRecipient = true;
+      if (channel === "in_app") {
+        const preferences = await getCommunicationPreferencesForProfile(user, { create: false });
+        includeRecipient = preferences.in_app_enabled !== false;
+        if (includeRecipient && campaign.category === "marketing_announcement") {
+          const email = lower(user.email || "");
+          const allowed = await marketingAllowedForProfile(user, email, "email");
+          includeRecipient = allowed.allowed;
+        }
+      }
+      if (channel === "email") {
+        const email = lower(user.email || "");
+        if (!isValidSignupEmail(email)) includeRecipient = false;
+        if (includeRecipient && campaign.category === "marketing_announcement") {
+          const allowed = await marketingAllowedForProfile(user, email, "email");
+          includeRecipient = allowed.allowed;
+        }
+        destinationHash = includeRecipient ? hashEmailValue(email) : null;
+      }
+      if (channel === "sms") {
+        const phone = await phoneForCampaignCandidate({ user_id: user.id, email: user.email });
+        const preferences = await getCommunicationPreferencesForProfile(user, { create: false });
+        if (!isValidE164Phone(phone)) includeRecipient = false;
+        if (includeRecipient && campaign.category === "marketing_announcement") {
+          const allowed = await marketingAllowedForProfile(user, phone, "sms");
+          includeRecipient = allowed.allowed;
+        }
+        if (includeRecipient && campaign.category !== "marketing_announcement") {
+          includeRecipient = Boolean(preferences.transactional_sms_enabled) && !(await isSuppressedDestination(phone, "sms"));
+        }
+        destinationHash = includeRecipient ? hashPhoneValue(phone) : null;
+      }
+      if (!includeRecipient) continue;
+      rows.push({
+        id: crypto.randomUUID(),
+        campaign_id: campaign.id,
+        user_id: user.id,
+        channel,
+        destination_hash: destinationHash,
+        language: normalizeLanguage(user.preferred_language || "en"),
+        status: "queued",
+        provider_message_id: null,
+        notification_id: null,
+        queued_at: now,
+        sent_at: null,
+        delivered_at: null,
+        read_at: null,
+        failed_at: null,
+        failure_reason: null
+      });
+    }
+  }
+  if (!supabaseConfigured) {
+    ensureDemo();
+    demo.systemMessageRecipients.unshift(...rows);
+  } else if (rows.length) {
+    await supabaseFetch("/rest/v1/system_message_recipients", {
+      method: "POST",
+      service: true,
+      headers: { Prefer: "return=minimal" },
+      body: rows
+    });
+  }
+  await updateSystemCampaign(campaign, { recipient_count: rows.length });
+  return rows;
+}
+
+async function updateSystemRecipient(recipient = {}, patch = {}) {
+  const next = { ...recipient, ...patch, updated_at: nowIso() };
+  if (!supabaseConfigured) {
+    ensureDemo();
+    const index = demo.systemMessageRecipients.findIndex((item) => item.id === recipient.id);
+    if (index >= 0) demo.systemMessageRecipients[index] = next;
+    return next;
+  }
+  await supabaseFetch(`/rest/v1/system_message_recipients?id=eq.${encodeURIComponent(recipient.id)}`, {
+    method: "PATCH",
+    service: true,
+    headers: { Prefer: "return=minimal" },
+    body: patch
+  }).catch(() => null);
+  return next;
+}
+
+async function insertSystemMessageRecipients(rows = []) {
+  if (!rows.length) return [];
+  if (!supabaseConfigured) {
+    ensureDemo();
+    demo.systemMessageRecipients.unshift(...rows);
+    return rows;
+  }
+  await supabaseFetch("/rest/v1/system_message_recipients", {
+    method: "POST",
+    service: true,
+    headers: { Prefer: "return=minimal" },
+    body: rows
+  });
+  return rows;
+}
+
+async function systemTestProfileForRecipient(rawRecipient = "") {
+  const value = clean(rawRecipient);
+  if (!value) return null;
+  const uuidLike = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+  const email = lower(value);
+  if (!supabaseConfigured) {
+    ensureDemo();
+    return demo.profiles.find((profile) => (uuidLike && profile.id === value) || (email && lower(profile.email) === email)) || null;
+  }
+  const filter = uuidLike
+    ? `id=eq.${encodeURIComponent(value)}`
+    : isValidSignupEmail(email)
+      ? `email=eq.${encodeURIComponent(email)}`
+      : "";
+  if (!filter) return null;
+  const rows = await supabaseFetch(`/rest/v1/profiles?select=id,email,full_name,role,restaurant_id,preferred_language,city,status,created_at&${filter}&limit=1`, { service: true }).catch(() => []);
+  return rows?.[0] || null;
+}
+
+async function adminSystemMessageTestSend(payload = {}, body = {}, profile = {}) {
+  const validation = validateSystemCampaignForSending(payload);
+  if (validation) return json(400, { error: validation });
+  const explicitRecipient = clean(body.test_recipient || body.test_user_id || body.test_email || body.test_phone);
+  if (!explicitRecipient) return json(400, { error: "Enter exactly one explicit test recipient." });
+  const channels = normalizeSystemChannels(payload.channels);
+  const recipientProfile = await systemTestProfileForRecipient(explicitRecipient);
+  const explicitEmail = lower(explicitRecipient);
+  const explicitPhone = normalizePhoneE164(explicitRecipient);
+  if (channels.includes("in_app") && !recipientProfile?.id) {
+    return json(400, { error: "An in-app test send requires an existing user ID or account email." });
+  }
+  if (channels.includes("email") && !isValidSignupEmail(explicitEmail) && !isValidSignupEmail(lower(recipientProfile?.email || ""))) {
+    return json(400, { error: "An email test send requires a valid email address or account email." });
+  }
+  if (channels.includes("sms")) {
+    const resolvedPhone = isValidE164Phone(explicitPhone) ? explicitPhone : await phoneForCampaignCandidate({ user_id: recipientProfile?.id, email: recipientProfile?.email });
+    if (!isValidE164Phone(resolvedPhone)) return json(400, { error: "An SMS test send requires a valid E.164 phone number or account phone." });
+    const allowlist = smsTestAllowlist();
+    if (!IS_PRODUCTION_RUNTIME && allowlist.length && !allowlist.includes(resolvedPhone)) {
+      return json(403, { error: "This test SMS recipient is not in the SMS allowlist." });
+    }
+  }
+  const recipientHash = hashEmailValue(explicitRecipient);
+  const campaign = await saveSystemCampaignRecord({
+    ...payload,
+    status: "queued",
+    scheduled_at: nowIso(),
+    audience_definition: {
+      ...(payload.audience_definition || {}),
+      test_only: true,
+      test_recipient_hash: recipientHash
+    },
+    recipient_count: channels.length,
+    created_at: nowIso(),
+    updated_at: nowIso()
+  });
+  const language = normalizeLanguage(body.language || recipientProfile?.preferred_language || payload.audience_definition?.language || "en");
+  const rows = [];
+  let sentCount = 0;
+  let failedCount = 0;
+  for (const channel of channels) {
+    const row = {
+      id: crypto.randomUUID(),
+      campaign_id: campaign.id,
+      user_id: recipientProfile?.id || null,
+      channel,
+      destination_hash: recipientHash,
+      language,
+      status: "queued",
+      provider_message_id: null,
+      notification_id: null,
+      queued_at: nowIso(),
+      sent_at: null,
+      delivered_at: null,
+      read_at: null,
+      failed_at: null,
+      failure_reason: null,
+      created_at: nowIso(),
+      updated_at: nowIso()
+    };
+    if (channel === "in_app") {
+      const notification = await createUserNotification({
+        userId: recipientProfile.id,
+        category: payload.category,
+        title: notificationLocalizedValue(payload, "title", language) || notificationLocalizedValue(payload, "subject", language),
+        body: notificationLocalizedValue(payload, "body", language),
+        severity: ["outage", "security_alert", "emergency_notice"].includes(payload.category) ? "critical" : "info",
+        sourceCampaignId: campaign.id,
+        nonDismissible: ["outage", "security_alert", "emergency_notice"].includes(payload.category)
+      });
+      row.status = "sent";
+      row.sent_at = nowIso();
+      row.notification_id = notification.id;
+      sentCount += 1;
+    } else if (channel === "email") {
+      const to = isValidSignupEmail(explicitEmail) ? explicitEmail : lower(recipientProfile?.email || "");
+      const subject = notificationLocalizedValue(payload, "subject", language) || notificationLocalizedValue(payload, "title", language);
+      const message = notificationLocalizedValue(payload, "body", language);
+      const footer = payload.category === "marketing_announcement" ? marketingEmailFooterText(language) : "";
+      const text = footer ? `${message}\n\n${footer}` : message;
+      const result = await sendEmail({
+        to,
+        subject,
+        text,
+        html: appEmailHtml(subject, message, footer ? { label: "Manage or unsubscribe", url: `${PUBLIC_BASE_URL}/account/notifications` } : null, footer ? { footer } : {})
+      }, {
+        email_type: "admin_system_broadcast_test",
+        event_type: "admin_system_broadcast_test",
+        recipient_user_id: recipientProfile?.id || null,
+        locale: language,
+        template_version: MESSAGE_CAMPAIGN_TEMPLATE_VERSION,
+        idempotency_key: hashEmailValue(`system-message-test:${campaign.id}:${to}:email`)
+      });
+      row.status = isEmailAccepted(result) ? "sent" : "failed";
+      row.sent_at = isEmailAccepted(result) ? nowIso() : null;
+      row.failed_at = isEmailAccepted(result) ? null : nowIso();
+      row.provider_message_id = result.messageId || result.provider_id || null;
+      row.failure_reason = isEmailAccepted(result) ? null : result.errorCode || "EMAIL_SEND_FAILED";
+      if (isEmailAccepted(result)) sentCount += 1;
+      else failedCount += 1;
+    } else if (channel === "sms") {
+      const to = isValidE164Phone(explicitPhone) ? explicitPhone : await phoneForCampaignCandidate({ user_id: recipientProfile?.id, email: recipientProfile?.email });
+      const message = [
+        "SmartTable:",
+        notificationLocalizedValue(payload, "body", language),
+        `Manage preferences: ${PUBLIC_BASE_URL}/account/notifications`
+      ].filter(Boolean).join(" ");
+      const result = await smsService.sendSms({
+        to,
+        body: message,
+        idempotencyKey: hashEmailValue(`system-message-test:${campaign.id}:${hashPhoneValue(to)}:sms`)
+      });
+      await recordSmsDelivery(result, {
+        sms_type: "admin_system_broadcast_test",
+        recipient_user_id: recipientProfile?.id || null,
+        restaurant_id: null,
+        sms_campaign_id: null,
+        segment_count: estimateSmsSegments(message),
+        cost_estimate_cents: smsCostEstimateCents(estimateSmsSegments(message)),
+        locale: language,
+        template_version: MESSAGE_CAMPAIGN_TEMPLATE_VERSION,
+        idempotency_key: hashEmailValue(`system-message-test:${campaign.id}:${hashPhoneValue(to)}:sms`)
+      });
+      row.status = result.accepted ? "sent" : "failed";
+      row.sent_at = result.accepted ? nowIso() : null;
+      row.failed_at = result.accepted ? null : nowIso();
+      row.provider_message_id = result.messageId || null;
+      row.failure_reason = result.accepted ? null : result.errorCode || "SMS_SEND_FAILED";
+      if (result.accepted) sentCount += 1;
+      else failedCount += 1;
+    }
+    rows.push(row);
+  }
+  await insertSystemMessageRecipients(rows);
+  const next = await updateSystemCampaign(campaign, {
+    status: failedCount ? "failed" : "sent",
+    recipient_count: rows.length,
+    sent_count: sentCount,
+    failed_count: failedCount
+  });
+  await createAuditLog({
+    profile,
+    action: "system_message_test_send",
+    entityType: "system_message_campaign",
+    entityId: campaign.id,
+    metadata: {
+      category: payload.category,
+      channels,
+      sent_count: sentCount,
+      failed_count: failedCount,
+      test_recipient_hash: recipientHash.slice(0, 16)
+    }
+  });
+  return json(failedCount ? 207 : 200, {
+    campaign: sanitizeSystemCampaignForClient(next, rows),
+    test_send: true,
+    sent_count: sentCount,
+    failed_count: failedCount,
+    raw_personal_data_exposed: false
+  });
+}
+
+async function processSystemMessageCampaign(campaign = {}) {
+  const recipients = await snapshotSystemRecipients(campaign);
+  const queued = recipients.filter((row) => clean(row.status) === "queued");
+  let sentCount = 0;
+  let failedCount = 0;
+  for (const recipient of queued.slice(0, PARTNER_CAMPAIGN_QUEUE_BATCH_LIMIT)) {
+    const lockedRecipient = await updateSystemRecipient(recipient, {
+      locked_at: nowIso(),
+      locked_by: "system_message_worker",
+      attempt_count: Number(recipient.attempt_count || 0) + 1
+    });
+    recipient.locked_at = lockedRecipient.locked_at;
+    recipient.locked_by = lockedRecipient.locked_by;
+    recipient.attempt_count = lockedRecipient.attempt_count;
+    const lang = normalizeLanguage(recipient.language || "en");
+    if (recipient.channel === "in_app") {
+      const notification = await createUserNotification({
+        userId: recipient.user_id,
+        category: campaign.category,
+        title: notificationLocalizedValue(campaign, "title", lang) || notificationLocalizedValue(campaign, "subject", lang),
+        body: notificationLocalizedValue(campaign, "body", lang),
+        actionUrl: campaign.audience_definition?.action_url || "",
+        severity: ["outage", "security_alert", "emergency_notice"].includes(campaign.category) ? "critical" : "info",
+        sourceCampaignId: campaign.id,
+        nonDismissible: ["outage", "security_alert", "emergency_notice"].includes(campaign.category)
+      });
+      await updateSystemRecipient(recipient, { status: "sent", sent_at: nowIso(), notification_id: notification.id, locked_at: null, locked_by: null });
+      sentCount += 1;
+    } else if (recipient.channel === "email") {
+      const user = (await systemMessageAudience({ manually_selected_user_ids: [recipient.user_id] }))[0];
+      const email = lower(user?.email || "");
+      if (!email || !isValidSignupEmail(email)) {
+        await updateSystemRecipient(recipient, { status: "failed", failed_at: nowIso(), failure_reason: "MISSING_EMAIL", dead_lettered_at: nowIso(), locked_at: null, locked_by: null });
+        failedCount += 1;
+        continue;
+      }
+      const subject = notificationLocalizedValue(campaign, "subject", lang) || notificationLocalizedValue(campaign, "title", lang);
+      const message = notificationLocalizedValue(campaign, "body", lang);
+      const footer = campaign.category === "marketing_announcement" ? marketingEmailFooterText(lang) : "";
+      const text = footer ? `${message}\n\n${footer}` : message;
+      const result = await sendEmail({
+        to: email,
+        subject,
+        text,
+        html: appEmailHtml(subject, message, footer ? { label: "Manage or unsubscribe", url: `${PUBLIC_BASE_URL}/account/notifications` } : null, footer ? { footer } : {})
+      }, {
+        email_type: "admin_system_broadcast",
+        event_type: "admin_system_broadcast",
+        recipient_user_id: recipient.user_id,
+        locale: lang,
+        template_version: MESSAGE_CAMPAIGN_TEMPLATE_VERSION,
+        idempotency_key: hashEmailValue(`system-message:${campaign.id}:${recipient.user_id}:email`)
+      });
+      await updateSystemRecipient(recipient, {
+        status: isEmailAccepted(result) ? "sent" : "failed",
+        sent_at: isEmailAccepted(result) ? nowIso() : null,
+        failed_at: isEmailAccepted(result) ? null : nowIso(),
+        provider_message_id: result.messageId || result.provider_id || null,
+        failure_reason: isEmailAccepted(result) ? null : result.errorCode || "EMAIL_SEND_FAILED",
+        dead_lettered_at: !isEmailAccepted(result) && Number(recipient.attempt_count || 0) >= 3 ? nowIso() : null,
+        next_retry_at: !isEmailAccepted(result) && Number(recipient.attempt_count || 0) < 3 ? new Date(Date.now() + 5 * 60 * 1000).toISOString() : null,
+        locked_at: null,
+        locked_by: null
+      });
+      if (isEmailAccepted(result)) sentCount += 1;
+      else failedCount += 1;
+    } else if (recipient.channel === "sms") {
+      const user = (await systemMessageAudience({ manually_selected_user_ids: [recipient.user_id] }))[0];
+      const phone = await phoneForCampaignCandidate({ user_id: recipient.user_id, email: user?.email });
+      if (!phone || await isSuppressedDestination(phone, "sms")) {
+        await updateSystemRecipient(recipient, { status: "failed", failed_at: nowIso(), failure_reason: "SMS_RECIPIENT_UNAVAILABLE", dead_lettered_at: nowIso(), locked_at: null, locked_by: null });
+        failedCount += 1;
+        continue;
+      }
+      const message = [
+        "SmartTable:",
+        notificationLocalizedValue(campaign, "body", lang),
+        `Manage preferences: ${PUBLIC_BASE_URL}/account/notifications`
+      ].filter(Boolean).join(" ");
+      const result = await smsService.sendSms({
+        to: phone,
+        body: message,
+        idempotencyKey: hashEmailValue(`system-message:${campaign.id}:${recipient.user_id}:sms`)
+      });
+      await recordSmsDelivery(result, {
+        sms_type: "admin_system_broadcast",
+        recipient_user_id: recipient.user_id,
+        restaurant_id: null,
+        sms_campaign_id: null,
+        segment_count: estimateSmsSegments(message),
+        cost_estimate_cents: smsCostEstimateCents(estimateSmsSegments(message)),
+        locale: lang,
+        template_version: MESSAGE_CAMPAIGN_TEMPLATE_VERSION,
+        idempotency_key: hashEmailValue(`system-message:${campaign.id}:${recipient.user_id}:sms`)
+      });
+      await updateSystemRecipient(recipient, {
+        status: result.accepted ? "sent" : "failed",
+        sent_at: result.accepted ? nowIso() : null,
+        failed_at: result.accepted ? null : nowIso(),
+        provider_message_id: result.messageId || null,
+        failure_reason: result.accepted ? null : result.errorCode || "SMS_SEND_FAILED",
+        dead_lettered_at: !result.accepted && Number(recipient.attempt_count || 0) >= 3 ? nowIso() : null,
+        next_retry_at: !result.accepted && Number(recipient.attempt_count || 0) < 3 ? new Date(Date.now() + 5 * 60 * 1000).toISOString() : null,
+        locked_at: null,
+        locked_by: null
+      });
+      if (result.accepted) sentCount += 1;
+      else failedCount += 1;
+    }
+  }
+  const refreshed = await listSystemMessageRecipients(campaign.id);
+  const pending = refreshed.some((row) => clean(row.status) === "queued");
+  const next = await updateSystemCampaign(campaign, {
+    status: pending ? "sending" : "sent",
+    sent_count: Number(campaign.sent_count || 0) + sentCount,
+    failed_count: Number(campaign.failed_count || 0) + failedCount
+  });
+  return { campaign: next, processed: sentCount + failedCount, sent_count: sentCount, failed_count: failedCount };
+}
+
+async function adminSystemMessages(method, body, headers, query) {
+  const { profile } = await requireProfile(headers, ["admin"]);
+  if (method === "GET") {
+    if (!supabaseConfigured) {
+      ensureDemo();
+      const campaigns = demo.systemMessageCampaigns.sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
+      return json(200, {
+        mode: "demo",
+        campaigns: campaigns.map((campaign) => sanitizeSystemCampaignForClient(campaign, demo.systemMessageRecipients.filter((item) => item.campaign_id === campaign.id))),
+        sms_provider: smsService.diagnostics()
+      });
+    }
+    const campaigns = await supabaseFetch("/rest/v1/system_message_campaigns?select=*&order=created_at.desc&limit=100", { service: true }).catch(() => []);
+    const recipients = await Promise.all((campaigns || []).map((campaign) => listSystemMessageRecipients(campaign.id)));
+    return json(200, {
+      mode: "supabase",
+      campaigns: (campaigns || []).map((campaign, index) => sanitizeSystemCampaignForClient(campaign, recipients[index] || [])),
+      sms_provider: smsService.diagnostics()
+    });
+  }
+  if (method !== "POST" && method !== "PATCH") return json(405, { error: "Method not allowed." });
+  const action = clean(body.action || "save_draft");
+  if (action === "estimate_audience") {
+    const payload = systemCampaignPayloadFromBody(body, profile);
+    const users = await systemMessageAudience(payload.audience_definition || {});
+    return json(200, {
+      audience_count: users.length,
+      recipient_count: users.length * normalizeSystemChannels(payload.channels).length,
+      channels: normalizeSystemChannels(payload.channels),
+      raw_personal_data_exposed: false
+    });
+  }
+  if (action === "test_send") {
+    const payload = systemCampaignPayloadFromBody(body, profile);
+    return await adminSystemMessageTestSend(payload, body, profile);
+  }
+  const existing = body.id ? await getSystemCampaignScoped(body.id) : null;
+  if (body.id && !existing) return json(404, { error: "System message not found." });
+  if (action === "cancel") {
+    if (!existing) return json(404, { error: "System message not found." });
+    const next = await updateSystemCampaign(existing, { status: "cancelled", cancelled_at: nowIso() });
+    await createAuditLog({
+      profile,
+      action: "system_message_cancelled",
+      entityType: "system_message_campaign",
+      entityId: next.id,
+      metadata: { category: next.category, channels: normalizeSystemChannels(next.channels), previous_status: existing.status }
+    });
+    return json(200, { campaign: sanitizeSystemCampaignForClient(next, await listSystemMessageRecipients(next.id)) });
+  }
+  if (action === "duplicate") {
+    if (!existing) return json(404, { error: "System message not found." });
+    const { id, created_at, updated_at, recipient_count, sent_count, delivered_count, failed_count, read_count, ...copy } = existing;
+    const cloned = await saveSystemCampaignRecord({ ...copy, name: `${existing.name || "Message"} copy`, status: "draft", scheduled_at: null, recipient_count: 0, sent_count: 0, delivered_count: 0, failed_count: 0, read_count: 0, created_at: nowIso(), updated_at: nowIso() });
+    await createAuditLog({
+      profile,
+      action: "system_message_duplicated",
+      entityType: "system_message_campaign",
+      entityId: cloned.id,
+      metadata: { source_campaign_id: existing.id, category: cloned.category }
+    });
+    return json(201, { campaign: sanitizeSystemCampaignForClient(cloned, []) });
+  }
+  const payload = systemCampaignPayloadFromBody(body, profile);
+  if (action === "save_draft") payload.status = "draft";
+  if (action === "schedule") {
+    if (!payload.scheduled_at) return json(400, { error: "A scheduled time is required." });
+    payload.status = "scheduled";
+  }
+  if (action === "send_now") {
+    payload.status = "queued";
+    payload.scheduled_at = nowIso();
+  }
+  if (["schedule", "send_now"].includes(action)) {
+    const validation = validateSystemCampaignForSending(payload);
+    if (validation) return json(400, { error: validation });
+  }
+  if (action === "save_draft") {
+    const variableError = validateCampaignTemplateVariables(payload);
+    if (variableError) return json(400, { error: variableError });
+  }
+  const campaign = await saveSystemCampaignRecord(payload, existing);
+  if (["schedule", "send_now"].includes(action)) {
+    const recipients = await snapshotSystemRecipients(campaign);
+    const processed = action === "send_now" ? await processSystemMessageCampaign(campaign) : null;
+    const next = action === "send_now"
+      ? (processed?.campaign || campaign)
+      : await updateSystemCampaign(campaign, {
+          status: "scheduled",
+          recipient_snapshot_at: campaign.recipient_snapshot_at || nowIso(),
+          recipient_snapshot_hash: hashEmailValue(`${campaign.id}:${recipients.map((item) => `${item.channel}:${item.destination_hash || item.user_id}`).sort().join(",")}`)
+        });
+    await createAuditLog({
+      profile,
+      action: action === "send_now" ? "system_message_sent_or_queued" : "system_message_scheduled",
+      entityType: "system_message_campaign",
+      entityId: campaign.id,
+      metadata: {
+        category: campaign.category,
+        channels: normalizeSystemChannels(campaign.channels),
+        recipient_count: recipients.length,
+        processed: processed?.processed || 0
+      }
+    });
+    return json(200, {
+      campaign: sanitizeSystemCampaignForClient(processed?.campaign || next, await listSystemMessageRecipients(campaign.id)),
+      processed: processed?.processed || 0
+    });
+  }
+  await createAuditLog({
+    profile,
+    action: existing ? "system_message_updated" : "system_message_created",
+    entityType: "system_message_campaign",
+    entityId: campaign.id,
+    metadata: { category: campaign.category, channels: normalizeSystemChannels(campaign.channels), status: campaign.status }
+  });
+  return json(existing ? 200 : 201, { campaign: sanitizeSystemCampaignForClient(campaign, await listSystemMessageRecipients(campaign.id)) });
+}
+
+function sanitizeNotification(row = {}) {
+  const actionUrl = safeInternalActionUrl(row.action_url || row.url || "");
+  return {
+    id: row.id,
+    category: clean(row.category || row.type || "system"),
+    title: clean(row.title),
+    body: clean(row.body || row.message),
+    message: clean(row.body || row.message),
+    action_url: actionUrl,
+    url: actionUrl,
+    severity: clean(row.severity || "info"),
+    read_at: row.read_at || null,
+    expires_at: row.expires_at || null,
+    non_dismissible: Boolean(row.non_dismissible),
+    created_at: row.created_at || null
+  };
+}
+
+async function listUserNotifications(profile = {}) {
+  if (!profile?.id) return [];
+  const now = nowIso();
+  if (!supabaseConfigured) {
+    ensureDemo();
+    return demo.notifications
+      .filter((item) => item.user_id === profile.id && (!item.expires_at || item.expires_at > now))
+      .sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")))
+      .map(sanitizeNotification);
+  }
+  const rows = await supabaseFetch(`/rest/v1/notifications?select=*&user_id=eq.${encodeURIComponent(profile.id)}&or=(expires_at.is.null,expires_at.gt.${encodeURIComponent(now)})&order=created_at.desc&limit=100`, { service: true }).catch(() => []);
+  return (rows || []).map(sanitizeNotification);
+}
+
+async function userNotifications(method, body, headers) {
+  const { profile } = await requireProfile(headers, []);
+  if (method === "GET") {
+    const notifications = await listUserNotifications(profile);
+    return json(200, {
+      notifications,
+      unread_count: notifications.filter((item) => !item.read_at).length
+    });
+  }
+  if (method !== "PATCH") return json(405, { error: "Method not allowed." });
+  const now = nowIso();
+  const ids = body.read_all ? [] : arrayFrom(body.id || body.ids);
+  if (!supabaseConfigured) {
+    ensureDemo();
+    for (const notification of demo.notifications) {
+      if (notification.user_id !== profile.id) continue;
+      if (body.read_all || ids.includes(notification.id)) notification.read_at = notification.read_at || now;
+    }
+  } else if (body.read_all) {
+    await supabaseFetch(`/rest/v1/notifications?user_id=eq.${encodeURIComponent(profile.id)}&read_at=is.null`, {
+      method: "PATCH",
+      service: true,
+      headers: { Prefer: "return=minimal" },
+      body: { read_at: now }
+    });
+  } else if (ids.length) {
+    await supabaseFetch(`/rest/v1/notifications?user_id=eq.${encodeURIComponent(profile.id)}&id=in.(${ids.map(encodeURIComponent).join(",")})`, {
+      method: "PATCH",
+      service: true,
+      headers: { Prefer: "return=minimal" },
+      body: { read_at: now }
+    });
+  }
+  const notifications = await listUserNotifications(profile);
+  return json(200, {
+    notifications,
+    unread_count: notifications.filter((item) => !item.read_at).length
+  });
 }
 
 async function logAuthProviderEmail({ to, subject, eventType, accepted = true, errorCode = null, errorMessage = null, locale = "en", idempotencyKey = "" }) {
   const result = {
     to,
-    from: "Supabase Auth",
+    from: EMAIL_FROM,
     subject,
     text: "",
     html: "",
     accepted,
-    provider: "supabase_auth",
+    provider: "supabase_auth_custom_smtp",
     messageId: null,
     provider_id: null,
     status: accepted ? "queued" : "failed",
@@ -6168,8 +11921,8 @@ async function sendGuestVerificationEmail({ email, guestName, lang, token = "", 
   const rows = await serverContentRows();
   const language = normalizeLanguage(lang || "en");
   const verificationUrl = token
-    ? `${PUBLIC_BASE_URL}/verify-email?token=${encodeURIComponent(token)}`
-    : `${PUBLIC_BASE_URL}/verify-email`;
+    ? `${AUTH_CALLBACK_URL}?token=${encodeURIComponent(token)}`
+    : AUTH_CALLBACK_URL;
   const context = {
     guest_name: clean(guestName) || clean(email),
     verification_url: verificationUrl
@@ -6216,15 +11969,36 @@ async function sendPasswordResetEmail({ email, guestName, lang, token, userId = 
   });
 }
 
-async function sendPasswordChangedEmail({ email, guestName, lang, userId = "", requestId = "" }) {
+async function sendPasswordChangedEmail({
+  email,
+  guestName,
+  firstName = "",
+  lang,
+  userId = "",
+  requestId = "",
+  localizedDateTime = "",
+  userAgentSummary = "",
+  maskedIp = ""
+}) {
   const rows = await serverContentRows();
   const language = normalizeLanguage(lang || "en");
+  const displayName = clean(guestName) || clean(email);
+  const firstNameValue = clean(firstName) || clean(displayName).split(/\s+/)[0] || clean(email);
   const context = {
-    guest_name: clean(guestName) || clean(email),
+    guest_name: displayName,
+    guestName: displayName,
+    firstName: firstNameValue,
+    first_name: firstNameValue,
+    localizedDateTime: clean(localizedDateTime) || localizedSecurityDateTime(new Date(), language),
+    localized_date_time: clean(localizedDateTime) || localizedSecurityDateTime(new Date(), language),
+    userAgentSummary: clean(userAgentSummary) || "Unknown browser",
+    user_agent_summary: clean(userAgentSummary) || "Unknown browser",
+    maskedIp: clean(maskedIp) || "unknown",
+    masked_ip: clean(maskedIp) || "unknown",
     account_url: `${PUBLIC_BASE_URL}/account/security`
   };
   const subject = template(contentValue(rows, "email_password_changed_subject", "Your SmartTable password was changed", language), context);
-  const body = template(contentValue(rows, "email_password_changed_body", "Hi {{guest_name}}, your SmartTable password was changed successfully.", language), context);
+  const body = template(contentValue(rows, "email_password_changed_body", "Hi {{firstName}}, your SmartTable account password was changed successfully. If you did not make this change, contact SmartTable support immediately.", language), context);
   const ctaLabel = contentValue(rows, "email_cta_my_account", "Open my account", language);
   return sendEmail({
     to: email,
@@ -6240,6 +12014,175 @@ async function sendPasswordChangedEmail({ email, guestName, lang, userId = "", r
   });
 }
 
+async function sendDataExportReadyEmail({ email, guestName, firstName = "", lang, userId = "", requestId = "", downloadUrl = "", expiresAt = "" }) {
+  const rows = await serverContentRows();
+  const language = normalizeLanguage(lang || "en");
+  const displayName = clean(guestName) || clean(email);
+  const firstNameValue = clean(firstName) || clean(displayName).split(/\s+/)[0] || clean(email);
+  const expires = expiresAt ? localizedSecurityDateTime(new Date(expiresAt), language) : "";
+  const context = {
+    guest_name: displayName,
+    firstName: firstNameValue,
+    first_name: firstNameValue,
+    downloadUrl,
+    download_url: downloadUrl,
+    expiresAt: expires,
+    expires_at: expires
+  };
+  const subject = template(contentValue(rows, "email_data_export_ready_subject", "Your SmartTable data export is ready", language), context);
+  const body = template(contentValue(rows, "email_data_export_ready_body", "Hi {{firstName}}, your SmartTable personal data export is ready. This secure link expires on {{expiresAt}}. Download it here: {{downloadUrl}}", language), context);
+  const ctaLabel = contentValue(rows, "email_cta_download_export", "Download export", language);
+  return sendEmail({
+    to: email,
+    subject,
+    text: `${body}\n\n${downloadUrl}`,
+    html: appEmailHtml(subject, body, { label: ctaLabel, url: downloadUrl })
+  }, {
+    event_type: "data_export_ready",
+    email_type: "data_export_ready",
+    recipient_user_id: userId,
+    locale: language,
+    template_version: EMAIL_TEMPLATE_VERSION,
+    idempotency_key: hashEmailValue(`data-export-ready:${userId || lower(email)}:${requestId}`)
+  });
+}
+
+function billingNotificationCopy(eventType = "", lang = "en", context = {}) {
+  const language = normalizeLanguage(lang || "en");
+  const restaurantName = clean(context.restaurant_name || context.restaurantName || "your restaurant");
+  const dateLabel = clean(context.date_label || context.dateLabel || "");
+  const portalUrl = clean(context.portal_url || context.portalUrl || `${PUBLIC_BASE_URL}/partner`);
+  const copies = {
+    trial_started: {
+      en: ["SmartTable trial started", `Your SmartTable trial for ${restaurantName} has started.${dateLabel ? ` Trial end: ${dateLabel}.` : ""} Manage billing: ${portalUrl}`],
+      es: ["Prueba de SmartTable iniciada", `Tu prueba de SmartTable para ${restaurantName} ha comenzado.${dateLabel ? ` Fin de la prueba: ${dateLabel}.` : ""} Gestionar facturacion: ${portalUrl}`],
+      hu: ["Elindult a SmartTable probaidoszak", `Elindult a SmartTable probaidoszak ehhez az etteremhez: ${restaurantName}.${dateLabel ? ` Probaidoszak vege: ${dateLabel}.` : ""} Szamlazas kezelese: ${portalUrl}`]
+    },
+    trial_ending_soon: {
+      en: ["SmartTable trial ending soon", `Your SmartTable trial for ${restaurantName} is ending soon.${dateLabel ? ` Trial end: ${dateLabel}.` : ""} Manage billing: ${portalUrl}`],
+      es: ["La prueba de SmartTable termina pronto", `Tu prueba de SmartTable para ${restaurantName} termina pronto.${dateLabel ? ` Fin de la prueba: ${dateLabel}.` : ""} Gestionar facturacion: ${portalUrl}`],
+      hu: ["Hamarosan veget er a SmartTable probaidoszak", `Hamarosan veget er a SmartTable probaidoszak ehhez az etteremhez: ${restaurantName}.${dateLabel ? ` Probaidoszak vege: ${dateLabel}.` : ""} Szamlazas kezelese: ${portalUrl}`]
+    },
+    subscription_activated: {
+      en: ["SmartTable subscription activated", `Your SmartTable subscription for ${restaurantName} is active. SmartTable waits for Stripe webhooks before confirming billing state. Manage billing: ${portalUrl}`],
+      es: ["Suscripcion SmartTable activada", `Tu suscripcion de SmartTable para ${restaurantName} esta activa. SmartTable espera los webhooks de Stripe antes de confirmar el estado de facturacion. Gestionar facturacion: ${portalUrl}`],
+      hu: ["A SmartTable elofizetes aktiv", `A SmartTable elofizetes aktiv ehhez az etteremhez: ${restaurantName}. A SmartTable a Stripe webhook utan erositi meg a szamlazasi allapotot. Szamlazas kezelese: ${portalUrl}`]
+    },
+    subscription_changed: {
+      en: ["SmartTable subscription changed", `The SmartTable subscription for ${restaurantName} was updated. Manage billing: ${portalUrl}`],
+      es: ["Suscripcion SmartTable actualizada", `La suscripcion de SmartTable para ${restaurantName} se actualizo. Gestionar facturacion: ${portalUrl}`],
+      hu: ["A SmartTable elofizetes frissult", `A SmartTable elofizetes frissult ehhez az etteremhez: ${restaurantName}. Szamlazas kezelese: ${portalUrl}`]
+    },
+    payment_failed: {
+      en: ["SmartTable payment failed", `A SmartTable payment for ${restaurantName} was not successful. Your restaurant may enter a grace period before partner access becomes read-only. Manage billing: ${portalUrl}`],
+      es: ["Pago de SmartTable fallido", `Un pago de SmartTable para ${restaurantName} no se completo. El restaurante puede entrar en periodo de gracia antes de que el acceso sea de solo lectura. Gestionar facturacion: ${portalUrl}`],
+      hu: ["Sikertelen SmartTable fizetes", `A SmartTable fizetes nem sikerult ehhez az etteremhez: ${restaurantName}. Az etterem turelmi idoszakba kerulhet, mielott a partner hozzaferes csak olvashato lesz. Szamlazas kezelese: ${portalUrl}`]
+    },
+    grace_period_started: {
+      en: ["SmartTable grace period started", `A billing grace period started for ${restaurantName}.${dateLabel ? ` Grace period end: ${dateLabel}.` : ""} Manage billing: ${portalUrl}`],
+      es: ["Periodo de gracia de SmartTable iniciado", `Comenzo un periodo de gracia de facturacion para ${restaurantName}.${dateLabel ? ` Fin del periodo de gracia: ${dateLabel}.` : ""} Gestionar facturacion: ${portalUrl}`],
+      hu: ["Elindult a SmartTable turelmi idoszak", `Szamlazasi turelmi idoszak indult ehhez az etteremhez: ${restaurantName}.${dateLabel ? ` Turelmi idoszak vege: ${dateLabel}.` : ""} Szamlazas kezelese: ${portalUrl}`]
+    },
+    access_read_only: {
+      en: ["SmartTable access is read-only", `Partner access for ${restaurantName} is now read-only until billing is resolved. Existing restaurant and reservation data was not deleted. Manage billing: ${portalUrl}`],
+      es: ["El acceso de SmartTable es de solo lectura", `El acceso de partner para ${restaurantName} ahora es de solo lectura hasta resolver la facturacion. No se elimino ningun dato del restaurante ni de reservas. Gestionar facturacion: ${portalUrl}`],
+      hu: ["A SmartTable hozzaferes csak olvashato", `A partner hozzaferes most csak olvashato ehhez az etteremhez: ${restaurantName}, amig a szamlazas nem rendezodik. Etterem- es foglalasi adat nem torlodott. Szamlazas kezelese: ${portalUrl}`]
+    },
+    subscription_canceled: {
+      en: ["SmartTable subscription canceled", `The SmartTable subscription for ${restaurantName} was canceled.${dateLabel ? ` Current access remains available until ${dateLabel} where applicable.` : ""} Manage billing: ${portalUrl}`],
+      es: ["Suscripcion SmartTable cancelada", `La suscripcion de SmartTable para ${restaurantName} fue cancelada.${dateLabel ? ` El acceso actual continua hasta ${dateLabel} cuando corresponda.` : ""} Gestionar facturacion: ${portalUrl}`],
+      hu: ["A SmartTable elofizetes lemondva", `A SmartTable elofizetes lemondva ehhez az etteremhez: ${restaurantName}.${dateLabel ? ` Az aktualis hozzaferes ${dateLabel} idoig maradhat elerheto, ha alkalmazhato.` : ""} Szamlazas kezelese: ${portalUrl}`]
+    },
+    subscription_resumed: {
+      en: ["SmartTable subscription resumed", `Billing for ${restaurantName} has recovered and partner access is active again. Manage billing: ${portalUrl}`],
+      es: ["Suscripcion SmartTable reanudada", `La facturacion de ${restaurantName} se recupero y el acceso de partner vuelve a estar activo. Gestionar facturacion: ${portalUrl}`],
+      hu: ["A SmartTable elofizetes helyreallt", `A szamlazas helyreallt ehhez az etteremhez: ${restaurantName}, es a partner hozzaferes ujra aktiv. Szamlazas kezelese: ${portalUrl}`]
+    }
+  };
+  const [subject, body] = copies[eventType]?.[language] || copies[eventType]?.en || copies.subscription_changed.en;
+  return { subject, body };
+}
+
+async function sendBillingNotificationEmail({ eventType, restaurant = {}, subscription = {}, billingAccount = null, lang = "en", idempotencyKey = "" } = {}) {
+  const normalizedEventType = clean(eventType || "subscription_changed");
+  const email = restaurantBillingEmail(restaurant, {}, billingAccount);
+  const portalUrl = safePartnerBillingUrl("/partner?billing=1");
+  if (!email) {
+    return recordEmailConfigurationFailure({
+      to: "",
+      subject: "SmartTable billing notification",
+      text: ""
+    }, {
+      event_type: `billing_${normalizedEventType}`,
+      email_type: "billing_notification",
+      restaurant_id: restaurant.id || subscription.restaurant_id || null,
+      locale: normalizeLanguage(lang || "en"),
+      template_version: EMAIL_TEMPLATE_VERSION,
+      idempotency_key: idempotencyKey || hashEmailValue(`billing:${normalizedEventType}:${restaurant.id || subscription.restaurant_id || "restaurant"}:${Math.floor(Date.now() / 600000)}`)
+    }, "BILLING_EMAIL_RECIPIENT_MISSING", "No billing recipient email is configured for this restaurant.");
+  }
+  const dateValue = subscription.trial_end || subscription.current_period_end || subscription.payment_grace_period_end || subscription.billing_access_override_expires_at || "";
+  const dateLabel = dateValue ? localizedSecurityDateTime(new Date(dateValue), lang) : "";
+  const copy = billingNotificationCopy(normalizedEventType, lang, {
+    restaurant_name: restaurant.name || subscription.restaurant_name || "your restaurant",
+    date_label: dateLabel,
+    portal_url: portalUrl
+  });
+  return sendEmail({
+    to: email,
+    subject: copy.subject,
+    text: `${copy.body}\n\n${portalUrl}`,
+    html: appEmailHtml(copy.subject, copy.body, { label: "Manage billing", url: portalUrl })
+  }, {
+    event_type: `billing_${normalizedEventType}`,
+    email_type: "billing_notification",
+    restaurant_id: restaurant.id || subscription.restaurant_id || null,
+    locale: normalizeLanguage(lang || "en"),
+    template_version: EMAIL_TEMPLATE_VERSION,
+    idempotency_key: idempotencyKey || hashEmailValue(`billing:${normalizedEventType}:${restaurant.id || subscription.restaurant_id || "restaurant"}:${Math.floor(Date.now() / 600000)}`)
+  });
+}
+
+function generatePartnerInvitationToken() {
+  return crypto.randomBytes(32).toString("base64url");
+}
+
+function partnerInvitationTokenHash(token = "") {
+  return crypto.createHash("sha256").update(String(token || "")).digest("hex");
+}
+
+function partnerInvitationUrl(token = "") {
+  return `${PUBLIC_BASE_URL}/partner/invite?token=${encodeURIComponent(token)}`;
+}
+
+async function sendRestaurantPartnerInvitationEmail({ email, partnerName, restaurantName, lang = "en", userId = "", restaurantId = "", invitationToken = "" }) {
+  const rows = await serverContentRows();
+  const language = normalizeLanguage(lang || "en");
+  const context = {
+    partner_name: clean(partnerName) || clean(email),
+    restaurant_name: clean(restaurantName) || "your restaurant",
+    partner_login_url: `${PUBLIC_BASE_URL}/partner`,
+    partner_invitation_url: invitationToken ? partnerInvitationUrl(invitationToken) : `${PUBLIC_BASE_URL}/partner`
+  };
+  const subject = template(contentValue(rows, "email_partner_invitation_subject", "SmartTable partner access for {{restaurant_name}}", language), context);
+  const body = template(contentValue(rows, "email_partner_invitation_body", "Hi {{partner_name}}, SmartTable partner access is ready for {{restaurant_name}}. Use your secure invitation link to create your password. If you were not expecting this invitation, contact SmartTable support.", language), context);
+  const ctaLabel = contentValue(rows, "email_cta_partner_dashboard", "Open partner portal", language);
+  return sendEmail({
+    to: email,
+    subject,
+    text: `${body}\n\n${context.partner_invitation_url}`,
+    html: appEmailHtml(subject, body, { label: ctaLabel, url: context.partner_invitation_url })
+  }, {
+    event_type: "restaurant_partner_invitation",
+    email_type: "restaurant_partner_invitation",
+    recipient_user_id: userId,
+    restaurant_id: restaurantId,
+    locale: language,
+    template_version: EMAIL_TEMPLATE_VERSION,
+    idempotency_key: hashEmailValue(`restaurant-partner-invitation:${userId || lower(email)}:${restaurantId || "restaurant"}:${invitationToken ? hashEmailValue(invitationToken).slice(0, 24) : "initial"}`)
+  });
+}
+
 function reservationEmailText(row, lang = "en") {
   const language = normalizeLanguage(lang);
   const date = row.reservation_date || row.offer_date;
@@ -6247,13 +12190,21 @@ function reservationEmailText(row, lang = "en") {
   const guests = Number(row.party_size) === 1
     ? { en: "guest", es: "persona", hu: "vend\u00e9g" }[language]
     : { en: "guests", es: "personas", hu: "vend\u00e9g" }[language];
+  if (isStandardReservation(row)) {
+    if (language === "hu") return `${row.restaurant_name}, ${date} ${time}, ${row.party_size} ${guests}, norm\u00e1l asztalfoglal\u00e1s`;
+    if (language === "es") return `${row.restaurant_name}, ${date} a las ${time}, ${row.party_size} ${guests}, reserva est\u00e1ndar`;
+    return `${row.restaurant_name}, ${date} at ${time}, ${row.party_size} ${guests}, standard reservation`;
+  }
   if (language === "hu") return `${row.restaurant_name}, ${date} ${time}, ${row.party_size} ${guests}, ${row.discount_percent || row.discount_value}% kedvezm\u00e9ny`;
   if (language === "es") return `${row.restaurant_name}, ${date} a las ${time}, ${row.party_size} ${guests}, ${row.discount_percent || row.discount_value}% de descuento`;
   return `${row.restaurant_name}, ${date} at ${time}, ${row.party_size} ${guests}, ${row.discount_percent || row.discount_value}% off`;
 }
 
-async function sendReservationCreatedEmails(row) {
+async function sendReservationCreatedEmails(row, options = {}) {
   const rows = await serverContentRows();
+  const targets = new Set((Array.isArray(options.targets) && options.targets.length ? options.targets : ["guest", "partner", "admin"]).map((item) => clean(item).toLowerCase()));
+  const idempotencySuffix = clean(options.idempotencySuffix || options.idempotency_suffix);
+  const idempotencyKeyFor = (base) => hashEmailValue(idempotencySuffix ? `${base}:${idempotencySuffix}` : base);
   const guestLang = normalizeLanguage(row.guest_language || row.language || row.lang || "en");
   const restaurantLang = normalizeLanguage(row.restaurant_language || "en");
   const context = {
@@ -6274,9 +12225,10 @@ async function sendReservationCreatedEmails(row) {
     reservation_id: row.reservation_id,
     restaurant_id: row.restaurant_id,
     event_type: "restaurant_request_notice",
+    email_type: "restaurant_request_notice",
     locale: restaurantLang,
     template_version: EMAIL_TEMPLATE_VERSION,
-    idempotency_key: hashEmailValue(`reservation-request-partner:${row.reservation_id}`)
+    idempotency_key: idempotencyKeyFor(`reservation-request-partner:${row.reservation_id}`)
   };
   const partnerMessage = {
     to: row.restaurant_email,
@@ -6284,7 +12236,7 @@ async function sendReservationCreatedEmails(row) {
     text: `${restaurantBody} Dashboard: ${context.dashboard_url}`,
     html: appEmailHtml(restaurantSubject, restaurantBody, { label: dashboardCta, url: context.dashboard_url })
   };
-  const partnerEmail = isValidSignupEmail(row.restaurant_email)
+  const partnerEmail = () => isValidSignupEmail(row.restaurant_email)
     ? sendEmail(partnerMessage, partnerContext)
     : recordEmailConfigurationFailure(
       partnerMessage,
@@ -6294,8 +12246,9 @@ async function sendReservationCreatedEmails(row) {
         ? "The restaurant reservation notification email is invalid."
         : "The restaurant reservation notification email is missing."
     );
-  const messages = [
-    sendEmail({
+  const messages = [];
+  if (targets.has("guest")) {
+    messages.push(sendEmail({
       to: row.guest_email,
       subject: guestSubject,
       text: `${guestBody}\n\n${context.my_reservations_url}`,
@@ -6304,14 +12257,15 @@ async function sendReservationCreatedEmails(row) {
       reservation_id: row.reservation_id,
       restaurant_id: row.restaurant_id,
       event_type: "guest_request_received",
+      email_type: "guest_request_received",
       locale: guestLang,
       template_version: EMAIL_TEMPLATE_VERSION,
-      idempotency_key: hashEmailValue(`reservation-request-guest:${row.reservation_id}`)
-    }),
-    partnerEmail
-  ];
+      idempotency_key: idempotencyKeyFor(`reservation-request-guest:${row.reservation_id}`)
+    }));
+  }
+  if (targets.has("partner")) messages.push(partnerEmail());
 
-  if (ADMIN_NOTIFICATION_EMAIL) {
+  if (ADMIN_NOTIFICATION_EMAIL && targets.has("admin")) {
     const adminSubject = template(contentValue(rows, "email_admin_new_subject", "Smart Table admin notice: new reservation request", "en"), context);
     const adminBody = template(contentValue(rows, "email_admin_new_body", "A new reservation was created for {{restaurant_name}}. {{reservation_summary}}.", "en"), context);
     messages.push(sendEmail({
@@ -6323,13 +12277,861 @@ async function sendReservationCreatedEmails(row) {
       reservation_id: row.reservation_id,
       restaurant_id: row.restaurant_id,
       event_type: "admin_request_notice",
+      email_type: "admin_request_notice",
       locale: "en",
       template_version: EMAIL_TEMPLATE_VERSION,
-      idempotency_key: hashEmailValue(`reservation-request-admin:${row.reservation_id}`)
+      idempotency_key: idempotencyKeyFor(`reservation-request-admin:${row.reservation_id}`)
     }));
   }
 
   return Promise.all(messages);
+}
+
+async function reservationAlertSchemaReady() {
+  if (!supabaseConfigured) return true;
+  const columns = await supabaseTableColumns("reservation_alerts");
+  return columns.has("restaurant_id") && columns.has("safe_payload");
+}
+
+async function getRestaurantNotificationPreferences(restaurantId = "") {
+  const id = clean(restaurantId);
+  const defaults = defaultRestaurantNotificationPreferences(id);
+  if (!id) return defaults;
+  if (!supabaseConfigured) {
+    ensureDemo();
+    return { ...defaults, ...(demo.restaurantNotificationPreferences.find((row) => row.restaurant_id === id) || {}) };
+  }
+  const columns = await supabaseTableColumns("restaurant_notification_preferences");
+  if (!columns.has("restaurant_id")) return defaults;
+  const rows = await supabaseFetch(`/rest/v1/restaurant_notification_preferences?select=*&restaurant_id=eq.${encodeURIComponent(id)}&limit=1`, { service: true }).catch(() => []);
+  return { ...defaults, ...(rows?.[0] || {}) };
+}
+
+async function saveRestaurantNotificationPreferences(restaurantId = "", body = {}, profile = null, headers = {}) {
+  const id = clean(restaurantId);
+  const patch = normalizeNotificationPreferencePatch(body, id);
+  const existing = await getRestaurantNotificationPreferences(id);
+  const next = { ...existing, ...patch, updated_at: nowIso() };
+  if (!supabaseConfigured) {
+    ensureDemo();
+    const index = demo.restaurantNotificationPreferences.findIndex((row) => row.restaurant_id === id);
+    if (index >= 0) demo.restaurantNotificationPreferences[index] = next;
+    else demo.restaurantNotificationPreferences.unshift({ ...next, created_at: nowIso() });
+    await upsertSmsRecipientFromPreference(next, "primary", profile);
+    await upsertSmsRecipientFromPreference(next, "escalation", profile);
+    await createAuditLog({
+      profile,
+      action: "restaurant_notification_preferences_updated",
+      entityType: "restaurant_notification_preferences",
+      entityId: id,
+      headers,
+      previousValue: clientRestaurantNotificationPreferences(existing),
+      newValue: clientRestaurantNotificationPreferences(next),
+      metadata: { restaurant_id: id }
+    }).catch(() => null);
+    return next;
+  }
+  const columns = await supabaseTableColumns("restaurant_notification_preferences");
+  if (!columns.has("restaurant_id")) {
+    const error = new Error("Reservation notification settings migration is not applied.");
+    error.status = 503;
+    error.code = "RESERVATION_ALERT_SCHEMA_MISSING";
+    throw error;
+  }
+  const rows = await supabaseFetch("/rest/v1/restaurant_notification_preferences?on_conflict=restaurant_id&select=*", {
+    method: "POST",
+    service: true,
+    headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+    body: await filterSupabaseTablePayload("restaurant_notification_preferences", next)
+  });
+  const saved = rows?.[0] || next;
+  await upsertSmsRecipientFromPreference(saved, "primary", profile);
+  await upsertSmsRecipientFromPreference(saved, "escalation", profile);
+  await createAuditLog({
+    profile,
+    action: "restaurant_notification_preferences_updated",
+    entityType: "restaurant_notification_preferences",
+    entityId: id,
+    headers,
+    previousValue: clientRestaurantNotificationPreferences(existing),
+    newValue: clientRestaurantNotificationPreferences(saved),
+    metadata: { restaurant_id: id }
+  }).catch(() => null);
+  return saved;
+}
+
+async function upsertSmsRecipientFromPreference(preferences = {}, type = "primary", profile = null) {
+  const restaurantId = clean(preferences.restaurant_id);
+  const phone = normalizePhoneE164(type === "primary" ? preferences.primary_sms_number : preferences.escalation_sms_number);
+  if (!restaurantId || !phone) return null;
+  const payload = {
+    restaurant_id: restaurantId,
+    recipient_type: type,
+    phone_number: phone,
+    phone_hash: hashPhoneValue(phone),
+    status: "active",
+    created_by: profile?.id || null,
+    updated_at: nowIso()
+  };
+  if (!supabaseConfigured) {
+    ensureDemo();
+    const existing = demo.restaurantNotificationSmsRecipients.find((row) => row.restaurant_id === restaurantId && row.recipient_type === type && row.status === "active");
+    if (existing) Object.assign(existing, payload);
+    else demo.restaurantNotificationSmsRecipients.unshift({ id: crypto.randomUUID(), ...payload, created_at: nowIso() });
+    return payload;
+  }
+  const columns = await supabaseTableColumns("restaurant_notification_sms_recipients");
+  if (!columns.has("restaurant_id")) return null;
+  const existing = await supabaseFetch(`/rest/v1/restaurant_notification_sms_recipients?select=id&restaurant_id=eq.${encodeURIComponent(restaurantId)}&recipient_type=eq.${encodeURIComponent(type)}&status=eq.active&limit=1`, { service: true }).catch(() => []);
+  if (existing?.[0]?.id) {
+    const rows = await supabaseFetch(`/rest/v1/restaurant_notification_sms_recipients?id=eq.${encodeURIComponent(existing[0].id)}&select=*`, {
+      method: "PATCH",
+      service: true,
+      headers: { Prefer: "return=representation" },
+      body: await filterSupabaseTablePayload("restaurant_notification_sms_recipients", payload)
+    }).catch(() => []);
+    return rows?.[0] || payload;
+  }
+  const rows = await supabaseFetch("/rest/v1/restaurant_notification_sms_recipients?select=*", {
+    method: "POST",
+    service: true,
+    headers: { Prefer: "return=representation" },
+    body: await filterSupabaseTablePayload("restaurant_notification_sms_recipients", payload)
+  }).catch(() => []);
+  return rows?.[0] || payload;
+}
+
+function clientPartnerDevice(row = {}) {
+  return {
+    id: row.id,
+    restaurant_id: row.restaurant_id,
+    device_name: row.device_name || "Restaurant device",
+    device_type: row.device_type || "browser",
+    push_provider: row.push_provider || "webpush",
+    permission_status: row.permission_status || "unknown",
+    status: row.status || "active",
+    last_active_at: row.last_active_at || null,
+    last_success_at: row.last_success_at || null,
+    last_failure_at: row.last_failure_at || null,
+    last_error_code: row.last_error_code || null,
+    offline_more_than_24h: row.last_active_at ? Date.now() - new Date(row.last_active_at).getTime() > 24 * 60 * 60 * 1000 : true
+  };
+}
+
+async function listRestaurantDevices(restaurantId = "", options = {}) {
+  const id = clean(restaurantId);
+  if (!id) return [];
+  if (!supabaseConfigured) {
+    ensureDemo();
+    return demo.partnerDeviceSubscriptions
+      .filter((row) => row.restaurant_id === id && (!options.activeOnly || row.status === "active"));
+  }
+  const columns = await supabaseTableColumns("partner_device_subscriptions");
+  if (!columns.has("restaurant_id")) return [];
+  const statusFilter = options.activeOnly ? "&status=eq.active" : "";
+  return await supabaseFetch(`/rest/v1/partner_device_subscriptions?select=*&restaurant_id=eq.${encodeURIComponent(id)}${statusFilter}&order=last_active_at.desc`, { service: true }).catch(() => []);
+}
+
+async function registerPartnerDeviceSubscription(restaurantId = "", body = {}, profile = null, headers = {}) {
+  const subscription = body.subscription || body.push_subscription || body;
+  const endpoint = clean(subscription?.endpoint || "");
+  if (!endpoint || !subscription?.keys?.p256dh || !subscription?.keys?.auth) {
+    return json(400, { error: "A valid push subscription is required." });
+  }
+  const providerCheck = await pushService.upsertSubscription(subscription);
+  if (providerCheck.status === "failed") return json(400, { error: providerCheck.message || "Push subscription is invalid." });
+  const installationId = clean(body.device_installation_id || body.deviceInstallationId).slice(0, 200);
+  const installationHash = installationId
+    ? hashEmailValue(`partner-push-device:${restaurantId}:${profile?.id || "anonymous"}:${installationId}`)
+    : "";
+  const payload = {
+    restaurant_id: restaurantId,
+    user_id: profile?.id || null,
+    endpoint_hash: endpointHash(endpoint),
+    endpoint,
+    subscription_json: subscription,
+    push_provider: "webpush",
+    device_name: normalizeDeviceName(body.device_name || body.deviceName),
+    device_type: normalizeDeviceType(body.device_type || body.deviceType || "browser"),
+    user_agent_summary: summarizeUserAgent(headers["user-agent"] || headers["User-Agent"] || body.user_agent),
+    permission_status: normalizePermissionStatus(body.permission_status || body.permissionStatus || "granted"),
+    status: "active",
+    last_active_at: nowIso(),
+    metadata: {
+      source: "partner_dashboard",
+      ...(installationHash ? { installation_hash: installationHash } : {})
+    }
+  };
+  if (!supabaseConfigured) {
+    ensureDemo();
+    const existing = demo.partnerDeviceSubscriptions.find((row) => row.endpoint_hash === payload.endpoint_hash)
+      || (installationHash
+        ? demo.partnerDeviceSubscriptions.find((row) => row.restaurant_id === restaurantId && row.user_id === payload.user_id && row.metadata?.installation_hash === installationHash)
+        : null);
+    const next = { ...(existing || { id: crypto.randomUUID(), created_at: nowIso() }), ...payload, updated_at: nowIso() };
+    if (existing) Object.assign(existing, next);
+    else demo.partnerDeviceSubscriptions.unshift(next);
+    return json(200, { device: clientPartnerDevice(next), push: pushService.getStatus() });
+  }
+  const columns = await supabaseTableColumns("partner_device_subscriptions");
+  if (!columns.has("restaurant_id")) return json(503, { error: "Reservation alert device migration is not applied.", code: "RESERVATION_ALERT_SCHEMA_MISSING" });
+  const endpointRows = await supabaseFetch(`/rest/v1/partner_device_subscriptions?select=*&endpoint_hash=eq.${encodeURIComponent(payload.endpoint_hash)}&limit=1`, { service: true }).catch(() => []);
+  const installationRows = installationHash
+    ? await supabaseFetch(`/rest/v1/partner_device_subscriptions?select=*&restaurant_id=eq.${encodeURIComponent(restaurantId)}&user_id=eq.${encodeURIComponent(payload.user_id)}&metadata->>installation_hash=eq.${encodeURIComponent(installationHash)}&order=last_active_at.desc`, { service: true }).catch(() => [])
+    : [];
+  const existing = endpointRows?.[0] || installationRows?.[0] || null;
+  if (existing?.status === "expired" && existing.endpoint_hash === payload.endpoint_hash) {
+    return json(200, {
+      device: clientPartnerDevice(existing),
+      push: pushService.getStatus(),
+      renewal_required: true
+    });
+  }
+  let rows;
+  if (existing?.id) {
+    rows = await supabaseFetch(`/rest/v1/partner_device_subscriptions?id=eq.${encodeURIComponent(existing.id)}&select=*`, {
+      method: "PATCH",
+      service: true,
+      headers: { Prefer: "return=representation" },
+      body: await filterSupabaseTablePayload("partner_device_subscriptions", { ...payload, updated_at: nowIso() })
+    });
+  } else {
+    rows = await supabaseFetch("/rest/v1/partner_device_subscriptions?on_conflict=endpoint_hash&select=*", {
+      method: "POST",
+      service: true,
+      headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+      body: await filterSupabaseTablePayload("partner_device_subscriptions", payload)
+    });
+  }
+  const savedId = rows?.[0]?.id || existing?.id || null;
+  for (const duplicate of installationRows.filter((row) => row.id && row.id !== savedId && row.status === "active")) {
+    await supabaseFetch(`/rest/v1/partner_device_subscriptions?id=eq.${encodeURIComponent(duplicate.id)}`, {
+      method: "PATCH",
+      service: true,
+      body: { status: "revoked", updated_at: nowIso() }
+    }).catch(() => null);
+  }
+  await createAuditLog({
+    profile,
+    action: "partner_push_device_registered",
+    entityType: "partner_device_subscription",
+    entityId: rows?.[0]?.id,
+    headers,
+    metadata: { restaurant_id: restaurantId, device_type: payload.device_type, permission_status: payload.permission_status }
+  }).catch(() => null);
+  return json(200, { device: clientPartnerDevice(rows?.[0] || payload), push: pushService.getStatus() });
+}
+
+async function removePartnerDeviceSubscription(restaurantId = "", deviceId = "", profile = null, headers = {}) {
+  const id = clean(deviceId);
+  if (!id) return json(400, { error: "Device id is required." });
+  if (!supabaseConfigured) {
+    ensureDemo();
+    const device = demo.partnerDeviceSubscriptions.find((row) => row.id === id && row.restaurant_id === restaurantId);
+    if (device) Object.assign(device, { status: "revoked", updated_at: nowIso() });
+    return json(200, { ok: Boolean(device) });
+  }
+  const rows = await supabaseFetch(`/rest/v1/partner_device_subscriptions?id=eq.${encodeURIComponent(id)}&restaurant_id=eq.${encodeURIComponent(restaurantId)}&select=*`, {
+    method: "PATCH",
+    service: true,
+    headers: { Prefer: "return=representation" },
+    body: { status: "revoked", updated_at: nowIso() }
+  }).catch(() => []);
+  await createAuditLog({
+    profile,
+    action: "partner_push_device_removed",
+    entityType: "partner_device_subscription",
+    entityId: id,
+    headers,
+    metadata: { restaurant_id: restaurantId }
+  }).catch(() => null);
+  return json(200, { ok: Boolean(rows?.[0]), device: rows?.[0] ? clientPartnerDevice(rows[0]) : null });
+}
+
+async function findAlertDeliveryRecord(idempotencyKey = "") {
+  const key = clean(idempotencyKey);
+  if (!key) return null;
+  if (!supabaseConfigured) {
+    ensureDemo();
+    return demo.reservationAlertDeliveries.find((item) => item.idempotency_key === key) || null;
+  }
+  const columns = await supabaseTableColumns("reservation_alert_deliveries");
+  if (!columns.has("idempotency_key")) return null;
+  const rows = await supabaseFetch(`/rest/v1/reservation_alert_deliveries?select=*&idempotency_key=eq.${encodeURIComponent(key)}&limit=1`, { service: true }).catch(() => []);
+  return rows?.[0] || null;
+}
+
+function alertDeliveryAlreadySent(delivery = {}) {
+  return ["queued", "sent", "delivered", "acknowledged", "escalated"].includes(normalizeAlertStatus(delivery.status));
+}
+
+function retryableAlertDelivery(delivery = {}, channel = "") {
+  const status = normalizeAlertStatus(delivery.status);
+  if (status !== "failed") return false;
+  const code = clean(delivery.error_code).toUpperCase();
+  if (channel === "sms") return ["SMS_PROVIDER_UNAVAILABLE", "SMS_ALERT_RATE_LIMITED"].includes(code);
+  if (channel === "push") return ["PUSH_PROVIDER_UNAVAILABLE", "PUSH_PROVIDER_REJECTED"].includes(code);
+  if (channel === "voice") return ["VOICE_PROVIDER_UNAVAILABLE", "VOICE_ALERT_RATE_LIMITED"].includes(code);
+  return false;
+}
+
+async function saveAlertDeliveryRecord(payload = {}) {
+  const now = nowIso();
+  const row = {
+    id: crypto.randomUUID(),
+    attempt_number: 1,
+    created_at: now,
+    updated_at: now,
+    ...payload
+  };
+  if (!supabaseConfigured) {
+    ensureDemo();
+    const existing = demo.reservationAlertDeliveries.find((item) => item.idempotency_key === row.idempotency_key);
+    if (existing) {
+      Object.assign(existing, row, { id: existing.id, created_at: existing.created_at });
+      return existing;
+    }
+    demo.reservationAlertDeliveries.unshift(row);
+    return row;
+  }
+  const columns = await supabaseTableColumns("reservation_alert_deliveries");
+  if (!columns.has("alert_id")) return null;
+  const rows = await supabaseFetch("/rest/v1/reservation_alert_deliveries?on_conflict=idempotency_key&select=*", {
+    method: "POST",
+    service: true,
+    headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+    body: await filterSupabaseTablePayload("reservation_alert_deliveries", row)
+  }).catch(() => []);
+  return rows?.[0] || row;
+}
+
+async function patchAlertRecord(alert = {}, patch = {}) {
+  if (!alert?.id) return alert;
+  const next = { ...alert, ...patch, updated_at: nowIso() };
+  if (!supabaseConfigured) {
+    const index = demo.reservationAlerts.findIndex((row) => row.id === alert.id);
+    if (index >= 0) demo.reservationAlerts[index] = next;
+    return next;
+  }
+  const rows = await supabaseFetch(`/rest/v1/reservation_alerts?id=eq.${encodeURIComponent(alert.id)}&select=*`, {
+    method: "PATCH",
+    service: true,
+    headers: { Prefer: "return=representation" },
+    body: await filterSupabaseTablePayload("reservation_alerts", patch)
+  }).catch(() => []);
+  return rows?.[0] || next;
+}
+
+async function upsertReservationAlert(row = {}, preferences = null, options = {}) {
+  const restaurantId = clean(row.restaurant_id);
+  const reservationId = clean(row.reservation_id || row.id);
+  if (!restaurantId) return null;
+  const settings = preferences || await getRestaurantNotificationPreferences(restaurantId);
+  const payload = reservationAlertPayload(row);
+  const now = nowIso();
+  const fallbackDue = settings.sms_fallback_enabled
+    ? new Date(Date.now() + Number(settings.sms_fallback_delay_seconds || RESERVATION_ALERT_SMS_FALLBACK_SECONDS) * 1000).toISOString()
+    : null;
+  const escalationDue = settings.sms_fallback_enabled
+    ? new Date(Date.now() + Number(settings.sms_escalation_delay_seconds || RESERVATION_ALERT_ESCALATION_SECONDS) * 1000).toISOString()
+    : null;
+  const voiceDue = settings.voice_call_enabled
+    ? new Date(Date.now() + Number(settings.voice_call_delay_seconds || RESERVATION_ALERT_VOICE_DELAY_SECONDS) * 1000).toISOString()
+    : null;
+  const alertPayload = {
+    reservation_id: reservationId || null,
+    restaurant_id: restaurantId,
+    alert_type: options.alertType || "new_reservation_request",
+    status: "sent",
+    priority: "high",
+    safe_payload: payload,
+    sms_fallback_due_at: fallbackDue,
+    sms_escalation_due_at: escalationDue,
+    voice_call_due_at: voiceDue,
+    sent_at: now,
+    expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+    updated_at: now
+  };
+  if (!supabaseConfigured) {
+    ensureDemo();
+    const existing = reservationId
+      ? demo.reservationAlerts.find((item) => item.reservation_id === reservationId && item.alert_type === alertPayload.alert_type)
+      : null;
+    const next = { ...(existing || { id: crypto.randomUUID(), created_at: now }), ...alertPayload };
+    if (existing) Object.assign(existing, next);
+    else demo.reservationAlerts.unshift(next);
+    return next;
+  }
+  if (!(await reservationAlertSchemaReady())) return null;
+  const requestPath = reservationId
+    ? "/rest/v1/reservation_alerts?on_conflict=reservation_id,alert_type&select=*"
+    : "/rest/v1/reservation_alerts?select=*";
+  const rows = await supabaseFetch(requestPath, {
+    method: "POST",
+    service: true,
+    headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+    body: await filterSupabaseTablePayload("reservation_alerts", alertPayload)
+  });
+  return rows?.[0] || alertPayload;
+}
+
+function pushNotificationPayload(alert = {}) {
+  const payload = clientReservationAlert(alert).payload;
+  return {
+    title: "New reservation request",
+    body: `${payload.restaurant_name} - ${payload.reservation_date} ${payload.reservation_time} - ${payload.party_size} guests - ${payload.discount_label || `${payload.discount_percent || 0}% off`} - ${payload.reference}`,
+    data: {
+      type: "reservation_alert",
+      alert_id: alert.id,
+      reservation_id: alert.reservation_id || "",
+      restaurant_id: alert.restaurant_id,
+      reference: payload.reference,
+      url: payload.dashboard_url || "/partner/reservations"
+    },
+    tag: `reservation-alert-${alert.reservation_id || alert.id}`
+  };
+}
+
+async function sendPushForReservationAlert(alert = {}, options = {}) {
+  const devices = await listRestaurantDevices(alert.restaurant_id, { activeOnly: true });
+  const outcomes = [];
+  const notification = pushNotificationPayload(alert);
+  for (const device of devices) {
+    const idempotencyKey = hashEmailValue(`reservation-alert-push:${alert.id}:${device.id || device.endpoint_hash}`);
+    const existingDelivery = await findAlertDeliveryRecord(idempotencyKey);
+    if (existingDelivery && alertDeliveryAlreadySent(existingDelivery)) {
+      outcomes.push({ device: clientPartnerDevice(device), result: { sent: false, skipped: true, reason: "duplicate_delivery" }, delivery: existingDelivery });
+      continue;
+    }
+    if (existingDelivery && (!options.retryFailed || !retryableAlertDelivery(existingDelivery, "push") || Number(existingDelivery.attempt_number || 1) >= RESERVATION_ALERT_PUSH_MAX_ATTEMPTS)) {
+      outcomes.push({ device: clientPartnerDevice(device), result: { sent: false, skipped: true, reason: "retry_limit_reached" }, delivery: existingDelivery });
+      continue;
+    }
+    const attemptNumber = existingDelivery ? Number(existingDelivery.attempt_number || 1) + 1 : 1;
+    const result = await pushService.sendNotification({
+      subscription: device.subscription_json,
+      title: notification.title,
+      body: notification.body,
+      data: notification.data,
+      tag: notification.tag,
+      ttl: 300
+    });
+    const status = result.sent ? "sent" : result.status === "expired" ? "failed" : "failed";
+    const delivery = await saveAlertDeliveryRecord({
+      alert_id: alert.id,
+      reservation_id: alert.reservation_id || null,
+      restaurant_id: alert.restaurant_id,
+      channel: "push",
+      recipient_user_id: device.user_id || null,
+      device_id: device.id || null,
+      recipient_hash: device.endpoint_hash || null,
+      provider: result.provider || "webpush",
+      provider_message_id: result.provider_message_id || null,
+      idempotency_key: idempotencyKey,
+      attempt_number: attemptNumber,
+      status,
+      error_code: result.errorCode || null,
+      error_message_safe: result.errorMessage ? "Push provider did not accept the notification." : null,
+      sent_at: result.sent ? nowIso() : null,
+      metadata: { http_status: result.httpStatus || null }
+    });
+    outcomes.push({ device: clientPartnerDevice(device), result, delivery });
+    if (!supabaseConfigured && device.id) {
+      const patch = result.sent
+        ? { last_success_at: nowIso(), last_active_at: nowIso(), failure_count: 0, last_error_code: null }
+        : {
+          status: result.status === "expired" ? "expired" : device.status || "active",
+          last_failure_at: nowIso(),
+          failure_count: Number(device.failure_count || 0) + 1,
+          last_error_code: result.errorCode || "PUSH_SEND_FAILED"
+        };
+      Object.assign(device, patch, { updated_at: nowIso() });
+    }
+    if (supabaseConfigured && device.id) {
+      const patch = result.sent
+        ? { last_success_at: nowIso(), last_active_at: nowIso(), failure_count: 0, last_error_code: null }
+        : {
+          status: result.status === "expired" ? "expired" : device.status || "active",
+          last_failure_at: nowIso(),
+          failure_count: Number(device.failure_count || 0) + 1,
+          last_error_code: result.errorCode || "PUSH_SEND_FAILED"
+        };
+      await supabaseFetch(`/rest/v1/partner_device_subscriptions?id=eq.${encodeURIComponent(device.id)}`, {
+        method: "PATCH",
+        service: true,
+        headers: { Prefer: "return=minimal" },
+        body: await filterSupabaseTablePayload("partner_device_subscriptions", patch)
+      }).catch(() => null);
+    }
+  }
+  return outcomes;
+}
+
+function partnerEmailAlertDelivery(emails = []) {
+  const list = Array.isArray(emails) ? emails.flat().filter(Boolean) : [];
+  return list.find((item) => clean(item.email_type || item.event_type) === "restaurant_request_notice" || clean(item.event_type) === "restaurant_request_notice") || null;
+}
+
+async function createReservationAlertForReservation(row = {}, options = {}) {
+  const restaurantId = clean(row.restaurant_id);
+  if (!restaurantId) return null;
+  const preferences = options.preferences || await getRestaurantNotificationPreferences(restaurantId);
+  const alert = await upsertReservationAlert(row, preferences);
+  if (!alert?.id) return null;
+  if (preferences.dashboard_popup_enabled !== false) {
+    await saveAlertDeliveryRecord({
+      alert_id: alert.id,
+      reservation_id: alert.reservation_id || null,
+      restaurant_id: alert.restaurant_id,
+      channel: "dashboard",
+      provider: "smarttable_dashboard",
+      idempotency_key: hashEmailValue(`reservation-alert-dashboard:${alert.id}`),
+      status: "sent",
+      sent_at: nowIso()
+    });
+  }
+  const partnerEmail = partnerEmailAlertDelivery(options.emails || []);
+  if (partnerEmail) {
+    await saveAlertDeliveryRecord({
+      alert_id: alert.id,
+      reservation_id: alert.reservation_id || null,
+      restaurant_id: alert.restaurant_id,
+      channel: "email",
+      provider: partnerEmail.provider || "resend",
+      provider_message_id: partnerEmail.messageId || partnerEmail.provider_id || null,
+      idempotency_key: hashEmailValue(`reservation-alert-email:${alert.id}:${partnerEmail.emailQueueId || partnerEmail.email_queue_id || "initial"}`),
+      status: isEmailAccepted(partnerEmail) ? "sent" : "failed",
+      error_code: partnerEmail.errorCode || null,
+      error_message_safe: partnerEmail.errorMessage ? "Restaurant email was not accepted by the provider." : null,
+      sent_at: isEmailAccepted(partnerEmail) ? nowIso() : null
+    });
+  }
+  if (preferences.push_enabled !== false) {
+    await sendPushForReservationAlert(alert).catch((error) => {
+      logSafeServerEvent("reservation_alert_push_failed", {
+        restaurant_id: restaurantId,
+        reservation_id: alert.reservation_id || "",
+        code: error.code || "PUSH_ALERT_FAILED"
+      });
+    });
+  }
+  return alert;
+}
+
+async function processReservationAlertSms(alert = {}, stage = "primary") {
+  if (!alert?.id || alert.acknowledged_at || normalizeAlertStatus(alert.status) === "acknowledged") return null;
+  const preferences = await getRestaurantNotificationPreferences(alert.restaurant_id);
+  if (!preferences.sms_fallback_enabled) return null;
+  const phone = normalizePhoneE164(stage === "primary" ? preferences.primary_sms_number : preferences.escalation_sms_number);
+  if (!phone) return null;
+  const normalizedStage = stage === "escalation" ? "escalation" : "primary";
+  const idempotencyKey = hashEmailValue(`reservation-alert-sms:${alert.id}:${normalizedStage}`);
+  const existingDelivery = await findAlertDeliveryRecord(idempotencyKey);
+  if (existingDelivery && alertDeliveryAlreadySent(existingDelivery)) {
+    return { result: { accepted: false, skipped: true, reason: "duplicate_delivery" }, delivery: existingDelivery };
+  }
+  if (existingDelivery && (!retryableAlertDelivery(existingDelivery, "sms") || Number(existingDelivery.attempt_number || 1) >= RESERVATION_ALERT_SMS_MAX_ATTEMPTS)) {
+    return { result: { accepted: false, skipped: true, reason: "retry_limit_reached" }, delivery: existingDelivery };
+  }
+  const attemptNumber = existingDelivery ? Number(existingDelivery.attempt_number || 1) + 1 : 1;
+  const rateLimit = scopedRateLimit(reservationAlertRateLimitBuckets, `sms:${alert.restaurant_id}:${normalizedStage}`, {
+    limit: RESERVATION_ALERT_SMS_LIMIT,
+    windowMs: RESERVATION_ALERT_SMS_WINDOW_MS
+  });
+  if (rateLimit) {
+    const delivery = await saveAlertDeliveryRecord({
+      alert_id: alert.id,
+      reservation_id: alert.reservation_id || null,
+      restaurant_id: alert.restaurant_id,
+      channel: "sms",
+      recipient_hash: hashPhoneValue(phone),
+      provider: smsService.provider || "twilio",
+      idempotency_key: idempotencyKey,
+      attempt_number: attemptNumber,
+      status: "failed",
+      error_code: "SMS_ALERT_RATE_LIMITED",
+      error_message_safe: "SMS alert rate limit delayed this delivery attempt.",
+      metadata: { stage: normalizedStage, recipient_last4: phoneLast4(phone), retry_after_seconds: rateLimit.retryAfterSeconds }
+    });
+    return { result: { accepted: false, skipped: true, reason: "rate_limited", retryAfterSeconds: rateLimit.retryAfterSeconds }, delivery };
+  }
+  const payload = clientReservationAlert(alert).payload;
+  const body = [
+    "SmartTable - New reservation request",
+    payload.restaurant_name,
+    `${payload.reservation_date} ${payload.reservation_time}`,
+    `${payload.party_size} guests, ${payload.discount_label || `${payload.discount_percent || 0}% off`}`,
+    `Reference: ${payload.reference}`,
+    `${PUBLIC_BASE_URL}/partner`
+  ].filter(Boolean).join("\n");
+  const result = await smsService.sendSms({ to: phone, body, idempotencyKey });
+  const status = result.accepted ? "escalated" : "failed";
+  const delivery = await saveAlertDeliveryRecord({
+    alert_id: alert.id,
+    reservation_id: alert.reservation_id || null,
+    restaurant_id: alert.restaurant_id,
+    channel: "sms",
+    recipient_hash: hashPhoneValue(phone),
+    provider: result.provider || "twilio",
+    provider_message_id: result.messageId || null,
+    idempotency_key: idempotencyKey,
+    attempt_number: attemptNumber,
+    status,
+    error_code: result.errorCode || null,
+    error_message_safe: result.errorMessage ? "SMS provider did not accept the reservation alert." : null,
+    sent_at: result.accepted ? nowIso() : null,
+    metadata: { stage: normalizedStage, recipient_last4: phoneLast4(phone), provider_status: result.providerStatus || null }
+  });
+  if (result.accepted) {
+    await patchAlertRecord(alert, { status: "escalated" });
+  }
+  return { result, delivery };
+}
+
+function smsStageDeliveryShouldSkip(deliveries = [], stage = "") {
+  const existing = deliveries.find((row) => row.metadata?.stage === stage);
+  if (!existing) return false;
+  if (alertDeliveryAlreadySent(existing)) return true;
+  if (!retryableAlertDelivery(existing, "sms")) return true;
+  return Number(existing.attempt_number || 1) >= RESERVATION_ALERT_SMS_MAX_ATTEMPTS;
+}
+
+async function processReservationAlertVoice(alert = {}) {
+  if (!alert?.id || alert.acknowledged_at || normalizeAlertStatus(alert.status) === "acknowledged") return null;
+  const preferences = await getRestaurantNotificationPreferences(alert.restaurant_id);
+  if (!preferences.voice_call_enabled) return null;
+  const phone = normalizePhoneE164(preferences.voice_call_number || preferences.escalation_sms_number || preferences.primary_sms_number);
+  if (!phone) return null;
+  const idempotencyKey = hashEmailValue(`reservation-alert-voice:${alert.id}:escalation`);
+  const existingDelivery = await findAlertDeliveryRecord(idempotencyKey);
+  if (existingDelivery && alertDeliveryAlreadySent(existingDelivery)) {
+    return { result: { ok: false, skipped: true, reason: "duplicate_delivery" }, delivery: existingDelivery };
+  }
+  if (existingDelivery && (!retryableAlertDelivery(existingDelivery, "voice") || Number(existingDelivery.attempt_number || 1) >= RESERVATION_ALERT_VOICE_MAX_ATTEMPTS)) {
+    return { result: { ok: false, skipped: true, reason: "retry_limit_reached" }, delivery: existingDelivery };
+  }
+  const attemptNumber = existingDelivery ? Number(existingDelivery.attempt_number || 1) + 1 : 1;
+  const rateLimit = scopedRateLimit(reservationAlertRateLimitBuckets, `voice:${alert.restaurant_id}`, {
+    limit: RESERVATION_ALERT_VOICE_LIMIT,
+    windowMs: RESERVATION_ALERT_VOICE_WINDOW_MS
+  });
+  if (rateLimit) {
+    const delivery = await saveAlertDeliveryRecord({
+      alert_id: alert.id,
+      reservation_id: alert.reservation_id || null,
+      restaurant_id: alert.restaurant_id,
+      channel: "voice",
+      recipient_hash: hashPhoneValue(phone),
+      provider: "twilio",
+      idempotency_key: idempotencyKey,
+      attempt_number: attemptNumber,
+      status: "failed",
+      error_code: "VOICE_ALERT_RATE_LIMITED",
+      error_message_safe: "Voice alert rate limit delayed this delivery attempt.",
+      metadata: { stage: "escalation", recipient_last4: phoneLast4(phone), retry_after_seconds: rateLimit.retryAfterSeconds }
+    });
+    return { result: { ok: false, skipped: true, reason: "rate_limited" }, delivery };
+  }
+
+  const payload = clientReservationAlert(alert).payload;
+  const restaurantName = emailHtmlEscape(payload.restaurant_name || "your restaurant");
+  const twiml = `<Response><Say language="en-US">SmartTable alert. A new reservation request for ${restaurantName} is still waiting for acknowledgement. Open the SmartTable partner dashboard now. This call does not accept the reservation.</Say><Pause length="1"/><Say language="en-US">Please open the partner dashboard to review the request.</Say></Response>`;
+  const result = await voiceService.call({ to: phone, twiml, idempotencyKey });
+  const delivery = await saveAlertDeliveryRecord({
+    alert_id: alert.id,
+    reservation_id: alert.reservation_id || null,
+    restaurant_id: alert.restaurant_id,
+    channel: "voice",
+    recipient_hash: hashPhoneValue(phone),
+    provider: result.provider || "twilio",
+    provider_message_id: result.providerMessageId || null,
+    idempotency_key: idempotencyKey,
+    attempt_number: attemptNumber,
+    status: result.ok ? "escalated" : "failed",
+    error_code: result.code || null,
+    error_message_safe: result.message ? "Voice provider did not accept the reservation alert." : null,
+    sent_at: result.ok ? nowIso() : null,
+    metadata: { stage: "escalation", recipient_last4: phoneLast4(phone), provider_status: result.status || null }
+  });
+  if (result.ok) await patchAlertRecord(alert, { status: "escalated" });
+  return { result, delivery };
+}
+
+async function processDueReservationAlertEscalations(restaurantId = "") {
+  const now = nowIso();
+  const restaurantFilter = restaurantId ? `&restaurant_id=eq.${encodeURIComponent(restaurantId)}` : "";
+  const activeStatuses = "queued,sent,delivered,escalated";
+  const dueFilter = `status=in.(${activeStatuses})${restaurantFilter}&acknowledged_at=is.null`;
+  let alerts = [];
+  if (!supabaseConfigured) {
+    ensureDemo();
+    alerts = demo.reservationAlerts.filter((alert) => (!restaurantId || alert.restaurant_id === restaurantId) && !alert.acknowledged_at && ["queued", "sent", "delivered", "escalated"].includes(normalizeAlertStatus(alert.status)));
+  } else {
+    const columns = await supabaseTableColumns("reservation_alerts");
+    if (!columns.has("sms_fallback_due_at")) return { processed: 0, sent: 0, failed: 0 };
+    alerts = await supabaseFetch(`/rest/v1/reservation_alerts?select=*&${dueFilter}&order=created_at.asc&limit=25`, { service: true }).catch(() => []);
+  }
+  let processed = 0;
+  let sent = 0;
+  let failed = 0;
+  for (const alert of alerts || []) {
+    await sendPushForReservationAlert(alert, { retryFailed: true }).catch((error) => {
+      logSafeServerEvent("reservation_alert_push_retry_failed", {
+        restaurant_id: alert.restaurant_id,
+        reservation_id: alert.reservation_id || "",
+        code: error.code || "PUSH_ALERT_RETRY_FAILED"
+      });
+    });
+    const deliveries = !supabaseConfigured
+      ? demo.reservationAlertDeliveries.filter((row) => row.alert_id === alert.id && row.channel === "sms")
+      : await supabaseFetch(`/rest/v1/reservation_alert_deliveries?select=id,metadata,status,error_code,attempt_number&alert_id=eq.${encodeURIComponent(alert.id)}&channel=eq.sms`, { service: true }).catch(() => []);
+    const skipPrimary = smsStageDeliveryShouldSkip(deliveries, "primary");
+    const skipEscalation = smsStageDeliveryShouldSkip(deliveries, "escalation");
+    if (!skipPrimary && alert.sms_fallback_due_at && alert.sms_fallback_due_at <= now) {
+      processed += 1;
+      const outcome = await processReservationAlertSms(alert, "primary").catch(() => null);
+      if (outcome?.result?.accepted) sent += 1;
+      else failed += 1;
+    }
+    if (!skipEscalation && alert.sms_escalation_due_at && alert.sms_escalation_due_at <= now) {
+      processed += 1;
+      const outcome = await processReservationAlertSms(alert, "escalation").catch(() => null);
+      if (outcome?.result?.accepted) sent += 1;
+      else failed += 1;
+    }
+    const voiceDeliveries = !supabaseConfigured
+      ? demo.reservationAlertDeliveries.filter((row) => row.alert_id === alert.id && row.channel === "voice")
+      : await supabaseFetch(`/rest/v1/reservation_alert_deliveries?select=id,metadata,status,error_code,attempt_number&alert_id=eq.${encodeURIComponent(alert.id)}&channel=eq.voice`, { service: true }).catch(() => []);
+    const voiceDelivery = voiceDeliveries[0];
+    const skipVoice = Boolean(voiceDelivery && (
+      alertDeliveryAlreadySent(voiceDelivery)
+      || !retryableAlertDelivery(voiceDelivery, "voice")
+      || Number(voiceDelivery.attempt_number || 1) >= RESERVATION_ALERT_VOICE_MAX_ATTEMPTS
+    ));
+    if (!skipVoice && alert.voice_call_due_at && alert.voice_call_due_at <= now) {
+      processed += 1;
+      const outcome = await processReservationAlertVoice(alert).catch(() => null);
+      if (outcome?.result?.ok) sent += 1;
+      else failed += 1;
+    }
+  }
+  return { processed, sent, failed };
+}
+
+async function reservationEmailRowById(reservationId = "") {
+  const id = clean(reservationId);
+  if (!id) return null;
+  if (!supabaseConfigured) {
+    ensureDemo();
+    return reservationOverviewRows().find((item) => item.reservation_id === id || item.id === id) || null;
+  }
+  const overviewRows = await supabaseFetch(`/rest/v1/reservation_overview?select=*&reservation_id=eq.${encodeURIComponent(id)}&limit=1`, { service: true }).catch(() => []);
+  if (overviewRows?.[0]) return overviewRows[0];
+  const reservationRows = await supabaseFetch(`/rest/v1/reservations?select=*&id=eq.${encodeURIComponent(id)}&limit=1`, { service: true }).catch(() => []);
+  const reservation = reservationRows?.[0];
+  if (!reservation) return null;
+  const [restaurantRows, offerRows] = await Promise.all([
+    supabaseFetch(`/rest/v1/restaurants?select=*&id=eq.${encodeURIComponent(reservation.restaurant_id)}&limit=1`, { service: true }).catch(() => []),
+    supabaseFetch(`/rest/v1/offers?select=*&id=eq.${encodeURIComponent(reservation.offer_id)}&limit=1`, { service: true }).catch(() => [])
+  ]);
+  const restaurant = restaurantRows?.[0] || {};
+  const offer = offerRows?.[0] || {};
+  return {
+    ...reservation,
+    reservation_id: reservation.id,
+    restaurant_name: restaurant.name || "",
+    restaurant_email: restaurant.reservation_notification_email || restaurant.email || restaurant.contact_email || "",
+    restaurant_language: restaurant.preferred_language || "en",
+    restaurant_address: restaurant.address || restaurant.full_address || "",
+    offer_title: offer.title_en || offer.title || "",
+    discount_percent: offer.discount_percent || offer.discount_value || "",
+    offer_date: offer.offer_date || reservation.reservation_date,
+    offer_time: offer.offer_time || offer.start_time || reservation.reservation_time,
+    start_time: offer.start_time || reservation.reservation_time
+  };
+}
+
+async function recentReservationEmailRetryBlocked(reservationId = "", target = "") {
+  const emailType = target === "partner" ? "restaurant_request_notice" : "guest_request_received";
+  const since = new Date(Date.now() - 60_000).toISOString();
+  if (!supabaseConfigured) {
+    ensureDemo();
+    return (demo.emailQueue || [])
+      .filter((row) => clean(row.reservation_id) === clean(reservationId))
+      .filter((row) => clean(row.email_type || row.event_type) === emailType)
+      .filter((row) => clean(row.created_at || row.updated_at) >= since)
+      .sort((a, b) => new Date(b.created_at || b.updated_at || 0) - new Date(a.created_at || a.updated_at || 0))
+      .find((row) => ["queued", "sending", "sent", "delayed", "delivered"].includes(normalizeEmailQueueStatus(row.status))) || null;
+  }
+  const rows = await supabaseFetch(`/rest/v1/email_queue?select=id,status,created_at,email_type&reservation_id=eq.${encodeURIComponent(reservationId)}&email_type=eq.${encodeURIComponent(emailType)}&created_at=gte.${encodeURIComponent(since)}&order=created_at.desc&limit=3`, { service: true }).catch(() => []);
+  const blocking = (rows || []).find((row) => ["queued", "sending", "sent", "delayed", "delivered"].includes(normalizeEmailQueueStatus(row.status)));
+  return blocking || null;
+}
+
+function safeEmailResendResult(result = {}, target = "") {
+  return {
+    target,
+    accepted: isEmailAccepted(result),
+    status: result.status || result.delivery || null,
+    provider: result.provider || "resend",
+    provider_message_id: result.messageId || result.provider_id || null,
+    email_log_id: result.emailLogId || result.email_log_id || null,
+    email_queue_id: result.emailQueueId || result.email_queue_id || null,
+    queue_status: result.queue_status || null,
+    errorCode: result.errorCode || null,
+    errorMessage: result.errorMessage ? "Email provider did not accept the message." : null
+  };
+}
+
+async function adminResendReservationEmail(body = {}, profile = null) {
+  const reservationId = clean(body.reservation_id || body.reservationId || body.id);
+  const target = clean(body.target || body.recipient_type || body.recipientType).toLowerCase();
+  if (!reservationId) return json(400, { error: "Reservation id is required." });
+  if (!["guest", "partner"].includes(target)) return json(400, { error: "Choose guest or partner email to resend." });
+  const row = await reservationEmailRowById(reservationId);
+  if (!row?.reservation_id) return json(404, { error: "Reservation was not found." });
+  const blocking = await recentReservationEmailRetryBlocked(row.reservation_id, target);
+  if (blocking) {
+    return json(429, {
+      error: "A recent resend attempt already exists for this reservation email.",
+      retry_after: 60,
+      latest_queue_id: blocking.id,
+      latest_status: normalizeEmailQueueStatus(blocking.status)
+    }, { "retry-after": "60" });
+  }
+  const idempotencySuffix = `admin-resend:${target}:${profile?.id || "system"}:${crypto.randomUUID()}`;
+  const [result] = await sendReservationCreatedEmails(row, { targets: [target], idempotencySuffix });
+  await createAuditLog({
+    profile,
+    action: "reservation_email_resend",
+    entityType: "reservation",
+    entityId: row.reservation_id,
+    metadata: {
+      target,
+      reservation_id: row.reservation_id,
+      restaurant_id: row.restaurant_id,
+      reference: row.reference || "",
+      accepted: isEmailAccepted(result),
+      provider_message_id: result?.messageId || result?.provider_id || null,
+      email_queue_id: result?.emailQueueId || result?.email_queue_id || null,
+      email_log_id: result?.emailLogId || result?.email_log_id || null,
+      status: result?.status || null,
+      error_code: result?.errorCode || null
+    }
+  }).catch((error) => {
+    logSafeServerEvent("reservation_email_resend_audit_failed", {
+      reservation_id: row.reservation_id,
+      target,
+      code: error.code || "AUDIT_WRITE_FAILED"
+    });
+  });
+  return json(isEmailAccepted(result) ? 202 : 502, {
+    ok: isEmailAccepted(result),
+    reservation_id: row.reservation_id,
+    reference: row.reference || "",
+    reservation_status: row.status || row.booking_status || "",
+    result: safeEmailResendResult(result, target)
+  });
 }
 
 async function sendReservationStatusEmail(row) {
@@ -6435,7 +13237,7 @@ async function createGuestPostVisitNotification(row) {
     title,
     message,
     cta,
-    url: context.rewards_url,
+    url: context.rate_url,
     read_at: null,
     created_at: nowIso()
   };
@@ -6699,7 +13501,7 @@ function buildPostVisitEmail(booking = {}, guest = {}, restaurant = {}, contentR
     visit_date: row.reservation_date || row.offer_date || ""
   };
   const loyaltyEnabled = isLoyaltyRewardsWorking();
-  const subject = template(contentValue(contentRows, "post_visit_email_subject", "How was your experience at {{restaurant_name}}?", lang), context);
+  const subject = template(contentValue(contentRows, "post_visit_email_subject", "How was your visit to {{restaurant_name}}?", lang), context);
   const preheader = template(contentValue(contentRows, "post_visit_email_preheader", "Share your SmartTable visit feedback after dining at {{restaurant_name}}.", lang), context);
   const baseBody = template(contentValue(contentRows, "post_visit_email_body", "Hi {{guest_name}},\n\nThank you for dining at {{restaurant_name}} through SmartTable.\n\nWe'd love to hear about your experience.\n\nPlease rate your visit:\n- Food\n- Service\n- Ambience\n- Overall experience\n\nYou can also share food or drink photos and a short note about what you ordered.\n\nYour feedback helps other guests discover great restaurants and helps SmartTable improve personalized dining recommendations.", lang), context);
   const loyaltyNote = loyaltyEnabled
@@ -6707,17 +13509,17 @@ function buildPostVisitEmail(booking = {}, guest = {}, restaurant = {}, contentR
     : "";
   const body = [baseBody, loyaltyNote].filter(Boolean).join("\n\n");
   const footer = template(contentValue(contentRows, "post_visit_email_footer", "You are receiving this because you completed a SmartTable reservation at {{restaurant_name}}.", lang), context);
-  const buttons = [
-    [contentValue(contentRows, "post_visit_rate_button", "Rate your experience", lang), context.rate_url],
-    [contentValue(contentRows, loyaltyEnabled ? "post_visit_upload_rewards_button" : "post_visit_upload_button", loyaltyEnabled ? "Upload photos & earn points" : "Upload photos", lang), context.photo_upload_url],
-    [contentValue(contentRows, "post_visit_ordered_button", "Share what you ordered", lang), context.ordered_items_url]
-  ];
-  const buttonHtml = buttons.map(([label, url]) => `<a href="${emailHtmlEscape(url)}" style="display:inline-block;margin:6px 8px 6px 0;padding:10px 14px;background:#0f735d;color:#ffffff;text-decoration:none;border-radius:8px;font-weight:700">${emailHtmlEscape(label)}</a>`).join("");
+  const primaryLabel = contentValue(contentRows, "post_visit_rate_button", "Rate your visit", lang);
+  const photoLabel = contentValue(contentRows, loyaltyEnabled ? "post_visit_upload_rewards_button" : "post_visit_upload_button", loyaltyEnabled ? "Upload photos & earn points" : "Add photos", lang);
+  const secondaryLinks = `${photoLabel}: ${context.photo_upload_url}`;
   return {
     to: row.guest_email,
     subject,
-    text: `${body}\n\n${buttons.map(([label, url]) => `${label}: ${url}`).join("\n")}\n\n${footer}`,
-    html: appEmailHtml(subject, body, null, { preheader }).replace("</div>", `<p>${buttonHtml}</p><p style="margin-top:24px;color:#68746f;font-size:13px;line-height:1.5">${emailHtmlEscape(footer)}</p></div>`)
+    text: `${body}\n\n${primaryLabel}: ${context.rate_url}\n${secondaryLinks}\n\n${footer}`,
+    html: appEmailHtml(subject, body, { label: primaryLabel, url: context.rate_url }, {
+      preheader,
+      footer: `${footer}\n\n${secondaryLinks}`
+    })
   };
 }
 
@@ -6727,21 +13529,32 @@ async function sendPostVisitFeedbackEmail(row) {
   if (!eligibility.eligible) throw postVisitEligibilityError(eligibility);
   const rows = await serverContentRows();
   const eligibleRow = eligibility.row || row;
+  const reviewToken = await createPostVisitActionToken(eligibleRow, "open_review", {
+    metadata: { source: "manual_partner_email" }
+  });
+  const rowWithReviewLink = {
+    ...eligibleRow,
+    verified_review_url: reviewToken.token ? verifiedReviewUrl(reviewToken.token) : verifiedReviewReservationUrl(eligibleRow.reservation_id || eligibleRow.id)
+  };
   const emailMessage = buildPostVisitEmail(
-    eligibleRow,
-    { name: eligibleRow.guest_name, email: eligibleRow.guest_email },
-    { name: eligibleRow.restaurant_name },
+    rowWithReviewLink,
+    { name: rowWithReviewLink.guest_name, email: rowWithReviewLink.guest_email },
+    { name: rowWithReviewLink.restaurant_name },
     rows
   );
   const email = await sendEmail(emailMessage, {
-    reservation_id: eligibleRow.reservation_id,
-    restaurant_id: eligibleRow.restaurant_id,
+    reservation_id: rowWithReviewLink.reservation_id,
+    restaurant_id: rowWithReviewLink.restaurant_id,
     event_type: "booking_completed",
-    locale: eligibleRow.guest_language || eligibleRow.language || eligibleRow.lang || "en",
+    locale: rowWithReviewLink.guest_language || rowWithReviewLink.language || rowWithReviewLink.lang || "en",
     template_version: EMAIL_TEMPLATE_VERSION,
-    idempotency_key: postVisitEmailIdempotencyKey(eligibleRow)
+    idempotency_key: postVisitEmailIdempotencyKey(rowWithReviewLink)
   });
-  await createGuestPostVisitNotification(eligibleRow);
+  await patchReservationVisitState(rowWithReviewLink.reservation_id, {
+    review_invitation_sent_at: nowIso()
+  }).catch(() => null);
+  await createPostVisitNotificationEvent(rowWithReviewLink, "review_invitation", "email", { email_status: email?.status || email?.provider_status || "" });
+  await createGuestPostVisitNotification(rowWithReviewLink);
   return email;
 }
 
@@ -6815,22 +13628,95 @@ function genericLoginError(status = 401) {
   return error;
 }
 
+function supabaseAuthErrorText(error = {}) {
+  return [
+    error.message,
+    error.code,
+    error.detail?.message,
+    error.detail?.error_description,
+    error.detail?.error,
+    error.detail?.error_code,
+    error.detail?.code
+  ].filter(Boolean).join(" ").toLowerCase();
+}
+
+function isSupabaseEmailNotConfirmedError(error = {}) {
+  const text = supabaseAuthErrorText(error);
+  return /email.*not.*confirm|not.*confirmed|email_not_confirmed|email_not_confirmed/i.test(text);
+}
+
+function emailNotConfirmedError() {
+  const error = new Error("Email verification is required before you can sign in.");
+  error.status = 403;
+  error.code = "EMAIL_NOT_CONFIRMED";
+  return error;
+}
+
+function mapSupabaseSignupError(error = {}) {
+  const text = supabaseAuthErrorText(error);
+  if (error.status === 429 || /rate.*limit|too many|over.*limit|email.*rate|signup.*limit/.test(text)) {
+    return {
+      status: 429,
+      code: "AUTH_SIGNUP_RATE_LIMITED",
+      error: "Too many account creation attempts. Please wait before trying again."
+    };
+  }
+  if (/already.*registered|already.*exists|user.*exists|email.*exists|email_exists|user_already_exists/.test(text)) {
+    return { status: 409, code: "ACCOUNT_ALREADY_EXISTS", error: "Account already exists." };
+  }
+  if (/weak.*password|password.*weak|password.*short|weak_password|password.*should|password.*at least/.test(text)) {
+    return { status: 400, code: "WEAK_PASSWORD", error: "Password does not meet the required strength." };
+  }
+  if (/invalid.*email|email.*invalid|bad email|invalid_email/.test(text)) {
+    return { status: 400, code: "INVALID_EMAIL", error: "Enter a valid email address." };
+  }
+  const status = error.status && error.status < 500 ? error.status : 502;
+  return {
+    status,
+    code: "AUTH_SIGNUP_FAILED",
+    error: "Account creation could not be completed. Please try again."
+  };
+}
+
 async function login(body) {
   const email = lower(body.email);
   const password = String(body.password || "");
   if (!email || !password) return json(400, { error: "Email and password are required." });
   if (!isValidSignupEmail(email)) return json(400, { error: "Enter a valid email address." });
+  logSafeServerEvent("guest_login_started", {
+    mode: supabaseConfigured ? "supabase" : "demo",
+    email_hash: hashEmailValue(email).slice(0, 16)
+  });
 
   if (!supabaseConfigured) {
     ensureDemo();
     const attempt = recordAuthAttempt(email, false);
-    if (attempt.locked) throw genericLoginError(429);
+    if (attempt.locked) {
+      logSafeServerEvent("guest_login_failed", {
+        mode: "demo",
+        category: "rate_limited",
+        email_hash: hashEmailValue(email).slice(0, 16)
+      });
+      throw genericLoginError(429);
+    }
     const user = demo.users.find((item) => item.email === email && item.password === password);
-    if (!user) throw genericLoginError(401);
+    if (!user) {
+      logSafeServerEvent("guest_login_failed", {
+        mode: "demo",
+        category: "invalid_credentials",
+        email_hash: hashEmailValue(email).slice(0, 16)
+      });
+      throw genericLoginError(401);
+    }
     recordAuthAttempt(email, true);
     const profile = clientProfile({
       ...demo.profiles.find((item) => item.id === user.id),
       email_verified: true
+    });
+    logSafeServerEvent("guest_login_success", {
+      mode: "demo",
+      user_hash: hashEmailValue(profile.id).slice(0, 16),
+      role: normalizeRole(profile.role)
     });
     return json(200, {
       mode: "demo",
@@ -6846,10 +13732,69 @@ async function login(body) {
       service: false,
       body: { email, password }
     });
-  } catch {
+  } catch (error) {
+    const emailNotConfirmed = isSupabaseEmailNotConfirmedError(error);
+    logSafeServerEvent("guest_login_rejected_by_auth_provider", {
+      status: error.status || 401,
+      code: emailNotConfirmed ? "EMAIL_NOT_CONFIRMED" : "AUTH_LOGIN_REJECTED",
+      email_hash: hashEmailValue(email).slice(0, 16)
+    });
+    logSafeServerEvent("guest_login_failed", {
+      mode: "supabase",
+      category: emailNotConfirmed ? "email_not_confirmed" : "invalid_credentials",
+      status: error.status || 401,
+      code: emailNotConfirmed ? "EMAIL_NOT_CONFIRMED" : "AUTH_LOGIN_REJECTED",
+      email_hash: hashEmailValue(email).slice(0, 16)
+    });
+    if (emailNotConfirmed) throw emailNotConfirmedError();
     throw genericLoginError(401);
   }
-  const profile = await getSupabaseProfile(session.access_token);
+  let profile;
+  try {
+    profile = await getSupabaseLoginProfile(session.access_token);
+  } catch (error) {
+    const setupIncomplete = error.code === "ACCOUNT_SETUP_INCOMPLETE";
+    logSafeServerEvent("guest_login_failed", {
+      mode: "supabase",
+      category: setupIncomplete ? "account_setup_incomplete" : "service_unavailable",
+      status: error.status || 503,
+      code: setupIncomplete ? "ACCOUNT_SETUP_INCOMPLETE" : "AUTH_SERVICE_UNAVAILABLE",
+      email_hash: hashEmailValue(email).slice(0, 16)
+    });
+    if (setupIncomplete) {
+      const authUser = error.authUser || await supabaseFetch("/auth/v1/user", {
+        service: false,
+        token: session.access_token
+      }).catch(() => null);
+      if (!authUser?.id) throw error;
+      return json(409, {
+        error: "Account setup is incomplete. Finish onboarding to activate your SmartTable profile.",
+        code: "ACCOUNT_SETUP_INCOMPLETE",
+        onboarding_required: true,
+        redirect: "/signup",
+        setup_reason: error.setupReason || "PROFILE_MISSING",
+        mode: "supabase",
+        access_token: session.access_token,
+        refresh_token: session.refresh_token,
+        expires_in: session.expires_in,
+        profile: clientProfile({
+          id: authUser.id,
+          email: authUser.email || email,
+          full_name: authUser.user_metadata?.full_name || authUser.email || email,
+          role: "guest",
+          restaurant_id: null,
+          preferred_language: normalizeLanguage(authUser.user_metadata?.preferred_language || "en"),
+          email_verified: Boolean(authUser.email_confirmed_at)
+        })
+      });
+    }
+    throw authServiceUnavailableError();
+  }
+  logSafeServerEvent("guest_login_success", {
+    mode: "supabase",
+    user_hash: hashEmailValue(profile.id).slice(0, 16),
+    role: normalizeRole(profile.role)
+  });
   return json(200, {
     mode: "supabase",
     access_token: session.access_token,
@@ -6956,7 +13901,7 @@ async function forgotPassword(method, body) {
   });
 }
 
-async function resetPassword(method, body) {
+async function resetPassword(method, body, headers = {}) {
   if (method !== "POST") return json(405, { error: "Method not allowed." });
   const password = String(body.password || "");
   const confirmPassword = String(body.confirm_password || body.confirmPassword || "");
@@ -6980,18 +13925,62 @@ async function resetPassword(method, body) {
       metadata: { message: "Guest password reset completed." }
     });
     const profile = demo.profiles.find((item) => item.id === user.id);
-    const emailResult = await sendPasswordChangedEmail({
-      email: user.email,
-      guestName: profile?.full_name || user.email,
-      lang: profile?.preferred_language || "en",
-      userId: user.id,
-      requestId: hashEmailValue(token).slice(0, 24)
+    const eventDate = new Date();
+    let emailResult = null;
+    try {
+      emailResult = await sendPasswordChangedEmail({
+        email: user.email,
+        guestName: profile?.full_name || user.email,
+        firstName: profile?.first_name || clean(profile?.full_name).split(/\s+/)[0],
+        lang: profile?.preferred_language || "en",
+        userId: user.id,
+        requestId: hashEmailValue(token).slice(0, 24),
+        localizedDateTime: localizedSecurityDateTime(eventDate, profile?.preferred_language || "en"),
+        userAgentSummary: summarizeUserAgent(headerValue(headers, "user-agent")),
+        maskedIp: maskedIpAddress(clientIpAddress(headers))
+      });
+    } catch (error) {
+      emailResult = {
+        accepted: false,
+        status: "failed",
+        provider: "resend",
+        errorCode: error.code || "EMAIL_SEND_EXCEPTION",
+        errorMessage: "Email provider did not accept the message.",
+        event_type: "password_changed"
+      };
+      logSafeServerEvent("password_change_security_email_failed", {
+        user_hash: hashEmailValue(user.id).slice(0, 16),
+        provider: "resend",
+        error_code: emailResult.errorCode
+      });
+    }
+    const emailNotificationStatus = isEmailAccepted(emailResult) ? "accepted" : "failed";
+    const securityEvent = await createGuestSecurityEvent({
+      profile: profile || { id: user.id, email: user.email, role: "guest" },
+      eventType: "password_changed",
+      headers,
+      emailNotificationStatus,
+      metadata: {
+        source: "password_reset",
+        email_log_id: emailResult?.emailLogId || emailResult?.email_log_id || null,
+        email_status: emailResult?.status || emailNotificationStatus,
+        email_error_code: emailResult?.errorCode || null
+      }
+    }).catch((error) => {
+      logSafeServerEvent("guest_security_event_failed", {
+        user_hash: hashEmailValue(user.id).slice(0, 16),
+        event_type: "password_changed",
+        code: error.code || "SECURITY_EVENT_WRITE_FAILED"
+      });
+      return null;
     });
     return json(200, {
       mode: "demo",
       message: "Password updated. Please sign in.",
       emails: [emailResult],
-      email_delivery: emailDeliverySummary([emailResult])
+      email_delivery: emailDeliverySummary([emailResult]),
+      email_notification_status: emailNotificationStatus,
+      security_event_logged: Boolean(securityEvent)
     });
   }
 
@@ -7005,23 +13994,74 @@ async function resetPassword(method, body) {
     body: { password }
   });
   let emailResult = null;
+  let emailNotificationStatus = "not_attempted";
+  let securityEventLogged = false;
   if (currentUser?.email) {
     const profiles = currentUser?.id
       ? await supabaseFetch(`/rest/v1/profiles?select=*&id=eq.${encodeURIComponent(currentUser.id)}&limit=1`, { service: true }).catch(() => [])
       : [];
     const profile = profiles?.[0] || {};
-    emailResult = await sendPasswordChangedEmail({
-      email: currentUser.email,
-      guestName: profile.full_name || currentUser.email,
-      lang: profile.preferred_language || "en",
-      userId: currentUser.id || "",
-      requestId: hashEmailValue(token).slice(0, 24)
+    const eventDate = new Date();
+    try {
+      emailResult = await sendPasswordChangedEmail({
+        email: currentUser.email,
+        guestName: profile.full_name || currentUser.email,
+        firstName: profile.first_name || clean(profile.full_name).split(/\s+/)[0],
+        lang: profile.preferred_language || "en",
+        userId: currentUser.id || "",
+        requestId: hashEmailValue(token).slice(0, 24),
+        localizedDateTime: localizedSecurityDateTime(eventDate, profile.preferred_language || "en"),
+        userAgentSummary: summarizeUserAgent(headerValue(headers, "user-agent")),
+        maskedIp: maskedIpAddress(clientIpAddress(headers))
+      });
+    } catch (error) {
+      emailResult = {
+        accepted: false,
+        status: "failed",
+        provider: "resend",
+        errorCode: error.code || "EMAIL_SEND_EXCEPTION",
+        errorMessage: "Email provider did not accept the message.",
+        event_type: "password_changed"
+      };
+      logSafeServerEvent("password_change_security_email_failed", {
+        user_hash: hashEmailValue(currentUser.id || currentUser.email).slice(0, 16),
+        provider: "resend",
+        error_code: emailResult.errorCode
+      });
+    }
+    emailNotificationStatus = isEmailAccepted(emailResult) ? "accepted" : "failed";
+    const securityEvent = await createGuestSecurityEvent({
+      profile: {
+        id: currentUser.id || null,
+        email: currentUser.email,
+        full_name: profile.full_name || currentUser.email,
+        role: "guest"
+      },
+      eventType: "password_changed",
+      headers,
+      emailNotificationStatus,
+      metadata: {
+        source: "password_reset",
+        email_log_id: emailResult?.emailLogId || emailResult?.email_log_id || null,
+        email_status: emailResult?.status || emailNotificationStatus,
+        email_error_code: emailResult?.errorCode || null
+      }
+    }).catch((error) => {
+      logSafeServerEvent("guest_security_event_failed", {
+        user_hash: hashEmailValue(currentUser.id || currentUser.email).slice(0, 16),
+        event_type: "password_changed",
+        code: error.code || "SECURITY_EVENT_WRITE_FAILED"
+      });
+      return null;
     });
+    securityEventLogged = Boolean(securityEvent);
   }
   return json(200, {
     message: "Password updated. Please sign in.",
     emails: emailResult ? [emailResult] : [],
-    email_delivery: emailResult ? emailDeliverySummary([emailResult]) : null
+    email_delivery: emailResult ? emailDeliverySummary([emailResult]) : null,
+    email_notification_status: emailNotificationStatus,
+    security_event_logged: securityEventLogged
   });
 }
 
@@ -7059,10 +14099,14 @@ async function authVerification(method, body, headers) {
     if (verifyLimit.limited) return json(429, { error: "Please wait before requesting another verification email.", retry_after: verifyLimit.retryAfterSeconds });
     let emailResult;
     try {
-      await supabaseFetch("/auth/v1/resend", {
+      await supabaseFetch(`/auth/v1/resend?redirect_to=${encodeURIComponent(AUTH_CALLBACK_URL)}`, {
         method: "POST",
         service: false,
-        body: { type: "signup", email: profile.email }
+        body: {
+          type: "signup",
+          email: profile.email,
+          options: { email_redirect_to: AUTH_CALLBACK_URL }
+        }
       });
       emailResult = await logAuthProviderEmail({
         to: profile.email,
@@ -7092,6 +14136,141 @@ async function authVerification(method, body, headers) {
   return json(405, { error: "Method not allowed." });
 }
 
+async function authCallback(method, body) {
+  if (method !== "POST") return json(405, { error: "Method not allowed." });
+  if (!supabaseConfigured) {
+    ensureDemo();
+    return json(200, {
+      mode: "demo",
+      verified: true,
+      message: "Demo account email is confirmed."
+    });
+  }
+
+  const accessToken = clean(body.access_token || body.accessToken);
+  const refreshToken = clean(body.refresh_token || body.refreshToken);
+  const code = clean(body.code);
+  const codeVerifier = clean(body.code_verifier || body.codeVerifier);
+  const tokenHash = clean(body.token_hash || body.tokenHash);
+  const token = clean(body.token);
+  const verificationType = clean(body.type || "email") || "email";
+  let session = null;
+
+  try {
+    if (accessToken) {
+      session = {
+        access_token: accessToken,
+        refresh_token: refreshToken || "",
+        expires_in: Number(body.expires_in || body.expiresIn || 3600)
+      };
+    } else if (tokenHash || token) {
+      session = await supabaseFetch("/auth/v1/verify", {
+        method: "POST",
+        service: false,
+        body: {
+          type: verificationType,
+          ...(tokenHash ? { token_hash: tokenHash } : { token })
+        }
+      });
+    } else if (code) {
+      if (!codeVerifier) {
+        return json(400, {
+          error: "This confirmation link could not be completed in this browser. Please request a new confirmation email.",
+          code: "PKCE_CODE_VERIFIER_MISSING"
+        });
+      }
+      session = await supabaseFetch("/auth/v1/token?grant_type=pkce", {
+        method: "POST",
+        service: false,
+        body: {
+          auth_code: code,
+          code_verifier: codeVerifier
+        }
+      });
+    } else {
+      return json(400, {
+        error: "Confirmation callback is missing a usable token.",
+        code: "AUTH_CALLBACK_MISSING_TOKEN"
+      });
+    }
+
+    const profile = await getSupabaseProfile(session.access_token);
+    return json(200, {
+      mode: "supabase",
+      verified: Boolean(profile.email_verified),
+      access_token: session.access_token,
+      refresh_token: session.refresh_token,
+      expires_in: session.expires_in,
+      profile
+    });
+  } catch (error) {
+    const text = supabaseAuthErrorText(error);
+    const expired = /expired|otp_expired|invalid.*link|invalid.*token/.test(text);
+    return json(expired ? 400 : 502, {
+      error: expired
+        ? "This confirmation link is invalid or has expired."
+        : "Email confirmation could not be completed. Please try again.",
+      code: expired ? "OTP_EXPIRED" : (error.code || "AUTH_CALLBACK_FAILED")
+    });
+  }
+}
+
+async function publicResendVerification(method, body, headers = {}) {
+  if (method !== "POST") return json(405, { error: "Method not allowed." });
+  const email = lower(body.email);
+  if (!isValidSignupEmail(email)) return json(400, { error: "Enter a valid email address.", code: "INVALID_EMAIL" });
+
+  const limitKey = `public-verification:${hashEmailValue(email).slice(0, 24)}:${hashEmailValue(clientIpAddress(headers)).slice(0, 16)}`;
+  const verifyLimit = rateLimitEmailRequest(limitKey, { limit: 3, windowMs: 10 * 60 * 1000 });
+  if (verifyLimit.limited) {
+    return json(429, {
+      error: "Please wait before requesting another verification email.",
+      code: "VERIFICATION_RESEND_RATE_LIMITED",
+      retry_after: verifyLimit.retryAfterSeconds
+    }, {
+      "retry-after": String(verifyLimit.retryAfterSeconds)
+    });
+  }
+
+  let emailResult = null;
+  if (supabaseConfigured) {
+    try {
+      await supabaseFetch(`/auth/v1/resend?redirect_to=${encodeURIComponent(AUTH_CALLBACK_URL)}`, {
+        method: "POST",
+        service: false,
+        body: {
+          type: "signup",
+          email,
+          options: { email_redirect_to: AUTH_CALLBACK_URL }
+        }
+      });
+      emailResult = await logAuthProviderEmail({
+        to: email,
+        subject: "Supabase Auth email verification",
+        eventType: "email_verification",
+        accepted: true,
+        idempotencyKey: hashEmailValue(`public-verification:${lower(email)}:${Math.floor(Date.now() / 600000)}`)
+      });
+    } catch (error) {
+      emailResult = await logAuthProviderEmail({
+        to: email,
+        subject: "Supabase Auth email verification",
+        eventType: "email_verification",
+        accepted: false,
+        errorCode: error.code || "AUTH_EMAIL_REQUEST_FAILED",
+        errorMessage: "Supabase Auth did not accept the verification email request.",
+        idempotencyKey: hashEmailValue(`public-verification:${lower(email)}:${Math.floor(Date.now() / 600000)}`)
+      });
+    }
+  }
+
+  return json(200, {
+    message: "If a SmartTable account exists and still needs verification, a new confirmation email will be sent.",
+    cooldown_seconds: 60,
+    email_delivery: emailResult ? emailDeliverySummary([emailResult]) : null
+  });
+}
+
 function isValidSignupEmail(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email || ""));
 }
@@ -7113,32 +14292,60 @@ function normalizeGuestSignup(body = {}) {
   const lastName = clean(body.last_name || body.lastName || nameParts.slice(1).join(" "));
   const email = lower(body.email);
   const phone = clean(body.phone || body.phone_number || body.guest_phone);
+  const country = clean(body.country || body.country_code || "US").toUpperCase();
+  const region = clean(body.region || body.state || body.state_region);
+  const citySelect = clean(body.city_select || body.citySelection);
+  const city = clean(citySelect === "__other_city__" ? body.other_city : body.city || citySelect);
+  const travelDistanceUnit = ["miles", "kilometers"].includes(clean(body.travel_distance_unit).toLowerCase())
+    ? clean(body.travel_distance_unit).toLowerCase()
+    : country === "US" ? "miles" : "kilometers";
+  const travelDistanceValue = Math.max(0, numberOr(body.travel_distance_value || body.travel_distance || body.travel_distance_miles || body.max_travel_distance_miles, 0));
+  const travelDistanceMiles = travelDistanceUnit === "kilometers"
+    ? Math.round(travelDistanceValue * 0.621371 * 10) / 10
+    : travelDistanceValue;
+  const smsCountryCode = clean(body.sms_country_code || (country === "US" ? "+1" : country === "HU" ? "+36" : ""));
+  const smsPhoneNumber = clean(body.sms_phone_number || "");
+  const smsDestination = normalizePhoneE164(`${smsCountryCode}${smsPhoneNumber || phone}`);
   const password = String(body.password || "");
   const confirmPassword = String(body.confirm_password || body.confirmPassword || "");
   const preferredLanguage = normalizeLanguage(body.preferred_language || body.guest_language || body.lang || body.language || "en");
+  const rawPreferredNeighborhoods = Array.isArray(body.preferred_neighborhoods)
+    ? body.preferred_neighborhoods
+    : String(body.preferred_neighborhoods || "").split(",").map((item) => item.trim()).filter(Boolean);
+  const preferredNeighborhoods = rawPreferredNeighborhoods.some((item) => clean(item).toLowerCase() === "no preference")
+    ? ["No preference"]
+    : rawPreferredNeighborhoods;
   const preferences = normalizeAiPreferences({
     ...body,
-    preferred_neighborhoods: Array.isArray(body.preferred_neighborhoods)
-      ? body.preferred_neighborhoods
-      : String(body.preferred_neighborhoods || "").split(",").map((item) => item.trim()).filter(Boolean),
+    preferred_neighborhoods: preferredNeighborhoods,
+    travel_distance_miles: travelDistanceMiles,
     dietary_restrictions: arrayFrom(body.dietary_restrictions).length ? arrayFrom(body.dietary_restrictions) : arrayFrom(body.dietary_needs),
     preferred_party_size: body.preferred_party_size || body.party_size || 2
   });
   const transportationMethods = arrayFrom(body.transportation_methods);
   preferences.location = {
-    city: clean(body.city),
-    region: clean(body.region || body.state),
+    country,
+    country_code: country,
+    state: region,
+    state_region: region,
+    city,
+    city_normalized: city,
+    region,
     postal_code: clean(body.postal_code || body.zip),
-    max_travel_distance_miles: Math.max(0, numberOr(body.travel_distance_miles, body.max_travel_distance_miles || 0)),
+    max_travel_distance_miles: travelDistanceMiles,
+    travel_distance_value: travelDistanceValue,
+    travel_distance_unit: travelDistanceUnit,
     transportation_method: clean(body.transportation_method || transportationMethods[0]),
     transportation_methods: transportationMethods.length ? transportationMethods : arrayFrom(body.transportation_method)
   };
+  preferences.preferred_neighborhoods = preferredNeighborhoods;
   preferences.transportation_methods = preferences.location.transportation_methods;
+  preferences.custom_cuisine = clean(body.custom_cuisine || body.other_cuisine);
   preferences.food_categories = arrayFrom(body.food_categories);
   preferences.dietary_needs = arrayFrom(body.dietary_needs);
   preferences.allergy_notes = clean(body.allergy_notes);
   preferences.dining_experiences = arrayFrom(body.dining_experiences);
-  preferences.companions = arrayFrom(body.companions);
+  preferences.companions = arrayFrom(body.companions).map((item) => /^(alone|single\s*\/\s*solo)$/i.test(clean(item)) ? "Single / Solo" : item);
   preferences.party_size = clean(body.party_size);
   preferences.preferred_days = arrayFrom(body.preferred_days);
   preferences.preferred_time_windows = arrayFrom(body.preferred_time_windows);
@@ -7158,12 +14365,24 @@ function normalizeGuestSignup(body = {}) {
   preferences.consider_no_discount_match = clean(body.consider_no_discount_match);
   preferences.notification_preferences = arrayFrom(body.notification_preferences);
   preferences.notification_channels = arrayFrom(body.notification_channels);
+  preferences.sms = {
+    country_code: smsCountryCode,
+    phone_number: smsPhoneNumber,
+    destination_e164: smsDestination
+  };
+  preferences.sms_country_code = smsCountryCode;
+  preferences.sms_phone_number = smsPhoneNumber;
   preferences.notification_frequency = clean(body.notification_frequency);
   preferences.event_recommendations_interest = clean(body.event_recommendations_interest);
   preferences.future_calendar_interest = clean(body.future_calendar_interest);
+  preferences.onboarding_progress = body.onboarding_progress && typeof body.onboarding_progress === "object"
+    ? body.onboarding_progress
+    : {};
   preferences.consents = {
     transactional_email: boolValue(body.transactional_email_consent),
     sms: boolValue(body.sms_consent),
+    sms_opted_in: boolValue(body.sms_consent) && arrayFrom(body.notification_channels).includes("SMS") && isValidE164Phone(smsDestination),
+    sms_consent_at: boolValue(body.sms_consent) ? nowIso() : null,
     marketing: boolValue(body.marketing_consent),
     allergy_acknowledgement: boolValue(body.allergy_acknowledgement),
     privacy: boolValue(body.privacy_consent),
@@ -7186,20 +14405,27 @@ function normalizeGuestSignup(body = {}) {
     confirmPassword,
     preferredLanguage,
     profileKey: aiProfileKey(body.profile_key || email),
+    accountCreationPhase: boolValue(body.account_creation_phase || body.account_creation_only || body.create_account_first),
+    onboardingProgress: body.onboarding_progress && typeof body.onboarding_progress === "object" ? body.onboarding_progress : {},
     preferences
   };
 }
 
 function validateGuestSignupPayload(payload) {
   const requiredText = [
-    ["firstName", payload.firstName],
-    ["lastName", payload.lastName],
-    ["email", payload.email],
-    ["phone", payload.phone],
-    ["city", payload.preferences.location.city],
-    ["region", payload.preferences.location.region],
-    ["postal_code", payload.preferences.location.postal_code],
-    ["transportation_method", payload.preferences.location.transportation_method],
+    ["fullName", payload.fullName],
+    ["email", payload.email]
+  ];
+  if (!payload.accountCreationPhase) {
+    requiredText.push(
+      ["phone", payload.phone],
+      ["city", payload.preferences.location.city],
+      ["region", payload.preferences.location.region],
+      ["postal_code", payload.preferences.location.postal_code],
+      ["transportation_method", payload.preferences.location.transportation_method]
+    );
+  }
+  const fullPreferenceRequiredText = [
     ["party_size", payload.preferences.party_size],
     ["booking_lead_time", payload.preferences.booking_lead_time],
     ["dining_duration", payload.preferences.dining_duration],
@@ -7212,23 +14438,30 @@ function validateGuestSignupPayload(payload) {
     ["event_recommendations_interest", payload.preferences.event_recommendations_interest],
     ["future_calendar_interest", payload.preferences.future_calendar_interest]
   ];
+  if (!payload.accountCreationPhase) requiredText.push(...fullPreferenceRequiredText);
   for (const [field, value] of requiredText) {
     if (!clean(value)) return `${field} is required.`;
   }
   if (!isValidSignupEmail(payload.email)) return "Enter a valid email address.";
-  if (!isValidSignupPhone(payload.phone)) return "Enter a valid phone number.";
+  if (payload.phone && !isValidSignupPhone(payload.phone)) return "Enter a valid phone number.";
+  if (!payload.accountCreationPhase && !isValidSignupPhone(payload.phone)) return "Enter a valid phone number.";
   if (!isStrongSignupPassword(payload.password)) return "Use a stronger password.";
   if (payload.password !== payload.confirmPassword) return "Passwords must match.";
-  if (!payload.preferences.location.max_travel_distance_miles) return "Maximum travel distance is required.";
+  if (!payload.accountCreationPhase && !payload.preferences.location.max_travel_distance_miles) return "Maximum travel distance is required.";
+  if (!payload.accountCreationPhase && !payload.preferences.location.travel_distance_unit) return "Travel distance unit is required.";
   const requiredArrays = [
     "cuisines", "food_categories", "dietary_needs", "drink_preferences", "dining_experiences", "companions",
     "preferred_neighborhoods", "preferred_days", "preferred_time_windows", "selection_priorities",
     "excluded_categories", "discount_levels", "notification_preferences", "notification_channels"
   ];
-  for (const field of requiredArrays) {
-    if (!arrayFrom(payload.preferences[field]).length) return `${field} is required.`;
+  if (!payload.accountCreationPhase) {
+    for (const field of requiredArrays) {
+      if (!arrayFrom(payload.preferences[field]).length) return `${field} is required.`;
+    }
   }
+  if (arrayFrom(payload.preferences.cuisines).includes("Other") && !payload.preferences.custom_cuisine) return "Custom cuisine is required.";
   if (arrayFrom(payload.preferences.notification_channels).includes("SMS") && !payload.preferences.consents.sms) return "SMS consent is required.";
+  if (arrayFrom(payload.preferences.notification_channels).includes("SMS") && !payload.preferences.consents.sms_opted_in) return "Enter a valid SMS phone number.";
   if (!payload.preferences.consents.transactional_email) return "Reservation email consent is required.";
   if (!payload.preferences.consents.privacy) return "Privacy consent is required.";
   if (!payload.preferences.consents.terms) return "Terms consent is required.";
@@ -7248,16 +14481,22 @@ async function rollbackSupabaseGuestSignup({ userId, guestId, email, profileKey 
     tasks.push(supabaseFetch(`/rest/v1/guest_profiles?guest_id=eq.${encodedGuestId}`, { method: "DELETE", service: true }));
     tasks.push(supabaseFetch(`/rest/v1/guests?id=eq.${encodedGuestId}`, { method: "DELETE", service: true }));
   }
+  if (userId) tasks.push(supabaseFetch(`/rest/v1/user_legal_consents?user_id=eq.${encodeURIComponent(userId)}`, { method: "DELETE", service: true }));
   tasks.push(supabaseFetch(`/rest/v1/ai_preference_profiles?profile_key=eq.${encodedProfileKey}`, { method: "DELETE", service: true }));
   tasks.push(supabaseFetch(`/rest/v1/profiles?email=eq.${encodedEmail}`, { method: "DELETE", service: true }));
   if (userId) tasks.push(supabaseFetch(`/auth/v1/admin/users/${encodeURIComponent(userId)}`, { method: "DELETE", service: true }));
   await Promise.allSettled(tasks);
 }
 
-async function signupGuest(body) {
+async function signupGuest(body, headers = {}) {
   const payload = normalizeGuestSignup(body);
   const validationError = validateGuestSignupPayload(payload);
   if (validationError) return json(400, { error: validationError });
+  logSafeServerEvent("guest_signup_request_started", {
+    mode: supabaseConfigured ? "supabase" : "demo",
+    email_hash: hashEmailValue(payload.email).slice(0, 16),
+    locale: payload.preferredLanguage
+  });
 
   if (!supabaseConfigured) {
     ensureDemo();
@@ -7307,6 +14546,48 @@ async function signupGuest(body) {
       ...row,
       created_at: nowIso()
     })));
+    demo.userLegalConsents.unshift(...legalConsentRowsFromSignup({
+      payload,
+      guestId: guest.id,
+      userId: id
+    }).map((row) => ({
+      id: crypto.randomUUID(),
+      ...row,
+      created_at: row.created_at || nowIso(),
+      updated_at: row.updated_at || nowIso()
+    })));
+    await updateCommunicationPreferencesForProfile(profile, {
+      transactional_email_enabled: true,
+      marketing_email_enabled: Boolean(payload.preferences.consents.marketing),
+      transactional_sms_enabled: Boolean(payload.preferences.consents.sms_opted_in),
+      marketing_sms_enabled: false,
+      in_app_enabled: true,
+      preferred_language: payload.preferredLanguage,
+      timezone: payload.preferences.location?.timezone || "America/New_York",
+      source: "guest_signup"
+    }, headers).catch((error) => logSafeServerEvent("communication_preferences_signup_failed", {
+      mode: "demo",
+      code: error.code || "COMMUNICATION_PREFERENCES_WRITE_FAILED",
+      user_hash: hashEmailValue(id).slice(0, 16)
+    }));
+    await recordCommunicationConsentEvent({
+      profile,
+      channel: "email",
+      consentType: "transactional",
+      status: "granted",
+      source: "guest_signup",
+      headers
+    }).catch(() => null);
+    if (payload.preferences.consents.sms_opted_in) {
+      await recordCommunicationConsentEvent({
+        profile,
+        channel: "sms",
+        consentType: "transactional",
+        status: "granted",
+        source: "guest_signup",
+        headers
+      }).catch(() => null);
+    }
     demo.aiPreferenceProfiles.unshift({
       id: crypto.randomUUID(),
       profile_key: payload.profileKey,
@@ -7321,11 +14602,33 @@ async function signupGuest(body) {
       created_at: nowIso(),
       updated_at: nowIso()
     });
+    logSafeServerEvent("guest_signup_profile_creation_success", {
+      mode: "demo",
+      user_hash: hashEmailValue(id).slice(0, 16),
+      locale: payload.preferredLanguage
+    });
     const registrationEmail = await sendGuestRegistrationEmail({
       email: payload.email,
       guestName: payload.fullName,
       lang: payload.preferredLanguage,
       userId: id
+    });
+    const delivery = emailDeliverySummary([registrationEmail]);
+    const welcomeEmail = emailDeliveryResult(registrationEmail, "resend");
+    logSafeServerEvent("guest_signup_welcome_email_result", {
+      mode: "demo",
+      user_hash: hashEmailValue(id).slice(0, 16),
+      accepted_count: delivery.accepted_count,
+      failed_count: delivery.failed_count,
+      status: registrationEmail?.status || "failed",
+      error_code: registrationEmail?.errorCode || null
+    });
+    logSafeServerEvent(isEmailAccepted(registrationEmail) ? "welcome_email_sent" : "welcome_email_failed", {
+      mode: "demo",
+      user_hash: hashEmailValue(id).slice(0, 16),
+      provider: welcomeEmail.provider,
+      accepted: welcomeEmail.accepted,
+      error_code: welcomeEmail.errorCode
     });
     return json(201, {
       mode: "demo",
@@ -7333,32 +14636,129 @@ async function signupGuest(body) {
       profile,
       preferences: payload.preferences,
       emails: [registrationEmail],
-      email_delivery: emailDeliverySummary([registrationEmail])
+      email_delivery: delivery,
+      auth_confirmation_email: supabaseConfirmationEmailResult({ required: false, requested: false }),
+      welcome_email: welcomeEmail,
+      email_verification_required: false
     });
+  }
+
+  const existingAuthToken = authToken(headers);
+  let resumeAuthUser = null;
+  if (existingAuthToken) {
+    try {
+      resumeAuthUser = await supabaseFetch("/auth/v1/user", { service: false, token: existingAuthToken });
+    } catch (error) {
+      logSafeServerEvent("guest_signup_resume_auth_failed", {
+        status: error.status || 401,
+        code: error.code || "AUTHENTICATION_REQUIRED",
+        email_hash: hashEmailValue(payload.email).slice(0, 16)
+      });
+      return json(401, {
+        error: "Please sign in again before completing onboarding.",
+        code: "AUTHENTICATION_REQUIRED"
+      });
+    }
+    if (lower(resumeAuthUser.email) !== payload.email) {
+      logSafeServerEvent("guest_signup_resume_email_mismatch", {
+        user_hash: hashEmailValue(resumeAuthUser.id || "").slice(0, 16),
+        email_hash: hashEmailValue(payload.email).slice(0, 16)
+      });
+      return json(403, {
+        error: "Authenticated account does not match the signup email.",
+        code: "AUTH_EMAIL_MISMATCH"
+      });
+    }
   }
 
   const existingProfiles = await supabaseFetch(`/rest/v1/profiles?select=id&email=eq.${encodeURIComponent(payload.email)}&limit=1`, { service: true }).catch(() => []);
   const existingGuests = await supabaseFetch(`/rest/v1/guests?select=id&email=eq.${encodeURIComponent(payload.email)}&limit=1`, { service: true }).catch(() => []);
-  if (existingProfiles?.length || existingGuests?.length) return json(409, { error: "Account already exists." });
+  if ((existingProfiles?.length || existingGuests?.length) && !resumeAuthUser) return json(409, { error: "Account already exists." });
 
-  const signup = await supabaseFetch("/auth/v1/signup", {
-    method: "POST",
-    service: false,
-    body: {
-      email: payload.email,
-      password: payload.password,
-      data: {
-        full_name: payload.fullName,
-        first_name: payload.firstName,
-        last_name: payload.lastName,
-        phone: payload.phone,
-        preferred_language: payload.preferredLanguage
-      }
+  let signup;
+  let createdNewAuthUser = false;
+  if (resumeAuthUser) {
+    signup = {
+      user: resumeAuthUser,
+      session: { access_token: existingAuthToken }
+    };
+    logSafeServerEvent("guest_signup_resume_auth_success", {
+      mode: "supabase",
+      user_hash: hashEmailValue(resumeAuthUser.id).slice(0, 16),
+      email_hash: hashEmailValue(payload.email).slice(0, 16)
+    });
+  } else {
+    try {
+      signup = await supabaseFetch(`/auth/v1/signup?redirect_to=${encodeURIComponent(AUTH_CALLBACK_URL)}`, {
+        method: "POST",
+        service: false,
+        body: {
+          email: payload.email,
+          password: payload.password,
+          data: {
+            full_name: payload.fullName,
+            first_name: payload.firstName,
+            last_name: payload.lastName,
+            phone: payload.phone,
+            preferred_language: payload.preferredLanguage
+          }
+        }
+      });
+      createdNewAuthUser = true;
+    } catch (error) {
+      const mapped = mapSupabaseSignupError(error);
+      logSafeServerEvent("guest_signup_rejected_by_auth_provider", {
+        status: error.status || mapped.status,
+        code: mapped.code,
+        email_hash: hashEmailValue(payload.email).slice(0, 16)
+      });
+      logSafeServerEvent("auth_signup_failure", {
+        provider: "supabase",
+        status: error.status || mapped.status,
+        code: mapped.code,
+        email_hash: hashEmailValue(payload.email).slice(0, 16)
+      });
+      return json(mapped.status, { error: mapped.error, code: mapped.code });
     }
-  });
+  }
   const user = signup.user || signup;
   const userId = user?.id;
-  if (!userId) return json(500, { error: "Account provider did not return a user ID. Account creation was not completed." });
+  if (!userId) {
+    logSafeServerEvent("guest_signup_missing_auth_user_id", {
+      code: "AUTH_SIGNUP_MISSING_USER_ID",
+      email_hash: hashEmailValue(payload.email).slice(0, 16)
+    });
+    logSafeServerEvent("auth_signup_failure", {
+      provider: "supabase",
+      code: "AUTH_SIGNUP_MISSING_USER_ID",
+      email_hash: hashEmailValue(payload.email).slice(0, 16)
+    });
+    return json(502, {
+      error: "Account creation could not be completed. Please try again.",
+      code: "AUTH_SIGNUP_MISSING_USER_ID"
+    });
+  }
+  logSafeServerEvent("guest_signup_auth_success", {
+    mode: "supabase",
+    user_hash: hashEmailValue(userId).slice(0, 16),
+    email_hash: hashEmailValue(payload.email).slice(0, 16),
+    email_verification_required: !signup.session?.access_token
+  });
+  logSafeServerEvent("auth_signup_success", {
+    provider: "supabase",
+    mode: "supabase",
+    user_hash: hashEmailValue(userId).slice(0, 16),
+    email_hash: hashEmailValue(payload.email).slice(0, 16),
+    email_verification_required: !signup.session?.access_token
+  });
+  if (!signup.session?.access_token) {
+    logSafeServerEvent("auth_confirmation_requested", {
+      provider: "supabase",
+      user_hash: hashEmailValue(userId).slice(0, 16),
+      email_hash: hashEmailValue(payload.email).slice(0, 16),
+      callback_path: AUTH_CALLBACK_PATH
+    });
+  }
   let createdGuestId = null;
   if (userId) {
     try {
@@ -7379,14 +14779,14 @@ async function signupGuest(body) {
         method: "POST",
         service: true,
         headers: { Prefer: "resolution=merge-duplicates,return=representation" },
-        body: {
+        body: await filterSupabaseTablePayload("guests", {
           user_id: userId,
           email: payload.email,
           full_name: payload.fullName,
           phone: payload.phone,
           ...guestSignupProfileFields(payload),
           status: "active"
-        }
+        })
       });
       const guest = guests?.[0];
       if (!guest?.id) throw new Error("Guest profile could not be created.");
@@ -7395,7 +14795,7 @@ async function signupGuest(body) {
         method: "POST",
         service: true,
         headers: { Prefer: "resolution=merge-duplicates" },
-        body: {
+        body: await filterSupabaseTablePayload("guest_profiles", {
           guest_id: guest.id,
           profile_key: payload.profileKey,
           preferences: payload.preferences,
@@ -7404,18 +14804,60 @@ async function signupGuest(body) {
           preferred_neighborhoods: payload.preferences.preferred_neighborhoods,
           ...guestPreferenceColumns(payload.preferences),
           consent: payload.preferences.consents
-        }
+        })
       });
       await supabaseFetch("/rest/v1/guest_consents", {
         method: "POST",
         service: true,
-        body: guestConsentRows(payload, guest.id, userId)
+        body: await Promise.all(guestConsentRows(payload, guest.id, userId).map((row) => filterSupabaseTablePayload("guest_consents", row)))
       });
+      if (await supabaseTableExists("user_legal_consents")) {
+        await supabaseFetch("/rest/v1/user_legal_consents", {
+          method: "POST",
+          service: true,
+          body: await Promise.all(legalConsentRowsFromSignup({ payload, guestId: guest.id, userId }).map((row) => filterSupabaseTablePayload("user_legal_consents", row)))
+        });
+      }
+      const signupProfile = clientProfile({
+        id: userId,
+        email: payload.email,
+        full_name: payload.fullName,
+        role: "guest",
+        preferred_language: payload.preferredLanguage
+      });
+      await updateCommunicationPreferencesForProfile(signupProfile, {
+        transactional_email_enabled: true,
+        marketing_email_enabled: Boolean(payload.preferences.consents.marketing),
+        transactional_sms_enabled: Boolean(payload.preferences.consents.sms_opted_in),
+        marketing_sms_enabled: false,
+        in_app_enabled: true,
+        preferred_language: payload.preferredLanguage,
+        timezone: payload.preferences.location?.timezone || "America/New_York",
+        source: "guest_signup"
+      }, headers);
+      await recordCommunicationConsentEvent({
+        profile: signupProfile,
+        channel: "email",
+        consentType: "transactional",
+        status: "granted",
+        source: "guest_signup",
+        headers
+      });
+      if (payload.preferences.consents.sms_opted_in) {
+        await recordCommunicationConsentEvent({
+          profile: signupProfile,
+          channel: "sms",
+          consentType: "transactional",
+          status: "granted",
+          source: "guest_signup",
+          headers
+        }).catch(() => null);
+      }
       await supabaseFetch("/rest/v1/ai_preference_profiles?on_conflict=profile_key", {
         method: "POST",
         service: true,
         headers: { Prefer: "resolution=merge-duplicates" },
-        body: {
+        body: await filterSupabaseTablePayload("ai_preference_profiles", {
           profile_key: payload.profileKey,
           user_id: userId,
           guest_email: payload.email,
@@ -7425,11 +14867,30 @@ async function signupGuest(body) {
           preferred_discount_range: payload.preferences.preferred_discount_range,
           minimum_interesting_discount: payload.preferences.minimumInterestingDiscount,
           calendar_opt_in: false
-        }
+        })
+      });
+      logSafeServerEvent("guest_signup_profile_creation_success", {
+        mode: "supabase",
+        user_hash: hashEmailValue(userId).slice(0, 16),
+        guest_hash: hashEmailValue(createdGuestId).slice(0, 16),
+        locale: payload.preferredLanguage
       });
     } catch (error) {
-      await rollbackSupabaseGuestSignup({ userId, guestId: createdGuestId, email: payload.email, profileKey: payload.profileKey });
-      return json(500, { error: `Account creation rolled back: ${error.message}` });
+      if (createdNewAuthUser) {
+        await rollbackSupabaseGuestSignup({ userId, guestId: createdGuestId, email: payload.email, profileKey: payload.profileKey });
+      }
+      logSafeServerEvent("guest_signup_profile_creation_failed", {
+        status: error.status || 500,
+        code: "SIGNUP_PROFILE_CREATION_FAILED",
+        email_hash: hashEmailValue(payload.email).slice(0, 16),
+        user_hash: hashEmailValue(userId).slice(0, 16),
+        rolled_back: createdNewAuthUser
+      });
+      return json(500, {
+        error: "Account setup could not be completed. Please try again or contact support.",
+        code: "SIGNUP_PROFILE_CREATION_FAILED",
+        rolled_back: createdNewAuthUser
+      });
     }
   }
   const session = signup.session || null;
@@ -7438,6 +14899,27 @@ async function signupGuest(body) {
     guestName: payload.fullName,
     lang: payload.preferredLanguage,
     userId
+  });
+  const registrationDelivery = emailDeliverySummary([registrationEmail]);
+  const welcomeEmail = emailDeliveryResult(registrationEmail, "resend");
+  const authConfirmationEmail = supabaseConfirmationEmailResult({
+    required: !session?.access_token,
+    requested: !session?.access_token
+  });
+  logSafeServerEvent("guest_signup_welcome_email_result", {
+    mode: "supabase",
+    user_hash: hashEmailValue(userId).slice(0, 16),
+    accepted_count: registrationDelivery.accepted_count,
+    failed_count: registrationDelivery.failed_count,
+    status: registrationEmail?.status || "failed",
+    error_code: registrationEmail?.errorCode || null
+  });
+  logSafeServerEvent(isEmailAccepted(registrationEmail) ? "welcome_email_sent" : "welcome_email_failed", {
+    mode: "supabase",
+    user_hash: hashEmailValue(userId).slice(0, 16),
+    provider: welcomeEmail.provider,
+    accepted: welcomeEmail.accepted,
+    error_code: welcomeEmail.errorCode
   });
   if (session?.access_token) {
     const profile = await getSupabaseProfile(session.access_token).catch(() => ({
@@ -7455,7 +14937,10 @@ async function signupGuest(body) {
       profile,
       preferences: payload.preferences,
       emails: [registrationEmail],
-      email_delivery: emailDeliverySummary([registrationEmail])
+      email_delivery: registrationDelivery,
+      auth_confirmation_email: authConfirmationEmail,
+      welcome_email: welcomeEmail,
+      email_verification_required: false
     });
   }
   return json(201, {
@@ -7463,7 +14948,10 @@ async function signupGuest(body) {
     preferences: payload.preferences,
     message: "Guest account created. Confirm email if Supabase email confirmation is enabled.",
     emails: [registrationEmail],
-    email_delivery: emailDeliverySummary([registrationEmail])
+    email_delivery: registrationDelivery,
+    auth_confirmation_email: authConfirmationEmail,
+    welcome_email: welcomeEmail,
+    email_verification_required: true
   });
 }
 
@@ -7578,14 +15066,35 @@ async function setPlatformSettings(updates = {}, profile) {
   return next;
 }
 
-async function listPublicConfig() {
+async function listPublicConfig(query = new URLSearchParams()) {
   const platformSettings = await getPlatformSettings();
+  const marketContext = resolveMarketContext({ query, publicOnly: true });
+  const pushStatus = pushService.getStatus();
   return json(200, {
-    mode: supabaseConfigured ? "supabase" : "demo",
+    mode: deploymentDataMode(),
+    environment: RUNTIME_ENVIRONMENT,
+    runtime_mode: RUNTIME_ENVIRONMENT,
+    production_runtime: IS_PRODUCTION_RUNTIME,
+    login_diagnostics_enabled: LOGIN_DIAGNOSTICS_ENABLED,
+    public_base_url: PUBLIC_BASE_URL,
+    default_market_code: DEFAULT_MARKET_CODE,
+    default_market: DEFAULT_MARKET,
+    resolved_market_code: marketContext.market.code,
+    resolved_market: marketContext.market,
+    market_resolution_source: marketContext.source,
+    active_markets: publicMarketConfig(),
     ...platformSettings,
     feature_registry: platformFeatureRegistry,
     google_maps_api_key: GOOGLE_MAPS_API_KEY,
-    google_maps_enabled: Boolean(GOOGLE_MAPS_API_KEY)
+    google_maps_enabled: Boolean(GOOGLE_MAPS_API_KEY),
+    partner_push: {
+      provider: pushStatus.provider,
+      enabled: Boolean(pushStatus.enabled),
+      status: pushStatus.status,
+      has_public_key: Boolean(pushStatus.has_public_key),
+      vapid_public_key: pushStatus.vapid_public_key || "",
+      poll_seconds: RESERVATION_ALERT_POLL_SECONDS
+    }
   });
 }
 
@@ -7613,8 +15122,9 @@ async function adminPlatformSettings(method, body, headers) {
 
 async function listPublicOffers(query) {
   const lang = normalizeLanguage(query.get("lang"));
+  const includeTestData = publicQueryIncludesTestData(query);
   if (!supabaseConfigured) {
-    const rows = publicOfferRows(lang).map(sanitizePublicOfferRow);
+    const rows = filterPublicTestDataRows(publicOfferRows(lang).map(sanitizePublicOfferRow), includeTestData);
     const restaurantIds = new Set(rows.map((row) => row.restaurant_id));
     for (const id of restaurantIds) {
       const restaurant = demo.restaurants.find((item) => item.id === id);
@@ -7623,7 +15133,7 @@ async function listPublicOffers(query) {
     return json(200, { mode: "demo", offers: rows });
   }
 
-  const rows = await supabaseFetch("/rest/v1/public_available_offers?select=*&order=sort_order.asc.nullslast,restaurant_name.asc,offer_date.asc,start_time.asc", { service: false });
+  const rows = filterPublicTestDataRows(await supabaseFetch("/rest/v1/public_available_offers?select=*&order=sort_order.asc.nullslast,restaurant_name.asc,offer_date.asc,start_time.asc", { service: false }), includeTestData);
   const restaurantIds = [...new Set((rows || []).map((row) => row.restaurant_id).filter(Boolean))];
   await Promise.all(restaurantIds.map((restaurantId) => supabaseFetch("/rest/v1/rpc/track_restaurant_view", {
     method: "POST",
@@ -7672,7 +15182,7 @@ async function followRestaurant(body) {
       existing.guest_name = guestName || existing.guest_name;
       existing.notification_enabled = notificationEnabled;
       existing.updated_at = nowIso();
-      return json(200, { mode: "demo", follower: existing });
+      return json(200, { mode: "demo", follower: publicFollowerResponse(existing) });
     }
     const follower = {
       id: crypto.randomUUID(),
@@ -7691,10 +15201,10 @@ async function followRestaurant(body) {
       restaurant_id: restaurantId,
       offer_id: null,
       reservation_id: null,
-      metadata: { guest_email: guestEmail },
+      metadata: { source: "public_follow", notification_enabled: notificationEnabled },
       created_at: nowIso()
     });
-    return json(201, { mode: "demo", follower });
+    return json(201, { mode: "demo", follower: publicFollowerResponse(follower) });
   }
 
   const rows = await supabaseFetch("/rest/v1/restaurant_followers?on_conflict=restaurant_id,guest_email&select=*", {
@@ -7717,26 +15227,85 @@ async function followRestaurant(body) {
       profile_key: aiProfileKey(body.profile_key || guestEmail),
       event_type: "favorite_restaurant",
       restaurant_id: restaurantId,
-      metadata: { guest_email: guestEmail }
+      metadata: { source: "public_follow", notification_enabled: notificationEnabled }
     }
   }).catch(() => null);
-  return json(200, { mode: "supabase", follower: rows?.[0] });
+  return json(200, { mode: "supabase", follower: publicFollowerResponse(rows?.[0] || {}) });
+}
+
+function publicFollowerResponse(row = {}) {
+  return {
+    restaurant_id: row.restaurant_id,
+    notification_enabled: Boolean(row.notification_enabled),
+    created_at: row.created_at || null,
+    updated_at: row.updated_at || null
+  };
 }
 
 async function listNewestRestaurants(query) {
   const lang = normalizeLanguage(query.get("lang"));
+  const includeTestData = publicQueryIncludesTestData(query);
   const weekStart = dateStartOfWeek(new Date()).toISOString();
   if (!supabaseConfigured) {
     ensureDemo();
     const restaurants = demo.restaurants
       .filter((restaurant) => restaurant.status === "approved" && new Date(restaurant.created_at) >= new Date(weekStart))
+      .filter((restaurant) => includeTestData || !isPublicTestDataRow(restaurant))
       .map((restaurant) => publicRestaurantCard(restaurant, lang))
       .sort((a, b) => String(b.restaurant_created_at || "").localeCompare(String(a.restaurant_created_at || "")));
     return json(200, { mode: "demo", restaurants });
   }
 
-  const rows = await supabaseFetch(`/rest/v1/public_restaurant_cards?select=*&restaurant_created_at=gte.${encodeURIComponent(weekStart)}&order=restaurant_created_at.desc`, { service: false });
-  const restaurants = (rows || []).map((row) => ({
+  let rows = [];
+  try {
+    rows = await supabaseFetch(`/rest/v1/public_restaurant_cards?select=*&restaurant_created_at=gte.${encodeURIComponent(weekStart)}&order=restaurant_created_at.desc`, { service: false });
+  } catch (error) {
+    const details = JSON.stringify(error.detail || {});
+    if (error.code === "PGRST205" && /public_restaurant_cards/.test(`${error.message || ""} ${details}`)) {
+      logSafeServerEvent("public_newest_restaurants_view_missing", {
+        code: "PGRST205"
+      });
+      return json(200, { mode: "supabase", restaurants: [] });
+    }
+    throw error;
+  }
+  const restaurants = filterPublicTestDataRows(rows || [], includeTestData).map((row) => ({
+    ...row,
+    restaurant_description: localizedField(row, "restaurant_description", lang) || row.restaurant_description || row.description
+  }));
+  return json(200, { mode: "supabase", restaurants });
+}
+
+async function listPublicRestaurants(query) {
+  const lang = normalizeLanguage(query.get("lang"));
+  const includeTestData = publicQueryIncludesTestData(query);
+  if (!supabaseConfigured) {
+    ensureDemo();
+    const restaurants = demo.restaurants
+      .filter((restaurant) => restaurant.status === "approved" && restaurant.visible_on_guest_site !== false)
+      .filter((restaurant) => includeTestData || !isPublicTestDataRow(restaurant))
+      .map((restaurant) => publicRestaurantCard(restaurant, lang))
+      .sort((a, b) => {
+        const order = numberOr(a.sort_order, 999999) - numberOr(b.sort_order, 999999);
+        return order || clean(a.restaurant_name).localeCompare(clean(b.restaurant_name));
+      });
+    return json(200, { mode: "demo", restaurants });
+  }
+
+  let rows = [];
+  try {
+    rows = await supabaseFetch("/rest/v1/public_restaurant_cards?select=*&order=sort_order.asc.nullslast,restaurant_name.asc", { service: false });
+  } catch (error) {
+    const details = JSON.stringify(error.detail || {});
+    if (error.code === "PGRST205" && /public_restaurant_cards/.test(`${error.message || ""} ${details}`)) {
+      logSafeServerEvent("public_restaurants_view_missing", {
+        code: "PGRST205"
+      });
+      return json(200, { mode: "supabase", restaurants: [] });
+    }
+    throw error;
+  }
+  const restaurants = filterPublicTestDataRows(rows || [], includeTestData).map((row) => ({
     ...row,
     restaurant_description: localizedField(row, "restaurant_description", lang) || row.restaurant_description || row.description
   }));
@@ -7744,9 +15313,14 @@ async function listNewestRestaurants(query) {
 }
 
 async function aiPreferences(method, body, headers, query) {
-  const token = authToken(headers);
-  const authProfile = !supabaseConfigured ? profileFromDemoToken(token) : null;
-  const profileKey = aiProfileKey(body.profile_key || query.get("profile_key") || authProfile?.id);
+  let authProfile = null;
+  try {
+    authProfile = (await requireProfile(headers, ["guest"])).profile;
+  } catch (error) {
+    if (error?.status === 403) return json(403, { error: "Forbidden.", code: "FORBIDDEN" });
+    return json(401, { error: "Authentication required.", code: "AUTHENTICATION_REQUIRED" });
+  }
+  const profileKey = aiProfileKey(authProfile?.email || authProfile?.id);
 
   if (!supabaseConfigured) {
     ensureDemo();
@@ -7761,7 +15335,7 @@ async function aiPreferences(method, body, headers, query) {
         id: crypto.randomUUID(),
         profile_key: profileKey,
         user_id: authProfile?.id || null,
-        guest_email: lower(body.guest_email || authProfile?.email),
+        guest_email: lower(authProfile?.email),
         created_at: nowIso()
       };
       Object.assign(row, {
@@ -7788,7 +15362,7 @@ async function aiPreferences(method, body, headers, query) {
         headers: { Prefer: "resolution=merge-duplicates,return=representation" },
         body: {
           profile_key: profileKey,
-          guest_email: lower(body.guest_email),
+          guest_email: lower(authProfile?.email),
           preferences,
           budget_per_person: preferences.budget_per_person,
           travel_distance_miles: preferences.travel_distance_miles,
@@ -7837,6 +15411,7 @@ async function aiEvent(method, body, headers) {
 
 async function aiRecommendations(query, headers) {
   const lang = normalizeLanguage(query.get("lang"));
+  const includeTestData = publicQueryIncludesTestData(query);
   const token = authToken(headers);
   const authProfile = !supabaseConfigured ? profileFromDemoToken(token) : null;
   const profileKey = aiProfileKey(query.get("profile_key") || authProfile?.id);
@@ -7848,12 +15423,13 @@ async function aiRecommendations(query, headers) {
     preferences = demo.aiPreferenceProfiles.find((item) => item.profile_key === profileKey)?.preferences || null;
     restaurants = demo.restaurants
       .filter((restaurant) => restaurant.status === "approved")
+      .filter((restaurant) => includeTestData || !isPublicTestDataRow(restaurant))
       .map((restaurant) => publicRestaurantCard(restaurant, lang));
   } else {
     const prefRows = await supabaseFetch(`/rest/v1/ai_preference_profiles?select=*&profile_key=eq.${encodeURIComponent(profileKey)}&limit=1`, { service: true }).catch(() => []);
     preferences = prefRows?.[0]?.preferences || null;
     const rows = await supabaseFetch("/rest/v1/public_restaurant_cards?select=*&order=sort_order.asc.nullslast,restaurant_name.asc", { service: false });
-    restaurants = (rows || []).map((row) => ({
+    restaurants = filterPublicTestDataRows(rows || [], includeTestData).map((row) => ({
       ...row,
       restaurant_description: localizedField(row, "restaurant_description", lang) || row.restaurant_description || row.description
     }));
@@ -8875,8 +16451,8 @@ async function reservationDataImport(method, body, headers, query) {
 }
 
 async function adminFeatureFlags(method, body, headers) {
-  await requireProfile(headers, ["admin"]);
   if (method === "GET") {
+    await requireProfile(headers, ["admin"]);
     if (!supabaseConfigured) {
       ensureDemo();
       return json(200, { mode: "demo", flags: demo.featureFlags, features: featureStatusRows() });
@@ -8885,6 +16461,7 @@ async function adminFeatureFlags(method, body, headers) {
     return json(200, { mode: "supabase", flags, features: featureStatusRows() });
   }
   if (method !== "PATCH") return json(405, { error: "Method not allowed." });
+  await requireProfile(headers, ["super_admin"]);
   const key = clean(body.key);
   const status = clean(body.status || "beta");
   const enabled = body.enabled === undefined ? true : Boolean(body.enabled === true || body.enabled === "true");
@@ -8941,41 +16518,2297 @@ async function adminMonitoring(method, headers) {
   return json(200, { mode: "supabase", app_errors: appErrors, integration_errors: integrationErrors, failed_emails: (failedEmails || []).map(maskEmailLogForAdmin), failed_ai_actions: failedAiActions, admin_alerts: adminAlerts });
 }
 
-async function adminBilling(method, headers) {
-  await requireProfile(headers, ["admin"]);
+function stripeDiagnostics() {
+  const billingEnvironment = stripeLiveModeActive ? "live" : "test";
+  return {
+    provider: "stripe",
+    configured: stripeConfigured,
+    test_mode_only: !stripeLiveModeActive,
+    billing_environment: billingEnvironment,
+    live_billing_enabled: STRIPE_LIVE_BILLING_ENABLED && IS_PRODUCTION_RUNTIME,
+    secret_mode: stripeConfigured ? billingEnvironment : stripeSecretMode,
+    webhook_configured: Boolean(STRIPE_WEBHOOK_SECRET),
+    billing_enforcement_mode: BILLING_ENFORCEMENT_MODE,
+    ach_enabled: STRIPE_ENABLE_ACH,
+    promotion_codes_enabled: STRIPE_ALLOW_PROMOTION_CODES,
+    fixed_monthly_plans: true,
+    publishable_key_configured: Boolean(STRIPE_PUBLISHABLE_KEY && STRIPE_PUBLISHABLE_KEY.startsWith("pk_")),
+    portal_configuration_configured: Boolean(STRIPE_PORTAL_CONFIGURATION_ID),
+    enterprise_self_service_enabled: STRIPE_ENTERPRISE_SELF_SERVICE_ENABLED,
+    trial_period_configured: STRIPE_TRIAL_PERIOD_DAYS > 0,
+    trial_days: STRIPE_TRIAL_PERIOD_DAYS,
+    grace_period_days: BILLING_PAYMENT_GRACE_PERIOD_DAYS,
+    override_max_days: BILLING_OVERRIDE_MAX_DAYS,
+    price_ids: {
+      basic_monthly_configured: Boolean(STRIPE_BASIC_MONTHLY_PRICE_ID),
+      professional_monthly_configured: Boolean(STRIPE_PROFESSIONAL_MONTHLY_PRICE_ID),
+      enterprise_monthly_configured: Boolean(STRIPE_ENTERPRISE_MONTHLY_PRICE_ID),
+      video_standard_configured: Boolean(STRIPE_VIDEO_STANDARD_PRICE_ID),
+      video_premium_configured: Boolean(STRIPE_VIDEO_PREMIUM_PRICE_ID)
+    }
+  };
+}
+
+function stripeBillingEnvironment() {
+  return stripeLiveModeActive ? "live" : "test";
+}
+
+function appendStripeFormValue(params, key, value) {
+  if (value === undefined || value === null || value === "") return;
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => appendStripeFormValue(params, `${key}[${index}]`, item));
+    return;
+  }
+  if (typeof value === "object") {
+    for (const [childKey, childValue] of Object.entries(value)) {
+      appendStripeFormValue(params, `${key}[${childKey}]`, childValue);
+    }
+    return;
+  }
+  params.append(key, String(value));
+}
+
+function stripeFormBody(payload = {}) {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(payload)) appendStripeFormValue(params, key, value);
+  return params;
+}
+
+async function stripeRequest(pathname, options = {}) {
+  if (!stripeConfigured) {
+    const error = new Error("Stripe is not configured.");
+    error.status = 503;
+    error.code = "STRIPE_NOT_CONFIGURED";
+    throw error;
+  }
+  const response = await fetch(`https://api.stripe.com${pathname}`, {
+    method: options.method || "GET",
+    headers: {
+      authorization: `Bearer ${STRIPE_SECRET_KEY}`,
+      "stripe-version": STRIPE_API_VERSION,
+      ...(options.body ? { "content-type": "application/x-www-form-urlencoded" } : {}),
+      ...(options.headers || {})
+    },
+    body: options.body ? stripeFormBody(options.body).toString() : undefined
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(payload?.error?.message || payload?.message || "Stripe request failed.");
+    error.status = response.status;
+    error.code = payload?.error?.code || payload?.error?.type || "STRIPE_REQUEST_FAILED";
+    error.detail = payload?.error || payload;
+    throw error;
+  }
+  return payload;
+}
+
+async function verifyStripePriceCatalogEntry(priceId, expected = {}) {
+  const price = await stripeRequest(`/v1/prices/${encodeURIComponent(priceId)}`);
+  const expectedAmount = Number(expected.amount_cents);
+  const expectedCurrency = clean(expected.currency || "usd").toLowerCase();
+  const expectedMode = clean(expected.mode || "payment").toLowerCase();
+  const actualAmount = Number(price?.unit_amount);
+  const actualCurrency = clean(price?.currency).toLowerCase();
+  const actualInterval = clean(price?.recurring?.interval).toLowerCase();
+  const recurringMatches = expectedMode === "subscription"
+    ? actualInterval === "month"
+    : !actualInterval;
+  if (
+    price?.active === false
+    || !Number.isInteger(expectedAmount)
+    || actualAmount !== expectedAmount
+    || actualCurrency !== expectedCurrency
+    || !recurringMatches
+  ) {
+    const error = new Error("The configured Stripe price does not match the SmartTable billing catalog.");
+    error.status = 409;
+    error.code = "STRIPE_PRICE_CATALOG_MISMATCH";
+    throw error;
+  }
+  return price;
+}
+
+function verifyStripeWebhookSignature(headers = {}, body = {}) {
+  if (!STRIPE_WEBHOOK_SECRET) return { ok: false, reason: "STRIPE_WEBHOOK_SECRET_NOT_CONFIGURED" };
+  const signatureHeader = headerValue(headers, "stripe-signature");
+  if (!signatureHeader) return { ok: false, reason: "STRIPE_SIGNATURE_MISSING" };
+  const parts = Object.fromEntries(signatureHeader
+    .split(",")
+    .map((part) => part.split("="))
+    .filter((part) => part.length >= 2)
+    .map(([key, ...value]) => [clean(key), clean(value.join("="))]));
+  const timestamp = Number(parts.t);
+  const signatures = signatureHeader
+    .split(",")
+    .map((part) => part.trim())
+    .filter((part) => part.startsWith("v1="))
+    .map((part) => part.slice(3));
+  if (!Number.isFinite(timestamp) || !signatures.length) return { ok: false, reason: "STRIPE_SIGNATURE_INVALID" };
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  if (Math.abs(nowSeconds - timestamp) > STRIPE_WEBHOOK_TOLERANCE_SECONDS) {
+    return { ok: false, reason: "STRIPE_TIMESTAMP_OUTSIDE_TOLERANCE" };
+  }
+  const signedPayload = `${timestamp}.${rawWebhookBody(body)}`;
+  const expected = crypto.createHmac("sha256", STRIPE_WEBHOOK_SECRET).update(signedPayload).digest("hex");
+  return signatures.some((signature) => safeEqualString(signature, expected))
+    ? { ok: true }
+    : { ok: false, reason: "STRIPE_SIGNATURE_MISMATCH" };
+}
+
+function parseStripeEvent(body = {}) {
+  const raw = rawWebhookBody(body);
+  if (!raw) return body || {};
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return body || {};
+  }
+}
+
+function stripeTimestamp(value) {
+  const seconds = Number(value || 0);
+  return Number.isFinite(seconds) && seconds > 0 ? new Date(seconds * 1000).toISOString() : null;
+}
+
+function fixedMonthlySubscriptionPlanDefinitions() {
+  return [
+    {
+      id: "94000000-0000-4000-8000-000000000001",
+      internal_name: "trial",
+      display_name_en: "Trial",
+      display_name_es: "Prueba",
+      display_name_hu: "Probaidoszak",
+      description_en: "Configurable free trial for restaurant onboarding.",
+      description_es: "Prueba gratuita configurable para la incorporacion de restaurantes.",
+      description_hu: "Konfiguralhato ingyenes probaidoszak ettermi bevezeteshez.",
+      included_features: { fixed_subscription: true, checkout_available: false, onboarding: true },
+      is_active: true,
+      sort_order: 10
+    },
+    {
+      id: "94000000-0000-4000-8000-000000000002",
+      internal_name: "basic",
+      display_name_en: "SmartTable Partner",
+      display_name_es: "SmartTable Partner",
+      display_name_hu: "SmartTable Partner",
+      description_en: "Complete SmartTable restaurant partner access for $149 per month with automatic renewal and no additional mandatory platform fee.",
+      description_es: "Acceso completo de restaurante asociado a SmartTable por 149 USD al mes, con renovacion automatica y sin otra tarifa obligatoria de plataforma.",
+      description_hu: "Teljes SmartTable ettermi partnerhozzaferes havi 149 USD-ert, automatikus megujitassal, tovabbi kotelezo platformdij nelkul.",
+      stripe_monthly_price_id: STRIPE_BASIC_MONTHLY_PRICE_ID,
+      included_features: { fixed_subscription: true, checkout_available: true, offers: true, reservations: true },
+      is_active: true,
+      sort_order: 20,
+      monthly_price_cents: 14900
+    },
+    {
+      id: "94000000-0000-4000-8000-000000000003",
+      internal_name: "professional",
+      display_name_en: "Professional",
+      display_name_es: "Profesional",
+      display_name_hu: "Professional",
+      description_en: "Fixed monthly SmartTable Professional subscription.",
+      description_es: "Suscripcion mensual fija SmartTable Professional.",
+      description_hu: "Fix havi SmartTable Professional elofizetes.",
+      stripe_monthly_price_id: STRIPE_PROFESSIONAL_MONTHLY_PRICE_ID,
+      included_features: { fixed_subscription: true, checkout_available: true, offers: true, reservations: true, advanced_admin: true },
+      is_active: false,
+      sort_order: 30
+    },
+    {
+      id: "94000000-0000-4000-8000-000000000004",
+      internal_name: "enterprise",
+      display_name_en: "Enterprise",
+      display_name_es: "Enterprise",
+      display_name_hu: "Enterprise",
+      description_en: "Fixed monthly or manually contracted enterprise subscription.",
+      description_es: "Suscripcion enterprise mensual fija o contratada manualmente.",
+      description_hu: "Fix havi vagy kezzel szerzodott enterprise elofizetes.",
+      stripe_monthly_price_id: STRIPE_ENTERPRISE_MONTHLY_PRICE_ID,
+      included_features: { fixed_subscription: true, checkout_available: STRIPE_ENTERPRISE_SELF_SERVICE_ENABLED, manual_contract_allowed: true },
+      is_active: false,
+      sort_order: 40
+    },
+    {
+      id: "94000000-0000-4000-8000-000000000005",
+      internal_name: "complimentary_test",
+      display_name_en: "Complimentary test",
+      display_name_es: "Prueba gratuita interna",
+      display_name_hu: "Dijmentes teszt",
+      description_en: "Complimentary access for explicitly approved test/demo restaurants only.",
+      description_es: "Acceso gratuito solo para restaurantes de prueba/demo aprobados.",
+      description_hu: "Dijmentes hozzaferes kizarolag jovahagyott teszt/demo ettermeknek.",
+      included_features: { fixed_subscription: true, checkout_available: false, test_restaurants_only: true },
+      is_active: false,
+      sort_order: 90
+    }
+  ].map((plan) => ({
+    monthly_price_cents: plan.monthly_price_cents || 0,
+    annual_price_cents: 0,
+    email_monthly_limit: null,
+    sms_monthly_limit: null,
+    stripe_product_id: null,
+    stripe_annual_price_id: null,
+    status: plan.is_active ? "active" : "archived",
+    key: plan.internal_name,
+    name: plan.display_name_en,
+    ...plan
+  }));
+}
+
+function fixedPlanPriceId(internalName = "") {
+  const key = clean(internalName);
+  if (key === "basic") return STRIPE_BASIC_MONTHLY_PRICE_ID;
+  if (key === "professional") return STRIPE_PROFESSIONAL_MONTHLY_PRICE_ID;
+  if (key === "enterprise") return STRIPE_ENTERPRISE_MONTHLY_PRICE_ID;
+  return "";
+}
+
+function normalizeInternalPlanName(value = "") {
+  const normalized = clean(value).toLowerCase();
+  if (normalized === "starter" || normalized === "growth" || normalized === "growth_monthly") return "basic";
+  if (normalized === "free") return "trial";
+  if (["trial", "basic", "professional", "enterprise", "complimentary_test", "no_subscription"].includes(normalized)) return normalized;
+  return normalized || "no_subscription";
+}
+
+function normalizeStripeSubscriptionStatus(value = "") {
+  const status = clean(value).toLowerCase();
+  if (status === "canceled" || status === "cancelled") return "canceled";
+  if (["no_subscription", "incomplete", "incomplete_expired", "trialing", "active", "past_due", "unpaid", "paused", "canceled"].includes(status)) return status;
+  return status || "incomplete";
+}
+
+function normalizeBillingInterval(value = "") {
+  const interval = clean(value).toLowerCase();
+  return interval === "year" || interval === "annual" || interval === "annually" ? "annual" : "monthly";
+}
+
+function subscriptionEntitlementDefinitions() {
+  return {
+    no_subscription: {
+      partner_user_limit: 0,
+      features: {
+        billing_management: true,
+        onboarding: true,
+        core_restaurant_profile: false,
+        offers: false,
+        reservations: false,
+        standard_email_notifications: false,
+        basic_analytics: false,
+        advanced_analytics: false,
+        campaign_placeholders: false,
+        priority_support_placeholder: false,
+        multi_location_placeholder: false,
+        custom_limits_placeholder: false,
+        dedicated_support_placeholder: false
+      }
+    },
+    trial: {
+      partner_user_limit: 3,
+      features: {
+        billing_management: true,
+        onboarding: true,
+        core_restaurant_profile: true,
+        offers: true,
+        reservations: true,
+        standard_email_notifications: true,
+        basic_analytics: true,
+        advanced_analytics: false,
+        campaign_placeholders: false,
+        priority_support_placeholder: false,
+        multi_location_placeholder: false,
+        custom_limits_placeholder: false,
+        dedicated_support_placeholder: false
+      }
+    },
+    basic: {
+      partner_user_limit: 3,
+      features: {
+        billing_management: true,
+        onboarding: true,
+        core_restaurant_profile: true,
+        offers: true,
+        reservations: true,
+        standard_email_notifications: true,
+        basic_analytics: true,
+        advanced_analytics: false,
+        campaign_placeholders: false,
+        priority_support_placeholder: false,
+        multi_location_placeholder: false,
+        custom_limits_placeholder: false,
+        dedicated_support_placeholder: false
+      }
+    },
+    professional: {
+      partner_user_limit: 10,
+      features: {
+        billing_management: true,
+        onboarding: true,
+        core_restaurant_profile: true,
+        offers: true,
+        reservations: true,
+        standard_email_notifications: true,
+        basic_analytics: true,
+        advanced_analytics: true,
+        campaign_placeholders: false,
+        priority_support_placeholder: false,
+        multi_location_placeholder: false,
+        custom_limits_placeholder: false,
+        dedicated_support_placeholder: false
+      }
+    },
+    enterprise: {
+      partner_user_limit: null,
+      features: {
+        billing_management: true,
+        onboarding: true,
+        core_restaurant_profile: true,
+        offers: true,
+        reservations: true,
+        standard_email_notifications: true,
+        basic_analytics: true,
+        advanced_analytics: true,
+        campaign_placeholders: false,
+        priority_support_placeholder: false,
+        multi_location_placeholder: true,
+        custom_limits_placeholder: true,
+        dedicated_support_placeholder: true
+      }
+    },
+    complimentary_test: {
+      partner_user_limit: 10,
+      features: {
+        billing_management: true,
+        onboarding: true,
+        core_restaurant_profile: true,
+        offers: true,
+        reservations: true,
+        standard_email_notifications: true,
+        basic_analytics: true,
+        advanced_analytics: true,
+        campaign_placeholders: false,
+        priority_support_placeholder: false,
+        multi_location_placeholder: false,
+        custom_limits_placeholder: false,
+        dedicated_support_placeholder: false,
+        test_restaurants_only: true
+      }
+    }
+  };
+}
+
+function entitlementsForPlan(internalPlan = "no_subscription") {
+  const definitions = subscriptionEntitlementDefinitions();
+  const key = normalizeInternalPlanName(internalPlan || "no_subscription");
+  return definitions[key] || definitions.no_subscription;
+}
+
+function clientEntitlementsForPlan(internalPlan = "no_subscription") {
+  const entitlements = entitlementsForPlan(internalPlan);
+  return {
+    partner_user_limit: entitlements.partner_user_limit,
+    features: { ...entitlements.features },
+    server_authoritative: true
+  };
+}
+
+function centsToDollars(cents = 0) {
+  return Number(numberOr(cents, 0)) / 100;
+}
+
+function stripePlanPriceId(plan = {}, interval = "monthly") {
+  const internalName = normalizeInternalPlanName(plan.internal_name || plan.key);
+  return clean(fixedPlanPriceId(internalName) || plan.stripe_monthly_price_id || plan.stripe_price_id);
+}
+
+function isChargeableFixedPlan(plan = {}) {
+  const internalName = normalizeInternalPlanName(plan.internal_name || plan.key);
+  return internalName === "basic";
+}
+
+function stripeVideoServicePackages() {
+  return [
+    {
+      key: "video_standard_3s",
+      display_name_en: "Standard 3-second video",
+      display_name_es: "Video estandar de 3 segundos",
+      display_name_hu: "Standard 3 masodperces video",
+      description_en: "One-time SmartTable production package for a 3-second restaurant promotional video.",
+      description_es: "Paquete unico de produccion SmartTable para un video promocional de restaurante de 3 segundos.",
+      description_hu: "Egyszeri SmartTable gyartasi csomag 3 masodperces ettermi promocios videohoz.",
+      amount_cents: 29900,
+      currency: "usd",
+      stripe_price_id: STRIPE_VIDEO_STANDARD_PRICE_ID,
+      sort_order: 10
+    },
+    {
+      key: "video_premium_3s",
+      display_name_en: "Premium 3-second video",
+      display_name_es: "Video premium de 3 segundos",
+      display_name_hu: "Premium 3 masodperces video",
+      description_en: "One-time premium SmartTable production package for a 3-second restaurant promotional video.",
+      description_es: "Paquete premium unico de produccion SmartTable para un video promocional de restaurante de 3 segundos.",
+      description_hu: "Egyszeri premium SmartTable gyartasi csomag 3 masodperces ettermi promocios videohoz.",
+      amount_cents: 49900,
+      currency: "usd",
+      stripe_price_id: STRIPE_VIDEO_PREMIUM_PRICE_ID,
+      sort_order: 20
+    }
+  ];
+}
+
+function clientVideoServicePackage(item = {}) {
+  return {
+    key: item.key,
+    display_name_en: item.display_name_en,
+    display_name_es: item.display_name_es,
+    display_name_hu: item.display_name_hu,
+    description_en: item.description_en,
+    description_es: item.description_es,
+    description_hu: item.description_hu,
+    amount: centsToDollars(item.amount_cents),
+    amount_cents: item.amount_cents,
+    currency: item.currency,
+    checkout_available: Boolean(stripeConfigured && item.stripe_price_id),
+    sort_order: item.sort_order
+  };
+}
+
+function mergeFixedMonthlyPlans(rows = [], { includeInactive = false } = {}) {
+  const byName = new Map();
+  for (const row of fixedMonthlySubscriptionPlanDefinitions()) byName.set(row.internal_name, row);
+  for (const row of rows || []) {
+    const internalName = normalizeInternalPlanName(row.internal_name || row.key);
+    if (!internalName || internalName === "no_subscription") continue;
+    const base = byName.get(internalName) || {};
+    byName.set(internalName, {
+      ...base,
+      ...row,
+      internal_name: internalName,
+      key: internalName,
+      name: row.display_name_en || row.name || base.display_name_en || internalName,
+      stripe_monthly_price_id: fixedPlanPriceId(internalName) || row.stripe_monthly_price_id || row.stripe_price_id || base.stripe_monthly_price_id || "",
+      stripe_annual_price_id: null,
+      annual_price_cents: 0,
+      monthly_price_cents: internalName === "basic" ? 14900 : Number(row.monthly_price_cents ?? base.monthly_price_cents ?? 0),
+      is_active: ["professional", "enterprise"].includes(internalName)
+        ? false
+        : (row.is_active !== undefined ? boolValue(row.is_active) : base.is_active !== false)
+    });
+  }
+  return Array.from(byName.values())
+    .filter((plan) => includeInactive || plan.is_active !== false)
+    .sort((a, b) => Number(a.sort_order || 0) - Number(b.sort_order || 0));
+}
+
+function normalizeSubscriptionPlanPayload(body = {}) {
+  const internalName = normalizeInternalPlanName(lower(body.internal_name || body.key || body.name).replace(/[^a-z0-9_-]+/g, "_").replace(/^_+|_+$/g, ""));
+  return {
+    stripe_product_id: nullableClean(body.stripe_product_id),
+    stripe_monthly_price_id: nullableClean(body.stripe_monthly_price_id || body.stripe_price_id || fixedPlanPriceId(internalName)),
+    stripe_annual_price_id: null,
+    internal_name: internalName,
+    display_name_en: clean(body.display_name_en || body.name || internalName || "Plan"),
+    display_name_es: clean(body.display_name_es || body.display_name_en || body.name || internalName || "Plan"),
+    display_name_hu: clean(body.display_name_hu || body.display_name_en || body.name || internalName || "Plan"),
+    description_en: clean(body.description_en),
+    description_es: clean(body.description_es),
+    description_hu: clean(body.description_hu),
+    monthly_price_cents: Math.max(0, Math.round(Number(body.monthly_price_cents ?? Number(body.monthly_price || 0) * 100))),
+    annual_price_cents: Math.max(0, Math.round(Number(body.annual_price_cents ?? Number(body.annual_price || 0) * 100))),
+    included_features: typeof body.included_features === "object" && body.included_features
+      ? body.included_features
+      : {},
+    email_monthly_limit: body.email_monthly_limit === "" || body.email_monthly_limit === undefined ? null : Math.max(0, Math.round(Number(body.email_monthly_limit || 0))),
+    sms_monthly_limit: body.sms_monthly_limit === "" || body.sms_monthly_limit === undefined ? null : Math.max(0, Math.round(Number(body.sms_monthly_limit || 0))),
+    is_active: boolValue(body.is_active),
+    sort_order: Math.round(Number(body.sort_order || 0)),
+    updated_at: nowIso()
+  };
+}
+
+function clientSubscriptionPlan(plan = {}) {
+  const internalName = normalizeInternalPlanName(plan.internal_name || plan.key);
+  const stripeMonthlyPriceId = fixedPlanPriceId(internalName) || clean(plan.stripe_monthly_price_id || plan.stripe_price_id);
+  const entitlements = clientEntitlementsForPlan(internalName);
+  const features = {
+    ...entitlements.features,
+    ...(plan.included_features || plan.features || {})
+  };
+  return {
+    ...plan,
+    internal_name: internalName,
+    key: internalName,
+    name: plan.display_name_en || plan.name || plan.internal_name || plan.key,
+    billing_model: "fixed_monthly",
+    monthly_price: plan.monthly_price_cents !== undefined ? centsToDollars(plan.monthly_price_cents) : numberOr(plan.monthly_price, 0),
+    annual_price: 0,
+    features,
+    entitlements,
+    checkout_available: isChargeableFixedPlan({ internal_name: internalName }),
+    stripe_monthly_configured: Boolean(stripeMonthlyPriceId),
+    stripe_annual_configured: false,
+    stripe_price_configured: Boolean(stripeMonthlyPriceId)
+  };
+}
+
+function subscriptionStatusAllowsAccess(subscription = null, context = {}) {
+  if (!subscription) return false;
+  const status = normalizeStripeSubscriptionStatus(subscription.subscription_status || subscription.status);
+  const internalPlan = normalizeInternalPlanName(subscription.internal_plan || subscription.plan?.internal_name || subscription.subscription_plans?.internal_name);
+  const now = Date.now();
+  const overrideEndsAt = subscription.billing_access_override_expires_at ? new Date(subscription.billing_access_override_expires_at).getTime() : 0;
+  const complimentaryUntil = subscription.complimentary_access_until ? new Date(subscription.complimentary_access_until).getTime() : 0;
+  const graceEndsAt = (subscription.payment_grace_period_end || subscription.grace_period_ends_at) ? new Date(subscription.payment_grace_period_end || subscription.grace_period_ends_at).getTime() : 0;
+  const currentPeriodEnd = subscription.current_period_end ? new Date(subscription.current_period_end).getTime() : 0;
+  if (subscription.billing_access_override && overrideEndsAt && overrideEndsAt > now) return true;
+  if (internalPlan === "complimentary_test") return Boolean(context.restaurant?.is_test_data || context.restaurant?.is_test_restaurant);
+  if (complimentaryUntil && complimentaryUntil > now) return true;
+  if (["trialing", "active"].includes(status)) return true;
+  if (status === "past_due" && graceEndsAt && graceEndsAt > now) return true;
+  if (status === "canceled" && currentPeriodEnd && currentPeriodEnd > now) return true;
+  return false;
+}
+
+function billingAccessSummary(subscription = null, plan = null, context = {}) {
+  const status = subscription ? normalizeStripeSubscriptionStatus(subscription.subscription_status || subscription.status) : "no_subscription";
+  const canUsePartnerFeatures = subscriptionStatusAllowsAccess(subscription, context);
+  const internalPlan = normalizeInternalPlanName(subscription?.internal_plan || plan?.internal_name || plan?.key || "no_subscription");
+  const isBillingOnly = !canUsePartnerFeatures && ["no_subscription", "incomplete", "incomplete_expired"].includes(status);
+  const entitlements = clientEntitlementsForPlan(internalPlan);
+  const gatedFeatures = Object.fromEntries(
+    Object.entries(entitlements.features).map(([feature, enabled]) => [feature, Boolean(enabled && (canUsePartnerFeatures || feature === "billing_management" || feature === "onboarding"))])
+  );
+  return {
+    status,
+    internal_plan: internalPlan,
+    can_use_partner_features: canUsePartnerFeatures,
+    read_only: !canUsePartnerFeatures && !isBillingOnly,
+    billing_only: isBillingOnly,
+    onboarding_only: isBillingOnly,
+    billing_required: !canUsePartnerFeatures,
+    warning: canUsePartnerFeatures ? "" : status === "past_due"
+      ? "Payment is past due. Some partner features may become read-only after the grace period."
+      : "A trialing or active fixed monthly subscription is required for full partner access.",
+    entitlements,
+    feature_gates: gatedFeatures,
+    subscription,
+    plan: plan ? clientSubscriptionPlan(plan) : null,
+    stripe: stripeDiagnostics()
+  };
+}
+
+async function getRestaurantBillingAccess(restaurantId) {
+  if (!restaurantId) return billingAccessSummary(null, null);
+  if (!supabaseConfigured) {
+    ensureDemo();
+    const restaurant = demo.restaurants.find((item) => item.id === restaurantId) || null;
+    const subscription = demo.subscriptions.find((item) => item.restaurant_id === restaurantId) || null;
+    const planRows = mergeFixedMonthlyPlans(demo.billingPlans, { includeInactive: true });
+    const plan = planRows.find((item) => item.id === subscription?.billing_plan_id || item.id === subscription?.plan_id || item.internal_name === normalizeInternalPlanName(subscription?.internal_plan)) || null;
+    return {
+      ...billingAccessSummary(subscription, plan, { restaurant }),
+      enforcement_mode: BILLING_ENFORCEMENT_MODE,
+      mode: "demo"
+    };
+  }
+  const [restaurantRows, rows] = await Promise.all([
+    supabaseFetch(`/rest/v1/restaurants?select=id,name,is_test_data,is_test_restaurant&id=eq.${encodeURIComponent(restaurantId)}&limit=1`, { service: true }).catch(() => []),
+    supabaseFetch(`/rest/v1/restaurant_subscriptions?select=*,subscription_plans(*)&restaurant_id=eq.${encodeURIComponent(restaurantId)}&order=created_at.desc&limit=1`, { service: true }).catch(() => [])
+  ]);
+  const restaurant = restaurantRows?.[0] || null;
+  const subscription = rows?.[0] || null;
+  const mergedPlans = mergeFixedMonthlyPlans(subscription?.subscription_plans ? [subscription.subscription_plans] : [], { includeInactive: true });
+  const plan = mergedPlans.find((item) => item.id === subscription?.plan_id || item.internal_name === normalizeInternalPlanName(subscription?.internal_plan || subscription?.subscription_plans?.internal_name)) || subscription?.subscription_plans || null;
+  return {
+    ...billingAccessSummary(subscription, plan, { restaurant }),
+    enforcement_mode: BILLING_ENFORCEMENT_MODE,
+    mode: "supabase"
+  };
+}
+
+async function requirePartnerBillingMutationAccess(restaurantId) {
+  const access = await getRestaurantBillingAccess(restaurantId);
+  if (BILLING_ENFORCEMENT_MODE === "strict" && !access.can_use_partner_features) {
+    const error = new Error("A trialing or active SmartTable subscription is required for this action.");
+    error.status = 402;
+    error.code = "SUBSCRIPTION_REQUIRED";
+    error.details = { billing_status: access.status };
+    throw error;
+  }
+  return access;
+}
+
+function safePartnerBillingUrl(pathAndSearch = "/partner") {
+  const path = String(pathAndSearch || "/partner").startsWith("/") ? String(pathAndSearch || "/partner") : "/partner";
+  return `${PUBLIC_BASE_URL}${path}`;
+}
+
+function stripeCustomerIdLooksValid(customerId = "") {
+  return /^cus_[A-Za-z0-9_]+$/.test(clean(customerId));
+}
+
+function forbiddenClientBillingMutation(body = {}) {
+  const forbidden = [
+    ["stripe_price_id", "STRIPE_PRICE_ID_CLIENT_REJECTED"],
+    ["price_id", "STRIPE_PRICE_ID_CLIENT_REJECTED"],
+    ["amount", "BILLING_AMOUNT_CLIENT_REJECTED"],
+    ["amount_cents", "BILLING_AMOUNT_CLIENT_REJECTED"],
+    ["currency", "BILLING_CURRENCY_CLIENT_REJECTED"],
+    ["stripe_customer_id", "STRIPE_CUSTOMER_ID_CLIENT_REJECTED"],
+    ["customer_id", "STRIPE_CUSTOMER_ID_CLIENT_REJECTED"],
+    ["success_url", "BILLING_REDIRECT_CLIENT_REJECTED"],
+    ["cancel_url", "BILLING_REDIRECT_CLIENT_REJECTED"],
+    ["return_url", "BILLING_REDIRECT_CLIENT_REJECTED"],
+    ["redirect_url", "BILLING_REDIRECT_CLIENT_REJECTED"],
+    ["subscription_status", "BILLING_STATUS_CLIENT_REJECTED"],
+    ["status", "BILLING_STATUS_CLIENT_REJECTED"],
+    ["trial_period_days", "BILLING_TRIAL_CLIENT_REJECTED"],
+    ["trial_end", "BILLING_TRIAL_CLIENT_REJECTED"],
+    ["trial_days", "BILLING_TRIAL_CLIENT_REJECTED"]
+  ];
+  for (const [field, code] of forbidden) {
+    if (Object.prototype.hasOwnProperty.call(body || {}, field)) {
+      return { field, code };
+    }
+  }
+  return null;
+}
+
+async function stripeCustomerIsReusable(customerId = "", restaurantId = "") {
+  const candidate = clean(customerId);
+  if (!stripeCustomerIdLooksValid(candidate)) return false;
+  const customer = await stripeRequest(`/v1/customers/${encodeURIComponent(candidate)}`).catch((error) => {
+    if (error.status === 404 || error.code === "resource_missing") return null;
+    throw error;
+  });
+  if (!customer || customer.deleted) return false;
+  const metadataRestaurantId = clean(customer.metadata?.restaurant_id);
+  return !metadataRestaurantId || metadataRestaurantId === clean(restaurantId);
+}
+
+async function restaurantBillingAccount(restaurantId = "") {
+  if (!supabaseConfigured || !restaurantId) return null;
+  const rows = await supabaseFetch(`/rest/v1/restaurant_billing_accounts?select=*&restaurant_id=eq.${encodeURIComponent(restaurantId)}&limit=1`, { service: true }).catch(() => []);
+  return rows?.[0] || null;
+}
+
+function restaurantBillingEmail(restaurant = {}, profile = {}, billingAccount = null) {
+  return clean(
+    billingAccount?.billing_email
+    || restaurant.billing_email
+    || restaurant.reservation_email
+    || restaurant.primary_email
+    || restaurant.email
+    || restaurant.contact_email
+    || profile.email
+  );
+}
+
+function requirePartnerBillingManager(profile = {}, restaurant = {}) {
+  if (!roleMatches(profile.role, ["partner"])) {
+    const error = new Error("Only assigned restaurant owners or managers may manage partner billing.");
+    error.status = 403;
+    error.code = "BILLING_PARTNER_ROLE_REQUIRED";
+    throw error;
+  }
+  requireRestaurantAccessRole(restaurant, ["owner", "manager"]);
+}
+
+function subscriptionBlocksNewCheckout(subscription = null) {
+  if (!subscription) return false;
+  const status = normalizeStripeSubscriptionStatus(subscription.subscription_status || subscription.status);
+  if (!subscription.stripe_subscription_id) return false;
+  if (status === "canceled") {
+    const currentPeriodEnd = subscription.current_period_end ? new Date(subscription.current_period_end).getTime() : 0;
+    return currentPeriodEnd > Date.now();
+  }
+  return ["incomplete", "trialing", "active", "past_due", "unpaid", "paused"].includes(status);
+}
+
+function stripeSubscriptionTrialData(subscription = null) {
+  if (subscription?.stripe_subscription_id || !STRIPE_TRIAL_PERIOD_DAYS) return {};
+  return { trial_period_days: STRIPE_TRIAL_PERIOD_DAYS };
+}
+
+async function createOrUpdateStripeCustomer(restaurant = {}, profile = {}, subscription = null) {
+  const billingEnvironment = stripeBillingEnvironment();
+  const billingAccount = await restaurantBillingAccount(restaurant.id);
+  const existingCustomerCandidates = [
+    subscription?.stripe_customer_id,
+    billingAccount?.stripe_customer_id
+  ].map(clean).filter(Boolean);
+  for (const candidate of existingCustomerCandidates) {
+    if (await stripeCustomerIsReusable(candidate, restaurant.id)) {
+      await recordBillingAuditEvent({
+        profile,
+        action: "stripe_customer_reused",
+        restaurantId: restaurant.id,
+        subscription,
+        metadata: { stripe_customer_id: candidate, source: "restaurant_billing_account" }
+      });
+      return candidate;
+    }
+  }
+  let customer;
+  try {
+    customer = await stripeRequest("/v1/customers", {
+      method: "POST",
+      body: {
+        email: restaurantBillingEmail(restaurant, profile, billingAccount),
+        name: restaurant.name || profile.full_name || "SmartTable restaurant",
+        metadata: {
+          restaurant_id: restaurant.id,
+          smarttable_profile_id: profile.id || "",
+          billing_environment: billingEnvironment,
+          smarttable_environment: RUNTIME_ENVIRONMENT,
+          source: "smarttable_partner_billing"
+        }
+      }
+    });
+  } catch (error) {
+    await recordBillingAuditEvent({
+      profile,
+      action: "stripe_customer_create_failed",
+      result: "failure",
+      restaurantId: restaurant.id,
+      subscription,
+      metadata: { code: error.code || "STRIPE_CUSTOMER_CREATE_FAILED", status: error.status || 500 }
+    }).catch(() => null);
+    throw error;
+  }
+  await recordBillingAuditEvent({
+    profile,
+    action: "stripe_customer_created",
+    restaurantId: restaurant.id,
+    subscription,
+    metadata: { stripe_customer_id: customer.id, billing_environment: billingEnvironment }
+  });
+  if (supabaseConfigured) {
+    const existing = await supabaseFetch(`/rest/v1/restaurant_subscriptions?select=*&restaurant_id=eq.${encodeURIComponent(restaurant.id)}&limit=1`, { service: true }).catch(() => []);
+    const row = existing?.[0];
+    const payload = {
+      restaurant_id: restaurant.id,
+      stripe_customer_id: customer.id,
+      status: row?.status || "incomplete",
+      subscription_status: row?.subscription_status || row?.status || "incomplete",
+      billing_interval: "monthly",
+      billing_environment: billingEnvironment,
+      stripe_livemode: billingEnvironment === "live",
+      updated_at: nowIso()
+    };
+    if (row?.id) {
+      await supabaseFetch(`/rest/v1/restaurant_subscriptions?id=eq.${encodeURIComponent(row.id)}`, {
+        method: "PATCH",
+        service: true,
+        headers: { Prefer: "return=minimal" },
+        body: await filterSupabaseTablePayload("restaurant_subscriptions", payload)
+      });
+    } else {
+      await supabaseFetch("/rest/v1/restaurant_subscriptions", {
+        method: "POST",
+        service: true,
+        headers: { Prefer: "return=minimal" },
+        body: await filterSupabaseTablePayload("restaurant_subscriptions", payload)
+      });
+    }
+    const accountRows = billingAccount ? [billingAccount] : await supabaseFetch(`/rest/v1/restaurant_billing_accounts?select=*&restaurant_id=eq.${encodeURIComponent(restaurant.id)}&limit=1`, { service: true }).catch(() => []);
+    const billingAccountPayload = {
+      restaurant_id: restaurant.id,
+      billing_email: restaurantBillingEmail(restaurant, profile, billingAccount) || null,
+      billing_contact_name: restaurant.contact_name || profile.full_name || null,
+      billing_country: restaurant.country || null,
+      billing_state_region: restaurant.state_region || restaurant.state || null,
+      stripe_customer_id: customer.id,
+      updated_at: nowIso()
+    };
+    if (accountRows?.[0]?.id) {
+      await supabaseFetch(`/rest/v1/restaurant_billing_accounts?id=eq.${encodeURIComponent(accountRows[0].id)}`, {
+        method: "PATCH",
+        service: true,
+        headers: { Prefer: "return=minimal" },
+        body: await filterSupabaseTablePayload("restaurant_billing_accounts", billingAccountPayload)
+      }).catch(() => null);
+    } else {
+      await supabaseFetch("/rest/v1/restaurant_billing_accounts", {
+        method: "POST",
+        service: true,
+        headers: { Prefer: "return=minimal" },
+        body: await filterSupabaseTablePayload("restaurant_billing_accounts", { ...billingAccountPayload, created_at: nowIso() })
+      }).catch(() => null);
+    }
+  }
+  return customer.id;
+}
+
+async function upsertRestaurantSubscription(payload = {}) {
+  const stripeSubscriptionId = clean(payload.stripe_subscription_id);
+  const normalizedStatus = normalizeStripeSubscriptionStatus(payload.subscription_status || payload.status);
+  const normalizedPlan = normalizeInternalPlanName(payload.internal_plan || payload.plan_key || payload.plan_internal_name);
+  const normalizedPayload = {
+    ...payload,
+    status: normalizedStatus === "no_subscription" || normalizedStatus === "incomplete_expired" ? "incomplete" : normalizedStatus,
+    subscription_status: normalizedStatus,
+    internal_plan: normalizedPlan === "no_subscription" && payload.plan_id ? "basic" : normalizedPlan,
+    billing_interval: "monthly",
+    billing_environment: payload.billing_environment || (payload.stripe_livemode ? "live" : "test"),
+    stripe_livemode: Boolean(payload.stripe_livemode)
+  };
+  if (!supabaseConfigured) {
+    ensureDemo();
+    const existing = demo.subscriptions.find((item) => item.stripe_subscription_id === stripeSubscriptionId || item.restaurant_id === normalizedPayload.restaurant_id);
+    const row = {
+      ...(existing || { id: crypto.randomUUID(), created_at: nowIso() }),
+      ...normalizedPayload,
+      updated_at: nowIso()
+    };
+    if (existing) Object.assign(existing, row);
+    else demo.subscriptions.unshift(row);
+    return row;
+  }
+  let existing = [];
+  if (stripeSubscriptionId) {
+    existing = await supabaseFetch(`/rest/v1/restaurant_subscriptions?select=*&stripe_subscription_id=eq.${encodeURIComponent(stripeSubscriptionId)}&limit=1`, { service: true }).catch(() => []);
+  }
+  if (!existing?.[0] && normalizedPayload.restaurant_id) {
+    existing = await supabaseFetch(`/rest/v1/restaurant_subscriptions?select=*&restaurant_id=eq.${encodeURIComponent(normalizedPayload.restaurant_id)}&limit=1`, { service: true }).catch(() => []);
+  }
+  const row = existing?.[0];
+  const next = {
+    ...normalizedPayload,
+    updated_at: nowIso()
+  };
+  const filteredNext = await filterSupabaseTablePayload("restaurant_subscriptions", next);
+  if (row?.id) {
+    const rows = await supabaseFetch(`/rest/v1/restaurant_subscriptions?id=eq.${encodeURIComponent(row.id)}&select=*`, {
+      method: "PATCH",
+      service: true,
+      headers: { Prefer: "return=representation" },
+      body: filteredNext
+    });
+    return rows?.[0] || { ...row, ...filteredNext };
+  }
+  const rows = await supabaseFetch("/rest/v1/restaurant_subscriptions?select=*", {
+    method: "POST",
+    service: true,
+    headers: { Prefer: "return=representation" },
+    body: filteredNext
+  });
+  return rows?.[0];
+}
+
+async function upsertStripeInvoice(invoice = {}, restaurantId = "", restaurantSubscriptionId = "") {
+  const payload = {
+    restaurant_id: restaurantId || null,
+    restaurant_subscription_id: restaurantSubscriptionId || null,
+    stripe_customer_id: clean(invoice.customer),
+    stripe_subscription_id: clean(invoice.subscription),
+    stripe_price_id: clean(invoice.lines?.data?.[0]?.price?.id || invoice.lines?.data?.[0]?.plan?.id),
+    stripe_invoice_id: clean(invoice.id),
+    invoice_number: clean(invoice.number),
+    amount_due: centsToDollars(invoice.amount_due || 0),
+    amount_paid: centsToDollars(invoice.amount_paid || 0),
+    currency: lower(invoice.currency || "usd"),
+    status: clean(invoice.status || "open"),
+    payment_status: clean(invoice.status || ""),
+    hosted_invoice_url: clean(invoice.hosted_invoice_url),
+    invoice_pdf: clean(invoice.invoice_pdf),
+    period_start: stripeTimestamp(invoice.period_start || invoice.lines?.data?.[0]?.period?.start),
+    period_end: stripeTimestamp(invoice.period_end || invoice.lines?.data?.[0]?.period?.end),
+    paid_at: stripeTimestamp(invoice.status_transitions?.paid_at),
+    billing_environment: invoice.livemode ? "live" : "test",
+    metadata: {
+      billing_reason: invoice.billing_reason || "",
+      collection_method: invoice.collection_method || ""
+    }
+  };
+  if (!payload.restaurant_id && !payload.stripe_invoice_id) return null;
+  if (!supabaseConfigured) {
+    ensureDemo();
+    const existing = demo.invoices.find((item) => item.stripe_invoice_id === payload.stripe_invoice_id);
+    const row = { ...(existing || { id: crypto.randomUUID(), created_at: nowIso() }), ...payload };
+    if (existing) Object.assign(existing, row);
+    else demo.invoices.unshift(row);
+    return row;
+  }
+  const existing = payload.stripe_invoice_id
+    ? await supabaseFetch(`/rest/v1/invoices?select=*&stripe_invoice_id=eq.${encodeURIComponent(payload.stripe_invoice_id)}&limit=1`, { service: true }).catch(() => [])
+    : [];
+  const filteredPayload = await filterSupabaseTablePayload("invoices", payload);
+  if (existing?.[0]?.id) {
+    const rows = await supabaseFetch(`/rest/v1/invoices?id=eq.${encodeURIComponent(existing[0].id)}&select=*`, {
+      method: "PATCH",
+      service: true,
+      headers: { Prefer: "return=representation" },
+      body: filteredPayload
+    });
+    return rows?.[0];
+  }
+  const rows = await supabaseFetch("/rest/v1/invoices?select=*", {
+    method: "POST",
+    service: true,
+    headers: { Prefer: "return=representation" },
+    body: filteredPayload
+  });
+  return rows?.[0];
+}
+
+function stripeSubscriptionPayloadFromObject(object = {}, fallback = {}) {
+  const metadata = object.metadata || fallback.metadata || {};
+  const planId = clean(metadata.plan_id || fallback.plan_id);
+  const restaurantId = clean(metadata.restaurant_id || fallback.restaurant_id);
+  const price = object.items?.data?.[0]?.price || object.items?.data?.[0]?.plan || {};
+  const internalPlan = normalizeInternalPlanName(metadata.internal_plan || fallback.internal_plan || fallback.plan_internal_name || fallback.subscription_plans?.internal_name);
+  return {
+    restaurant_id: restaurantId || fallback.restaurant_id,
+    stripe_customer_id: clean(object.customer || fallback.stripe_customer_id),
+    stripe_subscription_id: clean(object.id || fallback.stripe_subscription_id),
+    stripe_price_id: clean(price.id || metadata.stripe_price_id || fallback.stripe_price_id),
+    plan_id: planId || null,
+    internal_plan: internalPlan,
+    billing_interval: "monthly",
+    status: normalizeStripeSubscriptionStatus(object.status || fallback.status),
+    subscription_status: normalizeStripeSubscriptionStatus(object.status || fallback.subscription_status || fallback.status),
+    trial_start: stripeTimestamp(object.trial_start),
+    trial_end: stripeTimestamp(object.trial_end),
+    current_period_start: stripeTimestamp(object.current_period_start),
+    current_period_end: stripeTimestamp(object.current_period_end),
+    cancel_at_period_end: Boolean(object.cancel_at_period_end),
+    cancelled_at: stripeTimestamp(object.canceled_at || object.cancelled_at),
+    canceled_at: stripeTimestamp(object.canceled_at || object.cancelled_at),
+    ended_at: stripeTimestamp(object.ended_at),
+    last_payment_status: clean(object.latest_invoice?.status || fallback.last_payment_status),
+    stripe_livemode: Boolean(object.livemode || fallback.stripe_livemode),
+    metadata: {
+      source: "stripe_webhook",
+      latest_event_type: fallback.event_type || "",
+      stripe_status: object.status || ""
+    }
+  };
+}
+
+async function upsertRestaurantBillingAccount(payload = {}) {
+  const restaurantId = clean(payload.restaurant_id);
+  if (!restaurantId) return null;
+  const normalizedPayload = {
+    restaurant_id: restaurantId,
+    billing_email: payload.billing_email || null,
+    billing_contact_name: payload.billing_contact_name || null,
+    billing_country: payload.billing_country || null,
+    billing_state_region: payload.billing_state_region || null,
+    tax_identifier: payload.tax_identifier || null,
+    stripe_customer_id: clean(payload.stripe_customer_id),
+    metadata: payload.metadata || {},
+    updated_at: nowIso()
+  };
+  if (!supabaseConfigured) {
+    ensureDemo();
+    demo.billingAccounts ||= [];
+    const existing = demo.billingAccounts.find((item) => item.restaurant_id === restaurantId || item.stripe_customer_id === normalizedPayload.stripe_customer_id);
+    const row = { ...(existing || { id: crypto.randomUUID(), created_at: nowIso() }), ...normalizedPayload };
+    if (existing) Object.assign(existing, row);
+    else demo.billingAccounts.unshift(row);
+    return row;
+  }
+  const existing = await supabaseFetch(`/rest/v1/restaurant_billing_accounts?select=*&restaurant_id=eq.${encodeURIComponent(restaurantId)}&limit=1`, { service: true }).catch(() => []);
+  const body = await filterSupabaseTablePayload("restaurant_billing_accounts", normalizedPayload);
+  if (existing?.[0]?.id) {
+    const rows = await supabaseFetch(`/rest/v1/restaurant_billing_accounts?id=eq.${encodeURIComponent(existing[0].id)}&select=*`, {
+      method: "PATCH",
+      service: true,
+      headers: { Prefer: "return=representation" },
+      body
+    }).catch(() => null);
+    return rows?.[0] || { ...existing[0], ...body };
+  }
+  const rows = await supabaseFetch("/rest/v1/restaurant_billing_accounts?select=*", {
+    method: "POST",
+    service: true,
+    headers: { Prefer: "return=representation" },
+    body: await filterSupabaseTablePayload("restaurant_billing_accounts", { ...normalizedPayload, created_at: nowIso() })
+  }).catch(() => null);
+  return rows?.[0] || null;
+}
+
+async function billingRestaurantById(restaurantId = "") {
+  const id = clean(restaurantId);
+  if (!id) return null;
+  if (!supabaseConfigured) {
+    ensureDemo();
+    return demo.restaurants.find((restaurant) => restaurant.id === id) || null;
+  }
+  const rows = await supabaseFetch(`/rest/v1/restaurants?select=*&id=eq.${encodeURIComponent(id)}&limit=1`, { service: true }).catch(() => []);
+  return rows?.[0] || null;
+}
+
+async function latestRestaurantSubscription(restaurantId = "") {
+  const id = clean(restaurantId);
+  if (!id) return null;
+  if (!supabaseConfigured) {
+    ensureDemo();
+    return demo.subscriptions.find((subscription) => subscription.restaurant_id === id) || null;
+  }
+  const rows = await supabaseFetch(`/rest/v1/restaurant_subscriptions?select=*&restaurant_id=eq.${encodeURIComponent(id)}&order=created_at.desc&limit=1`, { service: true }).catch(() => []);
+  return rows?.[0] || null;
+}
+
+async function sendBillingNotificationForRestaurant(eventType = "", restaurantId = "", subscription = {}, options = {}) {
+  const normalizedEventType = clean(eventType);
+  if (!normalizedEventType) return null;
+  try {
+    const restaurant = await billingRestaurantById(restaurantId || subscription.restaurant_id);
+    if (!restaurant?.id) return null;
+    const billingAccount = await restaurantBillingAccount(restaurant.id);
+    const email = await sendBillingNotificationEmail({
+      eventType: normalizedEventType,
+      restaurant,
+      subscription,
+      billingAccount,
+      lang: normalizeLanguage(restaurant.default_language || restaurant.language || "en"),
+      idempotencyKey: options.idempotencyKey || hashEmailValue(`billing:${normalizedEventType}:${restaurant.id}:${clean(options.stripeEventId) || clean(options.reason) || Math.floor(Date.now() / 600000)}`)
+    });
+    await recordBillingAuditEvent({
+      profile: options.profile || null,
+      action: isEmailAccepted(email) ? "billing_notification_sent" : "billing_notification_failed",
+      result: isEmailAccepted(email) ? "success" : "failure",
+      restaurantId: restaurant.id,
+      subscription,
+      reason: clean(options.reason),
+      metadata: {
+        event_type: normalizedEventType,
+        stripe_event_id: clean(options.stripeEventId),
+        email_status: email?.status || email?.delivery || "unknown",
+        email_error_code: email?.errorCode || null
+      },
+      headers: options.headers || {}
+    }).catch(() => null);
+    return email;
+  } catch (error) {
+    logSafeServerEvent("billing_notification_failed", {
+      event_type: normalizedEventType,
+      restaurant_id: clean(restaurantId || subscription.restaurant_id),
+      code: error.code || "BILLING_NOTIFICATION_FAILED"
+    });
+    return null;
+  }
+}
+
+function billingNotificationEventForSubscription(type = "", subscription = {}, previous = {}) {
+  const status = normalizeStripeSubscriptionStatus(subscription.subscription_status || subscription.status);
+  const previousStatus = normalizeStripeSubscriptionStatus(previous.subscription_status || previous.status);
+  if (type === "customer.subscription.deleted") {
+    const currentPeriodEnd = subscription.current_period_end ? new Date(subscription.current_period_end).getTime() : 0;
+    return currentPeriodEnd && currentPeriodEnd < Date.now() ? "access_read_only" : "subscription_canceled";
+  }
+  if (status === "trialing" && previousStatus !== "trialing") return "trial_started";
+  if (status === "active" && previousStatus !== "active") return previousStatus === "past_due" || previousStatus === "unpaid" ? "subscription_resumed" : "subscription_activated";
+  if (subscription.cancel_at_period_end && !previous.cancel_at_period_end) return "subscription_canceled";
+  if (status && status !== previousStatus) return "subscription_changed";
+  return "";
+}
+
+async function processStripeEvent(event = {}) {
+  const type = clean(event.type);
+  const object = event.data?.object || {};
+  if (type === "customer.created" || type === "customer.updated") {
+    const restaurantId = clean(object.metadata?.restaurant_id);
+    if (!restaurantId) return { ignored: true, reason: "CUSTOMER_RESTAURANT_METADATA_MISSING" };
+    const account = await upsertRestaurantBillingAccount({
+      restaurant_id: restaurantId,
+      billing_email: clean(object.email),
+      billing_contact_name: clean(object.name),
+      billing_country: clean(object.address?.country),
+      billing_state_region: clean(object.address?.state),
+      tax_identifier: clean(object.tax_ids?.data?.[0]?.value),
+      stripe_customer_id: clean(object.id),
+      metadata: {
+        event_type: type,
+        livemode: Boolean(event.livemode)
+      }
+    });
+    return { restaurant_id: restaurantId, billing_account_id: account?.id || null };
+  }
+  if (type === "checkout.session.completed") {
+    const metadata = object.metadata || {};
+    if (clean(metadata.purchase_type) === "video_service") {
+      const videoPackage = stripeVideoServicePackages().find((item) => item.key === clean(metadata.package_key));
+      if (!videoPackage) return { ignored: true, reason: "VIDEO_PACKAGE_METADATA_INVALID" };
+      const paid = clean(object.payment_status) === "paid";
+      const order = await upsertVideoServiceOrder({
+        restaurant_id: clean(metadata.restaurant_id),
+        requested_by_user_id: nullableClean(metadata.requested_by_user_id),
+        package_key: videoPackage.key,
+        amount_cents: videoPackage.amount_cents,
+        currency: videoPackage.currency,
+        order_status: paid ? "paid" : "processing",
+        stripe_checkout_session_id: clean(object.id),
+        stripe_payment_intent_id: nullableClean(object.payment_intent),
+        stripe_customer_id: nullableClean(object.customer),
+        stripe_livemode: Boolean(event.livemode),
+        billing_environment: event.livemode ? "live" : "test",
+        paid_at: paid ? nowIso() : null,
+        metadata: { source: "checkout.session.completed", stripe_event_id: event.id }
+      });
+      return { restaurant_id: order?.restaurant_id || clean(metadata.restaurant_id), video_service_order_id: order?.id || null };
+    }
+    const stripeSubscriptionId = clean(object.subscription);
+    const restaurantId = clean(metadata.restaurant_id);
+    let existingRows = [];
+    if (stripeSubscriptionId) {
+      existingRows = supabaseConfigured
+        ? await supabaseFetch(`/rest/v1/restaurant_subscriptions?select=*&stripe_subscription_id=eq.${encodeURIComponent(stripeSubscriptionId)}&limit=1`, { service: true }).catch(() => [])
+        : (ensureDemo(), demo.subscriptions.filter((item) => item.stripe_subscription_id === stripeSubscriptionId).slice(0, 1));
+    }
+    if (!existingRows?.[0] && restaurantId) {
+      existingRows = supabaseConfigured
+        ? await supabaseFetch(`/rest/v1/restaurant_subscriptions?select=*&restaurant_id=eq.${encodeURIComponent(restaurantId)}&limit=1`, { service: true }).catch(() => [])
+        : (ensureDemo(), demo.subscriptions.filter((item) => item.restaurant_id === restaurantId).slice(0, 1));
+    }
+    const existingSubscription = existingRows?.[0] || {};
+    const existingStatus = normalizeStripeSubscriptionStatus(existingSubscription.subscription_status || existingSubscription.status);
+    const durableStatuses = new Set(["trialing", "active", "past_due", "unpaid", "paused", "canceled"]);
+    const checkoutStatus = clean(object.payment_status) === "paid"
+      ? "active"
+      : durableStatuses.has(existingStatus)
+        ? existingStatus
+        : "incomplete";
+    const subscription = await upsertRestaurantSubscription({
+      ...existingSubscription,
+      restaurant_id: restaurantId || existingSubscription.restaurant_id,
+      stripe_customer_id: clean(object.customer) || existingSubscription.stripe_customer_id,
+      stripe_subscription_id: stripeSubscriptionId || existingSubscription.stripe_subscription_id,
+      stripe_price_id: clean(metadata.stripe_price_id) || existingSubscription.stripe_price_id,
+      plan_id: clean(metadata.plan_id) || existingSubscription.plan_id || null,
+      internal_plan: normalizeInternalPlanName(metadata.internal_plan || existingSubscription.internal_plan),
+      billing_interval: normalizeBillingInterval(metadata.billing_interval || existingSubscription.billing_interval),
+      status: checkoutStatus,
+      subscription_status: checkoutStatus,
+      last_payment_status: clean(object.payment_status || ""),
+      stripe_livemode: Boolean(event.livemode),
+      metadata: {
+        source: "checkout.session.completed",
+        checkout_session_id: object.id || ""
+      }
+    });
+    return { restaurant_id: subscription?.restaurant_id || restaurantId, subscription_id: subscription?.id || null };
+  }
+  if (type.startsWith("customer.subscription.")) {
+    const fallbackRows = object.id && supabaseConfigured
+      ? await supabaseFetch(`/rest/v1/restaurant_subscriptions?select=*&stripe_subscription_id=eq.${encodeURIComponent(object.id)}&limit=1`, { service: true }).catch(() => [])
+      : [];
+    const fallback = fallbackRows?.[0] || {};
+    const subscription = await upsertRestaurantSubscription(stripeSubscriptionPayloadFromObject(object, { ...fallback, event_type: type }));
+    const billingEmailEvent = billingNotificationEventForSubscription(type, subscription, fallback);
+    if (billingEmailEvent) {
+      await sendBillingNotificationForRestaurant(billingEmailEvent, subscription?.restaurant_id || fallback.restaurant_id, subscription, {
+        stripeEventId: event.id,
+        idempotencyKey: hashEmailValue(`stripe-billing-email:${event.id}:${billingEmailEvent}`)
+      }).catch(() => null);
+    }
+    return { restaurant_id: subscription?.restaurant_id || fallback.restaurant_id || null, subscription_id: subscription?.id || null };
+  }
+  if (type.startsWith("invoice.")) {
+    const subscriptionRows = object.subscription
+      ? supabaseConfigured
+        ? await supabaseFetch(`/rest/v1/restaurant_subscriptions?select=*&stripe_subscription_id=eq.${encodeURIComponent(object.subscription)}&limit=1`, { service: true }).catch(() => [])
+        : (ensureDemo(), demo.subscriptions.filter((item) => item.stripe_subscription_id === clean(object.subscription)).slice(0, 1))
+      : [];
+    const subscription = subscriptionRows?.[0] || {};
+    let updatedSubscription = subscription;
+    if (subscription.id && ["invoice.payment_succeeded", "invoice.paid", "invoice.payment_failed"].includes(type)) {
+      const currentStatus = normalizeStripeSubscriptionStatus(subscription.status || "active");
+      const paidStatus = ["past_due", "unpaid", "incomplete"].includes(currentStatus) ? "active" : currentStatus;
+      updatedSubscription = await upsertRestaurantSubscription({
+        restaurant_id: subscription.restaurant_id,
+        stripe_customer_id: subscription.stripe_customer_id,
+        stripe_subscription_id: subscription.stripe_subscription_id,
+        plan_id: subscription.plan_id,
+        billing_interval: subscription.billing_interval || "monthly",
+        internal_plan: normalizeInternalPlanName(subscription.internal_plan || subscription.subscription_plans?.internal_name),
+        stripe_price_id: subscription.stripe_price_id,
+        status: type === "invoice.payment_failed" ? "past_due" : paidStatus,
+        subscription_status: type === "invoice.payment_failed" ? "past_due" : paidStatus,
+        last_payment_status: object.status || (type === "invoice.payment_failed" ? "failed" : "paid"),
+        last_invoice_id: clean(object.id),
+        last_invoice_number: clean(object.number),
+        last_invoice_status: clean(object.status),
+        last_invoice_url: clean(object.hosted_invoice_url),
+        last_payment_error_code: clean(object.last_finalization_error?.code || object.last_payment_error?.code),
+        last_payment_error_message_safe: clean(object.last_finalization_error?.message || object.last_payment_error?.message).slice(0, 240),
+        grace_period_ends_at: type === "invoice.payment_failed"
+          ? new Date(Date.now() + BILLING_PAYMENT_GRACE_PERIOD_DAYS * 24 * 60 * 60 * 1000).toISOString()
+          : null,
+        payment_grace_period_end: type === "invoice.payment_failed"
+          ? new Date(Date.now() + BILLING_PAYMENT_GRACE_PERIOD_DAYS * 24 * 60 * 60 * 1000).toISOString()
+          : null,
+        stripe_livemode: Boolean(event.livemode),
+        metadata: {
+          ...(subscription.metadata || {}),
+          latest_invoice_event: type
+        }
+      });
+      if (type === "invoice.payment_failed") {
+        await sendBillingNotificationForRestaurant("payment_failed", updatedSubscription.restaurant_id, updatedSubscription, {
+          stripeEventId: event.id,
+          idempotencyKey: hashEmailValue(`stripe-billing-email:${event.id}:payment_failed`)
+        }).catch(() => null);
+        await sendBillingNotificationForRestaurant("grace_period_started", updatedSubscription.restaurant_id, updatedSubscription, {
+          stripeEventId: event.id,
+          idempotencyKey: hashEmailValue(`stripe-billing-email:${event.id}:grace_period_started`)
+        }).catch(() => null);
+      } else if (["past_due", "unpaid", "incomplete"].includes(currentStatus)) {
+        await sendBillingNotificationForRestaurant("subscription_resumed", updatedSubscription.restaurant_id, updatedSubscription, {
+          stripeEventId: event.id,
+          idempotencyKey: hashEmailValue(`stripe-billing-email:${event.id}:subscription_resumed`)
+        }).catch(() => null);
+      }
+    }
+    const invoice = await upsertStripeInvoice(object, updatedSubscription.restaurant_id || subscription.restaurant_id, updatedSubscription.id || subscription.id);
+    return { restaurant_id: updatedSubscription.restaurant_id || subscription.restaurant_id || invoice?.restaurant_id || null, subscription_id: updatedSubscription.id || subscription.id || null };
+  }
+  if (type === "payment_intent.succeeded" || type === "payment_intent.payment_failed") {
+    const metadata = object.metadata || {};
+    const restaurantId = clean(metadata.restaurant_id);
+    if (clean(metadata.purchase_type) === "video_service") {
+      const videoPackage = stripeVideoServicePackages().find((item) => item.key === clean(metadata.package_key));
+      if (!videoPackage) return { ignored: true, reason: "VIDEO_PACKAGE_METADATA_INVALID" };
+      const succeeded = type === "payment_intent.succeeded";
+      const order = await upsertVideoServiceOrder({
+        restaurant_id: restaurantId,
+        requested_by_user_id: nullableClean(metadata.requested_by_user_id),
+        package_key: videoPackage.key,
+        amount_cents: videoPackage.amount_cents,
+        currency: videoPackage.currency,
+        order_status: succeeded ? "paid" : "failed",
+        stripe_payment_intent_id: clean(object.id),
+        stripe_customer_id: nullableClean(object.customer),
+        stripe_livemode: Boolean(event.livemode),
+        billing_environment: event.livemode ? "live" : "test",
+        paid_at: succeeded ? nowIso() : null,
+        failed_at: succeeded ? null : nowIso(),
+        metadata: { source: type, stripe_event_id: event.id, failure_code: clean(object.last_payment_error?.code) }
+      });
+      return { restaurant_id: order?.restaurant_id || restaurantId, video_service_order_id: order?.id || null };
+    }
+    const subscriptionId = clean(metadata.stripe_subscription_id || metadata.subscription_id);
+    const customerId = clean(object.customer || metadata.stripe_customer_id);
+    const subscriptionRows = subscriptionId && supabaseConfigured
+      ? await supabaseFetch(`/rest/v1/restaurant_subscriptions?select=*&stripe_subscription_id=eq.${encodeURIComponent(subscriptionId)}&limit=1`, { service: true }).catch(() => [])
+      : [];
+    const subscription = subscriptionRows?.[0] || {};
+    if (subscription.id || restaurantId) {
+      const updatedSubscription = await upsertRestaurantSubscription({
+        restaurant_id: subscription.restaurant_id || restaurantId,
+        stripe_customer_id: subscription.stripe_customer_id || customerId,
+        stripe_subscription_id: subscription.stripe_subscription_id || subscriptionId || null,
+        plan_id: subscription.plan_id || null,
+        internal_plan: normalizeInternalPlanName(subscription.internal_plan || metadata.internal_plan),
+        stripe_price_id: subscription.stripe_price_id || metadata.stripe_price_id,
+        status: type === "payment_intent.payment_failed" ? "past_due" : normalizeStripeSubscriptionStatus(subscription.status || "active"),
+        subscription_status: type === "payment_intent.payment_failed" ? "past_due" : normalizeStripeSubscriptionStatus(subscription.subscription_status || subscription.status || "active"),
+        last_payment_status: type === "payment_intent.payment_failed" ? "failed" : "paid",
+        last_payment_error_code: clean(object.last_payment_error?.code),
+        last_payment_error_message_safe: clean(object.last_payment_error?.message).slice(0, 240),
+        payment_grace_period_end: type === "payment_intent.payment_failed"
+          ? new Date(Date.now() + BILLING_PAYMENT_GRACE_PERIOD_DAYS * 24 * 60 * 60 * 1000).toISOString()
+          : null,
+        stripe_livemode: Boolean(event.livemode),
+        metadata: {
+          ...(subscription.metadata || {}),
+          latest_payment_intent_event: type,
+          payment_intent_id: clean(object.id)
+        }
+      });
+      if (type === "payment_intent.payment_failed") {
+        await sendBillingNotificationForRestaurant("payment_failed", updatedSubscription?.restaurant_id || subscription.restaurant_id || restaurantId, updatedSubscription || subscription, {
+          stripeEventId: event.id,
+          idempotencyKey: hashEmailValue(`stripe-billing-email:${event.id}:payment_intent_failed`)
+        }).catch(() => null);
+      }
+    }
+    return { restaurant_id: subscription.restaurant_id || restaurantId || null, subscription_id: subscription.id || null };
+  }
+  return { ignored: true };
+}
+
+async function recordBillingEvent(event = {}, status = "received", details = {}) {
+  const eventId = clean(event.id);
+  if (!eventId) return null;
+  const payload = {
+    stripe_event_id: eventId,
+    event_type: clean(event.type || "unknown"),
+    restaurant_id: details.restaurant_id || null,
+    processing_status: status,
+    error_message: clean(details.error_message || "").slice(0, 500) || null,
+    idempotency_key: hashEmailValue(`stripe:${eventId}`),
+    attempt_count: Number(details.attempt_count || 0),
+    max_attempts: 3,
+    stripe_livemode: Boolean(event.livemode),
+    billing_environment: event.livemode ? "live" : "test",
+    sanitized_error: details.error_message ? { code: clean(details.error_message).slice(0, 120) } : {},
+    dead_lettered_at: status === "failed" ? nowIso() : null,
+    processed_at: ["processed", "failed", "ignored", "duplicate"].includes(status) ? nowIso() : null,
+    payload: {
+      id: eventId,
+      type: event.type,
+      created: event.created || null,
+      livemode: Boolean(event.livemode),
+      object_id: event.data?.object?.id || "",
+      object_type: event.data?.object?.object || "",
+      customer: event.data?.object?.customer || "",
+      subscription: event.data?.object?.subscription || event.data?.object?.id || ""
+    }
+  };
+  if (!supabaseConfigured) {
+    ensureDemo();
+    const existing = demo.paymentEvents.find((item) => item.stripe_event_id === eventId || item.id === eventId);
+    const row = { ...(existing || { id: crypto.randomUUID(), created_at: nowIso() }), ...payload };
+    if (existing) Object.assign(existing, row);
+    else demo.paymentEvents.unshift(row);
+    return row;
+  }
+  const existing = await supabaseFetch(`/rest/v1/billing_events?select=*&stripe_event_id=eq.${encodeURIComponent(eventId)}&limit=1`, { service: true }).catch(() => []);
+  const filteredPayload = await filterSupabaseTablePayload("billing_events", payload);
+  if (existing?.[0]?.id) {
+    const rows = await supabaseFetch(`/rest/v1/billing_events?id=eq.${encodeURIComponent(existing[0].id)}&select=*`, {
+      method: "PATCH",
+      service: true,
+      headers: { Prefer: "return=representation" },
+      body: filteredPayload
+    });
+    return rows?.[0];
+  }
+  const rows = await supabaseFetch("/rest/v1/billing_events?select=*", {
+    method: "POST",
+    service: true,
+    headers: { Prefer: "return=representation" },
+    body: filteredPayload
+  });
+  return rows?.[0];
+}
+
+async function recordBillingAuditEvent({ profile = null, action = "", result = "success", restaurantId = "", subscription = {}, reason = "", metadata = {}, headers = {} } = {}) {
+  subscription ||= {};
+  const payload = {
+    restaurant_id: nullableClean(restaurantId || subscription.restaurant_id),
+    actor_user_id: profile?.id || null,
+    actor_role: normalizeRole(profile?.role || "system"),
+    action: clean(action || "billing_event"),
+    result: result === "failure" ? "failure" : "success",
+    stripe_event_id: nullableClean(metadata.stripe_event_id || metadata.stripeEventId),
+    stripe_customer_id: nullableClean(subscription.stripe_customer_id || metadata.stripe_customer_id),
+    stripe_subscription_id: nullableClean(subscription.stripe_subscription_id || metadata.stripe_subscription_id),
+    internal_plan: nullableClean(normalizeInternalPlanName(subscription.internal_plan || metadata.internal_plan)),
+    subscription_status: nullableClean(normalizeStripeSubscriptionStatus(subscription.subscription_status || subscription.status || metadata.subscription_status)),
+    reason: nullableClean(reason),
+    request_id: requestIdFromHeaders(headers),
+    ip_hash: clientIpAddress(headers) ? hashEmailValue(`ip:${clientIpAddress(headers)}`) : null,
+    metadata: sanitizeAuditMetadata(metadata),
+    created_at: nowIso()
+  };
+  if (!supabaseConfigured) {
+    ensureDemo();
+    demo.paymentEvents.unshift({
+      id: crypto.randomUUID(),
+      event_type: payload.action,
+      processing_status: payload.result,
+      payload,
+      created_at: payload.created_at
+    });
+    return payload;
+  }
+  const rows = await supabaseFetch("/rest/v1/billing_audit_events?select=*", {
+    method: "POST",
+    service: true,
+    headers: { Prefer: "return=representation" },
+    body: await filterSupabaseTablePayload("billing_audit_events", payload)
+  }).catch(() => null);
+  return rows?.[0] || null;
+}
+
+async function stripeWebhook(method, body, headers) {
+  if (method !== "POST") return json(405, { error: "Method not allowed." });
+  const signature = verifyStripeWebhookSignature(headers, body);
+  if (!signature.ok) {
+    logSafeServerEvent("stripe_webhook_rejected", { reason: signature.reason });
+    return json(401, { error: "Invalid webhook signature.", code: signature.reason || "STRIPE_SIGNATURE_INVALID" });
+  }
+  const event = parseStripeEvent(body);
+  if (!event?.id || !event?.type) return json(400, { error: "Invalid Stripe event.", code: "STRIPE_EVENT_INVALID" });
+  const existing = supabaseConfigured
+    ? await supabaseFetch(`/rest/v1/billing_events?select=id,processing_status&stripe_event_id=eq.${encodeURIComponent(event.id)}&limit=1`, { service: true }).catch(() => [])
+    : [];
+  if (["processed", "ignored", "duplicate"].includes(existing?.[0]?.processing_status)) {
+    return json(200, { received: true, duplicate: true });
+  }
+  await recordBillingEvent(event, "received");
+  try {
+    const result = await processStripeEvent(event);
+    await recordBillingEvent(event, result.ignored ? "ignored" : "processed", result);
+    logSafeServerEvent("stripe_webhook_processed", {
+      event_type: event.type,
+      status: result.ignored ? "ignored" : "processed"
+    });
+    return json(200, { received: true, status: result.ignored ? "ignored" : "processed" });
+  } catch (error) {
+    await recordBillingEvent(event, "failed", {
+      error_message: error.code || error.message || "Stripe webhook processing failed."
+    }).catch(() => null);
+    logSafeServerEvent("stripe_webhook_failed", {
+      event_type: event.type,
+      status: error.status || 500,
+      code: error.code || "STRIPE_WEBHOOK_PROCESSING_FAILED"
+    });
+    return json(500, { error: "Webhook processing failed.", code: "STRIPE_WEBHOOK_PROCESSING_FAILED" });
+  }
+}
+
+async function billingPlansForPartner() {
+  if (!supabaseConfigured) {
+    ensureDemo();
+    return mergeFixedMonthlyPlans(demo.billingPlans, { includeInactive: true }).map(clientSubscriptionPlan);
+  }
+  const rows = await supabaseFetch("/rest/v1/subscription_plans?select=*&is_active=eq.true&order=sort_order.asc,monthly_price_cents.asc", { service: true }).catch(() => []);
+  return mergeFixedMonthlyPlans(rows, { includeInactive: true }).map(clientSubscriptionPlan);
+}
+
+async function videoServiceOrdersForRestaurant(restaurantId = "") {
+  const id = clean(restaurantId);
+  if (!id) return [];
+  if (!supabaseConfigured) {
+    ensureDemo();
+    return demo.videoServiceOrders.filter((item) => item.restaurant_id === id);
+  }
+  return await supabaseFetch(`/rest/v1/video_service_orders?select=*&restaurant_id=eq.${encodeURIComponent(id)}&order=created_at.desc&limit=50`, { service: true }).catch(() => []);
+}
+
+async function upsertVideoServiceOrder(payload = {}) {
+  const normalized = {
+    restaurant_id: clean(payload.restaurant_id),
+    requested_by_user_id: nullableClean(payload.requested_by_user_id),
+    package_key: clean(payload.package_key),
+    amount_cents: Math.max(0, Math.round(Number(payload.amount_cents || 0))),
+    currency: clean(payload.currency || "usd").toLowerCase(),
+    order_status: clean(payload.order_status || "checkout_created"),
+    stripe_checkout_session_id: nullableClean(payload.stripe_checkout_session_id),
+    stripe_payment_intent_id: nullableClean(payload.stripe_payment_intent_id),
+    stripe_customer_id: nullableClean(payload.stripe_customer_id),
+    stripe_livemode: Boolean(payload.stripe_livemode),
+    billing_environment: payload.stripe_livemode ? "live" : clean(payload.billing_environment || "test"),
+    metadata: payload.metadata && typeof payload.metadata === "object" ? payload.metadata : {},
+    paid_at: payload.paid_at || null,
+    failed_at: payload.failed_at || null,
+    updated_at: nowIso()
+  };
+  if (!normalized.restaurant_id || !normalized.package_key) return null;
+  if (!supabaseConfigured) {
+    ensureDemo();
+    const existing = demo.videoServiceOrders.find((item) =>
+      (normalized.stripe_checkout_session_id && item.stripe_checkout_session_id === normalized.stripe_checkout_session_id)
+      || (normalized.stripe_payment_intent_id && item.stripe_payment_intent_id === normalized.stripe_payment_intent_id)
+    ) || (normalized.stripe_payment_intent_id && !normalized.stripe_checkout_session_id
+      ? demo.videoServiceOrders.find((item) =>
+          item.restaurant_id === normalized.restaurant_id
+          && item.package_key === normalized.package_key
+          && !item.stripe_payment_intent_id
+          && ["checkout_created", "processing"].includes(item.order_status))
+      : null);
+    const row = { ...(existing || { id: crypto.randomUUID(), created_at: nowIso() }), ...normalized };
+    if (existing) Object.assign(existing, row);
+    else demo.videoServiceOrders.unshift(row);
+    return row;
+  }
+  let existing = [];
+  if (normalized.stripe_checkout_session_id) {
+    existing = await supabaseFetch(`/rest/v1/video_service_orders?select=*&stripe_checkout_session_id=eq.${encodeURIComponent(normalized.stripe_checkout_session_id)}&limit=1`, { service: true }).catch(() => []);
+  }
+  if (!existing?.length && normalized.stripe_payment_intent_id) {
+    existing = await supabaseFetch(`/rest/v1/video_service_orders?select=*&stripe_payment_intent_id=eq.${encodeURIComponent(normalized.stripe_payment_intent_id)}&limit=1`, { service: true }).catch(() => []);
+  }
+  if (!existing?.length && normalized.stripe_payment_intent_id && !normalized.stripe_checkout_session_id) {
+    existing = await supabaseFetch(`/rest/v1/video_service_orders?select=*&restaurant_id=eq.${encodeURIComponent(normalized.restaurant_id)}&package_key=eq.${encodeURIComponent(normalized.package_key)}&stripe_payment_intent_id=is.null&order_status=in.(checkout_created,processing)&order=created_at.desc&limit=1`, { service: true }).catch(() => []);
+  }
+  const filtered = await filterSupabaseTablePayload("video_service_orders", normalized);
+  if (existing?.[0]?.id) {
+    if (filtered.stripe_payment_intent_id && filtered.stripe_payment_intent_id !== existing[0].stripe_payment_intent_id) {
+      const conflicts = await supabaseFetch(`/rest/v1/video_service_orders?select=id&stripe_payment_intent_id=eq.${encodeURIComponent(filtered.stripe_payment_intent_id)}&limit=1`, { service: true }).catch(() => []);
+      if (conflicts?.[0]?.id && conflicts[0].id !== existing[0].id) delete filtered.stripe_payment_intent_id;
+    }
+    if (filtered.stripe_checkout_session_id && filtered.stripe_checkout_session_id !== existing[0].stripe_checkout_session_id) {
+      const conflicts = await supabaseFetch(`/rest/v1/video_service_orders?select=id&stripe_checkout_session_id=eq.${encodeURIComponent(filtered.stripe_checkout_session_id)}&limit=1`, { service: true }).catch(() => []);
+      if (conflicts?.[0]?.id && conflicts[0].id !== existing[0].id) delete filtered.stripe_checkout_session_id;
+    }
+    const rows = await supabaseFetch(`/rest/v1/video_service_orders?id=eq.${encodeURIComponent(existing[0].id)}&select=*`, {
+      method: "PATCH",
+      service: true,
+      headers: { Prefer: "return=representation" },
+      body: filtered
+    });
+    return rows?.[0] || null;
+  }
+  const rows = await supabaseFetch("/rest/v1/video_service_orders?select=*", {
+    method: "POST",
+    service: true,
+    headers: { Prefer: "return=representation" },
+    body: { ...filtered, created_at: nowIso() }
+  });
+  return rows?.[0] || null;
+}
+
+async function partnerBilling(method, body, headers, query) {
+  const { profile } = await requireProfile(headers, ["partner", "admin"]);
+  const restaurant = await getPartnerRestaurant(profile, query, body);
+  const access = await getRestaurantBillingAccess(restaurant.id);
+  if (method === "GET") {
+    const plans = await billingPlansForPartner();
+    const invoices = !supabaseConfigured
+      ? demo.invoices.filter((invoice) => invoice.restaurant_id === restaurant.id)
+      : await supabaseFetch(`/rest/v1/invoices?select=*&restaurant_id=eq.${encodeURIComponent(restaurant.id)}&order=created_at.desc&limit=50`, { service: true }).catch(() => []);
+    const billingAccount = await restaurantBillingAccount(restaurant.id).catch(() => null);
+    const videoOrders = await videoServiceOrdersForRestaurant(restaurant.id);
+    return json(200, {
+      mode: supabaseConfigured ? "supabase" : "demo",
+      restaurant_id: restaurant.id,
+      billing: access,
+      billing_account: billingAccount,
+      plans,
+      invoices,
+      video_packages: stripeVideoServicePackages().map(clientVideoServicePackage),
+      video_orders: videoOrders,
+      stripe: stripeDiagnostics()
+    });
+  }
+  if (method !== "POST") return json(405, { error: "Method not allowed." });
+  const action = clean(body.action);
+  if (["checkout", "change_plan", "portal", "cancel_at_period_end", "video_checkout"].includes(action)) {
+    const forbidden = forbiddenClientBillingMutation(body);
+    if (forbidden) {
+      await recordBillingAuditEvent({
+        profile,
+        action: "stripe_billing_client_payload_rejected",
+        result: "failure",
+        restaurantId: restaurant.id,
+        subscription: access.subscription,
+        metadata: { action, field: forbidden.field, code: forbidden.code },
+        headers
+      }).catch(() => null);
+      return json(400, {
+        error: "Billing state, Stripe identifiers, redirect URLs, and trial settings are controlled by the server.",
+        code: forbidden.code,
+        field: forbidden.field
+      });
+    }
+    try {
+      requirePartnerBillingManager(profile, restaurant);
+    } catch (error) {
+      await createAuditLog({
+        profile,
+        action: "stripe_billing_access_denied",
+        entityType: "restaurant",
+        entityId: restaurant.id,
+        success: false,
+        metadata: { action, restaurant_role: restaurant.partner_access_role, code: error.code || "BILLING_MANAGER_REQUIRED" },
+        headers
+      }).catch(() => null);
+      await recordBillingAuditEvent({
+        profile,
+        action: "stripe_billing_access_denied",
+        result: "failure",
+        restaurantId: restaurant.id,
+        subscription: access.subscription,
+        metadata: { action, restaurant_role: restaurant.partner_access_role, code: error.code || "BILLING_MANAGER_REQUIRED" },
+        headers
+      }).catch(() => null);
+      return json(error.status || 403, { error: error.message || "You are not allowed to manage billing.", code: error.code || "BILLING_MANAGER_REQUIRED" });
+    }
+  }
+  if (action === "video_checkout") {
+    const packageKey = clean(body.package_key);
+    const videoPackage = stripeVideoServicePackages().find((item) => item.key === packageKey);
+    if (!videoPackage) return json(404, { error: "Video package not found.", code: "VIDEO_PACKAGE_NOT_FOUND" });
+    if (!videoPackage.stripe_price_id) return json(409, { error: "Selected video package is not configured in Stripe yet.", code: "VIDEO_PRICE_NOT_CONFIGURED" });
+    await verifyStripePriceCatalogEntry(videoPackage.stripe_price_id, {
+      amount_cents: videoPackage.amount_cents,
+      currency: videoPackage.currency,
+      mode: "payment"
+    });
+    const customerId = await createOrUpdateStripeCustomer(restaurant, profile, access.subscription);
+    const billingEnvironment = stripeBillingEnvironment();
+    const metadata = {
+      purchase_type: "video_service",
+      restaurant_id: restaurant.id,
+      package_key: videoPackage.key,
+      amount_cents: videoPackage.amount_cents,
+      currency: videoPackage.currency,
+      billing_environment: billingEnvironment,
+      requested_by_user_id: profile.id
+    };
+    const session = await stripeRequest("/v1/checkout/sessions", {
+      method: "POST",
+      body: {
+        mode: "payment",
+        customer: customerId,
+        success_url: safePartnerBillingUrl("/partner/billing?video=success&session_id={CHECKOUT_SESSION_ID}"),
+        cancel_url: safePartnerBillingUrl("/partner/billing?video=cancelled"),
+        allow_promotion_codes: STRIPE_ALLOW_PROMOTION_CODES,
+        payment_method_types: ["card"],
+        line_items: [{ price: videoPackage.stripe_price_id, quantity: 1 }],
+        payment_intent_data: { metadata },
+        metadata
+      }
+    });
+    const order = await upsertVideoServiceOrder({
+      ...metadata,
+      requested_by_user_id: profile.id,
+      order_status: "checkout_created",
+      stripe_checkout_session_id: session.id,
+      stripe_customer_id: customerId,
+      stripe_livemode: billingEnvironment === "live",
+      metadata: { source: "smarttable_partner_dashboard" }
+    });
+    await createAuditLog({
+      profile,
+      action: "stripe_video_checkout_created",
+      entityType: "video_service_order",
+      entityId: order?.id || session.id,
+      metadata: { restaurant_id: restaurant.id, package_key: videoPackage.key, amount_cents: videoPackage.amount_cents }
+    });
+    await recordBillingAuditEvent({
+      profile,
+      action: "stripe_video_checkout_created",
+      restaurantId: restaurant.id,
+      subscription: access.subscription,
+      metadata: { package_key: videoPackage.key, amount_cents: videoPackage.amount_cents, checkout_session_id: session.id },
+      headers
+    });
+    return json(200, { url: session.url, session_id: session.id, order_id: order?.id || null, stripe: { accepted: true } });
+  }
+  if (action === "checkout" || action === "change_plan") {
+    const planId = clean(body.plan_id);
+    const interval = "monthly";
+    const rawPlanRows = !supabaseConfigured
+      ? demo.billingPlans
+      : await supabaseFetch("/rest/v1/subscription_plans?select=*&is_active=eq.true", { service: true });
+    const planRows = mergeFixedMonthlyPlans(rawPlanRows);
+    const plan = planRows.find((item) => item.id === planId || item.internal_name === normalizeInternalPlanName(planId));
+    if (!plan) return json(404, { error: "Subscription plan not found.", code: "SUBSCRIPTION_PLAN_NOT_FOUND" });
+    if (!isChargeableFixedPlan(plan)) return json(409, { error: "This plan cannot be started through Stripe Checkout.", code: "PLAN_NOT_CHECKOUT_ELIGIBLE" });
+    if (action === "change_plan" && access.subscription?.stripe_customer_id && access.subscription?.stripe_subscription_id) {
+      body.action = "portal";
+      body.reason = "change_plan";
+      return await partnerBilling(method, body, headers, query);
+    }
+    if (action === "checkout" && subscriptionBlocksNewCheckout(access.subscription)) {
+      await recordBillingAuditEvent({
+        profile,
+        action: "stripe_checkout_blocked_existing_subscription",
+        result: "failure",
+        restaurantId: restaurant.id,
+        subscription: access.subscription,
+        metadata: { requested_plan: plan.internal_name, current_status: access.status },
+        headers
+      }).catch(() => null);
+      return json(409, {
+        error: "This restaurant already has a Stripe subscription. Use Manage billing to change or resume it.",
+        code: "STRIPE_ACTIVE_SUBSCRIPTION_EXISTS"
+      });
+    }
+    const priceId = stripePlanPriceId(plan, interval);
+    if (!priceId) return json(409, { error: "Selected plan is missing a Stripe price ID.", code: "STRIPE_PRICE_NOT_CONFIGURED" });
+    await verifyStripePriceCatalogEntry(priceId, {
+      amount_cents: Number(plan.monthly_price_cents || 0),
+      currency: "usd",
+      mode: "subscription"
+    });
+    const customerId = await createOrUpdateStripeCustomer(restaurant, profile, access.subscription);
+    const billingEnvironment = stripeBillingEnvironment();
+    const successUrl = safePartnerBillingUrl("/partner?billing=success&session_id={CHECKOUT_SESSION_ID}");
+    const cancelUrl = safePartnerBillingUrl("/partner?billing=cancelled");
+    const paymentMethodTypes = STRIPE_ENABLE_ACH ? ["card", "us_bank_account"] : ["card"];
+    const session = await stripeRequest("/v1/checkout/sessions", {
+      method: "POST",
+      body: {
+        mode: "subscription",
+        customer: customerId,
+        success_url: successUrl,
+        cancel_url: cancelUrl,
+        allow_promotion_codes: STRIPE_ALLOW_PROMOTION_CODES,
+        payment_method_types: paymentMethodTypes,
+        line_items: [{ price: priceId, quantity: 1 }],
+        subscription_data: {
+          ...stripeSubscriptionTrialData(access.subscription),
+          metadata: {
+            restaurant_id: restaurant.id,
+            plan_id: plan.id,
+            internal_plan: plan.internal_name,
+            billing_interval: interval,
+            stripe_price_id: priceId,
+            billing_environment: billingEnvironment
+          }
+        },
+        metadata: {
+          restaurant_id: restaurant.id,
+          plan_id: plan.id,
+          internal_plan: plan.internal_name,
+          billing_interval: interval,
+          stripe_price_id: priceId,
+          billing_environment: billingEnvironment,
+          source: "smarttable_partner_dashboard"
+        }
+      }
+    });
+    await createAuditLog({
+      profile,
+      action: "stripe_checkout_created",
+      entityType: "restaurant",
+      entityId: restaurant.id,
+      metadata: { plan_id: plan.id, internal_plan: plan.internal_name, billing_interval: interval }
+    });
+    await recordBillingAuditEvent({
+      profile,
+      action: "stripe_checkout_created",
+      restaurantId: restaurant.id,
+      subscription: access.subscription,
+      metadata: {
+        plan_id: plan.id,
+        internal_plan: plan.internal_name,
+        billing_interval: interval,
+        stripe_customer_id: customerId,
+        stripe_price_id: priceId,
+        checkout_session_id: session.id,
+        trial_period_days: STRIPE_TRIAL_PERIOD_DAYS
+      },
+      headers
+    });
+    return json(200, { url: session.url, session_id: session.id, stripe: { accepted: true } });
+  }
+  if (action === "portal") {
+    const customerId = access.subscription?.stripe_customer_id;
+    if (!customerId) return json(409, { error: "No Stripe customer is linked to this restaurant.", code: "STRIPE_CUSTOMER_NOT_FOUND" });
+    const session = await stripeRequest("/v1/billing_portal/sessions", {
+      method: "POST",
+      body: {
+        customer: customerId,
+        return_url: safePartnerBillingUrl("/partner?billing=portal-return"),
+        configuration: STRIPE_PORTAL_CONFIGURATION_ID || undefined
+      }
+    });
+    await createAuditLog({
+      profile,
+      action: "stripe_billing_portal_created",
+      entityType: "restaurant",
+      entityId: restaurant.id,
+      metadata: { restaurant_id: restaurant.id }
+    });
+    await recordBillingAuditEvent({
+      profile,
+      action: "stripe_billing_portal_created",
+      restaurantId: restaurant.id,
+      subscription: access.subscription,
+      metadata: { stripe_customer_id: customerId, billing_portal_session_id: session.id },
+      headers
+    });
+    return json(200, { url: session.url, session_id: session.id, stripe: { accepted: true } });
+  }
+  if (action === "cancel_at_period_end") {
+    const subscriptionId = access.subscription?.stripe_subscription_id;
+    if (!subscriptionId) return json(409, { error: "No active Stripe subscription is linked to this restaurant.", code: "STRIPE_SUBSCRIPTION_NOT_FOUND" });
+    const updated = await stripeRequest(`/v1/subscriptions/${encodeURIComponent(subscriptionId)}`, {
+      method: "POST",
+      body: { cancel_at_period_end: true }
+    });
+    const subscription = await upsertRestaurantSubscription(stripeSubscriptionPayloadFromObject(updated, {
+      restaurant_id: restaurant.id,
+      plan_id: access.subscription?.plan_id,
+      billing_interval: access.subscription?.billing_interval
+    }));
+    await createAuditLog({
+      profile,
+      action: "stripe_subscription_cancel_at_period_end",
+      entityType: "restaurant_subscription",
+      entityId: subscription?.id || subscriptionId,
+      metadata: { restaurant_id: restaurant.id }
+    });
+    await recordBillingAuditEvent({
+      profile,
+      action: "stripe_subscription_cancel_at_period_end",
+      restaurantId: restaurant.id,
+      subscription,
+      metadata: { stripe_subscription_id: subscriptionId },
+      headers
+    });
+    return json(200, { subscription, message: "Subscription will cancel at the end of the current billing period." });
+  }
+  return json(400, { error: "Unsupported billing action.", code: "UNSUPPORTED_BILLING_ACTION" });
+}
+
+async function adminBilling(method, body, headers, query) {
+  const { profile } = await requireProfile(headers, ["admin"]);
+  if (method === "POST" || method === "PATCH") {
+    if (clean(body.action) === "save_plan") {
+      const payload = normalizeSubscriptionPlanPayload(body);
+      if (!payload.internal_name) return json(400, { error: "Plan internal name is required." });
+      if (!["trial", "basic", "professional", "enterprise", "complimentary_test"].includes(payload.internal_name)) {
+        return json(400, { error: "Only fixed SmartTable subscription plan names are supported.", code: "FIXED_PLAN_REQUIRED" });
+      }
+      if (!supabaseConfigured) {
+        ensureDemo();
+        const existing = demo.billingPlans.find((plan) => plan.id === clean(body.id) || plan.key === payload.internal_name || plan.internal_name === payload.internal_name);
+        const row = {
+          ...(existing || { id: crypto.randomUUID(), created_at: nowIso() }),
+          ...payload,
+          key: payload.internal_name,
+          name: payload.display_name_en,
+          status: payload.is_active ? "active" : "archived",
+          monthly_price: centsToDollars(payload.monthly_price_cents),
+          per_booking_fee: 0
+        };
+        if (existing) Object.assign(existing, row);
+        else demo.billingPlans.unshift(row);
+        await createAuditLog({
+          profile,
+          action: existing ? "subscription_plan_updated" : "subscription_plan_created",
+          entityType: "subscription_plan",
+          entityId: row.id,
+          metadata: { internal_name: row.internal_name, is_active: row.is_active }
+        });
+        return json(existing ? 200 : 201, { plan: clientSubscriptionPlan(row) });
+      }
+      if (clean(body.id)) {
+        const rows = await supabaseFetch(`/rest/v1/subscription_plans?id=eq.${encodeURIComponent(clean(body.id))}&select=*`, {
+          method: "PATCH",
+          service: true,
+          headers: { Prefer: "return=representation" },
+          body: payload
+        });
+        await createAuditLog({
+          profile,
+          action: "subscription_plan_updated",
+          entityType: "subscription_plan",
+          entityId: clean(body.id),
+          metadata: { internal_name: payload.internal_name, is_active: payload.is_active }
+        });
+        return json(200, { plan: clientSubscriptionPlan(rows?.[0]) });
+      }
+      const rows = await supabaseFetch("/rest/v1/subscription_plans?select=*", {
+        method: "POST",
+        service: true,
+        headers: { Prefer: "return=representation" },
+        body: { ...payload, created_at: nowIso() }
+      });
+      await createAuditLog({
+        profile,
+        action: "subscription_plan_created",
+        entityType: "subscription_plan",
+        entityId: rows?.[0]?.id || payload.internal_name,
+        metadata: { internal_name: payload.internal_name, is_active: payload.is_active }
+      });
+      return json(201, { plan: clientSubscriptionPlan(rows?.[0]) });
+    }
+    if (clean(body.action) === "grant_complimentary_access" || clean(body.action) === "extend_trial") {
+      const restaurantId = clean(body.restaurant_id);
+      if (!restaurantId) return json(400, { error: "Restaurant ID is required." });
+      if (clean(body.action) === "grant_complimentary_access" && !isSuperAdminProfile(profile)) {
+        await recordBillingAuditEvent({
+          profile,
+          action: "subscription_complimentary_access_denied",
+          result: "failure",
+          restaurantId,
+          reason: "Superadmin approval is required for complimentary test access.",
+          metadata: { code: "SUPERADMIN_REQUIRED" },
+          headers
+        }).catch(() => null);
+        return json(403, { error: "Superadmin approval is required for complimentary test access.", code: "SUPERADMIN_REQUIRED" });
+      }
+      const restaurantRows = !supabaseConfigured
+        ? (ensureDemo(), demo.restaurants.filter((restaurant) => restaurant.id === restaurantId))
+        : await supabaseFetch(`/rest/v1/restaurants?select=id,name,is_test_data,is_test_restaurant&id=eq.${encodeURIComponent(restaurantId)}&limit=1`, { service: true }).catch(() => []);
+      const restaurant = restaurantRows?.[0];
+      if (!restaurant) return json(404, { error: "Restaurant not found.", code: "RESTAURANT_NOT_FOUND" });
+      const days = Math.max(1, Math.min(365, Math.round(Number(body.days || 30))));
+      const until = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
+      const writtenReason = clean(body.reason);
+      if (clean(body.action) === "grant_complimentary_access" && !boolValue(restaurant.is_test_data || restaurant.is_test_restaurant)) {
+        await createAuditLog({
+          profile,
+          action: "subscription_complimentary_access_denied",
+          entityType: "restaurant",
+          entityId: restaurantId,
+          metadata: { restaurant_id: restaurantId, reason: "Restaurant is not marked as test data." },
+          success: false,
+          headers
+        });
+        return json(409, { error: "Complimentary test access is restricted to explicitly marked test restaurants.", code: "COMPLIMENTARY_TEST_RESTAURANT_REQUIRED" });
+      }
+      if (clean(body.action) === "grant_complimentary_access" && writtenReason.length < 10) {
+        return json(400, { error: "A written reason is required.", code: "BILLING_REASON_REQUIRED" });
+      }
+      const payload = clean(body.action) === "grant_complimentary_access"
+        ? {
+          restaurant_id: restaurantId,
+          status: "active",
+          subscription_status: "active",
+          internal_plan: "complimentary_test",
+          complimentary_access_until: until,
+          complimentary_reason: writtenReason,
+          billing_access_override: true,
+          billing_access_override_reason: writtenReason,
+          billing_access_override_expires_at: until,
+          updated_at: nowIso()
+        }
+        : {
+          restaurant_id: restaurantId,
+          status: "trialing",
+          subscription_status: "trialing",
+          internal_plan: "trial",
+          trial_end: until,
+          trial_extension_count: Math.max(1, Math.round(Number(body.trial_extension_count || 0)) + 1),
+          updated_at: nowIso()
+        };
+      const subscription = await upsertRestaurantSubscription(payload);
+      if (supabaseConfigured && clean(body.action) === "grant_complimentary_access") {
+        await supabaseFetch("/rest/v1/billing_access_overrides", {
+          method: "POST",
+          service: true,
+          headers: { Prefer: "return=minimal" },
+          body: await filterSupabaseTablePayload("billing_access_overrides", {
+            restaurant_id: restaurantId,
+            granted_by: profile.id,
+            override_status: "active",
+            reason: payload.complimentary_reason,
+            expires_at: until,
+            metadata: { action: "grant_complimentary_access", internal_plan: "complimentary_test" }
+          })
+        }).catch(() => null);
+      }
+      await createAuditLog({
+        profile,
+        action: clean(body.action) === "grant_complimentary_access" ? "subscription_complimentary_access_granted" : "subscription_trial_extended",
+        entityType: "restaurant_subscription",
+        entityId: subscription?.id || restaurantId,
+        metadata: { restaurant_id: restaurantId, days, status: payload.status }
+      });
+      await recordBillingAuditEvent({
+        profile,
+        action: clean(body.action) === "grant_complimentary_access" ? "subscription_complimentary_access_granted" : "subscription_trial_extended",
+        restaurantId,
+        subscription,
+        reason: payload.complimentary_reason || clean(body.reason),
+        metadata: { days, internal_plan: payload.internal_plan },
+        headers
+      });
+      return json(200, { subscription });
+    }
+    if (clean(body.action) === "remove_billing_override") {
+      const restaurantId = clean(body.restaurant_id);
+      const reason = clean(body.reason);
+      if (!restaurantId) return json(400, { error: "Restaurant ID is required.", code: "RESTAURANT_REQUIRED" });
+      if (reason.length < 10) return json(400, { error: "A written billing override removal reason is required.", code: "BILLING_OVERRIDE_REASON_REQUIRED" });
+      const existing = await latestRestaurantSubscription(restaurantId);
+      if (!existing?.id && !existing?.restaurant_id) return json(404, { error: "Billing subscription record not found.", code: "BILLING_RECORD_NOT_FOUND" });
+      const subscription = await upsertRestaurantSubscription({
+        ...existing,
+        restaurant_id: restaurantId,
+        status: existing.status || existing.subscription_status || "incomplete",
+        subscription_status: existing.subscription_status || existing.status || "incomplete",
+        internal_plan: normalizeInternalPlanName(existing.internal_plan || "no_subscription"),
+        billing_access_override: false,
+        billing_access_override_reason: null,
+        billing_access_override_expires_at: null,
+        updated_at: nowIso()
+      });
+      if (supabaseConfigured) {
+        await supabaseFetch(`/rest/v1/billing_access_overrides?restaurant_id=eq.${encodeURIComponent(restaurantId)}&override_status=eq.active`, {
+          method: "PATCH",
+          service: true,
+          headers: { Prefer: "return=minimal" },
+          body: await filterSupabaseTablePayload("billing_access_overrides", {
+            override_status: "revoked",
+            revoked_at: nowIso(),
+            revoked_by: profile.id,
+            metadata: { action: "remove_billing_override", reason }
+          })
+        }).catch(() => null);
+      }
+      await createAuditLog({
+        profile,
+        action: "billing_access_override_removed",
+        entityType: "restaurant_subscription",
+        entityId: subscription?.id || restaurantId,
+        metadata: { restaurant_id: restaurantId, reason },
+        headers
+      });
+      await recordBillingAuditEvent({
+        profile,
+        action: "billing_access_override_removed",
+        restaurantId,
+        subscription,
+        reason,
+        metadata: { override_removed: true },
+        headers
+      });
+      return json(200, { subscription });
+    }
+    if (clean(body.action) === "resend_billing_email") {
+      const restaurantId = clean(body.restaurant_id);
+      const eventType = clean(body.event_type || body.billing_event_type || "subscription_changed");
+      const allowedEventTypes = new Set([
+        "trial_started",
+        "trial_ending_soon",
+        "subscription_activated",
+        "subscription_changed",
+        "payment_failed",
+        "grace_period_started",
+        "access_read_only",
+        "subscription_canceled",
+        "subscription_resumed"
+      ]);
+      if (!restaurantId) return json(400, { error: "Restaurant ID is required.", code: "RESTAURANT_REQUIRED" });
+      if (!allowedEventTypes.has(eventType)) return json(400, { error: "Unsupported billing email type.", code: "BILLING_EMAIL_TYPE_UNSUPPORTED" });
+      const subscription = await latestRestaurantSubscription(restaurantId) || { restaurant_id: restaurantId, internal_plan: "no_subscription", subscription_status: "no_subscription" };
+      const email = await sendBillingNotificationForRestaurant(eventType, restaurantId, subscription, {
+        profile,
+        reason: clean(body.reason || "admin resend"),
+        headers,
+        idempotencyKey: hashEmailValue(`admin-billing-email:${restaurantId}:${eventType}:${Math.floor(Date.now() / 300000)}`)
+      });
+      await createAuditLog({
+        profile,
+        action: "billing_email_resend_requested",
+        entityType: "restaurant_subscription",
+        entityId: subscription?.id || restaurantId,
+        metadata: { restaurant_id: restaurantId, event_type: eventType, accepted: isEmailAccepted(email) },
+        headers
+      });
+      return json(isEmailAccepted(email) ? 202 : 502, {
+        accepted: isEmailAccepted(email),
+        email: emailDeliveryResult(email, "resend"),
+        message: isEmailAccepted(email) ? "Billing email accepted by the provider." : "Billing email was not accepted by the provider."
+      });
+    }
+    if (clean(body.action) === "grant_billing_override") {
+      const restaurantId = clean(body.restaurant_id);
+      const reason = clean(body.reason);
+      if (!restaurantId) return json(400, { error: "Restaurant ID is required.", code: "RESTAURANT_REQUIRED" });
+      if (body.days === undefined || body.days === null || clean(body.days) === "") {
+        return json(400, { error: "Billing override expiration is required.", code: "BILLING_OVERRIDE_EXPIRATION_REQUIRED" });
+      }
+      const days = Math.max(1, Math.min(BILLING_OVERRIDE_MAX_DAYS, Math.round(Number(body.days || 1))));
+      if (reason.length < 10) return json(400, { error: "A written billing override reason is required.", code: "BILLING_OVERRIDE_REASON_REQUIRED" });
+      const expiresAt = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
+      const subscription = await upsertRestaurantSubscription({
+        restaurant_id: restaurantId,
+        status: "active",
+        subscription_status: "active",
+        internal_plan: normalizeInternalPlanName(body.internal_plan || "trial"),
+        billing_access_override: true,
+        billing_access_override_reason: reason,
+        billing_access_override_expires_at: expiresAt
+      });
+      if (supabaseConfigured) {
+        await supabaseFetch("/rest/v1/billing_access_overrides", {
+          method: "POST",
+          service: true,
+          headers: { Prefer: "return=minimal" },
+          body: await filterSupabaseTablePayload("billing_access_overrides", {
+            restaurant_id: restaurantId,
+            granted_by: profile.id,
+            override_status: "active",
+            reason,
+            expires_at: expiresAt,
+            metadata: { action: "grant_billing_override", internal_plan: subscription.internal_plan }
+          })
+        }).catch(() => null);
+      }
+      await createAuditLog({
+        profile,
+        action: "billing_access_override_granted",
+        entityType: "restaurant_subscription",
+        entityId: subscription?.id || restaurantId,
+        metadata: { restaurant_id: restaurantId, days, reason, internal_plan: subscription.internal_plan },
+        headers
+      });
+      await recordBillingAuditEvent({
+        profile,
+        action: "billing_access_override_granted",
+        restaurantId,
+        subscription,
+        reason,
+        metadata: { days, expires_at: expiresAt },
+        headers
+      });
+      return json(200, { subscription });
+    }
+    if (clean(body.action) === "correct_billing_plan" || clean(body.action) === "set_enterprise_contract_state") {
+      if (!isSuperAdminProfile(profile)) {
+        await recordBillingAuditEvent({
+          profile,
+          action: clean(body.action),
+          result: "failure",
+          restaurantId: clean(body.restaurant_id),
+          reason: "Superadmin billing action denied.",
+          metadata: { code: "SUPERADMIN_REQUIRED" },
+          headers
+        }).catch(() => null);
+        return json(403, { error: "Superadmin approval is required for this billing action.", code: "SUPERADMIN_REQUIRED" });
+      }
+      const restaurantId = clean(body.restaurant_id);
+      const reason = clean(body.reason);
+      if (!restaurantId) return json(400, { error: "Restaurant ID is required.", code: "RESTAURANT_REQUIRED" });
+      if (reason.length < 10) return json(400, { error: "A written reason is required.", code: "BILLING_REASON_REQUIRED" });
+      const internalPlan = clean(body.action) === "set_enterprise_contract_state"
+        ? "enterprise"
+        : normalizeInternalPlanName(body.internal_plan || body.plan || "no_subscription");
+      if (!["trial", "basic", "professional", "enterprise", "complimentary_test", "no_subscription"].includes(internalPlan)) {
+        return json(400, { error: "Unsupported internal billing plan.", code: "INTERNAL_PLAN_UNSUPPORTED" });
+      }
+      const status = normalizeStripeSubscriptionStatus(body.subscription_status || body.status || (internalPlan === "enterprise" ? "active" : "incomplete"));
+      if (!["no_subscription", "incomplete", "incomplete_expired", "trialing", "active", "past_due", "unpaid", "canceled", "paused"].includes(status)) {
+        return json(400, { error: "Unsupported subscription status.", code: "SUBSCRIPTION_STATUS_UNSUPPORTED" });
+      }
+      const existing = await latestRestaurantSubscription(restaurantId) || {};
+      const subscription = await upsertRestaurantSubscription({
+        ...existing,
+        restaurant_id: restaurantId,
+        internal_plan: internalPlan,
+        status,
+        subscription_status: status,
+        billing_interval: "monthly",
+        stripe_livemode: stripeBillingEnvironment() === "live",
+        billing_environment: stripeBillingEnvironment(),
+        metadata: {
+          ...(existing.metadata || {}),
+          manual_correction: true,
+          corrected_by: profile.id,
+          correction_action: clean(body.action)
+        },
+        updated_at: nowIso()
+      });
+      await createAuditLog({
+        profile,
+        action: clean(body.action) === "set_enterprise_contract_state" ? "billing_enterprise_contract_state_set" : "billing_plan_corrected",
+        entityType: "restaurant_subscription",
+        entityId: subscription?.id || restaurantId,
+        metadata: { restaurant_id: restaurantId, internal_plan: internalPlan, subscription_status: status, reason },
+        headers
+      });
+      await recordBillingAuditEvent({
+        profile,
+        action: clean(body.action) === "set_enterprise_contract_state" ? "billing_enterprise_contract_state_set" : "billing_plan_corrected",
+        restaurantId,
+        subscription,
+        reason,
+        metadata: { internal_plan: internalPlan, subscription_status: status, manual_correction: true },
+        headers
+      });
+      return json(200, { subscription });
+    }
+    if (clean(body.action) === "reconcile_billing") {
+      if (!isSuperAdminProfile(profile)) {
+        return json(403, { error: "Superadmin approval is required for billing reconciliation.", code: "SUPERADMIN_REQUIRED" });
+      }
+      const restaurantId = clean(body.restaurant_id);
+      const reason = clean(body.reason);
+      if (!restaurantId) return json(400, { error: "Restaurant ID is required.", code: "RESTAURANT_REQUIRED" });
+      if (reason.length < 10) return json(400, { error: "A written reconciliation reason is required.", code: "BILLING_REASON_REQUIRED" });
+      const existing = await latestRestaurantSubscription(restaurantId);
+      if (!existing?.stripe_subscription_id) {
+        await recordBillingAuditEvent({
+          profile,
+          action: "billing_reconciliation_skipped",
+          restaurantId,
+          subscription: existing || { restaurant_id: restaurantId },
+          reason,
+          metadata: { code: "STRIPE_SUBSCRIPTION_NOT_LINKED" },
+          headers
+        });
+        return json(409, { error: "No Stripe subscription is linked for reconciliation.", code: "STRIPE_SUBSCRIPTION_NOT_LINKED" });
+      }
+      const stripeSubscription = await stripeRequest(`/v1/subscriptions/${encodeURIComponent(existing.stripe_subscription_id)}`);
+      const subscription = await upsertRestaurantSubscription(stripeSubscriptionPayloadFromObject(stripeSubscription, existing));
+      await recordBillingAuditEvent({
+        profile,
+        action: "billing_reconciled",
+        restaurantId,
+        subscription,
+        reason,
+        metadata: { stripe_subscription_id: existing.stripe_subscription_id },
+        headers
+      });
+      return json(200, { subscription });
+    }
+    return json(400, { error: "Unsupported billing action.", code: "UNSUPPORTED_BILLING_ACTION" });
+  }
   if (method !== "GET") return json(405, { error: "Method not allowed." });
   if (!supabaseConfigured) {
     ensureDemo();
     return json(200, {
       mode: "demo",
-      plans: demo.billingPlans,
+      plans: mergeFixedMonthlyPlans(demo.billingPlans, { includeInactive: true }).map(clientSubscriptionPlan),
       subscriptions: demo.subscriptions.map((item) => ({ ...item, restaurant_name: demo.restaurants.find((restaurant) => restaurant.id === item.restaurant_id)?.name || "" })),
       invoices: demo.invoices,
       payment_events: demo.paymentEvents,
-      stripe_status: "foundation_ready_requires_stripe_keys"
+      billing_events: demo.paymentEvents,
+      billing_accounts: [],
+      billing_access_overrides: [],
+      billing_audit_events: demo.paymentEvents.filter((item) => clean(item.event_type || item.action).includes("billing") || clean(item.event_type || item.action).includes("subscription")),
+      video_service_orders: demo.videoServiceOrders,
+      stripe_status: stripeConfigured ? "configured" : "not_configured",
+      stripe: stripeDiagnostics()
     });
   }
-  const [plans, subscriptions, invoices, events] = await Promise.all([
+  const [newPlans, legacyPlans, subscriptions, invoices, events, legacyEvents, accounts, overrides, auditEvents, videoOrders] = await Promise.all([
+    supabaseFetch("/rest/v1/subscription_plans?select=*&order=sort_order.asc,monthly_price_cents.asc", { service: true }).catch(() => []),
     supabaseFetch("/rest/v1/billing_plans?select=*&order=monthly_price.asc", { service: true }).catch(() => []),
-    supabaseFetch("/rest/v1/subscriptions?select=*,restaurants(name)&order=created_at.desc", { service: true }).catch(() => []),
+    supabaseFetch("/rest/v1/restaurant_subscriptions?select=*,restaurants(name),subscription_plans(*)&order=created_at.desc", { service: true }).catch(() => []),
     supabaseFetch("/rest/v1/invoices?select=*&order=created_at.desc&limit=100", { service: true }).catch(() => []),
-    supabaseFetch("/rest/v1/payment_events?select=*&order=created_at.desc&limit=100", { service: true }).catch(() => [])
+    supabaseFetch("/rest/v1/billing_events?select=*&order=created_at.desc&limit=100", { service: true }).catch(() => []),
+    supabaseFetch("/rest/v1/payment_events?select=*&order=created_at.desc&limit=100", { service: true }).catch(() => []),
+    supabaseFetch("/rest/v1/restaurant_billing_accounts?select=*&order=updated_at.desc&limit=100", { service: true }).catch(() => []),
+    supabaseFetch("/rest/v1/billing_access_overrides?select=*&order=created_at.desc&limit=100", { service: true }).catch(() => []),
+    supabaseFetch("/rest/v1/billing_audit_events?select=*&order=created_at.desc&limit=100", { service: true }).catch(() => []),
+    supabaseFetch("/rest/v1/video_service_orders?select=*,restaurants(name)&order=created_at.desc&limit=100", { service: true }).catch(() => [])
   ]);
-  return json(200, { mode: "supabase", plans, subscriptions, invoices, payment_events: events, stripe_status: "foundation_ready_requires_stripe_keys" });
+  const plans = mergeFixedMonthlyPlans(newPlans?.length ? newPlans : legacyPlans, { includeInactive: true }).map(clientSubscriptionPlan);
+  return json(200, {
+    mode: "supabase",
+    plans,
+    subscriptions: subscriptions || [],
+    invoices,
+    payment_events: legacyEvents || [],
+    billing_events: events || [],
+    billing_accounts: accounts || [],
+    billing_access_overrides: overrides || [],
+    billing_audit_events: auditEvents || [],
+    video_service_orders: videoOrders || [],
+    stripe_status: stripeConfigured ? "configured" : "not_configured",
+    stripe: stripeDiagnostics()
+  });
 }
 
 async function privacyRequests(method, body, headers) {
   if (method === "GET") {
     await requireProfile(headers, ["admin"]);
+    const expiredExportsCleaned = await cleanupExpiredDataExports().catch(() => 0);
     if (!supabaseConfigured) {
       ensureDemo();
-      return json(200, { mode: "demo", requests: demo.privacyRequests, consents: demo.guestConsents });
+      return json(200, {
+        mode: "demo",
+        requests: demo.privacyRequests,
+        consents: demo.guestConsents,
+        data_export_cleanup: { expired_cleaned: expiredExportsCleaned }
+      });
     }
     const [requests, consents] = await Promise.all([
       supabaseFetch("/rest/v1/privacy_requests?select=*&order=created_at.desc&limit=100", { service: true }).catch(() => []),
       supabaseFetch("/rest/v1/guest_consents?select=*&order=created_at.desc&limit=100", { service: true }).catch(() => [])
     ]);
-    return json(200, { mode: "supabase", requests, consents });
+    return json(200, {
+      mode: "supabase",
+      requests,
+      consents,
+      data_export_cleanup: { expired_cleaned: expiredExportsCleaned }
+    });
   }
   if (method !== "POST") return json(405, { error: "Method not allowed." });
   const email = lower(body.guest_email || body.email);
@@ -9074,7 +18907,8 @@ function guestDataExportScope() {
     "Reservations",
     "Reviews and feedback",
     "Notification settings",
-    "Consent records"
+    "Legal consent history",
+    "Security event history"
   ];
 }
 
@@ -9085,11 +18919,15 @@ function buildDemoGuestDataExport(profile, guest, guestProfile) {
   const favorites = demo.restaurantFollowers.filter((item) => lower(item.guest_email) === email);
   const notifications = demo.guestNotifications.filter((item) => lower(item.guest_email) === email || item.profile_key === aiProfileKey(email));
   const consents = demo.guestConsents.filter((item) => lower(item.guest_email) === email || clean(item.guest_id) === clean(guest.id));
+  const legalConsents = demo.userLegalConsents.filter((item) => lower(item.guest_email) === email || clean(item.user_id) === clean(profile.id));
+  const securityEvents = demo.guestAuthEvents.filter((item) => clean(item.user_id) === clean(profile.id) || lower(item.email || item.guest_email) === email);
   return {
-    generated: false,
-    status: "request_received",
+    generated: true,
+    status: "completed",
+    format: "json",
+    generated_at: nowIso(),
     scope: guestDataExportScope(),
-    preview: {
+    data: {
       profile: {
         id: guest.id,
         email: guest.email,
@@ -9107,9 +18945,174 @@ function buildDemoGuestDataExport(profile, guest, guestProfile) {
       reviews: demo.restaurantReviews.filter((item) => lower(item.guest_email) === email),
       feedback: demo.photoRewardSubmissions.filter((item) => lower(item.guest_email) === email || clean(item.guest_id) === clean(profile.id)),
       notification_settings: guestNotificationSettings(preferences),
-      consent_records: consents
+      consent_records: consents,
+      legal_consent_history: legalConsentHistory(legalConsents, demo.legalDocuments),
+      security_event_history: securityEvents.map((item) => ({
+        event_type: item.event_type || item.action || "security_event",
+        created_at: item.created_at,
+        ip_masked: item.ip_masked || "",
+        user_agent_summary: item.user_agent_summary || ""
+      }))
     },
-    excluded: ["Password hashes", "Internal security metadata", "Other users' data", "Restaurant private data", "Admin-only notes"]
+    excluded: ["Password hashes", "Auth tokens", "Reset tokens", "Service keys", "Other users' data", "Restaurant private data", "Admin-only notes"]
+  };
+}
+
+function sanitizeExportRequest(row = {}, downloadUrl = "") {
+  if (!row) return null;
+  return {
+    id: row.id,
+    user_id: row.user_id || null,
+    guest_email: row.guest_email || null,
+    status: row.status || "requested",
+    requested_at: row.requested_at || row.created_at || null,
+    processing_started_at: row.processing_started_at || null,
+    completed_at: row.completed_at || null,
+    expires_at: row.expires_at || null,
+    download_count: row.download_count || 0,
+    error_code: row.error_code || null,
+    email_notification_status: row.email_notification_status || "not_attempted",
+    created_at: row.created_at || row.requested_at || null,
+    updated_at: row.updated_at || null,
+    download_url: downloadUrl || ""
+  };
+}
+
+function signedExportDownloadUrl(requestId, token) {
+  return `${PUBLIC_BASE_URL}/api/guest/privacy/export-download?request_id=${encodeURIComponent(requestId)}&token=${encodeURIComponent(token)}`;
+}
+
+function futureIso(ms) {
+  return new Date(Date.now() + ms).toISOString();
+}
+
+async function currentLegalDocuments(lang = "en") {
+  const language = normalizeLanguage(lang);
+  if (!supabaseConfigured) {
+    ensureDemo();
+    return demo.legalDocuments.filter((item) => [language, "en"].includes(normalizeLanguage(item.language)));
+  }
+  const rows = await supabaseFetch(`/rest/v1/legal_documents?select=*&status=eq.published&language=in.(${encodeURIComponent(`${language},en`)})&order=document_type.asc,language.asc,version.desc`, { service: true }).catch(() => []);
+  return rows || [];
+}
+
+async function currentLegalDocument(type, lang = "en") {
+  const docs = await currentLegalDocuments(lang);
+  const language = normalizeLanguage(lang);
+  return docs.find((item) => item.document_type === type && normalizeLanguage(item.language) === language && item.is_current !== false)
+    || docs.find((item) => item.document_type === type && normalizeLanguage(item.language) === "en" && item.is_current !== false)
+    || docs.find((item) => item.document_type === type)
+    || defaultLegalDocuments().find((item) => item.document_type === type && normalizeLanguage(item.language) === language);
+}
+
+async function insertUserLegalConsent({ profile, guest, documentType, accepted, source = "guest_account", headers = {}, lang = "en" }) {
+  if (!optionalLegalConsentTypes.has(documentType) && !mandatoryLegalConsentTypes.has(documentType)) {
+    const error = new Error("Unsupported legal document type.");
+    error.status = 400;
+    throw error;
+  }
+  if (mandatoryLegalConsentTypes.has(documentType) && accepted === false) {
+    const error = new Error("Mandatory consent cannot be withdrawn while the account remains active.");
+    error.status = 409;
+    error.code = "MANDATORY_CONSENT_REQUIRES_ACCOUNT_CLOSURE";
+    throw error;
+  }
+  const document = await currentLegalDocument(documentType, lang);
+  const timestamp = nowIso();
+  const row = {
+    user_id: profile.id,
+    guest_email: lower(profile.email || guest?.email),
+    document_type: documentType,
+    document_version: document?.version || (documentType === "privacy_policy" ? PRIVACY_POLICY_VERSION : LEGAL_DOCUMENT_VERSION),
+    language: normalizeLanguage(lang),
+    status: accepted ? "accepted" : "withdrawn",
+    accepted_at: accepted ? timestamp : null,
+    withdrawn_at: accepted ? null : timestamp,
+    ip_hash: hashEmailValue(clientIpAddress(headers)).slice(0, 64),
+    user_agent: summarizeUserAgent(headerValue(headers, "user-agent")),
+    source,
+    metadata: { guest_id: guest?.id || null },
+    created_at: timestamp,
+    updated_at: timestamp
+  };
+  if (!supabaseConfigured) {
+    ensureDemo();
+    const stored = { id: crypto.randomUUID(), ...row };
+    demo.userLegalConsents.unshift(stored);
+    return stored;
+  }
+  const rows = await supabaseFetch("/rest/v1/user_legal_consents?select=*", {
+    method: "POST",
+    service: true,
+    headers: { Prefer: "return=representation" },
+    body: row
+  });
+  return rows?.[0] || row;
+}
+
+async function buildSupabaseGuestDataExport(profile, guest, guestProfile, consents = [], legalConsents = []) {
+  const email = lower(profile.email || guest.email);
+  const [
+    reservations,
+    favorites,
+    notifications,
+    reviews,
+    feedback,
+    securityEvents,
+    docs
+  ] = await Promise.all([
+    supabaseFetch(`/rest/v1/reservation_overview?select=*&guest_email=eq.${encodeURIComponent(email)}&order=created_at.desc`, { service: true }).catch(() => []),
+    supabaseFetch(`/rest/v1/restaurant_followers?select=restaurant_id,notification_enabled,created_at,restaurants(name,cuisine_type,district)&guest_email=eq.${encodeURIComponent(email)}&order=created_at.desc`, { service: true }).catch(() => []),
+    supabaseFetch(`/rest/v1/guest_notifications?select=id,type,title,message,read_at,created_at,reservation_id,restaurant_id&guest_email=eq.${encodeURIComponent(email)}&order=created_at.desc`, { service: true }).catch(() => []),
+    supabaseFetch(`/rest/v1/restaurant_reviews?select=id,restaurant_id,food_rating,service_rating,ambience_rating,comment,status,created_at&guest_email=eq.${encodeURIComponent(email)}&order=created_at.desc`, { service: true }).catch(() => []),
+    supabaseFetch(`/rest/v1/photo_reward_submissions?select=id,restaurant_id,reservation_id,overall_rating,food_rating,service_rating,ambience_rating,short_review,moderation_status,created_at&guest_email=eq.${encodeURIComponent(email)}&order=created_at.desc`, { service: true }).catch(() => []),
+    supabaseFetch(`/rest/v1/guest_security_events?select=event_type,created_at,ip_masked,user_agent_summary,email_notification_status&user_id=eq.${encodeURIComponent(profile.id)}&order=created_at.desc`, { service: true }).catch(() => []),
+    currentLegalDocuments(guest.selected_language || profile.preferred_language || "en").catch(() => [])
+  ]);
+  const preferences = guestProfile?.preferences || {};
+  return {
+    generated: true,
+    status: "completed",
+    format: "json",
+    generated_at: nowIso(),
+    scope: guestDataExportScope(),
+    data: {
+      profile: {
+        id: guest.id,
+        email: guest.email,
+        first_name: guest.first_name,
+        last_name: guest.last_name,
+        phone: guest.phone,
+        city: guest.city,
+        region: guest.region,
+        postal_code: guest.postal_code,
+        selected_language: guest.selected_language
+      },
+      preferences,
+      favorites: (favorites || []).map((item) => ({
+        restaurant_id: item.restaurant_id,
+        restaurant_name: item.restaurants?.name || "",
+        cuisine: item.restaurants?.cuisine_type || "",
+        neighborhood: item.restaurants?.district || "",
+        notification_enabled: item.notification_enabled,
+        created_at: item.created_at
+      })),
+      reservations: guestReservationExportRows(reservations || []),
+      reviews: reviews || [],
+      feedback: feedback || [],
+      notification_settings: guestNotificationSettings(preferences),
+      notifications: notifications || [],
+      consent_records: consents || [],
+      legal_consent_history: legalConsentHistory(legalConsents || [], docs || []),
+      security_event_history: (securityEvents || []).map((item) => ({
+        event_type: item.event_type,
+        created_at: item.created_at,
+        ip_masked: item.ip_masked || "",
+        user_agent_summary: item.user_agent_summary || "",
+        email_notification_status: item.email_notification_status || ""
+      }))
+    },
+    excluded: ["Password hashes", "Auth tokens", "Reset tokens", "Service keys", "Other users' data", "Restaurant private data", "Admin-only notes"]
   };
 }
 
@@ -9161,6 +19164,330 @@ async function createGuestPrivacyRequest({ profile, guest, requestType, message,
   return rows?.[0] || payload;
 }
 
+async function guestLegalPayload({ profile, guest, guestProfile, consents = [], legalConsents = [], lang = "en" }) {
+  const docs = await currentLegalDocuments(lang);
+  const documents = legalSummaryDocuments({
+    legalConsents,
+    oldConsents: consents,
+    docs,
+    lang,
+    guestProfile
+  });
+  return {
+    documents,
+    history: legalConsentHistory(legalConsents, docs),
+    mandatory_withdrawal_requires_closure: true,
+    user_id: profile.id,
+    guest_id: guest.id
+  };
+}
+
+function activeDataExportRequest(rows = []) {
+  const now = Date.now();
+  return [...rows]
+    .filter((item) => ["requested", "processing", "completed"].includes(clean(item.status)))
+    .sort((a, b) => new Date(b.created_at || b.requested_at || 0) - new Date(a.created_at || a.requested_at || 0))
+    .find((item) => {
+      const requestedAt = new Date(item.requested_at || item.created_at || 0).getTime();
+      if (["requested", "processing"].includes(clean(item.status))) return true;
+      const expiresAt = new Date(item.expires_at || 0).getTime();
+      return Number.isFinite(requestedAt) && now - requestedAt < DATA_EXPORT_COOLDOWN_MS && (!expiresAt || expiresAt > now);
+    }) || null;
+}
+
+async function createGuestDataExport({ profile, guest, guestProfile, consents = [], legalConsents = [], headers = {} }) {
+  const email = lower(profile.email || guest.email);
+  const language = normalizeLanguage(guest.selected_language || profile.preferred_language || guestProfile?.preferences?.consents?.language || "en");
+  if (!supabaseConfigured) {
+    ensureDemo();
+    const existing = activeDataExportRequest(demo.dataExportRequests.filter((item) => clean(item.user_id) === clean(profile.id) || lower(item.guest_email) === email));
+    if (existing) {
+      const error = new Error("A data export is already pending or inside the request cooldown window.");
+      error.status = 429;
+      error.code = "DATA_EXPORT_COOLDOWN_ACTIVE";
+      error.request = sanitizeExportRequest(existing);
+      throw error;
+    }
+    const token = crypto.randomBytes(32).toString("base64url");
+    const requestedAt = nowIso();
+    const expiresAt = futureIso(DATA_EXPORT_LINK_TTL_MS);
+    const packagePayload = buildDemoGuestDataExport(profile, guest, guestProfile);
+    const row = {
+      id: crypto.randomUUID(),
+      user_id: profile.id,
+      guest_email: email,
+      status: "completed",
+      requested_at: requestedAt,
+      processing_started_at: requestedAt,
+      completed_at: nowIso(),
+      expires_at: expiresAt,
+      download_count: 0,
+      download_token_hash: hashEmailValue(token),
+      export_payload: packagePayload,
+      error_code: null,
+      email_notification_status: "not_attempted",
+      created_at: requestedAt,
+      updated_at: nowIso()
+    };
+    const downloadUrl = signedExportDownloadUrl(row.id, token);
+    let emailResult = null;
+    try {
+      emailResult = await sendDataExportReadyEmail({
+        email,
+        guestName: guest.full_name || profile.full_name || email,
+        firstName: guest.first_name || clean(guest.full_name || profile.full_name).split(/\s+/)[0],
+        lang: language,
+        userId: profile.id,
+        requestId: row.id,
+        downloadUrl,
+        expiresAt
+      });
+      row.email_notification_status = isEmailAccepted(emailResult) ? "accepted" : "failed";
+    } catch (error) {
+      row.email_notification_status = "failed";
+      logSafeServerEvent("data_export_ready_email_failed", {
+        user_hash: hashEmailValue(profile.id).slice(0, 16),
+        code: error.code || "EMAIL_SEND_EXCEPTION"
+      });
+    }
+    demo.dataExportRequests.unshift(row);
+    demo.privacyRequests.unshift({
+      id: crypto.randomUUID(),
+      guest_email: email,
+      request_type: "export",
+      status: "completed",
+      message: "Guest requested personal data export.",
+      created_at: requestedAt,
+      details: { data_export_request_id: row.id }
+    });
+    return {
+      request: sanitizeExportRequest(row, downloadUrl),
+      package: packagePayload,
+      emailResult
+    };
+  }
+
+  const existingRows = await supabaseFetch(`/rest/v1/data_export_requests?select=*&user_id=eq.${encodeURIComponent(profile.id)}&status=in.(requested,processing,completed)&order=created_at.desc&limit=5`, { service: true }).catch(() => []);
+  const existing = activeDataExportRequest(existingRows || []);
+  if (existing) {
+    const error = new Error("A data export is already pending or inside the request cooldown window.");
+    error.status = 429;
+    error.code = "DATA_EXPORT_COOLDOWN_ACTIVE";
+    error.request = sanitizeExportRequest(existing);
+    throw error;
+  }
+  const token = crypto.randomBytes(32).toString("base64url");
+  const requestedAt = nowIso();
+  const expiresAt = futureIso(DATA_EXPORT_LINK_TTL_MS);
+  const inserted = await supabaseFetch("/rest/v1/data_export_requests?select=*", {
+    method: "POST",
+    service: true,
+    headers: { Prefer: "return=representation" },
+    body: {
+      user_id: profile.id,
+      guest_email: email,
+      status: "processing",
+      requested_at: requestedAt,
+      processing_started_at: requestedAt,
+      expires_at: expiresAt,
+      download_token_hash: hashEmailValue(token),
+      email_notification_status: "not_attempted"
+    }
+  });
+  const row = inserted?.[0];
+  if (!row?.id) {
+    const error = new Error("Could not create data export request.");
+    error.status = 500;
+    error.code = "DATA_EXPORT_REQUEST_CREATE_FAILED";
+    throw error;
+  }
+  const downloadUrl = signedExportDownloadUrl(row.id, token);
+  try {
+    const packagePayload = await buildSupabaseGuestDataExport(profile, guest, guestProfile, consents, legalConsents);
+    const completedRows = await supabaseFetch(`/rest/v1/data_export_requests?id=eq.${encodeURIComponent(row.id)}&select=*`, {
+      method: "PATCH",
+      service: true,
+      headers: { Prefer: "return=representation" },
+      body: {
+        status: "completed",
+        completed_at: nowIso(),
+        export_payload: packagePayload,
+        updated_at: nowIso()
+      }
+    });
+    const completed = completedRows?.[0] || { ...row, status: "completed", export_payload: packagePayload, completed_at: nowIso(), expires_at: expiresAt };
+    let emailResult = null;
+    try {
+      emailResult = await sendDataExportReadyEmail({
+        email,
+        guestName: guest.full_name || profile.full_name || email,
+        firstName: guest.first_name || clean(guest.full_name || profile.full_name).split(/\s+/)[0],
+        lang: language,
+        userId: profile.id,
+        requestId: row.id,
+        downloadUrl,
+        expiresAt
+      });
+      await supabaseFetch(`/rest/v1/data_export_requests?id=eq.${encodeURIComponent(row.id)}`, {
+        method: "PATCH",
+        service: true,
+        body: {
+          email_notification_status: isEmailAccepted(emailResult) ? "accepted" : "failed",
+          updated_at: nowIso()
+        }
+      }).catch(() => null);
+    } catch (error) {
+      await supabaseFetch(`/rest/v1/data_export_requests?id=eq.${encodeURIComponent(row.id)}`, {
+        method: "PATCH",
+        service: true,
+        body: {
+          email_notification_status: "failed",
+          updated_at: nowIso()
+        }
+      }).catch(() => null);
+      logSafeServerEvent("data_export_ready_email_failed", {
+        user_hash: hashEmailValue(profile.id).slice(0, 16),
+        code: error.code || "EMAIL_SEND_EXCEPTION"
+      });
+    }
+    await createGuestPrivacyRequest({
+      profile,
+      guest,
+      requestType: "export",
+      message: "Guest requested personal data export.",
+      details: { data_export_request_id: row.id }
+    }).catch(() => null);
+    return {
+      request: sanitizeExportRequest({
+        ...completed,
+        email_notification_status: isEmailAccepted(emailResult) ? "accepted" : completed.email_notification_status || "failed"
+      }, downloadUrl),
+      package: packagePayload,
+      emailResult
+    };
+  } catch (error) {
+    await supabaseFetch(`/rest/v1/data_export_requests?id=eq.${encodeURIComponent(row.id)}`, {
+      method: "PATCH",
+      service: true,
+      body: {
+        status: "failed",
+        error_code: error.code || "DATA_EXPORT_GENERATION_FAILED",
+        updated_at: nowIso()
+      }
+    }).catch(() => null);
+    throw error;
+  }
+}
+
+async function cleanupExpiredDataExportsForUser(profile, email) {
+  const now = nowIso();
+  if (!supabaseConfigured) {
+    ensureDemo();
+    demo.dataExportRequests.forEach((item) => {
+      if ((clean(item.user_id) === clean(profile.id) || lower(item.guest_email) === lower(email))
+        && item.expires_at
+        && new Date(item.expires_at).getTime() < Date.now()
+        && item.status !== "expired") {
+        item.status = "expired";
+        item.download_token_hash = null;
+        item.export_payload = null;
+        item.updated_at = now;
+      }
+    });
+    return;
+  }
+  await supabaseFetch(`/rest/v1/data_export_requests?user_id=eq.${encodeURIComponent(profile.id)}&expires_at=lt.${encodeURIComponent(now)}&status=in.(requested,processing,completed)`, {
+    method: "PATCH",
+    service: true,
+    body: {
+      status: "expired",
+      download_token_hash: null,
+      export_payload: null,
+      updated_at: now
+    }
+  }).catch(() => null);
+}
+
+async function cleanupExpiredDataExports() {
+  const now = nowIso();
+  if (!supabaseConfigured) {
+    ensureDemo();
+    let cleaned = 0;
+    demo.dataExportRequests.forEach((item) => {
+      if (item.expires_at
+        && new Date(item.expires_at).getTime() < Date.now()
+        && ["requested", "processing", "completed"].includes(clean(item.status))) {
+        item.status = "expired";
+        item.download_token_hash = null;
+        item.export_payload = null;
+        item.updated_at = now;
+        cleaned += 1;
+      }
+    });
+    return cleaned;
+  }
+  const rows = await supabaseFetch(`/rest/v1/data_export_requests?expires_at=lt.${encodeURIComponent(now)}&status=in.(requested,processing,completed)&select=id`, {
+    method: "PATCH",
+    service: true,
+    headers: { Prefer: "return=representation" },
+    body: {
+      status: "expired",
+      download_token_hash: null,
+      export_payload: null,
+      updated_at: now
+    }
+  }).catch(() => []);
+  return Array.isArray(rows) ? rows.length : 0;
+}
+
+async function guestPrivacyExportDownload(method, query) {
+  if (method !== "GET") return json(405, { error: "Method not allowed." });
+  const requestId = clean(query.get("request_id") || query.get("id"));
+  const token = clean(query.get("token"));
+  if (!requestId || !token) return json(400, { error: "Export link is invalid or expired." });
+  const tokenHash = hashEmailValue(token);
+  let row = null;
+  if (!supabaseConfigured) {
+    ensureDemo();
+    row = demo.dataExportRequests.find((item) => item.id === requestId && item.download_token_hash === tokenHash);
+    if (!row) return json(404, { error: "Export link is invalid or expired." });
+    if (new Date(row.expires_at || 0).getTime() < Date.now()) {
+      row.status = "expired";
+      row.updated_at = nowIso();
+      return json(410, { error: "Export link has expired." });
+    }
+    if (row.status !== "completed" || !row.export_payload) return json(404, { error: "Export is not available." });
+    row.download_count = Number(row.download_count || 0) + 1;
+    row.updated_at = nowIso();
+    return json(200, row.export_payload, {
+      "content-disposition": `attachment; filename="smarttable-data-export-${requestId}.json"`
+    });
+  }
+  const rows = await supabaseFetch(`/rest/v1/data_export_requests?select=*&id=eq.${encodeURIComponent(requestId)}&download_token_hash=eq.${encodeURIComponent(tokenHash)}&limit=1`, { service: true }).catch(() => []);
+  row = rows?.[0];
+  if (!row) return json(404, { error: "Export link is invalid or expired." });
+  if (new Date(row.expires_at || 0).getTime() < Date.now()) {
+    await supabaseFetch(`/rest/v1/data_export_requests?id=eq.${encodeURIComponent(row.id)}`, {
+      method: "PATCH",
+      service: true,
+      body: { status: "expired", updated_at: nowIso() }
+    }).catch(() => null);
+    return json(410, { error: "Export link has expired." });
+  }
+  if (row.status !== "completed" || !row.export_payload) return json(404, { error: "Export is not available." });
+  await supabaseFetch(`/rest/v1/data_export_requests?id=eq.${encodeURIComponent(row.id)}`, {
+    method: "PATCH",
+    service: true,
+    body: {
+      download_count: Number(row.download_count || 0) + 1,
+      updated_at: nowIso()
+    }
+  }).catch(() => null);
+  return json(200, row.export_payload, {
+    "content-disposition": `attachment; filename="smarttable-data-export-${requestId}.json"`
+  });
+}
+
 async function guestPrivacy(method, body, headers) {
   const { profile, token } = await requireProfile(headers, ["guest"]);
   const email = lower(profile.email);
@@ -9170,14 +19497,27 @@ async function guestPrivacy(method, body, headers) {
     const guest = demoGuestForProfile(profile);
     if (!guest) return json(404, { error: "Guest profile not found." });
     const guestProfile = demoGuestProfileForGuest(guest);
+    await cleanupExpiredDataExportsForUser(profile, email);
     const requests = demo.privacyRequests.filter((item) => lower(item.guest_email) === email);
     const consents = demo.guestConsents.filter((item) => lower(item.guest_email) === email || clean(item.guest_id) === clean(guest.id));
+    const legalConsents = demo.userLegalConsents.filter((item) => lower(item.guest_email) === email || clean(item.user_id) === clean(profile.id));
+    const exportRequests = demo.dataExportRequests.filter((item) => lower(item.guest_email) === email || clean(item.user_id) === clean(profile.id));
     if (method === "GET") {
+      const legal = await guestLegalPayload({
+        profile,
+        guest,
+        guestProfile,
+        consents,
+        legalConsents,
+        lang: guest.selected_language || profile.preferred_language || "en"
+      });
       return json(200, {
         mode: "demo",
         consent: guestConsentSummary(guestProfile, consents),
+        legal,
         requests,
-        export_supported: false,
+        export_requests: exportRequests.map((item) => sanitizeExportRequest(item)),
+        export_supported: true,
         deletion_supported: true,
         export_scope: guestDataExportScope()
       });
@@ -9185,19 +19525,70 @@ async function guestPrivacy(method, body, headers) {
     if (method !== "POST") return json(405, { error: "Method not allowed." });
     const action = clean(body.action);
     if (action === "export") {
-      const request = await createGuestPrivacyRequest({
+      const result = await createGuestDataExport({
         profile,
         guest,
-        requestType: "export",
-        message: body.message || "Guest requested personal data export.",
-        details: { scope: guestDataExportScope() }
+        guestProfile,
+        consents,
+        legalConsents,
+        headers
       });
       return json(202, {
         mode: "demo",
-        request,
-        export: buildDemoGuestDataExport(profile, guest, guestProfile),
-        message: "Data export request received. No downloadable file has been generated yet."
+        request: result.request,
+        export: {
+          generated: true,
+          status: result.request.status,
+          format: "json",
+          download_url: result.request.download_url,
+          expires_at: result.request.expires_at,
+          excluded: result.package.excluded,
+          email_notification_status: result.request.email_notification_status
+        },
+        email_delivery: result.emailResult ? emailDeliverySummary([result.emailResult]) : null,
+        message: "Data export package generated. The secure download link expires automatically."
       });
+    }
+    if (action === "set_optional_consent") {
+      const documentType = clean(body.document_type);
+      if (!optionalLegalConsentTypes.has(documentType)) return json(400, { error: "Only optional consent can be updated this way." });
+      const accepted = boolValue(body.accepted);
+      const row = await insertUserLegalConsent({
+        profile,
+        guest,
+        documentType,
+        accepted,
+        source: "guest_account",
+        headers,
+        lang: guest.selected_language || profile.preferred_language || "en"
+      });
+      guestProfile.preferences ||= {};
+      guestProfile.preferences.consents ||= {};
+      if (documentType === "marketing_consent") {
+        guestProfile.preferences.consents.marketing = accepted;
+        guestProfile.preferences.consents.marketing_accepted_at = accepted ? row.accepted_at : null;
+        demo.guestConsents.unshift({
+          id: crypto.randomUUID(),
+          guest_id: guest.id,
+          guest_email: profile.email,
+          user_id: profile.id,
+          consent_type: "marketing",
+          status: accepted ? "granted" : "revoked",
+          source: "guest_account",
+          marketing_consent: accepted,
+          marketing_consent_timestamp: accepted ? row.accepted_at : null,
+          accepted_at: accepted ? row.accepted_at : null,
+          revoked_at: accepted ? null : row.withdrawn_at,
+          language: normalizeLanguage(profile.preferred_language || guest.selected_language),
+          created_at: nowIso()
+        });
+      }
+      if (documentType === "location_personalization_consent") {
+        guestProfile.preferences.consents.location_personalization = accepted;
+        guestProfile.preferences.consents.personalization = accepted;
+      }
+      guestProfile.updated_at = nowIso();
+      return json(200, { mode: "demo", consent: row });
     }
     if (action !== "delete_account") return json(400, { error: "Unsupported privacy action." });
     if (clean(body.confirmation_phrase) !== "DELETE MY ACCOUNT") return json(400, { error: "Confirmation phrase is required." });
@@ -9268,18 +19659,31 @@ async function guestPrivacy(method, body, headers) {
   const guests = await supabaseFetch(`/rest/v1/guests?select=*&user_id=eq.${encodeURIComponent(profile.id)}&limit=1`, { service: true });
   const guest = guests?.[0];
   if (!guest?.id) return json(404, { error: "Guest profile not found." });
-  const [guestProfiles, consents, requests] = await Promise.all([
+  await cleanupExpiredDataExportsForUser(profile, email);
+  const [guestProfiles, consents, requests, legalConsents, exportRequests] = await Promise.all([
     supabaseFetch(`/rest/v1/guest_profiles?select=*&guest_id=eq.${encodeURIComponent(guest.id)}&limit=1`, { service: true }).catch(() => []),
     supabaseFetch(`/rest/v1/guest_consents?select=*&guest_email=eq.${encodeURIComponent(email)}&order=created_at.desc`, { service: true }).catch(() => []),
-    supabaseFetch(`/rest/v1/privacy_requests?select=*&guest_email=eq.${encodeURIComponent(email)}&order=created_at.desc`, { service: true }).catch(() => [])
+    supabaseFetch(`/rest/v1/privacy_requests?select=*&guest_email=eq.${encodeURIComponent(email)}&order=created_at.desc`, { service: true }).catch(() => []),
+    supabaseFetch(`/rest/v1/user_legal_consents?select=*&or=(user_id.eq.${encodeURIComponent(profile.id)},guest_email.eq.${encodeURIComponent(email)})&order=created_at.desc`, { service: true }).catch(() => []),
+    supabaseFetch(`/rest/v1/data_export_requests?select=id,user_id,guest_email,status,requested_at,processing_started_at,completed_at,expires_at,download_count,error_code,email_notification_status,created_at,updated_at&user_id=eq.${encodeURIComponent(profile.id)}&order=created_at.desc`, { service: true }).catch(() => [])
   ]);
   const guestProfile = guestProfiles?.[0] || null;
   if (method === "GET") {
+    const legal = await guestLegalPayload({
+      profile,
+      guest,
+      guestProfile,
+      consents: consents || [],
+      legalConsents: legalConsents || [],
+      lang: guest.selected_language || profile.preferred_language || "en"
+    });
     return json(200, {
       mode: "supabase",
       consent: guestConsentSummary(guestProfile, consents || []),
+      legal,
       requests: requests || [],
-      export_supported: false,
+      export_requests: (exportRequests || []).map((item) => sanitizeExportRequest(item)),
+      export_supported: true,
       deletion_supported: true,
       export_scope: guestDataExportScope()
     });
@@ -9287,14 +19691,80 @@ async function guestPrivacy(method, body, headers) {
   if (method !== "POST") return json(405, { error: "Method not allowed." });
   const action = clean(body.action);
   if (action === "export") {
-    const request = await createGuestPrivacyRequest({
+    const result = await createGuestDataExport({
       profile,
       guest,
-      requestType: "export",
-      message: body.message || "Guest requested personal data export.",
-      details: { scope: guestDataExportScope() }
+      guestProfile,
+      consents: consents || [],
+      legalConsents: legalConsents || [],
+      headers
     });
-    return json(202, { mode: "supabase", request, export_supported: false, export_scope: guestDataExportScope(), message: "Data export request received. No downloadable file has been generated yet." });
+    return json(202, {
+      mode: "supabase",
+      request: result.request,
+      export: {
+        generated: true,
+        status: result.request.status,
+        format: "json",
+        download_url: result.request.download_url,
+        expires_at: result.request.expires_at,
+        excluded: result.package.excluded,
+        email_notification_status: result.request.email_notification_status
+      },
+      email_delivery: result.emailResult ? emailDeliverySummary([result.emailResult]) : null,
+      message: "Data export package generated. The secure download link expires automatically."
+    });
+  }
+  if (action === "set_optional_consent") {
+    const documentType = clean(body.document_type);
+    if (!optionalLegalConsentTypes.has(documentType)) return json(400, { error: "Only optional consent can be updated this way." });
+    const accepted = boolValue(body.accepted);
+    const row = await insertUserLegalConsent({
+      profile,
+      guest,
+      documentType,
+      accepted,
+      source: "guest_account",
+      headers,
+      lang: guest.selected_language || profile.preferred_language || "en"
+    });
+    if (guestProfile?.id) {
+      const preferences = { ...(guestProfile.preferences || {}) };
+      preferences.consents = { ...(preferences.consents || {}) };
+      if (documentType === "marketing_consent") {
+        preferences.consents.marketing = accepted;
+        preferences.consents.marketing_accepted_at = accepted ? row.accepted_at : null;
+      }
+      if (documentType === "location_personalization_consent") {
+        preferences.consents.location_personalization = accepted;
+        preferences.consents.personalization = accepted;
+      }
+      await supabaseFetch(`/rest/v1/guest_profiles?id=eq.${encodeURIComponent(guestProfile.id)}`, {
+        method: "PATCH",
+        service: true,
+        body: { preferences, consent: preferences.consents, updated_at: nowIso() }
+      }).catch(() => null);
+    }
+    if (documentType === "marketing_consent") {
+      await supabaseFetch("/rest/v1/guest_consents", {
+        method: "POST",
+        service: true,
+        body: {
+          guest_id: guest.id,
+          guest_email: profile.email,
+          user_id: profile.id,
+          consent_type: "marketing",
+          status: accepted ? "granted" : "revoked",
+          source: "guest_account",
+          marketing_consent: accepted,
+          marketing_consent_timestamp: accepted ? row.accepted_at : null,
+          accepted_at: accepted ? row.accepted_at : null,
+          revoked_at: accepted ? null : row.withdrawn_at,
+          language: normalizeLanguage(profile.preferred_language || guest.selected_language)
+        }
+      }).catch(() => null);
+    }
+    return json(200, { mode: "supabase", consent: row });
   }
   if (action !== "delete_account") return json(400, { error: "Unsupported privacy action." });
   if (clean(body.confirmation_phrase) !== "DELETE MY ACCOUNT") return json(400, { error: "Confirmation phrase is required." });
@@ -9379,27 +19849,116 @@ async function guestSecurity(method, body, headers) {
         body: { password: newPassword }
       });
     }
+    const eventDate = new Date();
+    const ip = clientIpAddress(headers);
+    const maskedIp = maskedIpAddress(ip);
+    const userAgentSummary = summarizeUserAgent(headerValue(headers, "user-agent"));
+    let passwordEmail = null;
+    let emailNotificationStatus = "not_attempted";
+    try {
+      passwordEmail = await sendPasswordChangedEmail({
+        email: profile.email,
+        guestName: profile.full_name || profile.email,
+        firstName: profile.first_name || clean(profile.full_name).split(/\s+/)[0],
+        lang: profile.preferred_language || "en",
+        userId: profile.id,
+        requestId: hashEmailValue(`${profile.id}:${eventDate.toISOString()}`).slice(0, 24),
+        localizedDateTime: localizedSecurityDateTime(eventDate, profile.preferred_language || "en"),
+        userAgentSummary,
+        maskedIp
+      });
+      emailNotificationStatus = isEmailAccepted(passwordEmail) ? "accepted" : "failed";
+      if (!isEmailAccepted(passwordEmail)) {
+        logSafeServerEvent("password_change_security_email_failed", {
+          user_hash: hashEmailValue(profile.id).slice(0, 16),
+          provider: passwordEmail?.provider || "resend",
+          error_code: passwordEmail?.errorCode || "EMAIL_SEND_FAILED"
+        });
+      }
+    } catch (error) {
+      emailNotificationStatus = "failed";
+      logSafeServerEvent("password_change_security_email_failed", {
+        user_hash: hashEmailValue(profile.id).slice(0, 16),
+        provider: "resend",
+        error_code: error.code || "EMAIL_SEND_EXCEPTION"
+      });
+    }
+    let securityEvent = null;
+    try {
+      securityEvent = await createGuestSecurityEvent({
+        profile,
+        eventType: "password_changed",
+        headers,
+        emailNotificationStatus,
+        metadata: {
+          email_log_id: passwordEmail?.emailLogId || passwordEmail?.email_log_id || null,
+          email_status: passwordEmail?.status || emailNotificationStatus,
+          email_error_code: passwordEmail?.errorCode || null
+        }
+      });
+    } catch (error) {
+      logSafeServerEvent("guest_security_event_failed", {
+        user_hash: hashEmailValue(profile.id).slice(0, 16),
+        event_type: "password_changed",
+        code: error.code || "SECURITY_EVENT_WRITE_FAILED"
+      });
+    }
     await createAuditLog({
       profile,
       action: "guest_password_changed",
       entityType: "auth",
       entityId: profile.id,
-      metadata: { message: "Guest changed password from account security settings." }
+      metadata: {
+        message: "Guest changed password from account security settings.",
+        email_notification_status: emailNotificationStatus,
+        security_event_logged: Boolean(securityEvent)
+      }
     });
-    return json(200, { mode: supabaseConfigured ? "supabase" : "demo", changed: true });
+    return json(200, {
+      mode: supabaseConfigured ? "supabase" : "demo",
+      changed: true,
+      email_notification_status: emailNotificationStatus,
+      security_event_logged: Boolean(securityEvent),
+      email_delivery: passwordEmail ? emailDeliverySummary([passwordEmail]) : null
+    });
   }
   if (action === "sign_out_all") {
     if (supabaseConfigured) {
-      await supabaseFetch("/auth/v1/logout?scope=global", { method: "POST", service: false, token }).catch(() => null);
+      await supabaseFetch("/auth/v1/logout?scope=global", { method: "POST", service: false, token });
+    }
+    let securityEvent = null;
+    try {
+      securityEvent = await createGuestSecurityEvent({
+        profile,
+        eventType: "all_sessions_revoked",
+        headers,
+        emailNotificationStatus: "not_applicable",
+        metadata: { provider_supported: supabaseConfigured }
+      });
+    } catch (error) {
+      logSafeServerEvent("guest_security_event_failed", {
+        user_hash: hashEmailValue(profile.id).slice(0, 16),
+        event_type: "all_sessions_revoked",
+        code: error.code || "SECURITY_EVENT_WRITE_FAILED"
+      });
     }
     await createAuditLog({
       profile,
       action: "guest_sign_out_all_sessions",
       entityType: "auth",
       entityId: profile.id,
-      metadata: { message: "Guest requested sign out of all sessions.", provider_supported: supabaseConfigured }
+      metadata: {
+        message: "Guest requested sign out of all sessions.",
+        provider_supported: supabaseConfigured,
+        security_event_logged: Boolean(securityEvent)
+      }
     });
-    return json(200, { mode: supabaseConfigured ? "supabase" : "demo", signed_out_all: supabaseConfigured, sign_out_current: true });
+    return json(200, {
+      mode: supabaseConfigured ? "supabase" : "demo",
+      signed_out_all: true,
+      sign_out_current: true,
+      security_event_logged: Boolean(securityEvent)
+    });
   }
   return json(400, { error: "Unsupported security action." });
 }
@@ -9415,19 +19974,14 @@ function demoGuestProfileForGuest(guest) {
 
 function guestProfileCompletion(guest = {}, guestProfile = {}) {
   const preferences = guestProfile?.preferences || {};
-  const checks = [
-    clean(guest.first_name || guest.full_name),
-    clean(guest.last_name || guest.full_name),
-    clean(guest.phone),
-    clean(guest.city || preferences.location?.city),
-    clean(guest.region || preferences.location?.region),
-    arrayFrom(guest.preferred_dining_areas || preferences.preferred_neighborhoods).length,
-    arrayFrom(preferences.cuisines).length,
-    arrayFrom(preferences.food_categories).length,
-    arrayFrom(preferences.dietary_needs).length,
-    arrayFrom(preferences.notification_preferences).length
+  const location = preferences.location || {};
+  const sections = [
+    Boolean(clean(guest.full_name || `${guest.first_name || ""} ${guest.last_name || ""}`) && clean(guest.email)),
+    Boolean(clean(guest.city || location.city) || clean(guest.region || location.region) || arrayFrom(guest.preferred_dining_areas || preferences.preferred_neighborhoods).length || numberOr(guest.max_travel_distance_miles || location.max_travel_distance_miles, 0)),
+    Boolean(arrayFrom(preferences.cuisines).length || arrayFrom(preferences.dietary_needs).length || arrayFrom(preferences.companions).length || clean(preferences.custom_cuisine) || clean(preferences.allergy_notes)),
+    Boolean(arrayFrom(preferences.notification_channels).length || arrayFrom(preferences.notification_preferences).length || clean(preferences.notification_frequency) || preferences.consents?.sms || preferences.consents?.marketing)
   ];
-  return Math.round((checks.filter(Boolean).length / checks.length) * 100);
+  return sections.reduce((total, completed) => total + (completed ? 25 : 0), 0);
 }
 
 function guestAccountOverview(profile, guest = {}, guestProfile = {}) {
@@ -9452,32 +20006,41 @@ function guestAccountOverview(profile, guest = {}, guestProfile = {}) {
 }
 
 function normalizeGuestAccountPatch(body = {}) {
+  const country = clean(body.country || body.country_code || "US").toUpperCase();
+  const travelDistanceUnit = ["miles", "kilometers"].includes(clean(body.travel_distance_unit).toLowerCase())
+    ? clean(body.travel_distance_unit).toLowerCase()
+    : country === "US" ? "miles" : "kilometers";
+  const travelDistanceValue = Math.max(0, numberOr(body.max_travel_distance_value || body.travel_distance_value || body.max_travel_distance_miles || body.travel_distance_miles, 0));
   const payload = {
     first_name: clean(body.first_name || body.firstName),
     last_name: clean(body.last_name || body.lastName),
     phone: clean(body.phone || body.phone_number),
+    country,
+    country_code: country,
     city: clean(body.city),
     region: clean(body.region || body.state),
+    state_region: clean(body.state_region || body.region || body.state),
+    city_normalized: clean(body.city_normalized || body.city),
     postal_code: clean(body.postal_code || body.zip),
     preferred_dining_areas: arrayFrom(body.preferred_dining_areas || body.preferred_neighborhoods),
-    max_travel_distance_miles: Math.max(0, numberOr(body.max_travel_distance_miles || body.travel_distance_miles, 0)),
+    max_travel_distance_value: travelDistanceValue,
+    travel_distance_unit: travelDistanceUnit,
+    max_travel_distance_miles: travelDistanceUnit === "kilometers" ? Math.round(travelDistanceValue * 0.621371 * 10) / 10 : travelDistanceValue,
     transportation_method: clean(body.transportation_method),
     selected_language: normalizeLanguage(body.selected_language || body.preferred_language || body.language)
   };
   payload.full_name = clean(`${payload.first_name} ${payload.last_name}`) || clean(body.full_name);
+  if (payload.preferred_dining_areas.some((item) => clean(item).toLowerCase() === "no preference")) {
+    payload.preferred_dining_areas = ["No preference"];
+  }
   return payload;
 }
 
 function validateGuestAccountPatch(payload) {
   if (!payload.first_name) return "First name is required.";
   if (!payload.last_name) return "Last name is required.";
-  if (!isValidSignupPhone(payload.phone)) return "Enter a valid phone number.";
-  if (!payload.city) return "City is required.";
-  if (!payload.region) return "State or region is required.";
-  if (!payload.postal_code) return "ZIP or postal code is required.";
-  if (!payload.preferred_dining_areas.length) return "Preferred dining areas are required.";
-  if (!payload.max_travel_distance_miles) return "Maximum travel distance is required.";
-  if (!payload.transportation_method) return "Transportation preference is required.";
+  if (payload.phone && !isValidSignupPhone(payload.phone)) return "Enter a valid phone number.";
+  if (payload.travel_distance_unit && !["miles", "kilometers"].includes(payload.travel_distance_unit)) return "Travel distance unit is invalid.";
   return "";
 }
 
@@ -9504,10 +20067,16 @@ async function guestAccount(method, body, headers) {
         last_name: payload.last_name,
         full_name: payload.full_name,
         phone: payload.phone,
+        country: payload.country,
+        country_code: payload.country_code,
         city: payload.city,
         region: payload.region,
+        state_region: payload.state_region,
+        city_normalized: payload.city_normalized,
         postal_code: payload.postal_code,
         preferred_dining_areas: payload.preferred_dining_areas,
+        max_travel_distance_value: payload.max_travel_distance_value,
+        travel_distance_unit: payload.travel_distance_unit,
         max_travel_distance_miles: payload.max_travel_distance_miles,
         transportation_method: payload.transportation_method,
         selected_language: payload.selected_language,
@@ -9525,7 +20094,13 @@ async function guestAccount(method, body, headers) {
           preferred_neighborhoods: payload.preferred_dining_areas,
           city: payload.city,
           region: payload.region,
+          country: payload.country,
+          country_code: payload.country_code,
+          state_region: payload.state_region,
+          city_normalized: payload.city_normalized,
           postal_code: payload.postal_code,
+          max_travel_distance_value: payload.max_travel_distance_value,
+          travel_distance_unit: payload.travel_distance_unit,
           max_travel_distance_miles: payload.max_travel_distance_miles,
           transportation_method: payload.transportation_method
         }, payload.selected_language);
@@ -9585,20 +20160,26 @@ async function guestAccount(method, body, headers) {
     method: "PATCH",
     service: true,
     headers: { Prefer: "return=representation" },
-    body: {
+    body: await filterSupabaseTablePayload("guests", {
       first_name: payload.first_name,
       last_name: payload.last_name,
       full_name: payload.full_name,
       phone: payload.phone,
+      country: payload.country,
+      country_code: payload.country_code,
       city: payload.city,
       region: payload.region,
+      state_region: payload.state_region,
+      city_normalized: payload.city_normalized,
       postal_code: payload.postal_code,
       preferred_dining_areas: payload.preferred_dining_areas,
+      max_travel_distance_value: payload.max_travel_distance_value,
+      travel_distance_unit: payload.travel_distance_unit,
       max_travel_distance_miles: payload.max_travel_distance_miles,
       transportation_method: payload.transportation_method,
       selected_language: payload.selected_language,
       updated_at: nowIso()
-    }
+    })
   });
   await supabaseFetch(`/rest/v1/profiles?id=eq.${encodeURIComponent(profile.id)}&select=*`, {
     method: "PATCH",
@@ -9613,9 +20194,15 @@ async function guestAccount(method, body, headers) {
   if (guestProfile?.id) {
     const preferences = normalizeGuestPreferencePatch(guestProfile.preferences || {}, {
       preferred_neighborhoods: payload.preferred_dining_areas,
+      country: payload.country,
+      country_code: payload.country_code,
       city: payload.city,
       region: payload.region,
+      state_region: payload.state_region,
+      city_normalized: payload.city_normalized,
       postal_code: payload.postal_code,
+      max_travel_distance_value: payload.max_travel_distance_value,
+      travel_distance_unit: payload.travel_distance_unit,
       max_travel_distance_miles: payload.max_travel_distance_miles,
       transportation_method: payload.transportation_method
     }, payload.selected_language);
@@ -9623,11 +20210,11 @@ async function guestAccount(method, body, headers) {
       method: "PATCH",
       service: true,
       headers: { Prefer: "return=representation" },
-      body: {
+      body: await filterSupabaseTablePayload("guest_profiles", {
         preferences,
         preferred_neighborhoods: payload.preferred_dining_areas,
         updated_at: nowIso()
-      }
+      })
     });
   }
   await createAuditLog({
@@ -9693,6 +20280,26 @@ async function guestReservations(method, body, headers) {
       const action = clean(body.action);
       const row = rows.find((item) => item.reservation_id === id);
       if (!row) return json(404, { error: "Reservation not found." });
+      if (stateChangingPostVisitActions.has(action)) {
+        let updated = row;
+        if (action === "cannot_attend" && canGuestCancelReservation(row)) {
+          updated = await updateReservationStatus(id, "cancelled", row.restaurant_id, {
+            cancelledByLabel: "Guest",
+            actorUserId: profile.id,
+            actorRole: profile.role
+          });
+        }
+        updated = await patchReservationVisitState(id, postVisitLifecyclePatch(action, "guest", updated || row));
+        await createPostVisitNotificationEvent(updated || row, `guest_${action}`, "in_app", { source: "guest_account" });
+        await createAuditLog({
+          profile,
+          action: `guest_post_visit_${action}`,
+          entityType: "reservation",
+          entityId: id,
+          metadata: { restaurant_id: row.restaurant_id, reservation_id: id, source: "guest_account" }
+        });
+        return json(200, { mode: "demo", reservation: updated });
+      }
       if (action !== "cancel") return json(400, { error: "Unsupported reservation action." });
       if (!canGuestCancelReservation(row)) return json(409, { error: "This reservation can no longer be cancelled online." });
       const updated = await updateReservationStatus(id, "cancelled", row.restaurant_id, {
@@ -9728,6 +20335,26 @@ async function guestReservations(method, body, headers) {
     const action = clean(body.action);
     const row = (rows || []).find((item) => item.reservation_id === id);
     if (!row) return json(404, { error: "Reservation not found." });
+    if (stateChangingPostVisitActions.has(action)) {
+      let updated = row;
+      if (action === "cannot_attend" && canGuestCancelReservation(row)) {
+        updated = await updateReservationStatus(id, "cancelled", row.restaurant_id, {
+          cancelledByLabel: "Guest",
+          actorUserId: profile.id,
+          actorRole: profile.role
+        });
+      }
+      updated = await patchReservationVisitState(id, postVisitLifecyclePatch(action, "guest", updated || row));
+      await createPostVisitNotificationEvent(updated || row, `guest_${action}`, "in_app", { source: "guest_account" });
+      await createAuditLog({
+        profile,
+        action: `guest_post_visit_${action}`,
+        entityType: "reservation",
+        entityId: id,
+        metadata: { restaurant_id: row.restaurant_id, reservation_id: id, source: "guest_account" }
+      });
+      return json(200, { mode: "supabase", reservation: updated });
+    }
     if (action !== "cancel") return json(400, { error: "Unsupported reservation action." });
     if (!canGuestCancelReservation(row)) return json(409, { error: "This reservation can no longer be cancelled online." });
     const updated = await updateReservationStatus(id, "cancelled", row.restaurant_id, {
@@ -9805,6 +20432,103 @@ async function guestFavorites(method, body, headers, query) {
   return json(405, { error: "Method not allowed." });
 }
 
+async function guestFoodFeedFavorites(method, body, headers, query) {
+  const { profile } = await requireProfile(headers, ["guest"]);
+  const videoId = clean(body.food_feed_video_id || body.video_id || query.get("food_feed_video_id") || query.get("video_id"));
+
+  if (!supabaseConfigured) {
+    ensureDemo();
+    if (method === "GET") {
+      return json(200, {
+        mode: "demo",
+        favorites: demo.foodFeedFavorites.filter((item) => item.guest_user_id === profile.id)
+      });
+    }
+    if (!videoId) return json(400, { error: "What to Eat item is required." });
+    if (method === "POST") {
+      let favorite = demo.foodFeedFavorites.find((item) => item.guest_user_id === profile.id && item.food_feed_video_id === videoId);
+      if (!favorite) {
+        favorite = { id: crypto.randomUUID(), guest_user_id: profile.id, food_feed_video_id: videoId, created_at: nowIso() };
+        demo.foodFeedFavorites.unshift(favorite);
+      }
+      return json(200, { mode: "demo", favorite });
+    }
+    if (method === "DELETE") {
+      demo.foodFeedFavorites = demo.foodFeedFavorites.filter((item) => !(item.guest_user_id === profile.id && item.food_feed_video_id === videoId));
+      return json(200, { mode: "demo", removed: true });
+    }
+    return json(405, { error: "Method not allowed." });
+  }
+
+  if (method === "GET") {
+    const favorites = await supabaseFetch(`/rest/v1/food_feed_favorites?select=id,food_feed_video_id,created_at&guest_user_id=eq.${encodeURIComponent(profile.id)}&order=created_at.desc`, { service: true });
+    const videoIds = [...new Set((favorites || []).map((item) => clean(item.food_feed_video_id)).filter(Boolean))];
+    if (!videoIds.length) return json(200, { mode: "supabase", favorites: [] });
+    const videos = await supabaseFetch(`/rest/v1/food_feed_videos?select=id,restaurant_id,title,caption,storage_path,media_type,mime_type,status,is_test_data&id=in.(${videoIds.join(",")})`, { service: true });
+    const restaurantIds = [...new Set((videos || []).map((item) => clean(item.restaurant_id)).filter(Boolean))];
+    const restaurants = restaurantIds.length
+      ? await supabaseFetch(`/rest/v1/restaurants?select=*&id=in.(${restaurantIds.join(",")})`, { service: true })
+      : [];
+    const videoById = new Map((videos || []).map((item) => [clean(item.id), item]));
+    const restaurantById = new Map((restaurants || []).map((item) => [clean(item.id), item]));
+    const result = await Promise.all((favorites || []).map(async (favorite) => {
+      const video = videoById.get(clean(favorite.food_feed_video_id));
+      if (!video || video.status !== "published" || video.is_test_data === true) return null;
+      const restaurantRow = restaurantById.get(clean(video.restaurant_id));
+      if (!restaurantRow) return null;
+      const restaurantStatus = lower(restaurantRow.status);
+      const lifecycleStatus = lower(restaurantRow.lifecycle_status || "active");
+      if (!["active", "approved"].includes(restaurantStatus)
+        || lifecycleStatus !== "active"
+        || restaurantRow.visible_on_guest_site === false
+        || restaurantRow.is_test_data === true
+        || restaurantRow.is_test_restaurant === true) return null;
+      const mediaUrl = await signedFoodFeedMediaUrl(video.storage_path);
+      return {
+        ...favorite,
+        video: {
+          id: video.id,
+          title: video.title,
+          caption: video.caption || "",
+          media_type: video.media_type || (clean(video.mime_type).startsWith("image/") ? "image" : "video"),
+          mime_type: video.mime_type,
+          media_url: mediaUrl,
+          restaurant: publicFoodFeedRestaurant(restaurantRow)
+        }
+      };
+    }));
+    return json(200, { mode: "supabase", favorites: result.filter(Boolean) });
+  }
+
+  if (!videoId) return json(400, { error: "What to Eat item is required." });
+  if (method === "POST") {
+    const videos = await supabaseFetch(`/rest/v1/food_feed_videos?select=id,restaurant_id,status,is_test_data&id=eq.${encodeURIComponent(videoId)}&limit=1`, { service: true });
+    const video = videos?.[0];
+    if (!video || video.status !== "published" || video.is_test_data === true) return json(404, { error: "What to Eat item not found." });
+    const restaurants = await supabaseFetch(`/rest/v1/restaurants?select=*&id=eq.${encodeURIComponent(video.restaurant_id)}&limit=1`, { service: true });
+    const restaurant = restaurants?.[0];
+    const restaurantStatus = lower(restaurant?.status);
+    const lifecycleStatus = lower(restaurant?.lifecycle_status || "active");
+    if (!restaurant || !["active", "approved"].includes(restaurantStatus)
+      || lifecycleStatus !== "active"
+      || restaurant.visible_on_guest_site === false
+      || restaurant.is_test_data === true
+      || restaurant.is_test_restaurant === true) return json(404, { error: "What to Eat item not found." });
+    const rows = await supabaseFetch("/rest/v1/food_feed_favorites?on_conflict=guest_user_id,food_feed_video_id&select=*", {
+      method: "POST",
+      service: true,
+      headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+      body: { guest_user_id: profile.id, food_feed_video_id: videoId }
+    });
+    return json(200, { mode: "supabase", favorite: rows?.[0] });
+  }
+  if (method === "DELETE") {
+    await supabaseFetch(`/rest/v1/food_feed_favorites?guest_user_id=eq.${encodeURIComponent(profile.id)}&food_feed_video_id=eq.${encodeURIComponent(videoId)}`, { method: "DELETE", service: true });
+    return json(200, { mode: "supabase", removed: true });
+  }
+  return json(405, { error: "Method not allowed." });
+}
+
 async function guestPreferences(method, body, headers) {
   const { profile } = await requireProfile(headers, ["guest"]);
 
@@ -9840,6 +20564,21 @@ async function guestPreferences(method, body, headers) {
       updated_at: nowIso()
     });
     if (body.marketing_consent !== undefined) {
+      await insertUserLegalConsent({
+        profile,
+        guest,
+        documentType: "marketing_consent",
+        accepted: boolValue(body.marketing_consent),
+        source: "guest_preferences",
+        headers: {},
+        lang: normalizeLanguage(body.preferred_language || profile.preferred_language)
+      }).catch((error) => {
+        logSafeServerEvent("legal_consent_event_failed", {
+          user_hash: hashEmailValue(profile.id).slice(0, 16),
+          document_type: "marketing_consent",
+          code: error.code || "LEGAL_CONSENT_WRITE_FAILED"
+        });
+      });
       demo.guestConsents.unshift({
         id: crypto.randomUUID(),
         guest_id: guest.id,
@@ -9855,6 +20594,11 @@ async function guestPreferences(method, body, headers) {
         language: normalizeLanguage(body.preferred_language || profile.preferred_language),
         created_at: nowIso()
       });
+      await updateCommunicationPreferencesForProfile(profile, {
+        marketing_email_enabled: boolValue(body.marketing_consent),
+        preferred_language: normalizeLanguage(body.preferred_language || profile.preferred_language),
+        source: "guest_preferences"
+      }, headers).catch(() => null);
     }
     return json(200, { mode: "demo", profile: guestProfile });
   }
@@ -9888,16 +20632,31 @@ async function guestPreferences(method, body, headers) {
     method: "PATCH",
     service: true,
     headers: { Prefer: "return=representation" },
-    body: {
+    body: await filterSupabaseTablePayload("guest_profiles", {
       preferences,
       dietary_restrictions: preferences.dietary_needs,
       favorite_cuisines: preferences.cuisines,
       preferred_neighborhoods: preferences.preferred_neighborhoods,
       ...guestPreferenceColumns(preferences),
       consent: preferences.consents
-    }
+    })
   });
   if (body.marketing_consent !== undefined) {
+    await insertUserLegalConsent({
+      profile,
+      guest,
+      documentType: "marketing_consent",
+      accepted: boolValue(body.marketing_consent),
+      source: "guest_preferences",
+      headers: {},
+      lang: normalizeLanguage(body.preferred_language || profile.preferred_language)
+    }).catch((error) => {
+      logSafeServerEvent("legal_consent_event_failed", {
+        user_hash: hashEmailValue(profile.id).slice(0, 16),
+        document_type: "marketing_consent",
+        code: error.code || "LEGAL_CONSENT_WRITE_FAILED"
+      });
+    });
     await supabaseFetch("/rest/v1/guest_consents", {
       method: "POST",
       service: true,
@@ -9915,6 +20674,11 @@ async function guestPreferences(method, body, headers) {
         language: normalizeLanguage(body.preferred_language || profile.preferred_language)
       }
     });
+    await updateCommunicationPreferencesForProfile(profile, {
+      marketing_email_enabled: boolValue(body.marketing_consent),
+      preferred_language: normalizeLanguage(body.preferred_language || profile.preferred_language),
+      source: "guest_preferences"
+    }, headers);
   }
   return json(200, { mode: "supabase", profile: updatedRows?.[0] });
 }
@@ -9944,13 +20708,17 @@ function emailProviderDiagnostics() {
   const replyTo = parseSenderAddress(EMAIL_REPLY_TO);
   return {
     provider: "resend",
+    environment: RUNTIME_ENVIRONMENT,
     mode: emailService.configured ? "external_provider_configured" : "not_configured",
     can_send_real_email: emailService.configured,
     delivery_status_limit: RESEND_WEBHOOK_SECRET ? "provider_webhook_can_update_delivery_events" : "provider_acceptance_only_until_webhook_secret_is_configured",
     sender: {
       name: sender.name || "SmartTable",
       email: sender.email,
-      configured: Boolean(sender.email)
+      configured: Boolean(sender.email),
+      expected_name: EXPECTED_TRANSACTIONAL_SENDER_NAME,
+      expected_email: EXPECTED_TRANSACTIONAL_SENDER_EMAIL,
+      matches_expected_sender: sender.email === EXPECTED_TRANSACTIONAL_SENDER_EMAIL && (sender.name || EXPECTED_TRANSACTIONAL_SENDER_NAME) === EXPECTED_TRANSACTIONAL_SENDER_NAME
     },
     reply_to: {
       email: replyTo.email || "",
@@ -9961,14 +20729,29 @@ function emailProviderDiagnostics() {
       production_endpoint: "https://smarttablenyc.com/api/webhooks/resend",
       configured: Boolean(RESEND_WEBHOOK_SECRET),
       signature_verification: RESEND_WEBHOOK_SECRET ? "enabled" : "disabled_until_RESEND_WEBHOOK_SECRET_is_set",
-      required_events: ["email.sent", "email.delivered", "email.bounced", "email.failed", "email.complained"]
+      required_events: ["email.sent", "email.delivered", "email.delivery_delayed", "email.bounced", "email.failed", "email.complained"]
+    },
+    supabase_auth_email: {
+      provider: "supabase_auth",
+      transport_required: "custom_smtp",
+      default_supabase_sender_allowed: false,
+      expected_from_name: EXPECTED_TRANSACTIONAL_SENDER_NAME,
+      expected_sender_email: EXPECTED_TRANSACTIONAL_SENDER_EMAIL,
+      configured_outside_application: true,
+      verification_source: "Supabase Auth SMTP settings and auth logs."
     },
     required_environment: {
       RESEND_API_KEY: Boolean(RESEND_API_KEY),
       EMAIL_FROM: Boolean(EMAIL_FROM),
       EMAIL_REPLY_TO: Boolean(EMAIL_REPLY_TO),
       PUBLIC_BASE_URL: Boolean(PUBLIC_BASE_URL),
-      RESEND_WEBHOOK_SECRET: Boolean(RESEND_WEBHOOK_SECRET)
+      RESEND_WEBHOOK_SECRET: Boolean(RESEND_WEBHOOK_SECRET),
+      EMAIL_RECIPIENT_ALLOWLIST: Boolean(EMAIL_RECIPIENT_ALLOWLIST.length)
+    },
+    non_production_recipient_safety: {
+      enabled: emailService.nonProductionRecipientRestrictionEnabled,
+      allowlist_configured: emailService.recipientAllowlistConfigured,
+      allowlist_count: EMAIL_RECIPIENT_ALLOWLIST.length
     },
     dns_readiness: {
       verified_sender_or_domain_required: true,
@@ -10003,37 +20786,55 @@ function restaurantEmailDiagnostics(restaurant = {}) {
   };
 }
 
-async function listEmailQueueRows({ limit = 25, onlyDue = false } = {}) {
+async function listEmailQueueRows({ limit = 25, onlyDue = false, reservationId = "", restaurantId = "" } = {}) {
   const cappedLimit = Math.min(Math.max(1, Number(limit || 25)), 250);
   const now = nowIso();
+  const reservationFilter = clean(reservationId);
+  const restaurantFilter = clean(restaurantId);
   if (!supabaseConfigured) {
     ensureDemo();
     return [...(demo.emailQueue || [])]
       .filter((item) => !onlyDue || (["pending", "queued"].includes(normalizeEmailQueueStatus(item.status)) && (!item.next_attempt_at || item.next_attempt_at <= now)))
+      .filter((item) => !reservationFilter || clean(item.reservation_id) === reservationFilter)
+      .filter((item) => !restaurantFilter || clean(item.restaurant_id) === restaurantFilter)
       .sort((a, b) => onlyDue
         ? new Date(a.next_attempt_at || a.created_at || 0) - new Date(b.next_attempt_at || b.created_at || 0)
         : new Date(b.created_at || b.updated_at || 0) - new Date(a.created_at || a.updated_at || 0))
       .slice(0, cappedLimit);
   }
+  const extraFilters = [
+    reservationFilter ? `reservation_id=eq.${encodeURIComponent(reservationFilter)}` : "",
+    restaurantFilter ? `restaurant_id=eq.${encodeURIComponent(restaurantFilter)}` : ""
+  ].filter(Boolean).join("&");
+  const filterSuffix = extraFilters ? `&${extraFilters}` : "";
   const path = onlyDue
-    ? `/rest/v1/email_queue?select=*&status=in.(pending,queued)&next_attempt_at=lte.${encodeURIComponent(now)}&order=next_attempt_at.asc&limit=${cappedLimit}`
-    : `/rest/v1/email_queue?select=*&order=created_at.desc&limit=${cappedLimit}`;
+    ? `/rest/v1/email_queue?select=*&status=in.(pending,queued)&next_attempt_at=lte.${encodeURIComponent(now)}${filterSuffix}&order=next_attempt_at.asc&limit=${cappedLimit}`
+    : `/rest/v1/email_queue?select=*${filterSuffix}&order=created_at.desc&limit=${cappedLimit}`;
   return await supabaseFetch(path, { service: true }).catch((error) => {
     console.error("[email-queue] Queue list failed:", error.message);
     return [];
   });
 }
 
-async function listEmailLogRows({ limit = 25 } = {}) {
+async function listEmailLogRows({ limit = 25, reservationId = "", restaurantId = "" } = {}) {
   const cappedLimit = Math.min(Math.max(1, Number(limit || 25)), 250);
+  const reservationFilter = clean(reservationId);
+  const restaurantFilter = clean(restaurantId);
   if (!supabaseConfigured) {
     ensureDemo();
     return (demo.emailLogs || [])
       .slice()
+      .filter((item) => !reservationFilter || clean(item.reservation_id) === reservationFilter)
+      .filter((item) => !restaurantFilter || clean(item.restaurant_id) === restaurantFilter)
       .sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0))
       .slice(0, cappedLimit);
   }
-  return await supabaseFetch(`/rest/v1/email_logs?select=*&order=created_at.desc&limit=${cappedLimit}`, { service: true }).catch((error) => {
+  const extraFilters = [
+    reservationFilter ? `reservation_id=eq.${encodeURIComponent(reservationFilter)}` : "",
+    restaurantFilter ? `restaurant_id=eq.${encodeURIComponent(restaurantFilter)}` : ""
+  ].filter(Boolean).join("&");
+  const filterSuffix = extraFilters ? `&${extraFilters}` : "";
+  return await supabaseFetch(`/rest/v1/email_logs?select=*${filterSuffix}&order=created_at.desc&limit=${cappedLimit}`, { service: true }).catch((error) => {
     console.error("[email-logs] Log list failed:", error.message);
     return [];
   });
@@ -10118,7 +20919,7 @@ async function processDueEmailQueue({ limit = 10, id = "", idempotencyKey = "" }
   const rows = single ? [single] : await listEmailQueueRows({ limit, onlyDue: true });
   const processed = [];
   for (const queueRecord of rows) {
-    if (!queueRecord || ["sent", "delivered", "bounced", "failed", "complained", "cancelled"].includes(normalizeEmailQueueStatus(queueRecord.status))) {
+    if (!queueRecord || ["sending", "sent", "delayed", "delivered", "bounced", "failed", "complained", "cancelled"].includes(normalizeEmailQueueStatus(queueRecord.status))) {
       continue;
     }
     const currentLog = await findEmailDeliveryLog(queueRecord.idempotency_key);
@@ -10165,8 +20966,10 @@ async function adminEmailDiagnostics(method, headers, query = new URLSearchParam
   if (method !== "GET") return json(405, { error: "Method not allowed." });
   const filters = parseEmailDiagnosticFilters(query);
   const fetchLimit = Math.min(Math.max(filters.limit * 4, 100), 250);
-  const allLogs = await listEmailLogRows({ limit: fetchLimit });
-  const allQueue = await listEmailQueueRows({ limit: fetchLimit });
+  const directReservationId = looksLikeUuid(filters.reservation) ? filters.reservation : "";
+  const directRestaurantId = looksLikeUuid(filters.restaurant) ? filters.restaurant : "";
+  const allLogs = await listEmailLogRows({ limit: fetchLimit, reservationId: directReservationId, restaurantId: directRestaurantId });
+  const allQueue = await listEmailQueueRows({ limit: fetchLimit, reservationId: directReservationId, restaurantId: directRestaurantId });
   const reservationRefs = await emailReservationReferenceMap([...allLogs, ...allQueue]);
   const linked = linkEmailDiagnostics(allLogs, allQueue, reservationRefs);
   const recentLogs = linked.logs
@@ -10210,7 +21013,9 @@ async function adminEmailQueue(method, body, headers, query) {
   if (method === "GET") {
     const filters = parseEmailDiagnosticFilters(query);
     const fetchLimit = Math.min(Math.max(filters.limit * 4, 100), 250);
-    const allQueue = await listEmailQueueRows({ limit: fetchLimit });
+    const directReservationId = looksLikeUuid(filters.reservation) ? filters.reservation : "";
+    const directRestaurantId = looksLikeUuid(filters.restaurant) ? filters.restaurant : "";
+    const allQueue = await listEmailQueueRows({ limit: fetchLimit, reservationId: directReservationId, restaurantId: directRestaurantId });
     const reservationRefs = await emailReservationReferenceMap(allQueue);
     const linked = linkEmailDiagnostics([], allQueue, reservationRefs);
     const queue = linked.queue
@@ -10250,6 +21055,9 @@ async function adminEmailQueue(method, body, headers, query) {
     });
     const processed = await processDueEmailQueue({ id: retryable?.id || queueRecord.id });
     return json(200, { processed });
+  }
+  if (action === "resend_reservation_email") {
+    return await adminResendReservationEmail(body, profile);
   }
   if (action === "send_test") {
     const recipient = lower(body.to || EMAIL_REPLY_TO);
@@ -10295,17 +21103,29 @@ async function emailProviderWebhook(method, body, headers) {
   delete payload.__rawBody;
   const data = payload.data || payload.email || payload;
   const eventType = clean(payload.type || payload.event || data.event || data.type);
-  const eventId = clean(payload.id || payload.event_id || headerValue(headers, "svix-id") || `${eventType}:${data.id || data.message_id || Date.now()}`);
-  const providerMessageId = clean(data.id || data.email_id || data.message_id || data.messageId || payload.message_id);
+  const eventId = clean(headerValue(headers, "svix-id") || payload.id || payload.event_id || `${eventType}:${data.email_id || data.id || data.message_id || Date.now()}`);
+  const providerMessageId = clean(data.email_id || data.id || data.message_id || data.messageId || payload.message_id);
   const status = mapProviderEmailEventStatus(eventType, data);
+  const eventTimestamp = providerEventTimestamp(payload, data);
   const event = {
     event_id: eventId,
     event_type: eventType,
     provider_message_id: providerMessageId,
-    status
+    status,
+    event_timestamp: eventTimestamp,
+    recipient: Array.isArray(data.to) ? data.to.join(",") : clean(data.to || data.recipient),
+    sanitized_error: sanitizeProviderEventDetails(data)
   };
   const updated = await updateEmailLogFromProviderEvent(event);
   const queue = await updateEmailQueueFromProviderEvent(event);
+  logSafeServerEvent("resend_webhook_processed", {
+    event_type: eventType,
+    status,
+    provider_message_id: providerMessageId ? `${providerMessageId.slice(0, 8)}...` : "",
+    email_log_id: updated.email_log_id || "",
+    email_queue_id: queue.email_queue_id || "",
+    duplicate: updated.reason === "WEBHOOK_EVENT_ALREADY_PROCESSED"
+  });
   return json(200, {
     ok: true,
     provider: "resend",
@@ -10433,20 +21253,80 @@ async function aiRoutePlan(method, body, headers) {
   return json(201, { mode: "supabase", plan: { ...plan, ...(rows?.[0] || {}) } });
 }
 
-async function aiConsumptionSignUpload(method, body) {
+const MAX_CONSUMPTION_IMAGE_BYTES = 5 * 1024 * 1024;
+const CONSUMPTION_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
+
+function assertConsumptionUploadEligibility(reservation = {}) {
+  const reservationStatus = lower(reservation.reservation_status || reservation.status);
+  const arrivalStatus = lower(reservation.arrival_status);
+  const visitStatus = lower(reservation.visit_status);
+  if (["cancelled", "canceled", "declined", "rejected", "no_show", "expired"].includes(reservationStatus)
+    || arrivalStatus === "no_show" || visitStatus === "no_show" || visitStatus === "cancelled") {
+    const error = new Error("This reservation is not eligible for a dining photo reward.");
+    error.status = 409;
+    throw error;
+  }
+  const completed = visitStatus === "completed" || Boolean(reservation.visit_completed_at) || reservationStatus === "completed";
+  const attended = arrivalStatus === "arrived"
+    || ["checked_in", "in_progress", "completed"].includes(visitStatus)
+    || Boolean(reservation.arrival_confirmed_at)
+    || Boolean(reservation.visit_completed_at);
+  if (!completed || !attended) {
+    const error = new Error("Complete and confirm attendance for this visit before uploading a dining photo.");
+    error.status = 409;
+    throw error;
+  }
+}
+
+async function existingConsumptionUpload(reservationId = "") {
+  const id = clean(reservationId);
+  if (!id) return null;
+  if (!supabaseConfigured) {
+    ensureDemo();
+    return demo.consumptionUploads.find((item) => clean(item.reservation_id) === id) || null;
+  }
+  const rows = await supabaseFetch(`/rest/v1/dining_consumption_uploads?select=id&reservation_id=eq.${encodeURIComponent(id)}&limit=1`, { service: true });
+  return rows?.[0] || null;
+}
+
+function validatedConsumptionRating(value, field, { halfSteps = false } = {}) {
+  const rating = Number(value);
+  const validStep = halfSteps ? Number.isInteger(rating * 2) : Number.isInteger(rating);
+  if (!Number.isFinite(rating) || rating < 1 || rating > 5 || !validStep) {
+    const error = new Error(`${field} must be between 1 and 5.`);
+    error.status = 400;
+    throw error;
+  }
+  return rating;
+}
+
+function consumptionPublicImageUrl(storagePath = "") {
+  const encodedPath = clean(storagePath).split("/").map((segment) => encodeURIComponent(segment)).join("/");
+  return `${SUPABASE_URL}/storage/v1/object/public/${encodeURIComponent(SUPABASE_STORAGE_BUCKET)}/${encodedPath}`;
+}
+
+async function aiConsumptionSignUpload(method, body, headers) {
   if (method !== "POST") return json(405, { error: "Method not allowed." });
+  const reservationId = clean(body.reservation_id);
+  const { profile, row: reservation } = await authenticatedGuestReservationRow(headers, reservationId);
+  assertConsumptionUploadEligibility(reservation);
+  if (await existingConsumptionUpload(reservationId)) return json(409, { error: "A dining photo reward already exists for this reservation." });
   const contentType = clean(body.content_type || body.contentType || "image/jpeg");
-  if (!["image/jpeg", "image/png", "image/webp"].includes(contentType)) return json(400, { error: "Only JPG, PNG, and WebP images are allowed." });
-  const profileKey = safeFileName(aiProfileKey(body.profile_key));
+  if (!CONSUMPTION_IMAGE_TYPES.has(contentType)) return json(400, { error: "Only JPG, PNG, and WebP images are allowed." });
+  const fileSize = Number(body.file_size);
+  if (!Number.isInteger(fileSize) || fileSize < 1 || fileSize > MAX_CONSUMPTION_IMAGE_BYTES) {
+    return json(400, { error: "The image must be no larger than 5 MB." });
+  }
+  const profileKey = safeFileName(profile.id || profile.email);
   const filename = safeFileName(body.filename || "dining-photo.jpg");
-  const path = `guest-consumption/${profileKey}/${crypto.randomUUID()}-${filename}`;
+  const path = `guest-consumption/${profileKey}/${safeFileName(reservationId)}/${crypto.randomUUID()}-${filename}`;
 
   if (!supabaseConfigured) {
     return json(200, {
       mode: "demo",
       bucket: SUPABASE_STORAGE_BUCKET,
       path,
-      public_url: body.preview_url || "/assets/restaurant-hero.png",
+      storage_path: path,
       message: "Demo mode records metadata. Configure Supabase Storage for real guest photo uploads."
     });
   }
@@ -10458,7 +21338,7 @@ async function aiConsumptionSignUpload(method, body) {
       authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
       "content-type": "application/json"
     },
-    body: JSON.stringify({ upsert: true })
+    body: JSON.stringify({ upsert: false })
   });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
@@ -10471,8 +21351,8 @@ async function aiConsumptionSignUpload(method, body) {
     mode: "supabase",
     bucket: SUPABASE_STORAGE_BUCKET,
     path,
-    upload_url: signedUrl?.startsWith("http") ? signedUrl : `${SUPABASE_URL}${signedUrl || ""}`,
-    public_url: `${SUPABASE_URL}/storage/v1/object/public/${SUPABASE_STORAGE_BUCKET}/${path}`
+    storage_path: path,
+    upload_url: signedUrl?.startsWith("http") ? signedUrl : `${SUPABASE_URL}${signedUrl || ""}`
   });
 }
 
@@ -10493,40 +21373,58 @@ async function aiConsumptionUploads(method, body, headers, query) {
   }
   if (method !== "POST") return json(405, { error: "Method not allowed." });
 
-  const restaurantId = clean(body.restaurant_id);
-  const profileKey = aiProfileKey(body.profile_key || body.guest_email);
-  if (!restaurantId) return json(400, { error: "Restaurant is required." });
+  const reservationId = clean(body.reservation_id);
+  const { profile, row: reservation } = await authenticatedGuestReservationRow(headers, reservationId);
+  assertConsumptionUploadEligibility(reservation);
+  if (await existingConsumptionUpload(reservationId)) return json(409, { error: "A dining photo reward already exists for this reservation." });
+  const restaurantId = clean(reservation.restaurant_id);
+  const profileKey = aiProfileKey(profile.id || profile.email);
+  if (!restaurantId) return json(409, { error: "The reservation is not assigned to a restaurant." });
   const restaurant = !supabaseConfigured
     ? (ensureDemo(), demo.restaurants.find((item) => item.id === restaurantId && item.status === "approved"))
     : (await supabaseFetch(`/rest/v1/restaurants?select=*&id=eq.${encodeURIComponent(restaurantId)}&limit=1`, { service: true }))?.[0];
   if (!restaurant) return json(404, { error: "Restaurant not found." });
+  const expectedStoragePrefix = `guest-consumption/${safeFileName(profile.id || profile.email)}/${safeFileName(reservationId)}/`;
+  const storagePath = clean(body.storage_path);
+  if (!storagePath || storagePath.includes("..") || !storagePath.startsWith(expectedStoragePrefix)) {
+    return json(400, { error: "The uploaded image does not belong to this reservation." });
+  }
   const analysis = analyzeConsumptionSignals(body, restaurant);
-  const points = loyaltyForUpload(body);
-  const reservationId = nullableClean(body.reservation_id || body.booking_id || body.bookingId);
-  const overallRating = body.overall_rating === "" || body.overall_rating === undefined ? (body.rating === "" || body.rating === undefined ? null : numberOr(body.rating, null)) : numberOr(body.overall_rating, null);
+  const points = loyaltyForUpload({ ...body, image_url: storagePath });
+  const overallRating = validatedConsumptionRating(body.overall_rating ?? body.rating, "Overall rating", { halfSteps: true });
+  const foodRating = validatedConsumptionRating(body.food_rating, "Food rating");
+  const serviceRating = validatedConsumptionRating(body.service_rating, "Service rating");
+  const ambienceRating = validatedConsumptionRating(body.ambience_rating, "Ambience rating");
+  const mediaType = clean(body.media_type || "food");
+  if (!["food", "drink", "dessert", "menu"].includes(mediaType)) return json(400, { error: "Invalid photo type." });
+  const wouldRecommend = nullableClean(body.would_recommend);
+  const wouldReturn = nullableClean(body.would_return);
+  if (wouldRecommend && !["yes", "not_sure", "no"].includes(wouldRecommend)) return json(400, { error: "Invalid recommendation value." });
+  if (wouldReturn && !["yes", "maybe", "no"].includes(wouldReturn)) return json(400, { error: "Invalid return value." });
   const row = {
     id: crypto.randomUUID(),
     profile_key: profileKey,
-    guest_id: nullableClean(body.guest_id),
-    guest_name: nullableClean(body.guest_name),
-    guest_email: lower(body.guest_email || body.email) || null,
+    guest_id: nullableClean(profile.id || reservation.guest_id || reservation.guest_user_id),
+    guest_name: nullableClean(profile.full_name || profile.name || reservation.guest_name),
+    guest_email: lower(profile.email || reservation.guest_email) || null,
     restaurant_id: restaurant.id,
     reservation_id: reservationId,
-    image_url: nullableClean(body.image_url),
-    uploaded_file_name: nullableClean(body.uploaded_file_name),
-    media_type: clean(body.media_type || "food"),
-    description: clean(body.description),
+    image_url: supabaseConfigured ? consumptionPublicImageUrl(storagePath) : "/assets/restaurant-hero.png",
+    storage_path: storagePath,
+    uploaded_file_name: nullableClean(body.uploaded_file_name)?.slice(0, 255) || null,
+    media_type: mediaType,
+    description: clean(body.description).slice(0, 500),
     rating: overallRating,
     overall_rating: overallRating,
-    food_rating: body.food_rating === "" || body.food_rating === undefined ? null : numberOr(body.food_rating, null),
-    service_rating: body.service_rating === "" || body.service_rating === undefined ? null : numberOr(body.service_rating, null),
-    ambience_rating: body.ambience_rating === "" || body.ambience_rating === undefined ? null : numberOr(body.ambience_rating, null),
-    short_review: clean(body.short_review),
-    liked_highlight: clean(body.liked_highlight),
-    ordered_items: clean(body.ordered_items || body.what_did_you_order),
-    would_recommend: nullableClean(body.would_recommend),
-    would_return: nullableClean(body.would_return),
-    tags: arrayFrom(body.tags),
+    food_rating: foodRating,
+    service_rating: serviceRating,
+    ambience_rating: ambienceRating,
+    short_review: clean(body.short_review).slice(0, 2000),
+    liked_highlight: clean(body.liked_highlight).slice(0, 1000),
+    ordered_items: clean(body.ordered_items || body.what_did_you_order).slice(0, 1000),
+    would_recommend: wouldRecommend,
+    would_return: wouldReturn,
+    tags: arrayFrom(body.tags).slice(0, 12).map((tag) => clean(tag).slice(0, 64)),
     loyalty_points_awarded: points,
     moderation_status: "pending",
     analysis_status: analysis.status,
@@ -10552,8 +21450,8 @@ async function aiConsumptionUploads(method, body, headers, query) {
       popularity_signal: analysis.popularity_signal,
       points_awarded: points,
       moderation_status: "pending",
-      would_recommend: nullableClean(body.would_recommend),
-      would_return: nullableClean(body.would_return),
+      would_recommend: wouldRecommend,
+      would_return: wouldReturn,
       no_personal_data_shared_with_restaurants: true
     },
     created_at: nowIso()
@@ -10702,9 +21600,23 @@ function reviewPayload(body, options = {}) {
   };
 }
 
+function publicReviewSubmissionResponse(row = {}) {
+  return {
+    restaurant_id: row.restaurant_id,
+    food_rating: row.food_rating,
+    service_rating: row.service_rating,
+    ambience_rating: row.ambience_rating,
+    status: row.status,
+    created_at: row.created_at || null
+  };
+}
+
 async function createReview(body) {
   const payload = reviewPayload(body);
   if (!payload || !payload.restaurant_id) return json(400, { error: "Restaurant and 1-5 ratings are required." });
+  payload.legacy_unverified = true;
+  payload.verified_visit = false;
+  payload.moderation_status = "pending_moderation";
 
   if (!supabaseConfigured) {
     ensureDemo();
@@ -10732,7 +21644,7 @@ async function createReview(body) {
       },
       created_at: nowIso()
     });
-    return json(201, { mode: "demo", review });
+    return json(201, { mode: "demo", review: publicReviewSubmissionResponse(review) });
   }
 
   const rows = await supabaseFetch("/rest/v1/restaurant_reviews?select=*", {
@@ -10756,7 +21668,506 @@ async function createReview(body) {
       }
     }
   }).catch(() => null);
-  return json(201, { mode: "supabase", review: rows?.[0] });
+  return json(201, { mode: "supabase", review: publicReviewSubmissionResponse(rows?.[0] || {}) });
+}
+
+function clientPostVisitTokenContext(tokenRow = {}, row = {}) {
+  return {
+    action: tokenRow.action,
+    action_label: postVisitActionLabel(tokenRow.action),
+    expires_at: tokenRow.expires_at,
+    used_at: tokenRow.used_at || null,
+    reservation: clientReservationVisitContext(row),
+    review_eligibility: reviewEligibility(row)
+  };
+}
+
+async function postVisitAction(method, body, headers, query) {
+  if (!["GET", "POST"].includes(method)) return json(405, { error: "Method not allowed." });
+  const token = clean(body.token || query.get("token"));
+  if (!token) return json(400, { error: "Post-visit action link is missing.", code: "POST_VISIT_TOKEN_MISSING" });
+  const tokenRow = await lookupPostVisitActionToken(token);
+  if (!tokenRow) return json(404, { error: "This post-visit link is invalid.", code: "POST_VISIT_TOKEN_INVALID" });
+  if (tokenRow.expires_at && new Date(tokenRow.expires_at).getTime() <= Date.now()) {
+    return json(410, { error: "This post-visit link has expired.", code: "POST_VISIT_TOKEN_EXPIRED" });
+  }
+  const row = await refreshReservationOverview(tokenRow.reservation_id);
+  if (!row) return json(404, { error: "Reservation not found.", code: "RESERVATION_NOT_FOUND" });
+  if (method === "GET") {
+    return json(200, {
+      mode: supabaseConfigured ? "supabase" : "demo",
+      token_status: tokenRow.used_at ? "used" : "active",
+      context: clientPostVisitTokenContext(tokenRow, row)
+    });
+  }
+  const action = clean(body.action || tokenRow.action);
+  if (action !== tokenRow.action || !stateChangingPostVisitActions.has(action)) {
+    return json(400, { error: "Unsupported post-visit action.", code: "INVALID_POST_VISIT_ACTION" });
+  }
+  if (tokenRow.used_at) {
+    return json(200, {
+      mode: supabaseConfigured ? "supabase" : "demo",
+      already_used: true,
+      reservation: clientReservationVisitContext(row)
+    });
+  }
+  const patch = postVisitLifecyclePatch(action, "guest", row);
+  const updated = await patchReservationVisitState(row.reservation_id, patch);
+  await markPostVisitTokenUsed(tokenRow);
+  await createPostVisitNotificationEvent(updated || row, `guest_${action}`, "in_app", { source: "secure_token" });
+  await createAuditLog({
+    profile: null,
+    action: `guest_post_visit_${action}`,
+    entityType: "reservation",
+    entityId: row.reservation_id,
+    headers,
+    metadata: {
+      restaurant_id: row.restaurant_id,
+      reservation_id: row.reservation_id,
+      source: "secure_token"
+    }
+  }).catch(() => null);
+  return json(200, {
+    mode: supabaseConfigured ? "supabase" : "demo",
+    reservation: clientReservationVisitContext(updated || row)
+  });
+}
+
+async function authenticatedGuestReservationRow(headers, reservationId = "") {
+  const { profile } = await requireProfile(headers, ["guest"]);
+  const id = clean(reservationId);
+  const email = lower(profile.email);
+  const rows = !supabaseConfigured
+    ? reservationOverviewRows().filter((item) => clean(item.reservation_id) === id)
+    : await supabaseFetch(`/rest/v1/reservation_overview?select=*&reservation_id=eq.${encodeURIComponent(id)}&limit=1`, { service: true }).catch(() => []);
+  const row = rows?.[0];
+  if (!row) {
+    const error = new Error("Reservation not found.");
+    error.status = 404;
+    throw error;
+  }
+  if (clean(row.guest_id) !== clean(profile.id) && lower(row.guest_email) !== email) {
+    const error = new Error("You can review only your own reservation.");
+    error.status = 403;
+    throw error;
+  }
+  return { profile, row };
+}
+
+async function verifiedReviewContextFromRequest(headers, query, body = {}) {
+  const token = clean(body.token || query.get("token"));
+  if (token) {
+    const tokenRow = await lookupPostVisitActionToken(token);
+    if (!tokenRow) {
+      const error = new Error("This review link is invalid.");
+      error.status = 404;
+      error.code = "POST_VISIT_TOKEN_INVALID";
+      throw error;
+    }
+    if (tokenRow.action !== "open_review") {
+      const error = new Error("This link does not open a review.");
+      error.status = 400;
+      error.code = "POST_VISIT_TOKEN_ACTION_MISMATCH";
+      throw error;
+    }
+    if (tokenRow.expires_at && new Date(tokenRow.expires_at).getTime() <= Date.now()) {
+      const error = new Error("This review link has expired.");
+      error.status = 410;
+      error.code = "POST_VISIT_TOKEN_EXPIRED";
+      throw error;
+    }
+    const row = await refreshReservationOverview(tokenRow.reservation_id);
+    if (!row) {
+      const error = new Error("Reservation not found.");
+      error.status = 404;
+      throw error;
+    }
+    return { tokenRow, row, profile: null };
+  }
+  return await authenticatedGuestReservationRow(headers, clean(body.reservation_id || query.get("reservation_id")));
+}
+
+function verifiedReviewPayload(body = {}, row = {}, profile = null) {
+  const food = integerInRange(body.food_rating, 1, 5);
+  const service = integerInRange(body.service_rating, 1, 5);
+  const atmosphere = integerInRange(body.atmosphere_rating || body.ambience_rating, 1, 5);
+  if (food === null || service === null || atmosphere === null) return null;
+  const writtenReview = nullableClean(body.written_review || body.comment);
+  const visitDuration = integerInRange(body.visit_duration_minutes, 1, 720);
+  const guestUserId = clean(profile?.id || row.guest_id);
+  return {
+    restaurant_id: row.restaurant_id,
+    reservation_id: row.reservation_id,
+    guest_user_id: guestUserId || null,
+    guest_name: nullableClean(row.guest_name),
+    guest_email: row.guest_email ? lower(row.guest_email) : null,
+    food_rating: food,
+    service_rating: service,
+    ambience_rating: atmosphere,
+    atmosphere_rating: atmosphere,
+    overall_rating: Math.round((food + service + atmosphere) / 3),
+    comment: writtenReview,
+    written_review: writtenReview,
+    visit_duration_minutes: visitDuration,
+    visit_duration_confirmed: boolValue(body.visit_duration_confirmed),
+    status: "pending",
+    moderation_status: "pending_moderation",
+    verified_visit: true,
+    legacy_unverified: false,
+    submitted_at: nowIso()
+  };
+}
+
+async function guestVerifiedReview(method, body, headers, query) {
+  if (!["GET", "POST"].includes(method)) return json(405, { error: "Method not allowed." });
+  const { tokenRow, row, profile } = await verifiedReviewContextFromRequest(headers, query, body);
+  const eligibility = reviewEligibility(row, profile);
+  if (method === "GET") {
+    return json(200, {
+      mode: supabaseConfigured ? "supabase" : "demo",
+      context: {
+        reservation: clientReservationVisitContext(row),
+        review_eligibility: eligibility,
+        token_status: tokenRow?.used_at ? "used" : tokenRow ? "active" : "authenticated"
+      }
+    });
+  }
+  if (tokenRow?.used_at || !eligibility.eligible) {
+    return json(409, {
+      error: eligibility.reason === "review_already_submitted"
+        ? "A verified review has already been submitted for this reservation."
+        : "This reservation is not eligible for a verified review yet.",
+      code: eligibility.reason
+    });
+  }
+  const payload = verifiedReviewPayload(body, row, profile);
+  if (!payload) return json(400, { error: "Food, service, and atmosphere ratings from 1 to 5 are required." });
+  if (!supabaseConfigured) {
+    ensureDemo();
+    if (demo.restaurantReviews.some((item) => item.reservation_id === row.reservation_id)) {
+      return json(409, { error: "A verified review has already been submitted for this reservation.", code: "review_already_submitted" });
+    }
+    const review = { id: crypto.randomUUID(), ...payload, created_at: nowIso(), updated_at: nowIso() };
+    demo.restaurantReviews.unshift(review);
+    const reservation = demo.reservations.find((item) => item.id === row.reservation_id);
+    if (reservation) Object.assign(reservation, { review_submitted_at: review.submitted_at, verified_visit: true, updated_at: nowIso() });
+    if (tokenRow) await markPostVisitTokenUsed(tokenRow);
+    return json(201, { mode: "demo", review: publicReviewSubmissionResponse(review), reservation: clientReservationVisitContext(await refreshReservationOverview(row.reservation_id) || row) });
+  }
+  const rows = await supabaseFetch("/rest/v1/restaurant_reviews?select=*", {
+    method: "POST",
+    service: true,
+    headers: { Prefer: "return=representation" },
+    body: await filterSupabaseTablePayload("restaurant_reviews", payload)
+  });
+  const review = rows?.[0];
+  const photos = Array.isArray(body.photos) ? body.photos.slice(0, 5) : [];
+  if (review?.id && photos.length) {
+    const photoRows = photos.map((photo, index) => ({
+      review_id: review.id,
+      guest_id: payload.guest_user_id,
+      reservation_id: row.reservation_id,
+      restaurant_id: row.restaurant_id,
+      storage_path: clean(photo.storage_path || photo.path),
+      mime_type: clean(photo.mime_type || photo.type),
+      file_size: integerInRange(photo.file_size || photo.size, 1, 5 * 1024 * 1024),
+      width: integerInRange(photo.width, 1, 12000),
+      height: integerInRange(photo.height, 1, 12000),
+      moderation_status: "pending_moderation",
+      display_order: index
+    })).filter((photo) => photo.storage_path && ["image/jpeg", "image/png", "image/webp"].includes(photo.mime_type) && photo.file_size);
+    if (photoRows.length) {
+      await supabaseFetch("/rest/v1/review_photos", {
+        method: "POST",
+        service: true,
+        headers: { Prefer: "return=minimal" },
+        body: await Promise.all(photoRows.map((photo) => filterSupabaseTablePayload("review_photos", photo)))
+      });
+    }
+  }
+  await patchReservationVisitState(row.reservation_id, {
+    review_submitted_at: payload.submitted_at,
+    verified_visit: true
+  }).catch(() => null);
+  if (tokenRow) await markPostVisitTokenUsed(tokenRow);
+  await createPostVisitNotificationEvent(row, "review_submitted", "in_app", { review_id: review?.id || "" });
+  await createAuditLog({
+    profile,
+    action: "verified_review_submitted",
+    entityType: "restaurant_review",
+    entityId: review?.id || "",
+    headers,
+    metadata: {
+      restaurant_id: row.restaurant_id,
+      reservation_id: row.reservation_id,
+      verified_visit: true
+    }
+  }).catch(() => null);
+  return json(201, {
+    mode: "supabase",
+    review: publicReviewSubmissionResponse(review || payload),
+    reservation: clientReservationVisitContext(await refreshReservationOverview(row.reservation_id) || row)
+  });
+}
+
+async function guestReviewPhotoSignUpload(method, body, headers) {
+  if (method !== "POST") return json(405, { error: "Method not allowed." });
+  const { profile, row } = clean(body.token)
+    ? await verifiedReviewContextFromRequest(headers, new URLSearchParams(), body)
+    : await authenticatedGuestReservationRow(headers, clean(body.reservation_id));
+  const eligibility = reviewEligibility(row, profile);
+  if (!eligibility.eligible) return json(409, { error: "This reservation is not eligible for review photo upload yet.", code: eligibility.reason });
+  const mimeType = clean(body.mime_type || body.content_type);
+  if (!["image/jpeg", "image/png", "image/webp"].includes(mimeType)) {
+    return json(400, { error: "Only JPEG, PNG, or WebP photos are supported." });
+  }
+  const fileSize = integerInRange(body.file_size || body.size, 1, 5 * 1024 * 1024);
+  if (!fileSize) return json(400, { error: "Review photos must be 5 MB or smaller." });
+  const filename = clean(body.filename || "review-photo.jpg").replace(/[^a-zA-Z0-9._-]/g, "-");
+  const extension = filename.split(".").pop()?.toLowerCase() || "";
+  const expectedExtensions = { "image/jpeg": ["jpg", "jpeg"], "image/png": ["png"], "image/webp": ["webp"] };
+  if (!expectedExtensions[mimeType]?.includes(extension)) {
+    return json(400, { error: "Photo filename extension does not match the image type." });
+  }
+  const storagePath = `review-photos/${row.restaurant_id}/${row.reservation_id}/${crypto.randomUUID()}-${filename}`;
+  if (!supabaseConfigured) return json(200, { mode: "demo", storage_path: storagePath, upload_url: "", token: "" });
+  const response = await fetch(`${SUPABASE_URL}/storage/v1/object/upload/sign/${encodeURIComponent(SUPABASE_STORAGE_BUCKET)}/${storagePath}`, {
+    method: "POST",
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({ upsert: false })
+  });
+  const signed = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(signed.message || signed.error || "Could not create upload URL.");
+    error.status = response.status;
+    throw error;
+  }
+  const signedUrl = signed?.signedURL || signed?.signedUrl || signed?.url || signed?.signed_url;
+  const uploadUrl = signedUrl?.startsWith("http")
+    ? signedUrl
+    : signedUrl?.startsWith("/storage/v1/")
+      ? `${SUPABASE_URL}${signedUrl}`
+      : signedUrl?.startsWith("/object/")
+        ? `${SUPABASE_URL}/storage/v1${signedUrl}`
+        : `${SUPABASE_URL}${signedUrl || ""}`;
+  return json(200, {
+    mode: "supabase",
+    storage_path: storagePath,
+    upload_url: uploadUrl,
+    token: signed?.token || ""
+  });
+}
+
+function publicReviewerDisplayName(name = "") {
+  const parts = clean(name).split(/\s+/).filter(Boolean);
+  if (!parts.length) return "SmartTable guest";
+  if (parts.length === 1) return parts[0];
+  return `${parts[0]} ${parts[parts.length - 1].charAt(0).toUpperCase()}.`;
+}
+
+function partnerReviewResponseFromMetadata(metadata = {}) {
+  const parsed = jsonFrom(metadata, {});
+  const response = parsed?.restaurant_response;
+  if (!response || typeof response !== "object" || Array.isArray(response)) return null;
+  const text = clean(response.text).slice(0, 800);
+  if (!text) return null;
+  const status = clean(response.status || "pending_moderation") || "pending_moderation";
+  return {
+    text,
+    status,
+    submitted_at: nullableClean(response.submitted_at),
+    submitted_by: nullableClean(response.submitted_by),
+    moderated_at: nullableClean(response.moderated_at),
+    moderated_by: nullableClean(response.moderated_by)
+  };
+}
+
+function publicPartnerReviewResponse(metadata = {}) {
+  const response = partnerReviewResponseFromMetadata(metadata);
+  return response && response.status === "published" ? response : null;
+}
+
+function nextPartnerReviewResponseMetadata(metadata = {}, patch = {}) {
+  const parsed = jsonFrom(metadata, {});
+  const existing = parsed?.restaurant_response && typeof parsed.restaurant_response === "object" && !Array.isArray(parsed.restaurant_response)
+    ? parsed.restaurant_response
+    : {};
+  return {
+    ...parsed,
+    restaurant_response: {
+      ...existing,
+      ...patch
+    }
+  };
+}
+
+async function signedReviewPhotoUrl(storagePath = "") {
+  const path = clean(storagePath);
+  if (!path || !supabaseConfigured) return "";
+  const response = await fetch(`${SUPABASE_URL}/storage/v1/object/sign/${encodeURIComponent(SUPABASE_STORAGE_BUCKET)}/${path}`, {
+    method: "POST",
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({ expiresIn: 60 * 60 })
+  });
+  const signed = await response.json().catch(() => ({}));
+  if (!response.ok) return "";
+  const signedUrl = signed?.signedURL || signed?.signedUrl || signed?.url || signed?.signed_url;
+  return signedUrl?.startsWith("http")
+    ? signedUrl
+    : signedUrl?.startsWith("/storage/v1/")
+      ? `${SUPABASE_URL}${signedUrl}`
+      : signedUrl?.startsWith("/object/")
+        ? `${SUPABASE_URL}/storage/v1${signedUrl}`
+        : `${SUPABASE_URL}${signedUrl || ""}`;
+}
+
+async function publicRestaurantReviewRows(restaurantId) {
+  const id = clean(restaurantId);
+  if (!id) return [];
+  if (!supabaseConfigured) {
+    ensureDemo();
+    return demo.restaurantReviews
+      .filter((review) => review.restaurant_id === id && review.verified_visit && ["approved", "published"].includes(review.status || review.moderation_status))
+      .filter((review) => !isGeneratedPublicQaContentRow(review))
+      .map((review) => ({
+        ...review,
+        reviewer_name: publicReviewerDisplayName(review.guest_name),
+        restaurant_response: publicPartnerReviewResponse(review.metadata),
+        photos: review.photos || []
+      }));
+  }
+  const reviewColumns = await supabaseTableColumns("restaurant_reviews");
+  const publicReviewSelect = [
+    "id",
+    "restaurant_id",
+    "guest_name",
+    "food_rating",
+    "service_rating",
+    "ambience_rating",
+    "atmosphere_rating",
+    "overall_rating",
+    "written_review",
+    "comment",
+    "visit_duration_minutes",
+    "visit_duration_confirmed",
+    "submitted_at",
+    "published_at",
+    "created_at",
+    "status",
+    "moderation_status",
+    "verified_visit",
+    "metadata"
+  ].filter((column) => reviewColumns.has(column)).join(",");
+  const reviewFilters = [
+    `restaurant_id=eq.${encodeURIComponent(id)}`
+  ];
+  if (reviewColumns.has("verified_visit")) {
+    reviewFilters.push("verified_visit=eq.true");
+  }
+  if (reviewColumns.has("status") && reviewColumns.has("moderation_status")) {
+    reviewFilters.push("or=(status.eq.approved,moderation_status.eq.published)");
+  } else if (reviewColumns.has("status")) {
+    reviewFilters.push("status=eq.approved");
+  } else if (reviewColumns.has("moderation_status")) {
+    reviewFilters.push("moderation_status=eq.published");
+  }
+  const reviewOrderColumns = ["published_at", "submitted_at", "created_at"].filter((column) => reviewColumns.has(column));
+  const reviewOrder = reviewOrderColumns.length
+    ? `&order=${reviewOrderColumns.map((column) => `${column}.desc.nullslast`).join(",")}`
+    : "";
+  const rawReviews = await supabaseFetch(
+    `/rest/v1/restaurant_reviews?select=${publicReviewSelect || "id"}&${reviewFilters.join("&")}${reviewOrder}&limit=50`,
+    { service: true }
+  );
+  const reviews = (rawReviews || []).filter((review) => !isGeneratedPublicQaContentRow(review));
+  const reviewIds = (reviews || []).map((review) => clean(review.id)).filter(Boolean);
+  let photosByReview = new Map();
+  if (reviewIds.length) {
+    const photoRows = await supabaseFetch(
+      `/rest/v1/review_photos?select=id,review_id,mime_type,width,height,display_order,created_at,storage_path&review_id=in.(${reviewIds.map(encodeURIComponent).join(",")})&moderation_status=eq.published&order=display_order.asc,created_at.asc`,
+      { service: true }
+    ).catch(() => []);
+    const enriched = await Promise.all((photoRows || []).map(async (photo) => ({
+      id: photo.id,
+      review_id: photo.review_id,
+      mime_type: photo.mime_type,
+      width: photo.width,
+      height: photo.height,
+      display_order: photo.display_order,
+      created_at: photo.created_at,
+      url: await signedReviewPhotoUrl(photo.storage_path)
+    })));
+    for (const photo of enriched.filter((item) => item.url)) {
+      if (!photosByReview.has(photo.review_id)) photosByReview.set(photo.review_id, []);
+      photosByReview.get(photo.review_id).push(photo);
+    }
+  }
+  return (reviews || []).map((review) => ({
+    id: review.id,
+    restaurant_id: review.restaurant_id,
+    reviewer_name: publicReviewerDisplayName(review.guest_name),
+    food_rating: review.food_rating,
+    service_rating: review.service_rating,
+    atmosphere_rating: review.atmosphere_rating ?? review.ambience_rating,
+    overall_rating: review.overall_rating,
+    written_review: review.written_review || review.comment || "",
+    visit_duration_minutes: review.visit_duration_minutes,
+    visit_duration_confirmed: boolValue(review.visit_duration_confirmed),
+    submitted_at: review.submitted_at || review.published_at || review.created_at,
+    verified_visit: true,
+    restaurant_response: publicPartnerReviewResponse(review.metadata),
+    photos: photosByReview.get(review.id) || []
+  }));
+}
+
+function publicReviewSummaryFromRows(rows = []) {
+  const count = rows.length;
+  const avg = (key) => {
+    const values = rows.map((row) => Number(row[key])).filter(Number.isFinite);
+    return values.length ? Number((values.reduce((sum, value) => sum + value, 0) / values.length).toFixed(1)) : null;
+  };
+  return {
+    overall_rating: avg("overall_rating"),
+    food_rating: avg("food_rating"),
+    service_rating: avg("service_rating"),
+    atmosphere_rating: avg("atmosphere_rating"),
+    verified_review_count: count
+  };
+}
+
+async function publicRestaurantReviews(query) {
+  const restaurantId = clean(query.get("restaurant_id"));
+  if (!restaurantId) return json(400, { error: "Restaurant is required." });
+  if (supabaseConfigured) {
+    const restaurants = await supabaseFetch(
+      `/rest/v1/restaurants?select=id,status,lifecycle_status,visible_on_guest_site,is_test_restaurant,is_test_data&id=eq.${encodeURIComponent(restaurantId)}&limit=1`,
+      { service: true }
+    ).catch(async (error) => {
+      if (error?.code !== "42703" && error?.code !== "PGRST204") throw error;
+      return await supabaseFetch(
+        `/rest/v1/restaurants?select=id,status&id=eq.${encodeURIComponent(restaurantId)}&limit=1`,
+        { service: true }
+      );
+    });
+    const restaurant = restaurants?.[0];
+    const visibleFlag = Object.hasOwn(restaurant || {}, "visible_on_guest_site") ? boolValue(restaurant.visible_on_guest_site) : true;
+    const visible = restaurant && visibleFlag !== false
+      && !["archived", "suspended"].includes(clean(restaurant.lifecycle_status || restaurant.status));
+    if (!visible) return json(404, { error: "Restaurant not found." });
+  }
+  const reviews = await publicRestaurantReviewRows(restaurantId);
+  return json(200, {
+    reviews,
+    summary: publicReviewSummaryFromRows(reviews)
+  }, { "cache-control": "no-store" });
 }
 
 function reviewRows() {
@@ -10765,44 +22176,808 @@ function reviewRows() {
     const restaurant = demo.restaurants.find((item) => item.id === review.restaurant_id);
     return {
       ...review,
-      restaurant_name: restaurant?.name || "Restaurant"
+      restaurant_name: restaurant?.name || "Restaurant",
+      restaurant_response: partnerReviewResponseFromMetadata(review.metadata)
     };
   });
 }
 
-async function adminReviews(method, body, headers) {
-  await requireProfile(headers, ["admin"]);
+function foodFeedSchemaMissing(error) {
+  return /food_feed_videos|food_feed_favorites|relation .* does not exist|schema cache/i.test(clean(error?.message));
+}
+
+async function signedFoodFeedMediaUrl(storagePath = "") {
+  const path = clean(storagePath);
+  if (!path || !supabaseConfigured) return "";
+  const response = await fetch(`${SUPABASE_URL}/storage/v1/object/sign/${encodeURIComponent(FOOD_FEED_STORAGE_BUCKET)}/${path}`, {
+    method: "POST",
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({ expiresIn: 60 * 60 })
+  });
+  const signed = await response.json().catch(() => ({}));
+  if (!response.ok) return "";
+  const signedUrl = signed?.signedURL || signed?.signedUrl || signed?.url || signed?.signed_url || "";
+  if (!signedUrl) return "";
+  if (signedUrl.startsWith("http")) return signedUrl;
+  if (signedUrl.startsWith("/storage/v1/")) return `${SUPABASE_URL}${signedUrl}`;
+  if (signedUrl.startsWith("/object/")) return `${SUPABASE_URL}/storage/v1${signedUrl}`;
+  return `${SUPABASE_URL}${signedUrl.startsWith("/") ? "" : "/"}${signedUrl}`;
+}
+
+function publicFoodFeedRestaurant(row = {}) {
+  return {
+    id: row.id,
+    name: row.display_name || row.name || "Restaurant",
+    slug: row.slug || row.id,
+    cuisine: row.cuisine || row.cuisine_type || "",
+    neighborhood: row.neighborhood || "",
+    city: row.city || "",
+    cover_image_url: row.cover_image_url || row.card_image_url || row.image_url || "",
+    latitude: optionalFiniteNumber(row.latitude ?? row.lat),
+    longitude: optionalFiniteNumber(row.longitude ?? row.lng)
+  };
+}
+
+function optionalFiniteNumber(value) {
+  if (value === null || value === undefined || clean(value) === "") return null;
+  const numericValue = Number(value);
+  return Number.isFinite(numericValue) ? numericValue : null;
+}
+
+function distanceKm(aLat, aLng, bLat, bLng) {
+  if (![aLat, aLng, bLat, bLng].every(Number.isFinite)) return null;
+  const radians = (value) => value * Math.PI / 180;
+  const dLat = radians(bLat - aLat);
+  const dLng = radians(bLng - aLng);
+  const value = Math.sin(dLat / 2) ** 2
+    + Math.cos(radians(aLat)) * Math.cos(radians(bLat)) * Math.sin(dLng / 2) ** 2;
+  return 6371 * 2 * Math.atan2(Math.sqrt(value), Math.sqrt(1 - value));
+}
+
+function randomizeFoodFeedVideos(items = [], seedValue = "") {
+  const seed = clean(seedValue) || crypto.randomUUID();
+  return [...items]
+    .map((item) => ({
+      item,
+      rank: crypto.createHash("sha256").update(`${seed}:${clean(item?.video?.id || item?.id)}`).digest("hex")
+    }))
+    .sort((left, right) => left.rank.localeCompare(right.rank))
+    .map(({ item }) => item);
+}
+
+async function publicFoodFeed(query = new URLSearchParams()) {
+  if (!supabaseConfigured) return json(200, { videos: [], mode: "demo" });
+  const limit = Math.min(Math.max(Number.parseInt(clean(query.get("limit") || "30"), 10) || 30, 1), 50);
+  const candidateLimit = Math.min(Math.max(limit * 5, 50), 200);
+  const includeTestData = boolValue(query.get("include_test_data"));
+  const previewRestaurantId = lower(query.get("preview_restaurant_id"));
+  const previewRequested = includeTestData || Boolean(previewRestaurantId);
+  const previewMode = includeTestData
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(previewRestaurantId);
+  if (previewRequested && !previewMode) {
+    return json(400, {
+      error: "A valid restaurant is required for the Food Feed test preview.",
+      code: "FOOD_FEED_PREVIEW_RESTAURANT_REQUIRED"
+    });
+  }
+  const userLat = optionalFiniteNumber(query.get("lat"));
+  const userLng = optionalFiniteNumber(query.get("lng"));
+  const radiusKm = Math.min(Math.max(Number(query.get("radius_km")) || 0, 0), 250);
+  const videoFilter = previewMode
+    ? `is_test_data=eq.true&restaurant_id=eq.${previewRestaurantId}`
+    : "is_test_data=eq.false";
+  let videos;
+  try {
+    videos = await supabaseFetch(`/rest/v1/food_feed_videos?select=id,restaurant_id,offer_id,title,caption,storage_path,media_type,mime_type,duration_ms,width,height,published_at,display_order,is_test_data&status=eq.published&${videoFilter}&order=published_at.desc&limit=${candidateLimit}`, { service: true });
+  } catch (error) {
+    if (foodFeedSchemaMissing(error)) return json(200, { videos: [], schema_missing: true });
+    throw error;
+  }
+  const restaurantIds = [...new Set((videos || []).map((row) => clean(row.restaurant_id)).filter(Boolean))];
+  const offerIds = previewMode ? [] : [...new Set((videos || []).map((row) => clean(row.offer_id)).filter(Boolean))];
+  const [restaurants, offers] = await Promise.all([
+    restaurantIds.length
+      ? supabaseFetch(`/rest/v1/restaurants?select=*&id=in.(${restaurantIds.join(",")})`, { service: true })
+      : [],
+    offerIds.length
+      ? supabaseFetch(`/rest/v1/offers?select=id,restaurant_id,title,title_en,discount_value,discount_percentage,offer_date,start_time,end_time,max_party_size,status&id=in.(${offerIds.join(",")})`, { service: true }).catch(() => [])
+      : []
+  ]);
+  const restaurantById = new Map((restaurants || []).map((row) => [clean(row.id), row]));
+  const offerById = new Map((offers || []).map((row) => [clean(row.id), row]));
+  const eligibleVideos = (videos || []).map((video) => {
+    const restaurantRow = restaurantById.get(clean(video.restaurant_id));
+    if (!restaurantRow) return null;
+    if (previewMode) {
+      if (clean(video.restaurant_id) !== previewRestaurantId || !boolValue(video.is_test_data)) return null;
+    } else {
+      const restaurantStatus = lower(restaurantRow.status);
+      const lifecycleStatus = lower(restaurantRow.lifecycle_status || "active");
+      if (!["active", "approved"].includes(restaurantStatus)
+        || lifecycleStatus !== "active"
+        || restaurantRow.visible_on_guest_site === false
+        || restaurantRow.is_test_data === true
+        || restaurantRow.is_test_restaurant === true) return null;
+    }
+    const restaurant = {
+      ...publicFoodFeedRestaurant(restaurantRow),
+      preview_only: previewMode
+    };
+    const distance = previewMode ? null : distanceKm(userLat, userLng, restaurant.latitude, restaurant.longitude);
+    if (!previewMode && radiusKm && distance !== null && distance > radiusKm) return null;
+    const offer = previewMode ? null : offerById.get(clean(video.offer_id));
+    return { video, restaurant, offer, distance };
+  }).filter(Boolean);
+  const randomizedVideos = randomizeFoodFeedVideos(eligibleVideos, query.get("fresh")).slice(0, limit);
+  const result = await Promise.all(randomizedVideos.map(async ({ video, restaurant, offer, distance }) => {
+    const mediaUrl = await signedFoodFeedMediaUrl(video.storage_path);
+    return {
+      id: video.id,
+      title: video.title,
+      caption: video.caption || "",
+      media_type: video.media_type || (clean(video.mime_type).startsWith("image/") ? "image" : "video"),
+      media_url: mediaUrl,
+      video_url: mediaUrl,
+      mime_type: video.mime_type,
+      duration_ms: video.duration_ms,
+      preview_mode: previewMode,
+      is_test_data: previewMode && boolValue(video.is_test_data),
+      restaurant,
+      offer: offer ? {
+        id: offer.id,
+        title: offer.title_en || offer.title || "",
+        discount_percentage: Number(offer.discount_percentage ?? offer.discount_value ?? 0),
+        offer_date: offer.offer_date,
+        start_time: offer.start_time,
+        end_time: offer.end_time,
+        max_party_size: offer.max_party_size
+      } : null,
+      distance_km: distance === null ? null : Math.round(distance * 10) / 10
+    };
+  }));
+  return json(200, {
+    videos: result.filter((item) => item?.media_url),
+    preview_mode: previewMode
+  });
+}
+
+function foodFeedMediaType(mimeType = "") {
+  return clean(mimeType).startsWith("image/") ? "image" : "video";
+}
+
+async function createFoodFeedUploadUrl(restaurant, body = {}, options = {}) {
+  const contentType = clean(body.content_type || body.contentType);
+  const allowedTypes = options.allowImages
+    ? ['video/mp4', 'video/webm', 'image/jpeg', 'image/png', 'image/webp']
+    : ['video/mp4', 'video/webm'];
+  if (!allowedTypes.includes(contentType)) {
+    return json(400, { error: options.allowImages ? "Only MP4, WebM, JPEG, PNG, and WebP files are allowed." : "Only MP4 and WebM videos are allowed." });
+  }
+  const filename = safeFileName(body.filename || `smarttable-food-${Date.now()}.${foodFeedMediaType(contentType) === "image" ? "jpg" : "mp4"}`);
+  const path = `${restaurant.id}/food-feed/${crypto.randomUUID()}-${filename}`;
+  if (!supabaseConfigured) return json(200, { mode: "demo", path, upload_url: "", bucket: FOOD_FEED_STORAGE_BUCKET });
+  const response = await fetch(`${SUPABASE_URL}/storage/v1/object/upload/sign/${encodeURIComponent(FOOD_FEED_STORAGE_BUCKET)}/${path}`, {
+    method: "POST",
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({ upsert: false })
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(payload.message || payload.error || "Could not create the media upload URL.");
+    error.status = response.status;
+    throw error;
+  }
+  const signedUrl = payload.signedURL || payload.signedUrl || payload.url || payload.signed_url || "";
+  const uploadUrl = signedUrl.startsWith("http")
+    ? signedUrl
+    : signedUrl.startsWith("/storage/v1/")
+      ? `${SUPABASE_URL}${signedUrl}`
+      : signedUrl.startsWith("/object/")
+        ? `${SUPABASE_URL}/storage/v1${signedUrl}`
+        : `${SUPABASE_URL}${signedUrl}`;
+  return json(200, {
+    mode: "supabase",
+    bucket: FOOD_FEED_STORAGE_BUCKET,
+    path,
+    token: payload.token || null,
+    upload_url: uploadUrl
+  });
+}
+
+function validFoodFeedMediaInput(body = {}, options = {}) {
+  const durationMs = Number(body.duration_ms);
+  const fileSize = Number(body.file_size_bytes);
+  const width = Number(body.width);
+  const height = Number(body.height);
+  const mimeType = clean(body.mime_type);
+  const mediaType = foodFeedMediaType(mimeType);
+  const imageTypes = ['image/jpeg', 'image/png', 'image/webp'];
+  if (mediaType === "image" && (!options.allowImages || !imageTypes.includes(mimeType))) return "Only MP4 and WebM videos are allowed.";
+  if (mediaType === "video" && !['video/mp4', 'video/webm'].includes(mimeType)) return "Only MP4 and WebM videos are allowed.";
+  const maxSize = mediaType === "image" ? 10485760 : 20971520;
+  if (!Number.isInteger(fileSize) || fileSize <= 0 || fileSize > maxSize) return mediaType === "image" ? "Image size must be 10 MB or less." : "Video size must be 20 MB or less.";
+  if (mediaType === "video" && (!Number.isInteger(durationMs) || durationMs < 2500 || durationMs > 3500)) return "What to Eat videos must be 3 seconds long.";
+  if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= width) return "What to Eat media must use a vertical format.";
+  if (width < 720 || height < 1280) return "What to Eat media must be at least 720 by 1280 pixels. 1080 by 1920 pixels is recommended.";
+  if (!stripUnsafeHtml(body.title || "").trim()) return "Media title is required.";
+  return "";
+}
+
+async function partnerFoodFeed(method, body, headers, query = new URLSearchParams()) {
+  const { profile } = await requireProfile(headers, ["partner", "admin"]);
+  const restaurant = await getPartnerRestaurant(profile, query, body);
+  requireRestaurantAccessRole(restaurant, ["owner", "manager"]);
+  if (method === "GET") {
+    if (!supabaseConfigured) return json(200, { videos: [] });
+    let rows;
+    try {
+      rows = await supabaseFetch(`/rest/v1/food_feed_videos?select=*&restaurant_id=eq.${encodeURIComponent(restaurant.id)}&order=created_at.desc`, { service: true });
+    } catch (error) {
+      if (foodFeedSchemaMissing(error)) return json(200, { videos: [], schema_missing: true });
+      throw error;
+    }
+    const videos = await Promise.all((rows || []).map(async (row) => {
+      const mediaUrl = await signedFoodFeedMediaUrl(row.storage_path);
+      return {
+        ...row,
+        media_url: mediaUrl,
+        video_url: mediaUrl
+      };
+    }));
+    return json(200, { videos });
+  }
+  if (method === "POST" && clean(body.action) === "sign_upload") {
+    return await createFoodFeedUploadUrl(restaurant, body);
+  }
+  if (method === "POST") {
+    if (!supabaseConfigured) return json(503, { error: "What to Eat uploads require Supabase Storage." });
+    const validationError = validFoodFeedMediaInput(body);
+    if (validationError) return json(400, { error: validationError });
+    const storagePath = clean(body.storage_path);
+    if (!storagePath.startsWith(`${restaurant.id}/food-feed/`)) return json(403, { error: "Invalid restaurant video path." });
+    const offerId = clean(body.offer_id);
+    if (offerId) {
+      const offerRows = await supabaseFetch(`/rest/v1/offers?id=eq.${encodeURIComponent(offerId)}&restaurant_id=eq.${encodeURIComponent(restaurant.id)}&select=id`, { service: true });
+      if (!offerRows?.length) return json(400, { error: "The selected offer does not belong to this restaurant." });
+    }
+    const payload = await filterSupabaseTablePayload("food_feed_videos", {
+      restaurant_id: restaurant.id,
+      offer_id: offerId || null,
+      created_by_user_id: profile.id,
+      title: stripUnsafeHtml(body.title).trim().slice(0, 120),
+      caption: nullableClean(stripUnsafeHtml(body.caption || "").trim().slice(0, 600)),
+      storage_path: storagePath,
+      media_type: "video",
+      mime_type: clean(body.mime_type),
+      file_size_bytes: Number(body.file_size_bytes),
+      duration_ms: Number(body.duration_ms),
+      width: Number(body.width),
+      height: Number(body.height),
+      status: "pending_moderation",
+      is_test_data: Boolean(restaurant.is_test_data || restaurant.is_test_restaurant)
+    });
+    const rows = await supabaseFetch("/rest/v1/food_feed_videos?select=*", {
+      method: "POST",
+      service: true,
+      headers: { Prefer: "return=representation" },
+      body: payload
+    });
+    await createAuditLog({ profile, action: "food_feed_video_submitted", entityType: "food_feed_video", entityId: rows?.[0]?.id, restaurant });
+    return json(201, { video: rows?.[0] });
+  }
+  if (method === "PATCH") {
+    const id = clean(body.id);
+    if (!id) return json(400, { error: "Video is required." });
+    const existing = await supabaseFetch(`/rest/v1/food_feed_videos?id=eq.${encodeURIComponent(id)}&restaurant_id=eq.${encodeURIComponent(restaurant.id)}&select=id,status`, { service: true });
+    if (!existing?.length) return json(404, { error: "Video not found." });
+    const requestedStatus = clean(body.status);
+    const status = requestedStatus === "archived" ? "archived" : existing[0].status === "rejected" ? "pending_moderation" : existing[0].status;
+    const rows = await supabaseFetch(`/rest/v1/food_feed_videos?id=eq.${encodeURIComponent(id)}&restaurant_id=eq.${encodeURIComponent(restaurant.id)}&select=*`, {
+      method: "PATCH",
+      service: true,
+      headers: { Prefer: "return=representation" },
+      body: await filterSupabaseTablePayload("food_feed_videos", {
+        title: body.title === undefined ? undefined : stripUnsafeHtml(body.title).trim().slice(0, 120),
+        caption: body.caption === undefined ? undefined : nullableClean(stripUnsafeHtml(body.caption).trim().slice(0, 600)),
+        status,
+        moderation_reason: status === "pending_moderation" ? null : undefined
+      })
+    });
+    return json(200, { video: rows?.[0] });
+  }
+  return json(405, { error: "Method not allowed." });
+}
+
+async function adminFoodFeed(method, body, headers) {
+  const { profile } = await requireProfile(headers, ["admin"]);
+  if (!supabaseConfigured && method === "GET") return json(200, { videos: [] });
+  if (!supabaseConfigured) return json(503, { error: "What to Eat uploads require Supabase Storage." });
+  if (method === "GET") {
+    let rows;
+    try {
+      rows = await supabaseFetch("/rest/v1/food_feed_videos?select=*&order=created_at.desc&limit=500", { service: true });
+    } catch (error) {
+      if (foodFeedSchemaMissing(error)) return json(200, { videos: [], schema_missing: true });
+      throw error;
+    }
+    const restaurantIds = [...new Set((rows || []).map((row) => row.restaurant_id))];
+    const restaurants = restaurantIds.length ? await supabaseFetch(`/rest/v1/restaurants?select=*&id=in.(${restaurantIds.join(",")})`, { service: true }) : [];
+    const restaurantById = new Map(restaurants.map((row) => [row.id, row]));
+    const videos = await Promise.all((rows || []).map(async (row) => {
+      const mediaUrl = await signedFoodFeedMediaUrl(row.storage_path);
+      return {
+        ...row,
+        media_type: row.media_type || (clean(row.mime_type).startsWith("image/") ? "image" : "video"),
+        restaurant: restaurantById.get(row.restaurant_id) || null,
+        media_url: mediaUrl,
+        video_url: mediaUrl
+      };
+    }));
+    return json(200, { videos });
+  }
+  if (method === "POST") {
+    if (!isSuperAdminProfile(profile)) return json(403, { error: "Only Super Admin can upload What to Eat media." });
+    const restaurantId = clean(body.restaurant_id);
+    if (!restaurantId) return json(400, { error: "Restaurant is required." });
+    const restaurantRows = await supabaseFetch(`/rest/v1/restaurants?select=*&id=eq.${encodeURIComponent(restaurantId)}&limit=1`, { service: true });
+    const restaurant = restaurantRows?.[0];
+    if (!restaurant) return json(404, { error: "Restaurant not found." });
+    if (clean(body.action) === "sign_upload") return await createFoodFeedUploadUrl(restaurant, body, { allowImages: true });
+    const validationError = validFoodFeedMediaInput(body, { allowImages: true });
+    if (validationError) return json(400, { error: validationError });
+    const storagePath = clean(body.storage_path);
+    if (!storagePath.startsWith(`${restaurant.id}/food-feed/`)) return json(403, { error: "Invalid restaurant media path." });
+    const mediaType = foodFeedMediaType(body.mime_type);
+    const publishImmediately = body.publish_immediately === true;
+    const now = nowIso();
+    const payload = await filterSupabaseTablePayload("food_feed_videos", {
+      restaurant_id: restaurant.id,
+      created_by_user_id: profile.id,
+      title: stripUnsafeHtml(body.title).trim().slice(0, 120),
+      caption: nullableClean(stripUnsafeHtml(body.caption || "").trim().slice(0, 600)),
+      storage_path: storagePath,
+      media_type: mediaType,
+      mime_type: clean(body.mime_type),
+      file_size_bytes: Number(body.file_size_bytes),
+      duration_ms: mediaType === "video" ? Number(body.duration_ms) : null,
+      width: Number(body.width),
+      height: Number(body.height),
+      status: publishImmediately ? "published" : "pending_moderation",
+      moderated_by: publishImmediately ? profile.id : null,
+      moderated_at: publishImmediately ? now : null,
+      published_at: publishImmediately ? now : null,
+      is_test_data: Boolean(restaurant.is_test_data || restaurant.is_test_restaurant)
+    });
+    const rows = await supabaseFetch("/rest/v1/food_feed_videos?select=*", {
+      method: "POST",
+      service: true,
+      headers: { Prefer: "return=representation" },
+      body: payload
+    });
+    await createAuditLog({
+      profile,
+      action: "food_feed_media_uploaded_by_superadmin",
+      entityType: "food_feed_video",
+      entityId: rows?.[0]?.id,
+      restaurant,
+      metadata: { media_type: mediaType, published_immediately: publishImmediately }
+    });
+    return json(201, { video: rows?.[0] });
+  }
+  if (method === "PATCH") {
+    const id = clean(body.id);
+    const status = clean(body.status);
+    if (!id || !["published", "rejected", "archived", "pending_moderation"].includes(status)) return json(400, { error: "Valid video and moderation status are required." });
+    const rows = await supabaseFetch(`/rest/v1/food_feed_videos?id=eq.${encodeURIComponent(id)}&select=*`, {
+      method: "PATCH",
+      service: true,
+      headers: { Prefer: "return=representation" },
+      body: await filterSupabaseTablePayload("food_feed_videos", {
+        status,
+        moderation_reason: nullableClean(stripUnsafeHtml(body.moderation_reason || body.reason || "").trim().slice(0, 500)),
+        moderated_by: profile.id,
+        moderated_at: nowIso(),
+        published_at: status === "published" ? nowIso() : null
+      })
+    });
+    await createAuditLog({ profile, action: "food_feed_video_moderated", entityType: "food_feed_video", entityId: id, metadata: { status } });
+    return json(200, { video: rows?.[0] });
+  }
+  return json(405, { error: "Method not allowed." });
+}
+
+async function adminReviews(method, body, headers, query = new URLSearchParams()) {
+  const { profile } = await requireProfile(headers, ["admin"]);
   if (!supabaseConfigured) {
     ensureDemo();
     if (method === "GET") return json(200, { reviews: reviewRows() });
     if (method === "PATCH") {
       const review = demo.restaurantReviews.find((item) => item.id === clean(body.id));
       if (!review) return json(404, { error: "Review not found." });
+      const responseStatus = clean(body.response_status || body.restaurant_response_status);
+      if (responseStatus) {
+        if (!["pending_moderation", "published", "removed"].includes(responseStatus)) return json(400, { error: "Invalid restaurant response status." });
+        const currentResponse = partnerReviewResponseFromMetadata(review.metadata);
+        if (!currentResponse) return json(400, { error: "No restaurant response is waiting for moderation." });
+        review.metadata = nextPartnerReviewResponseMetadata(review.metadata, {
+          status: responseStatus,
+          moderated_at: nowIso(),
+          moderated_by: profile.id,
+          moderation_reason: nullableClean(body.reason || body.moderation_reason)
+        });
+        review.updated_at = nowIso();
+        return json(200, { review: reviewRows().find((item) => item.id === review.id) });
+      }
       const status = clean(body.status);
       if (!allowedReviewStatuses.has(status)) return json(400, { error: "Invalid review status." });
       review.status = status;
+      review.moderation_status = status === "approved" ? "published" : status === "rejected" ? "rejected" : status;
+      review.moderation_reason = nullableClean(body.reason || body.moderation_reason);
+      review.moderated_by = profile.id;
+      review.moderated_at = nowIso();
       review.updated_at = nowIso();
       return json(200, { review: reviewRows().find((item) => item.id === review.id) });
     }
   } else {
     if (method === "GET") {
-      const rows = await supabaseFetch("/rest/v1/restaurant_reviews_overview?select=*&order=created_at.desc", { service: true });
-      return json(200, { reviews: rows || [] });
+      const queryValue = (key, fallback = "") => clean(query?.get?.(key) || fallback);
+      const normalized = (value) => clean(value).toLowerCase();
+      const pageSize = Math.min(Math.max(Number.parseInt(queryValue("page_size", "25"), 10) || 25, 1), 100);
+      const requestedPage = Math.max(Number.parseInt(queryValue("page", "1"), 10) || 1, 1);
+      const filters = {
+        search: normalized(queryValue("search")),
+        restaurantId: queryValue("restaurant_id", "all"),
+        country: normalized(queryValue("country", "all")),
+        city: normalized(queryValue("city", "all")),
+        status: normalized(queryValue("status", "all")),
+        photoStatus: normalized(queryValue("photo_status", "all"))
+      };
+      const [rows, restaurants, photos] = await Promise.all([
+        supabaseFetch("/rest/v1/restaurant_reviews_overview?select=*&order=created_at.desc&limit=5000", { service: true }),
+        supabaseFetch("/rest/v1/restaurants?select=id,name,display_name,city,country,neighborhood,status,lifecycle_status&limit=5000", { service: true }).catch(() => []),
+        supabaseFetch("/rest/v1/review_photos?select=id,review_id,mime_type,file_size,width,height,display_order,moderation_status,created_at,storage_path&order=display_order.asc,created_at.asc&limit=5000", { service: true }).catch(() => [])
+      ]);
+      const restaurantById = new Map((restaurants || []).map((restaurant) => [clean(restaurant.id), restaurant]));
+      const photosByReview = new Map();
+      for (const photo of photos || []) {
+        const reviewId = clean(photo.review_id);
+        if (!reviewId) continue;
+        if (!photosByReview.has(reviewId)) photosByReview.set(reviewId, []);
+        photosByReview.get(reviewId).push(photo);
+      }
+      const enrichedRows = (rows || []).map((row) => {
+        const restaurant = restaurantById.get(clean(row.restaurant_id)) || {};
+        return {
+          ...row,
+          restaurant_name: row.restaurant_name || restaurant.display_name || restaurant.name || row.restaurant_id,
+          restaurant_city: row.restaurant_city || restaurant.city || "",
+          restaurant_country: row.restaurant_country || restaurant.country || "",
+          restaurant_response: partnerReviewResponseFromMetadata(row.metadata),
+          photos: photosByReview.get(clean(row.id)) || []
+        };
+      });
+      const filteredRows = enrichedRows.filter((row) => {
+        if (filters.restaurantId && filters.restaurantId !== "all" && clean(row.restaurant_id) !== filters.restaurantId) return false;
+        if (filters.country && filters.country !== "all" && normalized(row.restaurant_country) !== filters.country) return false;
+        if (filters.city && filters.city !== "all" && normalized(row.restaurant_city) !== filters.city) return false;
+        const rowStatusCandidates = [row.moderation_status, row.status]
+          .map((value) => normalized(value))
+          .filter(Boolean);
+        if (filters.status && filters.status !== "all" && !rowStatusCandidates.includes(filters.status)) return false;
+        const rowPhotos = row.photos || [];
+        if (filters.photoStatus === "has_photos" && !rowPhotos.length) return false;
+        if (filters.photoStatus === "no_photos" && rowPhotos.length) return false;
+        if (filters.photoStatus && !["all", "has_photos", "no_photos"].includes(filters.photoStatus)) {
+          if (!rowPhotos.some((photo) => normalized(photo.moderation_status) === filters.photoStatus)) return false;
+        }
+        if (filters.search) {
+          const haystack = [
+            row.restaurant_name,
+            row.restaurant_city,
+            row.restaurant_country,
+            row.guest_name,
+            row.written_review,
+            row.comment,
+            row.reservation_reference,
+            row.reference,
+            row.reservation_id
+          ].map((value) => normalized(value)).join(" ");
+          if (!haystack.includes(filters.search)) return false;
+        }
+        return true;
+      });
+      const total = filteredRows.length;
+      const totalPages = Math.max(Math.ceil(total / pageSize), 1);
+      const page = Math.min(requestedPage, totalPages);
+      const start = (page - 1) * pageSize;
+      const pageRows = filteredRows.slice(start, start + pageSize);
+      const pageRowsWithPhotos = await Promise.all(pageRows.map(async (row) => {
+        const enrichedPhotos = await Promise.all((row.photos || []).map(async (photo) => ({
+          id: photo.id,
+          review_id: photo.review_id,
+          mime_type: photo.mime_type,
+          file_size: photo.file_size,
+          width: photo.width,
+          height: photo.height,
+          display_order: photo.display_order,
+          moderation_status: photo.moderation_status,
+          created_at: photo.created_at,
+          url: await signedReviewPhotoUrl(photo.storage_path)
+        })));
+        return {
+          ...row,
+          photos: enrichedPhotos.filter((item) => item.url)
+        };
+      }));
+      return json(200, {
+        reviews: pageRowsWithPhotos,
+        pagination: {
+          page,
+          page_size: pageSize,
+          total,
+          total_pages: totalPages
+        }
+      });
     }
     if (method === "PATCH") {
+      const photoId = clean(body.photo_id);
+      if (photoId) {
+        const photoStatus = clean(body.photo_status || body.moderation_status);
+        if (!["pending_moderation", "published", "rejected", "removed"].includes(photoStatus)) return json(400, { error: "Invalid photo moderation status." });
+        const rows = await supabaseFetch(`/rest/v1/review_photos?id=eq.${encodeURIComponent(photoId)}&select=*`, {
+          method: "PATCH",
+          service: true,
+          headers: { Prefer: "return=representation" },
+          body: await filterSupabaseTablePayload("review_photos", {
+            moderation_status: photoStatus
+          })
+        });
+        await createAuditLog({
+          profile,
+          action: "review_photo_moderated",
+          entityType: "review_photo",
+          entityId: photoId,
+          metadata: {
+            status: photoStatus,
+            reason: nullableClean(body.reason || body.moderation_reason)
+          }
+        }).catch(() => null);
+        return json(200, { photo: rows?.[0] });
+      }
+      const responseStatus = clean(body.response_status || body.restaurant_response_status);
+      if (responseStatus) {
+        if (!["pending_moderation", "published", "removed"].includes(responseStatus)) return json(400, { error: "Invalid restaurant response status." });
+        const id = clean(body.id);
+        if (!id) return json(400, { error: "Review is required." });
+        const existingRows = await supabaseFetch(`/rest/v1/restaurant_reviews?id=eq.${encodeURIComponent(id)}&select=id,metadata`, { service: true });
+        const existing = existingRows?.[0];
+        if (!existing) return json(404, { error: "Review not found." });
+        const currentResponse = partnerReviewResponseFromMetadata(existing.metadata);
+        if (!currentResponse) return json(400, { error: "No restaurant response is waiting for moderation." });
+        const metadata = nextPartnerReviewResponseMetadata(existing.metadata, {
+          status: responseStatus,
+          moderated_at: nowIso(),
+          moderated_by: profile.id,
+          moderation_reason: nullableClean(body.reason || body.moderation_reason)
+        });
+        const rows = await supabaseFetch(`/rest/v1/restaurant_reviews?id=eq.${encodeURIComponent(id)}&select=*`, {
+          method: "PATCH",
+          service: true,
+          headers: { Prefer: "return=representation" },
+          body: await filterSupabaseTablePayload("restaurant_reviews", {
+            metadata,
+            updated_at: nowIso()
+          })
+        });
+        await createAuditLog({
+          profile,
+          action: "review_response_moderated",
+          entityType: "restaurant_review",
+          entityId: id,
+          metadata: {
+            status: responseStatus,
+            reason: nullableClean(body.reason || body.moderation_reason)
+          }
+        }).catch(() => null);
+        return json(200, {
+          review: {
+            ...rows?.[0],
+            restaurant_response: partnerReviewResponseFromMetadata(metadata)
+          }
+        });
+      }
       const id = clean(body.id);
       const status = clean(body.status);
       if (!allowedReviewStatuses.has(status)) return json(400, { error: "Invalid review status." });
+      const moderationStatus = status === "approved" ? "published" : status === "rejected" ? "rejected" : status === "removed" ? "removed" : status;
       const rows = await supabaseFetch(`/rest/v1/restaurant_reviews?id=eq.${encodeURIComponent(id)}&select=*`, {
         method: "PATCH",
         service: true,
         headers: { Prefer: "return=representation" },
-        body: { status }
+        body: await filterSupabaseTablePayload("restaurant_reviews", {
+          status,
+          moderation_status: moderationStatus,
+          moderation_reason: nullableClean(body.reason || body.moderation_reason),
+          moderated_by: profile.id,
+          moderated_at: nowIso(),
+          published_at: moderationStatus === "published" ? nowIso() : null
+        })
       });
+      if (["published", "rejected", "removed"].includes(moderationStatus)) {
+        await supabaseFetch(`/rest/v1/review_photos?review_id=eq.${encodeURIComponent(id)}&moderation_status=eq.pending_moderation`, {
+          method: "PATCH",
+          service: true,
+          headers: { Prefer: "return=minimal" },
+          body: await filterSupabaseTablePayload("review_photos", {
+            moderation_status: moderationStatus
+          })
+        }).catch(() => null);
+      }
+      await createAuditLog({
+        profile,
+        action: "review_moderated",
+        entityType: "restaurant_review",
+        entityId: id,
+        metadata: {
+          status,
+          moderation_status: moderationStatus,
+          reason: nullableClean(body.reason || body.moderation_reason)
+        }
+      }).catch(() => null);
       return json(200, { review: rows?.[0] });
     }
   }
   return json(405, { error: "Method not allowed." });
+}
+
+async function partnerReviews(method, body, headers, query = new URLSearchParams()) {
+  const { profile } = await requireProfile(headers, ["partner", "admin"]);
+  const restaurant = await getPartnerRestaurant(profile, query, body);
+  const restaurantId = clean(restaurant?.id);
+  if (!restaurantId) return json(403, { error: "Restaurant access is required." });
+
+  if (!supabaseConfigured) {
+    ensureDemo();
+    if (method === "GET") {
+      const rows = reviewRows()
+        .filter((review) => clean(review.restaurant_id) === restaurantId)
+        .sort((a, b) => new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime())
+        .map((review) => ({ ...review, restaurant_response: partnerReviewResponseFromMetadata(review.metadata) }));
+      return json(200, { reviews: rows });
+    }
+    if (method === "PATCH") {
+      const review = demo.restaurantReviews.find((item) => clean(item.id) === clean(body.id) && clean(item.restaurant_id) === restaurantId);
+      if (!review) return json(404, { error: "Review not found." });
+      const responseText = stripUnsafeHtml(body.response_text || body.restaurant_response || "").trim();
+      if (responseText.length < 2) return json(400, { error: "Restaurant response is required." });
+      if (responseText.length > 800) return json(400, { error: "Restaurant response is too long." });
+      review.metadata = nextPartnerReviewResponseMetadata(review.metadata, {
+        text: responseText,
+        status: "pending_moderation",
+        submitted_at: nowIso(),
+        submitted_by: profile.id
+      });
+      return json(200, { review: { ...review, restaurant_response: partnerReviewResponseFromMetadata(review.metadata) } });
+    }
+    return json(405, { error: "Method not allowed." });
+  }
+
+  if (method === "PATCH") {
+    const id = clean(body.id);
+    if (!id) return json(400, { error: "Review is required." });
+    const responseText = stripUnsafeHtml(body.response_text || body.restaurant_response || "").trim();
+    if (responseText.length < 2) return json(400, { error: "Restaurant response is required." });
+    if (responseText.length > 800) return json(400, { error: "Restaurant response is too long." });
+    const existingRows = await supabaseFetch(
+      `/rest/v1/restaurant_reviews?id=eq.${encodeURIComponent(id)}&restaurant_id=eq.${encodeURIComponent(restaurantId)}&select=id,restaurant_id,metadata`,
+      { service: true }
+    );
+    const existing = existingRows?.[0];
+    if (!existing) return json(404, { error: "Review not found." });
+    const metadata = nextPartnerReviewResponseMetadata(existing.metadata, {
+      text: responseText,
+      status: "pending_moderation",
+      submitted_at: nowIso(),
+      submitted_by: profile.id,
+      moderated_at: null,
+      moderated_by: null,
+      moderation_reason: null
+    });
+    const rows = await supabaseFetch(`/rest/v1/restaurant_reviews?id=eq.${encodeURIComponent(id)}&restaurant_id=eq.${encodeURIComponent(restaurantId)}&select=*`, {
+      method: "PATCH",
+      service: true,
+      headers: { Prefer: "return=representation" },
+      body: await filterSupabaseTablePayload("restaurant_reviews", {
+        metadata,
+        updated_at: nowIso()
+      })
+    });
+    await createAuditLog({
+      profile,
+      action: "partner_review_response_submitted",
+      entityType: "restaurant_review",
+      entityId: id,
+      metadata: {
+        restaurant_id: restaurantId,
+        response_status: "pending_moderation"
+      }
+    }).catch(() => null);
+    return json(200, {
+      review: {
+        ...rows?.[0],
+        restaurant_response: partnerReviewResponseFromMetadata(metadata)
+      }
+    });
+  }
+
+  if (method !== "GET") return json(405, { error: "Method not allowed." });
+
+  const rows = await supabaseFetch(
+    `/rest/v1/restaurant_reviews_overview?select=*&restaurant_id=eq.${encodeURIComponent(restaurantId)}&order=created_at.desc&limit=500`,
+    { service: true }
+  ).catch(async () => await supabaseFetch(
+    `/rest/v1/restaurant_reviews?select=*&restaurant_id=eq.${encodeURIComponent(restaurantId)}&order=created_at.desc&limit=500`,
+    { service: true }
+  ).catch(() => []));
+  const reviewIds = (rows || []).map((row) => clean(row.id)).filter(Boolean);
+  let photos = [];
+  if (reviewIds.length) {
+    const inList = reviewIds.map(encodeURIComponent).join(",");
+    photos = await supabaseFetch(
+      `/rest/v1/review_photos?select=id,review_id,mime_type,file_size,width,height,display_order,moderation_status,created_at,storage_path&review_id=in.(${inList})&order=display_order.asc,created_at.asc&limit=2500`,
+      { service: true }
+    ).catch(() => []);
+  }
+  const photosByReview = new Map();
+  for (const photo of photos || []) {
+    const reviewId = clean(photo.review_id);
+    if (!reviewId) continue;
+    if (!photosByReview.has(reviewId)) photosByReview.set(reviewId, []);
+    photosByReview.get(reviewId).push(photo);
+  }
+  const reviewsWithPhotos = await Promise.all((rows || []).map(async (row) => {
+    const enrichedPhotos = await Promise.all((photosByReview.get(clean(row.id)) || []).map(async (photo) => ({
+      id: photo.id,
+      review_id: photo.review_id,
+      mime_type: photo.mime_type,
+      file_size: photo.file_size,
+      width: photo.width,
+      height: photo.height,
+      display_order: photo.display_order,
+      moderation_status: photo.moderation_status,
+      created_at: photo.created_at,
+      url: await signedReviewPhotoUrl(photo.storage_path)
+    })));
+    return {
+      id: row.id,
+      restaurant_id: row.restaurant_id,
+      restaurant_name: row.restaurant_name || restaurant.display_name || restaurant.name || "",
+      guest_name: row.guest_name || "",
+      food_rating: row.food_rating,
+      service_rating: row.service_rating,
+      atmosphere_rating: row.atmosphere_rating || row.ambience_rating,
+      overall_rating: row.overall_rating,
+      written_review: row.written_review || row.comment || "",
+      moderation_status: row.moderation_status || row.status,
+      status: row.status,
+      verified_visit: row.verified_visit,
+      visit_duration_minutes: row.visit_duration_minutes,
+      created_at: row.created_at,
+      submitted_at: row.submitted_at,
+      published_at: row.published_at,
+      restaurant_response: partnerReviewResponseFromMetadata(row.metadata),
+      photos: enrichedPhotos.filter((item) => item.url)
+    };
+  }));
+  return json(200, { reviews: reviewsWithPhotos });
 }
 
 function photoRewardSubmissionRows() {
@@ -11015,6 +23190,25 @@ async function partnerPhotoRewardSubmissions(method, body, headers, query) {
   return json(200, { mode: "supabase", submissions, insights: postVisitFeedbackInsights(submissions) });
 }
 
+function publicRewardsContextPayload(row = {}, requestedBookingId = "") {
+  const reservationId = clean(row.reservation_id || row.id);
+  const reference = clean(row.reference);
+  return {
+    bookingId: reservationId || reference || clean(requestedBookingId),
+    reservation_id: reservationId,
+    reference,
+    restaurantId: row.restaurant_id,
+    restaurant_id: row.restaurant_id,
+    restaurantName: row.restaurant_name,
+    restaurant_name: row.restaurant_name,
+    visitDate: row.reservation_date || row.offer_date,
+    visit_date: row.reservation_date || row.offer_date,
+    reservationTime: row.reservation_time || row.offer_time,
+    reservation_time: row.reservation_time || row.offer_time,
+    status: normalizeReservationStatus(row.status)
+  };
+}
+
 async function publicRewardsContext(query) {
   const bookingId = clean(query.get("bookingId") || query.get("booking_id") || query.get("reservationId") || query.get("reference"));
   if (!bookingId) return json(400, { error: "Booking ID is required." });
@@ -11023,58 +23217,27 @@ async function publicRewardsContext(query) {
     ensureDemo();
     const row = reservationOverviewRows().find((item) => item.reservation_id === bookingId || item.reference === bookingId);
     if (!row) return json(404, { error: "Booking not found." });
-    return json(200, {
-      context: {
-        bookingId: row.reservation_id,
-        reservation_id: row.reservation_id,
-        reference: row.reference,
-        restaurantId: row.restaurant_id,
-        restaurant_id: row.restaurant_id,
-        restaurantName: row.restaurant_name,
-        guestId: row.guest_id,
-        guestName: row.guest_name,
-        guestEmail: row.guest_email,
-        visitDate: row.reservation_date || row.offer_date,
-        reservationTime: row.reservation_time || row.offer_time,
-        partySize: row.party_size,
-        status: row.status
-      }
-    });
+    return json(200, { context: publicRewardsContextPayload(row, bookingId) });
   }
 
-  const rows = await supabaseFetch(`/rest/v1/reservation_overview?select=*&or=(reservation_id.eq.${encodeURIComponent(bookingId)},reference.eq.${encodeURIComponent(bookingId)})&limit=1`, { service: true });
+  const rows = await supabaseFetch(`/rest/v1/reservation_overview?select=reservation_id,reference,restaurant_id,restaurant_name,reservation_date,offer_date,reservation_time,offer_time,status&or=(reservation_id.eq.${encodeURIComponent(bookingId)},reference.eq.${encodeURIComponent(bookingId)})&limit=1`, { service: true });
   const row = rows?.[0];
   if (!row) return json(404, { error: "Booking not found." });
-  return json(200, {
-    context: {
-      bookingId: row.reservation_id,
-      reservation_id: row.reservation_id,
-      reference: row.reference,
-      restaurantId: row.restaurant_id,
-      restaurant_id: row.restaurant_id,
-      restaurantName: row.restaurant_name,
-      guestId: row.guest_id,
-      guestName: row.guest_name,
-      guestEmail: row.guest_email,
-      visitDate: row.reservation_date || row.offer_date,
-      reservationTime: row.reservation_time || row.offer_time,
-      partySize: row.party_size,
-      status: normalizeReservationStatus(row.status)
-    }
-  });
+  return json(200, { context: publicRewardsContextPayload(row, bookingId) });
 }
 
 async function guestNotifications(method, body, headers, query) {
+  if (method !== "GET" && method !== "PATCH") return json(405, { error: "Method not allowed." });
   let authProfile = null;
   try {
     authProfile = (await requireProfile(headers, ["guest"])).profile;
-  } catch {
-    authProfile = null;
+  } catch (error) {
+    if (error?.status === 403) return json(403, { error: "Forbidden.", code: "FORBIDDEN" });
+    return json(401, { error: "Authentication required.", code: "AUTHENTICATION_REQUIRED" });
   }
-  if (method !== "GET" && method !== "PATCH") return json(405, { error: "Method not allowed." });
-  const guestEmail = lower(authProfile?.email || query.get("guest_email") || query.get("email"));
-  const profileKey = clean(query.get("profile_key") || (authProfile?.email ? aiProfileKey(authProfile.email) : ""));
-  if (!guestEmail && !profileKey) return json(400, { error: "Guest email or profile key is required." });
+  const guestEmail = lower(authProfile?.email);
+  const profileKey = authProfile?.email ? aiProfileKey(authProfile.email) : "";
+  if (!guestEmail && !profileKey) return json(401, { error: "Authentication required.", code: "AUTHENTICATION_REQUIRED" });
   if (!supabaseConfigured) {
     ensureDemo();
     const rows = demo.guestNotifications.filter((item) => (
@@ -11082,7 +23245,6 @@ async function guestNotifications(method, body, headers, query) {
       (profileKey && item.profile_key === profileKey)
     ));
     if (method === "PATCH") {
-      if (!authProfile) return json(401, { error: "Authentication required." });
       const id = clean(body.id);
       rows.forEach((item) => {
         if (!id || item.id === id) item.read_at = nowIso();
@@ -11094,24 +23256,44 @@ async function guestNotifications(method, body, headers, query) {
       unread_count: rows.filter((item) => !item.read_at).length
     });
   }
-  const filters = profileKey
-    ? `profile_key=eq.${encodeURIComponent(profileKey)}`
-    : `guest_email=eq.${encodeURIComponent(guestEmail)}`;
+  const profileKeyFilter = `profile_key=eq.${encodeURIComponent(profileKey)}`;
+  const guestEmailFilter = `guest_email=eq.${encodeURIComponent(guestEmail)}`;
+  const filters = profileKey ? profileKeyFilter : guestEmailFilter;
+  const missingProfileKeyColumn = (error) => {
+    const message = String(error?.message || error?.detail?.message || "");
+    return error?.status === 400 && (error?.code === "42703" || error?.detail?.code === "42703" || /guest_notifications\.profile_key|profile_key.*does not exist/i.test(message));
+  };
   if (method === "PATCH") {
-    if (!authProfile) return json(401, { error: "Authentication required." });
     const id = clean(body.id);
     const endpoint = id
       ? `/rest/v1/guest_notifications?id=eq.${encodeURIComponent(id)}&guest_email=eq.${encodeURIComponent(guestEmail)}&select=*`
       : `/rest/v1/guest_notifications?${filters}&select=*`;
-    const updated = await supabaseFetch(endpoint, {
-      method: "PATCH",
-      service: true,
-      headers: { Prefer: "return=representation" },
-      body: { read_at: nowIso() }
-    });
+    let updated;
+    try {
+      updated = await supabaseFetch(endpoint, {
+        method: "PATCH",
+        service: true,
+        headers: { Prefer: "return=representation" },
+        body: { read_at: nowIso() }
+      });
+    } catch (error) {
+      if (!missingProfileKeyColumn(error) || id || !guestEmail) throw error;
+      updated = await supabaseFetch(`/rest/v1/guest_notifications?${guestEmailFilter}&select=*`, {
+        method: "PATCH",
+        service: true,
+        headers: { Prefer: "return=representation" },
+        body: { read_at: nowIso() }
+      });
+    }
     return json(200, { mode: "supabase", notifications: updated || [] });
   }
-  const rows = await supabaseFetch(`/rest/v1/guest_notifications?select=*&${filters}&order=created_at.desc`, { service: true });
+  let rows;
+  try {
+    rows = await supabaseFetch(`/rest/v1/guest_notifications?select=*&${filters}&order=created_at.desc`, { service: true });
+  } catch (error) {
+    if (!missingProfileKeyColumn(error) || !guestEmail) throw error;
+    rows = await supabaseFetch(`/rest/v1/guest_notifications?select=*&${guestEmailFilter}&order=created_at.desc`, { service: true });
+  }
   return json(200, { notifications: rows || [], unread_count: (rows || []).filter((item) => !item.read_at).length });
 }
 
@@ -11158,14 +23340,81 @@ async function createSystemAdminNotification({ type, title, message, profile, en
   return rows?.[0] || null;
 }
 
-async function createAuditLog({ profile, action, entityType, entityId, metadata = {} }) {
+const AUDIT_SENSITIVE_METADATA_KEY = /secret|token|password|authorization|api[_-]?key|service[_-]?role/i;
+
+function sanitizeAuditMetadataValue(value, key = "", depth = 0, seen = new WeakSet()) {
+  if (AUDIT_SENSITIVE_METADATA_KEY.test(key)) return "[redacted]";
+  if (typeof value === "string") {
+    const cleaned = clean(value);
+    return cleaned.length > 500 ? `${cleaned.slice(0, 500)}...` : cleaned;
+  }
+  if (typeof value === "number" || typeof value === "boolean" || value === null) return value;
+  if (value instanceof Date) return value.toISOString();
+  if (Array.isArray(value)) {
+    if (depth >= 2) return { summary: "array_truncated", count: value.length };
+    return value.slice(0, 25).map((item, index) => sanitizeAuditMetadataValue(item, `${key}[${index}]`, depth + 1, seen));
+  }
+  if (value && typeof value === "object") {
+    if (seen.has(value)) return "[circular]";
+    const keys = Object.keys(value).slice(0, 25);
+    if (depth >= 3) return { summary: "object_redacted", keys };
+    seen.add(value);
+    const safe = {};
+    for (const [childKey, childValue] of Object.entries(value).slice(0, 25)) {
+      const sanitized = sanitizeAuditMetadataValue(childValue, childKey, depth + 1, seen);
+      if (typeof sanitized !== "undefined") safe[childKey] = sanitized;
+    }
+    seen.delete(value);
+    return safe;
+  }
+  return undefined;
+}
+
+function sanitizeAuditMetadata(metadata = {}) {
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return {};
+  return sanitizeAuditMetadataValue(metadata) || {};
+}
+
+async function createAuditLog({
+  profile,
+  action,
+  entityType,
+  entityId,
+  metadata = {},
+  previousValue = null,
+  newValue = null,
+  headers = {},
+  targetUserId = null,
+  targetRole = "",
+  success = true,
+  requestId = ""
+}) {
+  const safeMetadata = sanitizeAuditMetadata(metadata);
+  const requestIdentifier = clean(requestId || requestIdFromHeaders(headers));
+  const ip = clientIpAddress(headers);
   const payload = {
     actor_user_id: profile?.id || null,
     actor_role: normalizeRole(profile?.role || "system"),
     action: clean(action || "system_activity"),
     entity_type: nullableClean(entityType),
     entity_id: nullableClean(entityId),
-    metadata: metadata && typeof metadata === "object" ? metadata : {}
+    restaurant_id: nullableClean(metadata.restaurant_id || metadata.restaurantId),
+    reservation_id: nullableClean(metadata.reservation_id || metadata.reservationId),
+    campaign_id: nullableClean(metadata.campaign_id || metadata.campaignId || (String(entityType || "").includes("campaign") ? entityId : "")),
+    billing_event_id: nullableClean(metadata.billing_event_id || metadata.billingEventId),
+    ip_hash: ip ? hashEmailValue(`ip:${ip}`) : null,
+    previous_value: previousValue && typeof previousValue === "object" ? sanitizeAuditMetadata(previousValue) : null,
+    new_value: newValue && typeof newValue === "object" ? sanitizeAuditMetadata(newValue) : null,
+    ip_address: maskedIpAddress(ip),
+    request_id: requestIdentifier,
+    success: Boolean(success),
+    target_user_id: nullableClean(targetUserId),
+    target_role: nullableClean(targetRole ? normalizeRole(targetRole) : ""),
+    impersonation_session_id: nullableClean(metadata.impersonation_session_id || metadata.impersonationSessionId),
+    metadata: {
+      ...safeMetadata,
+      request_id: requestIdentifier
+    }
   };
 
   if (!supabaseConfigured) {
@@ -11185,9 +23434,111 @@ async function createAuditLog({ profile, action, entityType, entityId, metadata 
     method: "POST",
     service: true,
     headers: { Prefer: "return=representation" },
-    body: payload
+    body: await filterSupabaseTablePayload("audit_logs", payload)
   }).catch(() => null);
   return rows?.[0] || null;
+}
+
+async function createRestaurantStatusHistory({
+  profile,
+  restaurantId,
+  previousStatus,
+  newStatus,
+  reason = "",
+  changedFields = [],
+  headers = {},
+  result = "success",
+  metadata = {},
+  isTestData = false
+}) {
+  const id = clean(restaurantId);
+  if (!id || !newStatus) return null;
+  const ip = clientIpAddress(headers);
+  const payload = {
+    restaurant_id: id,
+    previous_status: nullableClean(previousStatus),
+    new_status: clean(newStatus),
+    reason: nullableClean(reason),
+    actor_user_id: profile?.id || null,
+    actor_role: normalizeRole(profile?.role || "system"),
+    result: result === "failure" ? "failure" : "success",
+    changed_fields: Array.isArray(changedFields) ? changedFields.map((item) => clean(item)).filter(Boolean) : [],
+    request_id: nullableClean(requestIdFromHeaders(headers)),
+    ip_hash: ip ? hashEmailValue(`ip:${ip}`) : null,
+    metadata: sanitizeAuditMetadata(metadata),
+    is_test_data: boolValue(isTestData),
+    created_at: nowIso()
+  };
+
+  if (!supabaseConfigured) {
+    ensureDemo();
+    const row = { id: crypto.randomUUID(), ...payload };
+    demo.restaurantStatusHistory.unshift(row);
+    return row;
+  }
+
+  const rows = await supabaseFetch("/rest/v1/restaurant_status_history?select=*", {
+    method: "POST",
+    service: true,
+    headers: { Prefer: "return=representation" },
+    body: await filterSupabaseTablePayload("restaurant_status_history", payload)
+  }).catch(() => null);
+  return rows?.[0] || null;
+}
+
+async function createGuestSecurityEvent({ profile, eventType, headers = {}, emailNotificationStatus = "not_applicable", metadata = {} }) {
+  const ip = clientIpAddress(headers);
+  const userAgentSummary = summarizeUserAgent(headerValue(headers, "user-agent"));
+  const payload = {
+    user_id: profile?.id || null,
+    guest_email: lower(profile?.email || ""),
+    event_type: clean(eventType || "security_event"),
+    ip_hash: ip ? hashEmailValue(`ip:${ip}`) : null,
+    ip_masked: maskedIpAddress(ip),
+    user_agent_summary: userAgentSummary,
+    email_notification_status: clean(emailNotificationStatus || "not_applicable"),
+    metadata: metadata && typeof metadata === "object" ? metadata : {},
+    created_at: nowIso()
+  };
+
+  if (!supabaseConfigured) {
+    ensureDemo();
+    const row = { id: crypto.randomUUID(), ...payload };
+    demo.guestAuthEvents.unshift(row);
+    return row;
+  }
+
+  try {
+    const rows = await supabaseFetch("/rest/v1/guest_auth_events?select=*", {
+      method: "POST",
+      service: true,
+      headers: { Prefer: "return=representation" },
+      body: payload
+    });
+    return rows?.[0] || null;
+  } catch (error) {
+    if (error.code === "PGRST204") {
+      const rows = await supabaseFetch("/rest/v1/guest_auth_events?select=*", {
+        method: "POST",
+        service: true,
+        headers: { Prefer: "return=representation" },
+        body: {
+          user_id: payload.user_id,
+          guest_email: payload.guest_email,
+          event_type: payload.event_type,
+          metadata: {
+            ...payload.metadata,
+            ip_masked: payload.ip_masked,
+            user_agent_summary: payload.user_agent_summary,
+            email_notification_status: payload.email_notification_status
+          },
+          created_at: payload.created_at
+        }
+      });
+      return rows?.[0] || null;
+    }
+    throw error;
+  }
 }
 
 async function createAdminNotification({ type, title, message, profile, restaurant, entityType, entityId }) {
@@ -11240,8 +23591,17 @@ async function adminNotifications(method, body, headers) {
       return json(200, { notifications, unread_count: notifications.filter((item) => !item.read_at).length });
     }
   } else {
+    const notificationRowsFromSupabase = async () => {
+      const overview = await supabaseFetch("/rest/v1/admin_notifications_overview?select=*&order=created_at.desc", { service: true })
+        .catch((error) => {
+          if (String(error?.code || "").startsWith("PGRST") || /schema cache|admin_notifications_overview/i.test(error?.message || "")) return null;
+          throw error;
+        });
+      if (overview) return overview;
+      return await supabaseFetch("/rest/v1/admin_notifications?select=*&order=created_at.desc", { service: true }).catch(() => []);
+    };
     if (method === "GET") {
-      const notifications = await supabaseFetch("/rest/v1/admin_notifications_overview?select=*&order=created_at.desc", { service: true });
+      const notifications = await notificationRowsFromSupabase();
       const countRows = await supabaseFetch("/rest/v1/admin_notifications?select=id&read_at=is.null", { service: true }).catch(() => []);
       return json(200, { notifications: notifications || [], unread_count: countRows?.length || 0 });
     }
@@ -11262,7 +23622,7 @@ async function adminNotifications(method, body, headers) {
           body: { read_at: nowIso() }
         });
       }
-      const notifications = await supabaseFetch("/rest/v1/admin_notifications_overview?select=*&order=created_at.desc", { service: true });
+      const notifications = await notificationRowsFromSupabase();
       const countRows = await supabaseFetch("/rest/v1/admin_notifications?select=id&read_at=is.null", { service: true }).catch(() => []);
       return json(200, { notifications: notifications || [], unread_count: countRows?.length || 0 });
     }
@@ -11272,6 +23632,7 @@ async function adminNotifications(method, body, headers) {
 
 async function createReservation(body, headers) {
   const offerId = clean(body.offer_id);
+  const reservationType = normalizeReservationType(body.reservation_type || body.type, offerId);
   const partySize = Number(body.party_size);
   const guest = {
     name: clean(body.guest_name || body.name),
@@ -11280,6 +23641,9 @@ async function createReservation(body, headers) {
   };
   const guestLanguage = normalizeLanguage(body.guest_language || body.language || body.lang || "en");
   const notes = clean(body.notes);
+  if (reservationType === "standard") {
+    return await createStandardReservation(body, headers, { partySize, guest, guestLanguage, notes });
+  }
   if (!offerId || !guest.name || !guest.email || !guest.phone || !Number.isInteger(partySize) || partySize < 1) {
     return json(400, { error: "Offer, guest contact details, and party size are required." });
   }
@@ -11291,7 +23655,7 @@ async function createReservation(body, headers) {
     const reservationDate = clean(body.reservation_date) || offer.offer_date;
     const reservationTime = clean(body.reservation_time) || offer.start_time || offer.offer_time;
     const restaurant = demo.restaurants.find((item) => item.id === offer.restaurant_id);
-    if (!restaurant || restaurant.status !== "approved") {
+    if (!restaurant || restaurant.status !== "approved" || restaurant.visible_on_guest_site === false || restaurant.accepts_reservation_requests === false) {
       const validity = evaluateOfferValidity(offerWithRestaurantContext(offer, restaurant), { reservationDate, reservationTime, partySize });
       logOfferValidityRejection({ ...validity, code: "OFFER_UNAVAILABLE", status: "unavailable" }, offer, { mode: "demo", restaurant_id: offer.restaurant_id });
       return json(409, { code: "OFFER_UNAVAILABLE", error: "Restaurant is not available for reservations.", offer_status: "unavailable" });
@@ -11308,6 +23672,7 @@ async function createReservation(body, headers) {
     const profile = profileFromDemoToken(token);
     offer.reserved_tables = numberOr(offer.reserved_tables, 0) + 1;
     offer.reserved_seats = numberOr(offer.reserved_seats, 0) + partySize;
+    const isTestReservation = Boolean(restaurant.is_test_restaurant || offer.is_test_offer);
     const reservation = {
       id: crypto.randomUUID(),
       reference: `ST-${Math.floor(10000 + Math.random() * 90000)}`,
@@ -11326,6 +23691,9 @@ async function createReservation(body, headers) {
       source: "smarttable",
       booking_source: "SMARTTABLE",
       booking_status: "pending",
+      is_test_reservation: isTestReservation,
+      test_record: isTestReservation,
+      metadata: isTestReservation ? { is_test_reservation: true, reservation_provider: restaurant.reservation_provider || "internal_test" } : {},
       created_at: nowIso(),
       updated_at: nowIso()
     };
@@ -11347,15 +23715,30 @@ async function createReservation(body, headers) {
       created_at: nowIso()
     });
     const row = reservationOverviewRows().find((item) => item.reservation_id === reservation.id);
-    const emails = await sendReservationCreatedEmails(row);
-    return json(201, { reservation: row, emails, email_delivery: emailDeliverySummary(emails) });
+    const alertPreferences = await getRestaurantNotificationPreferences(row.restaurant_id);
+    const emailTargets = alertPreferences.email_enabled === false ? ["guest", "admin"] : undefined;
+    const emails = await sendReservationCreatedEmails(row, emailTargets ? { targets: emailTargets } : {});
+    const reservationAlert = await createReservationAlertForReservation(row, { preferences: alertPreferences, emails }).catch((error) => {
+      logSafeServerEvent("reservation_alert_creation_failed", {
+        restaurant_id: row.restaurant_id,
+        reservation_id: row.reservation_id,
+        code: error.code || "RESERVATION_ALERT_FAILED"
+      });
+      return null;
+    });
+    return json(201, {
+      reservation: row,
+      emails,
+      email_delivery: emailDeliverySummary(emails),
+      reservation_alert: reservationAlert ? clientReservationAlert(reservationAlert) : null
+    });
   }
 
   const token = authToken(headers);
   const offerRows = await supabaseFetch(`/rest/v1/offers?select=*,restaurants(*)&id=eq.${encodeURIComponent(offerId)}&limit=1`, { service: true }).catch(() => []);
   const offer = offerRows?.[0];
   if (!offer) return json(404, { code: "OFFER_NOT_FOUND", error: "Offer not found.", offer_status: "unavailable" });
-  if (offer.restaurants && offer.restaurants.status && offer.restaurants.status !== "approved") {
+  if (offer.restaurants && (offer.restaurants.status !== "approved" || offer.restaurants.visible_on_guest_site === false || offer.restaurants.accepts_reservation_requests === false)) {
     const validity = evaluateOfferValidity(offerWithRestaurantContext(offer, offer.restaurants), {
       reservationDate: clean(body.reservation_date) || offer.offer_date,
       reservationTime: clean(body.reservation_time) || offer.start_time || offer.offer_time,
@@ -11402,6 +23785,16 @@ async function createReservation(body, headers) {
     body: { guest_language: guestLanguage }
   }).catch(() => null);
   row.guest_language = guestLanguage;
+  if (offer.restaurants?.is_test_restaurant || offer.is_test_offer) {
+    await supabaseFetch(`/rest/v1/reservations?id=eq.${encodeURIComponent(row.reservation_id)}&select=id`, {
+      method: "PATCH",
+      service: true,
+      headers: { Prefer: "return=minimal" },
+      body: { is_test_reservation: true, test_record: true }
+    }).catch(() => null);
+    row.is_test_reservation = true;
+    row.test_record = true;
+  }
   const reservationRow = decorateReservationRow({
     ...row,
     source: row.source || "smarttable",
@@ -11426,8 +23819,163 @@ async function createReservation(body, headers) {
       }
     }
   }).catch(() => null);
-  const emails = await sendReservationCreatedEmails(reservationRow);
-  return json(201, { reservation: reservationRow, emails, email_delivery: emailDeliverySummary(emails) });
+  const alertPreferences = await getRestaurantNotificationPreferences(reservationRow.restaurant_id);
+  const emailTargets = alertPreferences.email_enabled === false ? ["guest", "admin"] : undefined;
+  const emails = await sendReservationCreatedEmails(reservationRow, emailTargets ? { targets: emailTargets } : {});
+  const reservationAlert = await createReservationAlertForReservation(reservationRow, { preferences: alertPreferences, emails }).catch((error) => {
+    logSafeServerEvent("reservation_alert_creation_failed", {
+      restaurant_id: reservationRow.restaurant_id,
+      reservation_id: reservationRow.reservation_id,
+      code: error.code || "RESERVATION_ALERT_FAILED"
+    });
+    return null;
+  });
+  return json(201, {
+    reservation: reservationRow,
+    emails,
+    email_delivery: emailDeliverySummary(emails),
+    reservation_alert: reservationAlert ? clientReservationAlert(reservationAlert) : null
+  });
+}
+
+function stripUnsafeHtml(value = "") {
+  return clean(value).replace(/<[^>]*>/g, "").replace(/[<>]/g, "");
+}
+
+function slugFrom(value = "") {
+  return lower(value)
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .replace(/-{2,}/g, "-")
+    .slice(0, 80);
+}
+
+function safeUrlValue(value = "", options = {}) {
+  const url = clean(value);
+  if (!url) return "";
+  if (options.allowRelative && /^\/(?!\/)/.test(url)) return url;
+  try {
+    const parsed = new URL(url);
+    return ["http:", "https:"].includes(parsed.protocol) ? parsed.toString() : "";
+  } catch {
+    return "";
+  }
+}
+
+function safeInternalActionUrl(value = "") {
+  const safe = safeUrlValue(value, { allowRelative: true });
+  if (!safe) return "";
+  if (/^\/(?!\/)/.test(safe)) return safe;
+  try {
+    const parsed = new URL(safe);
+    const base = new URL(PUBLIC_BASE_URL);
+    if (parsed.origin !== base.origin) return "";
+    return `${parsed.pathname}${parsed.search}${parsed.hash}`;
+  } catch {
+    return "";
+  }
+}
+
+function assertSafeUrlValue(value = "", field = "url", options = {}) {
+  const input = clean(value);
+  const safe = safeUrlValue(input, options);
+  if (input && !safe) {
+    const error = new Error(`${field} must be a safe http(s) URL${options.allowRelative ? " or root-relative path" : ""}.`);
+    error.status = 400;
+    error.code = "RESTAURANT_URL_INVALID";
+    error.field = field;
+    throw error;
+  }
+  return safe;
+}
+
+function isValidTimeZone(value = "") {
+  const timezone = clean(value);
+  if (!timezone) return false;
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: timezone }).format(new Date("2026-01-01T12:00:00Z"));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function minutesFromTime(value = "") {
+  const match = clean(value).match(/^([01]?\d|2[0-3]):([0-5]\d)(?::[0-5]\d)?$/);
+  if (!match) return null;
+  return Number(match[1]) * 60 + Number(match[2]);
+}
+
+function normalizeServicePeriodDay(value = "") {
+  const day = clean(value).toLowerCase();
+  const map = {
+    monday: "mon",
+    tuesday: "tue",
+    wednesday: "wed",
+    thursday: "thu",
+    friday: "fri",
+    saturday: "sat",
+    sunday: "sun"
+  };
+  return map[day] || day.slice(0, 3);
+}
+
+function validateServicePeriods(periods = []) {
+  if (!Array.isArray(periods)) return [];
+  const normalized = periods.map((item, index) => {
+    const status = clean(item.status || "active").toLowerCase();
+    const day = normalizeServicePeriodDay(item.day || item.day_of_week || item.weekday || item.effective_date || item.date || `period-${index + 1}`);
+    const start = minutesFromTime(item.opens || item.open || item.start_time || item.start || "");
+    const end = minutesFromTime(item.closes || item.close || item.end_time || item.end || "");
+    if (status !== "inactive" && status !== "archived" && (start === null || end === null || start >= end)) {
+      const error = new Error("Service periods need valid start and end times.");
+      error.status = 400;
+      error.code = "SERVICE_PERIOD_TIME_INVALID";
+      error.field = `service_periods[${index}]`;
+      throw error;
+    }
+    return { item, index, day, start, end, status };
+  });
+  for (let i = 0; i < normalized.length; i += 1) {
+    const left = normalized[i];
+    if (left.status === "inactive" || left.status === "archived" || left.start === null || left.end === null) continue;
+    for (let j = i + 1; j < normalized.length; j += 1) {
+      const right = normalized[j];
+      if (right.status === "inactive" || right.status === "archived" || right.start === null || right.end === null) continue;
+      if (left.day === right.day && left.start < right.end && right.start < left.end) {
+        const error = new Error("Service periods cannot overlap for the same day.");
+        error.status = 409;
+        error.code = "SERVICE_PERIOD_OVERLAP";
+        error.field = `service_periods[${left.index}],service_periods[${right.index}]`;
+        throw error;
+      }
+    }
+  }
+  return periods;
+}
+
+function jsonArrayFrom(value, fallback = []) {
+  const array = arrayFrom(value);
+  return array.length ? array : fallback;
+}
+
+function jsonValueFrom(value, fallback) {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (typeof value === "object") return value;
+  try {
+    return JSON.parse(String(value));
+  } catch {
+    return fallback;
+  }
+}
+
+function structuredServicePeriodsFrom(body = {}) {
+  const raw = body.service_periods !== undefined ? jsonValueFrom(body.service_periods, []) : [];
+  if (Array.isArray(raw)) return raw;
+  const settings = jsonFrom(body.settings, {});
+  return Array.isArray(settings.service_periods) ? settings.service_periods : [];
 }
 
 function restaurantPayload(body, options = {}) {
@@ -11438,49 +23986,89 @@ function restaurantPayload(body, options = {}) {
     "phone",
     "address",
     "district",
-    "website",
-    "instagram",
-    "facebook",
-    "tiktok",
-    "google_maps_url",
     "google_place_id",
     "restaurant_type",
     "opening_hours",
-    "cover_image",
-    "card_image",
-    "icon_image",
-    "logo_url",
-    "hero_image_url",
-    "menu_pdf_url",
     "price_range",
     "dress_code",
     "chef_name",
+    "primary_timezone",
+    "onboarding_status",
+    "country",
+    "city",
+    "currency_code",
+    "price_level",
+    "reservation_provider",
+    "state_region",
+    "postal_code",
+    "street_address",
+    "default_language",
+    "dining_style"
+  ];
+  for (const field of fields) {
+    if (body[field] !== undefined || options.full) payload[field] = stripUnsafeHtml(body[field]);
+  }
+  if (payload.primary_timezone && !isValidTimeZone(payload.primary_timezone)) {
+    const error = new Error("Restaurant timezone must be a valid IANA timezone.");
+    error.status = 400;
+    error.code = "RESTAURANT_TIMEZONE_INVALID";
+    error.field = "primary_timezone";
+    throw error;
+  }
+  const urlFields = ["website", "instagram", "facebook", "tiktok", "google_maps_url"];
+  for (const field of urlFields) {
+    if (body[field] !== undefined || options.full) payload[field] = assertSafeUrlValue(body[field], field);
+  }
+  const assetUrlFields = ["cover_image", "card_image", "icon_image", "logo_url", "hero_image_url", "menu_pdf_url"];
+  for (const field of assetUrlFields) {
+    if (body[field] !== undefined || options.full) payload[field] = assertSafeUrlValue(body[field], field, { allowRelative: true });
+  }
+  const textFields = [
     "description_en",
     "description_es",
     "description_hu",
-    "primary_timezone",
-    "onboarding_status"
+    "short_description",
+    "full_description",
+    "accessibility_info",
+    "parking_info",
+    "public_contact_info",
+    "seo_title",
+    "seo_description",
+    "cancellation_policy",
+    "no_show_policy",
+    "confirmation_message",
+    "arrival_instructions"
   ];
-  for (const field of fields) {
-    if (body[field] !== undefined || options.full) payload[field] = clean(body[field]);
+  for (const field of textFields) {
+    if (body[field] !== undefined || options.full) payload[field] = stripUnsafeHtml(body[field]);
+  }
+  if (body.slug !== undefined || body.public_slug !== undefined || options.full) {
+    payload.slug = slugFrom(body.slug || body.public_slug || body.name || body.legal_name);
   }
   if (body.email !== undefined || body.contact_email !== undefined || options.full) {
     const email = lower(body.email || body.contact_email);
     payload.email = email;
     payload.contact_email = email;
   }
+  if (body.primary_email !== undefined || options.full) payload.primary_email = lower(body.primary_email || payload.contact_email || payload.email);
+  if (body.reservation_email !== undefined || options.full) payload.reservation_email = lower(body.reservation_email || payload.primary_email || payload.contact_email || payload.email);
   if (body.cuisine_type !== undefined || body.cuisine !== undefined || options.full) {
-    const cuisine = clean(body.cuisine_type || body.cuisine);
+    const cuisine = stripUnsafeHtml(body.cuisine_type || body.cuisine);
     payload.cuisine_type = cuisine;
     payload.cuisine = cuisine;
   }
   if (body.description !== undefined || options.full) {
-    payload.description = clean(body.description);
+    payload.description = stripUnsafeHtml(body.description);
     if (!payload.description_en) payload.description_en = payload.description;
+    if (!payload.short_description) payload.short_description = payload.description.slice(0, 220);
+    if (!payload.full_description) payload.full_description = payload.description;
   }
   if (body.gallery_images !== undefined || options.full) payload.gallery_images = arrayFrom(body.gallery_images);
+  if (body.gallery_image_order !== undefined || options.full) payload.gallery_image_order = arrayFrom(body.gallery_image_order);
+  if (body.cuisine_categories !== undefined || options.full) payload.cuisine_categories = jsonArrayFrom(body.cuisine_categories);
+  if (body.supported_languages !== undefined || options.full) payload.supported_languages = jsonArrayFrom(body.supported_languages, ["en"]);
   if (body.payment_methods !== undefined || options.full) payload.payment_methods = arrayFrom(body.payment_methods);
-  for (const field of ["outdoor_seating", "parking_available", "kids_friendly", "pet_friendly", "wheelchair_accessible", "private_room_available"]) {
+  for (const field of ["outdoor_seating", "parking_available", "kids_friendly", "pet_friendly", "wheelchair_accessible", "private_room_available", "partner_approval_required", "accepts_reservation_requests", "visible_on_guest_site", "is_test_data", "is_test_restaurant", "is_featured", "is_new_restaurant", "same_day_reservations_enabled", "waitlist_enabled", "special_requests_enabled", "accessibility_requests_enabled", "high_chair_requests_enabled", "occasion_field_enabled", "guest_notes_enabled", "internal_notes_enabled"]) {
     if (body[field] !== undefined || options.full) {
       const value = Array.isArray(body[field]) ? body[field].at(-1) : body[field];
       payload[field] = value === true || value === "true" || value === "on" || value === 1 || value === "1";
@@ -11522,8 +24110,33 @@ function restaurantPayload(body, options = {}) {
   if (body.table_capacity !== undefined || options.full) {
     payload.table_capacity = body.table_capacity === "" || body.table_capacity === undefined ? null : Math.max(0, Math.trunc(numberOr(body.table_capacity, 0)));
   }
+  if (body.booking_horizon_days !== undefined || options.full) payload.booking_horizon_days = Math.max(1, Math.trunc(numberOr(body.booking_horizon_days, 30)));
+  if (body.minimum_booking_notice_minutes !== undefined || body.minimum_advance_minutes !== undefined || options.full) payload.minimum_booking_notice_minutes = Math.max(0, Math.trunc(numberOr(body.minimum_booking_notice_minutes || body.minimum_advance_minutes, 30)));
+  if (body.default_table_duration_minutes !== undefined || body.default_reservation_duration !== undefined || options.full) payload.default_table_duration_minutes = Math.max(15, Math.trunc(numberOr(body.default_table_duration_minutes || body.default_reservation_duration, 90)));
+  if (body.grace_period_minutes !== undefined || options.full) payload.grace_period_minutes = Math.max(0, Math.trunc(numberOr(body.grace_period_minutes, 15)));
+  if (body.last_seating_time !== undefined || options.full) payload.last_seating_time = nullableClean(body.last_seating_time);
+  if (body.reservation_interval_minutes !== undefined || body.booking_interval_minutes !== undefined || options.full) {
+    payload.reservation_interval_minutes = Math.max(5, Math.trunc(numberOr(body.reservation_interval_minutes || body.booking_interval_minutes, 30)));
+  }
+  if (body.min_party_size !== undefined || options.full) payload.min_party_size = Math.max(1, Math.trunc(numberOr(body.min_party_size, 1)));
+  if (body.max_party_size !== undefined || options.full) payload.max_party_size = Math.max(1, Math.trunc(numberOr(body.max_party_size, 8)));
+  if (payload.min_party_size !== undefined && payload.max_party_size !== undefined && payload.max_party_size < payload.min_party_size) {
+    payload.max_party_size = payload.min_party_size;
+  }
   if (body.weak_hours !== undefined || options.full) payload.weak_hours = Array.isArray(body.weak_hours) ? body.weak_hours : arrayFrom(body.weak_hours);
+  if (body.available_party_sizes !== undefined || options.full) payload.available_party_sizes = jsonArrayFrom(body.available_party_sizes);
+  if (body.service_periods !== undefined || options.full) payload.service_periods = validateServicePeriods(structuredServicePeriodsFrom(body));
+  if (body.holiday_exceptions !== undefined || options.full) payload.holiday_exceptions = jsonValueFrom(body.holiday_exceptions, []);
+  if (body.temporary_closures !== undefined || options.full) payload.temporary_closures = jsonValueFrom(body.temporary_closures, []);
   if (body.discount_rules !== undefined || options.full) payload.discount_rules = jsonFrom(body.discount_rules, {});
+  if (body.social_links !== undefined || options.full) payload.social_links = jsonFrom(body.social_links, {});
+  if (body.settings !== undefined || options.full) {
+    payload.settings = jsonFrom(body.settings, {});
+  }
+  if (body.reservation_acceptance_mode !== undefined || body.acceptance_mode !== undefined || options.full) {
+    const mode = clean(body.reservation_acceptance_mode || body.acceptance_mode || "manual");
+    payload.reservation_acceptance_mode = mode === "automatic" ? "automatic" : "manual";
+  }
   if (body.onboarding_completed_at !== undefined) payload.onboarding_completed_at = nullableClean(body.onboarding_completed_at);
   if (payload.min_discount_percent !== undefined && payload.max_discount_percent !== undefined && payload.max_discount_percent < payload.min_discount_percent) {
     payload.max_discount_percent = payload.min_discount_percent;
@@ -11533,7 +24146,29 @@ function restaurantPayload(body, options = {}) {
   if (body.sort_order !== undefined || options.full) payload.sort_order = body.sort_order === "" || body.sort_order === undefined ? null : Math.max(0, Math.trunc(numberOr(body.sort_order, 0)));
   if (body.latitude !== undefined || options.full) payload.latitude = body.latitude === "" || body.latitude === undefined ? null : numberOr(body.latitude, null);
   if (body.longitude !== undefined || options.full) payload.longitude = body.longitude === "" || body.longitude === undefined ? null : numberOr(body.longitude, null);
-  if (body.status && allowedRestaurantStatuses.has(body.status)) payload.status = body.status;
+  if (body.status) {
+    const status = clean(body.status);
+    const mappedStatus = status === "draft" || status === "pending_review" || status === "pending review"
+      ? "pending"
+      : status === "active"
+        ? "approved"
+        : status === "archived"
+          ? "suspended"
+          : status;
+    if (allowedRestaurantStatuses.has(mappedStatus)) payload.status = mappedStatus;
+    if (body.onboarding_status === undefined) {
+      const onboardingStatus = status === "pending_review" || status === "pending review"
+        ? "pending_review"
+        : status === "active" || status === "approved"
+          ? "active"
+          : status === "archived"
+            ? "archived"
+            : status === "suspended"
+              ? "suspended"
+              : "draft";
+      payload.onboarding_status = onboardingStatus;
+    }
+  }
   if (options.full) {
     payload.status ||= "pending";
     payload.rating ??= 4.5;
@@ -11549,7 +24184,39 @@ function restaurantPayload(body, options = {}) {
     payload.table_capacity ??= payload.capacity ?? null;
     payload.weak_hours ||= [];
     payload.discount_rules ||= {};
-    payload.onboarding_status ||= "incomplete";
+    payload.onboarding_status ||= "draft";
+    payload.country ||= "US";
+    payload.city ||= payload.district || "New York";
+    payload.currency_code ||= "USD";
+    payload.price_level ||= payload.price_range || "$$";
+    payload.reservation_provider ||= "internal";
+    payload.reservation_interval_minutes ??= 30;
+    payload.min_party_size ??= 1;
+    payload.max_party_size ??= 8;
+    payload.available_party_sizes ||= [1, 2, 3, 4, 5, 6, 7, 8];
+    payload.partner_approval_required ??= true;
+    payload.accepts_reservation_requests ??= true;
+    payload.visible_on_guest_site ??= false;
+    payload.is_test_data ??= false;
+    payload.is_test_restaurant ??= false;
+    payload.settings ||= {};
+    payload.supported_languages ||= ["en"];
+    payload.service_periods ||= [];
+    payload.holiday_exceptions ||= [];
+    payload.temporary_closures ||= [];
+    payload.reservation_acceptance_mode ||= "manual";
+    payload.booking_horizon_days ??= 30;
+    payload.minimum_booking_notice_minutes ??= 30;
+    payload.default_table_duration_minutes ??= 90;
+    payload.grace_period_minutes ??= 15;
+    payload.same_day_reservations_enabled ??= true;
+    payload.waitlist_enabled ??= false;
+    payload.special_requests_enabled ??= true;
+    payload.accessibility_requests_enabled ??= true;
+    payload.high_chair_requests_enabled ??= true;
+    payload.occasion_field_enabled ??= true;
+    payload.guest_notes_enabled ??= true;
+    payload.internal_notes_enabled ??= true;
     payload.primary_timezone ||= "America/New_York";
     payload.district ||= "New York";
     payload.description ||= payload.description_en || "";
@@ -11580,6 +24247,578 @@ function restaurantPayload(body, options = {}) {
     payload.restaurant_type ||= payload.cuisine_type || "restaurant";
   }
   return payload;
+}
+
+function normalizedDuplicateText(value = "") {
+  return lower(value).replace(/[^a-z0-9]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function normalizedDuplicatePhone(value = "") {
+  return clean(value).replace(/\D/g, "");
+}
+
+function normalizedDuplicateWebsite(value = "") {
+  return lower(value).replace(/^https?:\/\//, "").replace(/^www\./, "").split(/[?#]/)[0].replace(/\/+$/, "");
+}
+
+function duplicateRestaurantInput(body = {}) {
+  return {
+    name: normalizedDuplicateText(body.name || body.legal_name),
+    address: normalizedDuplicateText(body.address),
+    phone: normalizedDuplicatePhone(body.phone),
+    website: normalizedDuplicateWebsite(body.website),
+    partner_email: lower(body.partner_email || body.email || body.contact_email)
+  };
+}
+
+function restaurantDuplicateCandidate(row = {}) {
+  return {
+    id: clean(row.id),
+    name: clean(row.name || row.legal_name),
+    status: clean(row.status),
+    normalized: {
+      name: normalizedDuplicateText(row.name || row.legal_name),
+      address: normalizedDuplicateText(row.address),
+      phone: normalizedDuplicatePhone(row.phone),
+      website: normalizedDuplicateWebsite(row.website),
+      partner_email: lower(row.partner_email || row.email || row.contact_email)
+    }
+  };
+}
+
+function restaurantDuplicateMatches(body = {}, rows = []) {
+  const input = duplicateRestaurantInput(body);
+  return (rows || []).map((row) => {
+    const candidate = restaurantDuplicateCandidate(row);
+    const matched_fields = ["name", "address", "phone", "website", "partner_email"]
+      .filter((field) => input[field] && candidate.normalized[field] && input[field] === candidate.normalized[field]);
+    return matched_fields.length
+      ? { id: candidate.id, name: candidate.name, status: candidate.status, matched_fields }
+      : null;
+  }).filter(Boolean);
+}
+
+function normalizePartnerAccessMode(value = "") {
+  const mode = clean(value || "none_later");
+  return ["none_later", "invite_new", "assign_existing"].includes(mode) ? mode : "none_later";
+}
+
+function restaurantOnboardingPartnerPayload(body = {}, restaurant = {}) {
+  const mode = normalizePartnerAccessMode(body.partner_access_mode);
+  if (mode === "none_later") return null;
+  const email = lower(body.partner_email || body.partner_contact_email || "");
+  if (!email || !restaurant?.id) return null;
+  return {
+    email,
+    full_name: clean(body.partner_full_name || body.contact_name || email),
+    restaurant_id: restaurant.id,
+    restaurant_role: normalizeRestaurantUserRole(body.restaurant_role || "owner"),
+    is_test_data: boolValue(body.is_test_data || restaurant.is_test_data),
+    source: "restaurant_onboarding",
+    partner_access_mode: mode
+  };
+}
+
+async function createRestaurantOnboardingPartnerAccess(body = {}, restaurant = {}, headers = {}) {
+  const payload = restaurantOnboardingPartnerPayload(body, restaurant);
+  if (!payload) return null;
+  const response = await adminPartners("POST", payload, headers);
+  if (response.status >= 400) {
+    return {
+      status: "failed",
+      code: response.body?.code || "PARTNER_INVITATION_FAILED",
+      error: response.body?.error || "Partner invitation could not be created."
+    };
+  }
+  return {
+    status: payload.partner_access_mode === "assign_existing" ? "assigned_or_invited" : "invitation_created",
+    invitation: response.body?.invitation || null,
+    partner: response.body?.partner || null,
+    email_delivery: response.body?.email_delivery || null
+  };
+}
+
+async function findRestaurantDuplicateCandidates(body = {}) {
+  if (!supabaseConfigured) {
+    ensureDemo();
+    return restaurantDuplicateMatches(body, demo.restaurants);
+  }
+  const rows = await supabaseFetch("/rest/v1/restaurants?select=*", { service: true }).catch(() => []);
+  return restaurantDuplicateMatches(body, rows || []);
+}
+
+function duplicateOverrideReason(body = {}) {
+  return clean(body.duplicate_override_reason || body.override_reason || body.reason);
+}
+
+function restaurantLifecycleStatus(row = {}) {
+  const onboarding = clean(row.onboarding_status).toLowerCase();
+  if (["draft", "pending_review", "active", "suspended", "archived"].includes(onboarding)) return onboarding;
+  const status = clean(row.status).toLowerCase();
+  if (status === "approved") return "active";
+  if (status === "suspended") return "suspended";
+  return "draft";
+}
+
+const restaurantLifecycleTransitions = new Map([
+  ["draft", new Set(["draft", "pending_review", "archived", "active"])],
+  ["pending_review", new Set(["draft", "pending_review", "active", "archived"])],
+  ["active", new Set(["active", "suspended", "archived"])],
+  ["suspended", new Set(["suspended", "active", "archived"])],
+  ["archived", new Set(["archived", "draft", "suspended", "active"])]
+]);
+
+function normalizeRestaurantLifecycleStatus(value = "") {
+  const normalized = clean(value).toLowerCase().replace(/[\s-]+/g, "_");
+  if (normalized === "approved") return "active";
+  if (normalized === "pending") return "draft";
+  if (["draft", "pending_review", "active", "suspended", "archived"].includes(normalized)) return normalized;
+  return "";
+}
+
+function restaurantStoragePatchForLifecycle(status = {}) {
+  const lifecycle = normalizeRestaurantLifecycleStatus(status);
+  if (lifecycle === "active") return { status: "approved", onboarding_status: "active" };
+  if (lifecycle === "suspended") return { status: "suspended", onboarding_status: "suspended", visible_on_guest_site: false };
+  if (lifecycle === "archived") return { status: "suspended", onboarding_status: "archived", visible_on_guest_site: false };
+  if (lifecycle === "pending_review") return { status: "pending", onboarding_status: "pending_review", visible_on_guest_site: false };
+  return { status: "pending", onboarding_status: "draft", visible_on_guest_site: false };
+}
+
+function restaurantReadinessChecks(restaurant = {}, context = {}) {
+  const servicePeriods = Array.isArray(restaurant.service_periods)
+    ? restaurant.service_periods
+    : jsonValueFrom(restaurant.service_periods, []);
+  const tables = context.tables || [];
+  const activeTables = tables.filter((item) => clean(item.status || "active") === "active");
+  const checks = [
+    { key: "name", label: "Restaurant name", pass: Boolean(clean(restaurant.name)) },
+    { key: "slug", label: "Public slug", pass: Boolean(clean(restaurant.slug)) || !("slug" in restaurant) },
+    { key: "timezone", label: "Timezone", pass: Boolean(clean(restaurant.primary_timezone || restaurant.timezone)) },
+    { key: "reservation_email", label: "Reservation contact email", pass: Boolean(lower(restaurant.reservation_email || restaurant.primary_email || restaurant.contact_email || restaurant.email)) },
+    { key: "service_periods", label: "Service periods", pass: servicePeriods.length > 0 || Boolean(clean(restaurant.opening_hours)) },
+    { key: "duplicate_warning", label: "Blocking duplicate warning", pass: !context.hasBlockingDuplicate }
+  ];
+  const warnings = [
+    { key: "partner_access", label: "Partner access", pass: Number(context.assigned_partner_count || 0) > 0 },
+    { key: "public_profile", label: "Public profile", pass: Boolean(clean(restaurant.description || restaurant.description_en || restaurant.short_description)) },
+    { key: "table_capacity", label: "Table/capacity configuration", pass: activeTables.length > 0 || Number(restaurant.table_capacity || restaurant.capacity || 0) > 0 }
+  ];
+  const blocking = checks.filter((item) => !item.pass);
+  const completedCount = checks.filter((item) => item.pass).length + warnings.filter((item) => item.pass).length;
+  const totalCount = checks.length + warnings.length;
+  return {
+    checks,
+    warnings,
+    blocking,
+    can_activate: blocking.length === 0,
+    completeness_percent: totalCount ? Math.round((completedCount / totalCount) * 100) : 0
+  };
+}
+
+function validateRestaurantLifecycleTransition(restaurant = {}, body = {}, context = {}) {
+  const current = restaurantLifecycleStatus(restaurant);
+  const requested = normalizeRestaurantLifecycleStatus(body.status || body.onboarding_status);
+  if (!requested) return { status: current, patch: {}, readiness: restaurantReadinessChecks(restaurant, context) };
+  const allowed = restaurantLifecycleTransitions.get(current) || new Set();
+  if (!allowed.has(requested)) {
+    const error = new Error(`Restaurant cannot transition from ${current} to ${requested}.`);
+    error.status = 409;
+    error.code = "RESTAURANT_STATUS_TRANSITION_INVALID";
+    throw error;
+  }
+  const reason = clean(body.status_reason || body.reason || body.audit_reason);
+  if (["suspended", "archived"].includes(requested) && !reason) {
+    const error = new Error("A reason is required for suspension or archive.");
+    error.status = 400;
+    error.code = "RESTAURANT_STATUS_REASON_REQUIRED";
+    throw error;
+  }
+  const next = { ...restaurant, ...restaurantStoragePatchForLifecycle(requested), ...restaurantPayload(body) };
+  const readiness = restaurantReadinessChecks(next, context);
+  if (requested === "active") {
+    const confirmed = boolValue(body.activate_confirmed ?? body.activation_confirmed ?? body.confirm_activation);
+    if (!confirmed) {
+      const error = new Error("Activation requires explicit confirmation.");
+      error.status = 400;
+      error.code = "RESTAURANT_ACTIVATION_CONFIRMATION_REQUIRED";
+      error.readiness = readiness;
+      throw error;
+    }
+    if (boolValue(next.is_test_data || next.is_test_restaurant) && boolValue(next.visible_on_guest_site) && !boolValue(body.test_visibility_confirmed || body.public_test_visibility_confirmed)) {
+      const error = new Error("Test restaurants cannot become publicly visible without explicit test visibility confirmation.");
+      error.status = 409;
+      error.code = "TEST_RESTAURANT_PUBLIC_VISIBILITY_BLOCKED";
+      error.readiness = readiness;
+      throw error;
+    }
+    if (!readiness.can_activate) {
+      const error = new Error("Restaurant is not ready for activation.");
+      error.status = 409;
+      error.code = "RESTAURANT_ACTIVATION_READINESS_FAILED";
+      error.readiness = readiness;
+      throw error;
+    }
+  }
+  const patch = restaurantStoragePatchForLifecycle(requested);
+  if (reason) patch.status_reason = reason;
+  if (requested === "active") {
+    patch.activation_confirmed_at = nowIso();
+    if (context.actorId) patch.activation_confirmed_by = context.actorId;
+  }
+  return { status: requested, patch, readiness };
+}
+
+function tableConfigStatus(areas = [], tables = []) {
+  const activeAreas = (areas || []).filter((item) => clean(item.status || "active") === "active").length;
+  const activeTables = (tables || []).filter((item) => clean(item.status || "active") === "active").length;
+  if (activeAreas && activeTables) return "configured";
+  if (activeAreas || activeTables) return "partial";
+  return "not_configured";
+}
+
+function normalizedCapacityCode(value = "", fallback = "") {
+  return slugFrom(value || fallback || crypto.randomUUID()).slice(0, 80);
+}
+
+function normalizeCapacityStatus(value = "") {
+  const status = clean(value || "active").toLowerCase();
+  return ["active", "inactive", "archived"].includes(status) ? status : "active";
+}
+
+function capacityArrayFrom(value) {
+  const raw = value === undefined ? [] : jsonValueFrom(value, []);
+  return Array.isArray(raw) ? raw : [];
+}
+
+function sanitizedDiningAreas(value, restaurantId, restaurant = {}) {
+  return capacityArrayFrom(value).map((item, index) => {
+    const name = stripUnsafeHtml(item.name || item.display_name || `Dining area ${index + 1}`) || `Dining area ${index + 1}`;
+    const code = normalizedCapacityCode(item.code || name, `area-${index + 1}`);
+    return {
+      id: nullableClean(item.id),
+      restaurant_id: restaurantId,
+      name,
+      code,
+      description: stripUnsafeHtml(item.description || ""),
+      capacity: Math.max(0, Math.trunc(numberOr(item.capacity, 0))),
+      status: normalizeCapacityStatus(item.status),
+      sort_order: Math.max(0, Math.trunc(numberOr(item.sort_order ?? index, index))),
+      is_test_data: boolValue(item.is_test_data ?? restaurant.is_test_data ?? restaurant.is_test_restaurant),
+      metadata: jsonFrom(item.metadata, {})
+    };
+  });
+}
+
+function sanitizedRestaurantTables(value, restaurantId, restaurant = {}) {
+  const seen = new Set();
+  return capacityArrayFrom(value).map((item, index) => {
+    const tableIdentifier = clean(item.table_identifier || item.identifier || item.name || item.number || `T${index + 1}`);
+    const key = lower(tableIdentifier);
+    if (!tableIdentifier) {
+      const error = new Error("Every table needs a table name or number.");
+      error.status = 400;
+      error.code = "TABLE_IDENTIFIER_REQUIRED";
+      throw error;
+    }
+    if (seen.has(key)) {
+      const error = new Error("Duplicate table identifiers are not allowed within the same restaurant.");
+      error.status = 409;
+      error.code = "DUPLICATE_TABLE_IDENTIFIER";
+      throw error;
+    }
+    seen.add(key);
+    const minCapacity = Math.max(0, Math.trunc(numberOr(item.min_capacity ?? item.minimum_capacity, 1)));
+    const maxCapacity = Math.max(0, Math.trunc(numberOr(item.max_capacity ?? item.maximum_capacity, Math.max(2, minCapacity))));
+    if (minCapacity > maxCapacity) {
+      const error = new Error("Minimum table capacity cannot exceed maximum capacity.");
+      error.status = 400;
+      error.code = "TABLE_CAPACITY_INVALID";
+      throw error;
+    }
+    const seatingType = clean(item.seating_type || item.indoor_outdoor || (boolValue(item.outdoor) ? "outdoor" : "indoor")).toLowerCase();
+    return {
+      id: nullableClean(item.id),
+      restaurant_id: restaurantId,
+      dining_area_id: nullableClean(item.dining_area_id),
+      table_identifier: tableIdentifier,
+      display_name: stripUnsafeHtml(item.display_name || item.name || tableIdentifier),
+      min_capacity: minCapacity,
+      max_capacity: maxCapacity,
+      is_combinable: boolValue(item.is_combinable ?? item.combinable),
+      combinable_with: jsonValueFrom(item.combinable_with, []),
+      is_accessible: boolValue(item.is_accessible ?? item.accessible),
+      seating_type: ["indoor", "outdoor", "mixed", "private"].includes(seatingType) ? seatingType : "indoor",
+      status: normalizeCapacityStatus(item.status),
+      has_reservations: boolValue(item.has_reservations),
+      is_test_data: boolValue(item.is_test_data ?? restaurant.is_test_data ?? restaurant.is_test_restaurant),
+      metadata: jsonFrom(item.metadata, {})
+    };
+  });
+}
+
+function sanitizedCapacityOverrides(value, restaurantId, restaurant = {}) {
+  return capacityArrayFrom(value).map((item, index) => {
+    const startTime = nullableClean(item.start_time || item.opens);
+    const endTime = nullableClean(item.end_time || item.closes);
+    const startMinutes = startTime ? minutesFromTime(startTime) : null;
+    const endMinutes = endTime ? minutesFromTime(endTime) : null;
+    if ((startTime || endTime) && (startMinutes === null || endMinutes === null || startMinutes >= endMinutes)) {
+      const error = new Error("Capacity overrides need valid start and end times.");
+      error.status = 400;
+      error.code = "CAPACITY_OVERRIDE_TIME_INVALID";
+      error.field = `capacity_overrides[${index}]`;
+      throw error;
+    }
+    return {
+      id: nullableClean(item.id),
+      restaurant_id: restaurantId,
+      dining_area_id: nullableClean(item.dining_area_id),
+      service_period_key: clean(item.service_period_key || item.period || `period-${index + 1}`),
+      day_of_week: nullableClean(item.day_of_week || item.day),
+      effective_date: nullableClean(item.effective_date || item.date),
+      start_time: startTime,
+      end_time: endTime,
+      capacity: Math.max(0, Math.trunc(numberOr(item.capacity, 0))),
+      table_capacity: Math.max(0, Math.trunc(numberOr(item.table_capacity, 0))),
+      status: normalizeCapacityStatus(item.status),
+      metadata: jsonFrom(item.metadata, { is_test_data: boolValue(restaurant.is_test_data || restaurant.is_test_restaurant) })
+    };
+  });
+}
+
+function restaurantCapacitySummary(areas = [], tables = [], overrides = []) {
+  const activeAreas = (areas || []).filter((item) => clean(item.status || "active") === "active");
+  const activeTables = (tables || []).filter((item) => clean(item.status || "active") === "active");
+  return {
+    active_dining_area_count: activeAreas.length,
+    active_table_count: activeTables.length,
+    accessible_table_count: activeTables.filter((item) => item.is_accessible === true).length,
+    outdoor_table_count: activeTables.filter((item) => clean(item.seating_type) === "outdoor").length,
+    indoor_table_count: activeTables.filter((item) => clean(item.seating_type) === "indoor").length,
+    active_capacity_override_count: (overrides || []).filter((item) => clean(item.status || "active") === "active").length,
+    area_capacity: activeAreas.reduce((sum, item) => sum + Math.max(0, numberOr(item.capacity, 0)), 0),
+    restaurant_total_capacity: activeTables.reduce((sum, item) => sum + Math.max(0, numberOr(item.max_capacity, 0)), 0),
+    table_configuration_status: tableConfigStatus(areas, tables),
+    automatic_table_allocation_enabled: false
+  };
+}
+
+function restaurantSubscriptionPlaceholder(row = {}) {
+  return clean(row.subscription_status || row.billing_status || row.billing_plan || "not_configured") || "not_configured";
+}
+
+function restaurantAdminSummary(row = {}, metrics = {}) {
+  const readiness = restaurantReadinessChecks(row, metrics);
+  return {
+    ...row,
+    lifecycle_status: restaurantLifecycleStatus(row),
+    subscription_placeholder_status: restaurantSubscriptionPlaceholder(row),
+    assigned_partner_count: Number(metrics.assigned_partner_count || 0),
+    pending_invitation_count: Number(metrics.pending_invitation_count || 0),
+    active_offer_count: Number(metrics.active_offer_count || 0),
+    upcoming_reservation_count: Number(metrics.upcoming_reservation_count || 0),
+    active_dining_area_count: Number(metrics.active_dining_area_count || 0),
+    active_table_count: Number(metrics.active_table_count || 0),
+    restaurant_total_capacity: metrics.restaurant_total_capacity ?? row.restaurant_total_capacity ?? row.capacity ?? null,
+    table_configuration_status: metrics.table_configuration_status || row.table_configuration_status || "not_configured",
+    profile_completeness_percent: readiness.completeness_percent,
+    activation_readiness: readiness,
+    created_at: row.created_at || null,
+    updated_at: row.updated_at || row.created_at || null
+  };
+}
+
+function buildRestaurantAdminRows(restaurants = [], context = {}) {
+  const offers = context.offers || [];
+  const reservations = context.reservations || [];
+  const restaurantUsers = context.restaurantUsers || [];
+  const invitations = context.invitations || [];
+  const diningAreas = context.diningAreas || [];
+  const tables = context.tables || [];
+  const capacityOverrides = context.capacityOverrides || [];
+  const today = new Date().toISOString().slice(0, 10);
+  return (restaurants || []).map((restaurant) => {
+    const restaurantId = clean(restaurant.id);
+    const relatedAreas = diningAreas.filter((item) => clean(item.restaurant_id) === restaurantId);
+    const relatedTables = tables.filter((item) => clean(item.restaurant_id) === restaurantId);
+    const relatedOverrides = capacityOverrides.filter((item) => clean(item.restaurant_id) === restaurantId);
+    const capacityMetrics = restaurantCapacitySummary(relatedAreas, relatedTables, relatedOverrides);
+    const metrics = {
+      assigned_partner_count: restaurantUsers.filter((item) => clean(item.restaurant_id) === restaurantId && !["revoked", "disabled", "expired"].includes(clean(item.status))).length,
+      pending_invitation_count: invitations.filter((item) => clean(item.restaurant_id) === restaurantId && effectivePartnerInvitationStatus(item) === "pending").length,
+      active_offer_count: offers.filter((item) => clean(item.restaurant_id) === restaurantId && clean(item.status || "active") === "active").length,
+      upcoming_reservation_count: reservations.filter((item) => {
+        const date = clean(item.reservation_date || item.date || item.offer_date);
+        return clean(item.restaurant_id) === restaurantId
+          && (!date || date >= today)
+          && ["pending", "requested", "accepted", "confirmed", "waiting_external_confirmation"].includes(clean(item.status || item.booking_status || "pending"));
+      }).length,
+      ...capacityMetrics
+    };
+    return restaurantAdminSummary(restaurant, metrics);
+  });
+}
+
+async function restaurantSlugConflict(slug = "", currentId = "") {
+  const value = slugFrom(slug);
+  if (!value) return null;
+  if (!supabaseConfigured) {
+    ensureDemo();
+    return demo.restaurants.find((item) => slugFrom(item.slug) === value && clean(item.id) !== clean(currentId)) || null;
+  }
+  const columns = await supabaseTableColumns("restaurants");
+  if (!columns.has("slug")) return null;
+  const rows = await supabaseFetch(`/rest/v1/restaurants?select=id,name,slug&slug=eq.${encodeURIComponent(value)}&limit=1`, { service: true }).catch(() => []);
+  const conflict = rows?.find((item) => clean(item.id) !== clean(currentId));
+  return conflict || null;
+}
+
+async function preparedRestaurantPayload(body = {}, options = {}) {
+  const payload = restaurantPayload(body, options);
+  if (supabaseConfigured) return await filterSupabaseTablePayload("restaurants", payload);
+  return payload;
+}
+
+function restaurantCreateHasCapacityPayload(body = {}) {
+  return ["dining_areas", "tables", "capacity_overrides"].some((field) => {
+    const value = body[field];
+    if (Array.isArray(value)) return value.length > 0;
+    if (value && typeof value === "object") return Object.keys(value).length > 0;
+    const text = clean(value);
+    return text && !["[]", "{}"].includes(text);
+  });
+}
+
+async function rollbackCreatedRestaurantOnboarding(restaurantId, profile, headers, reason = "") {
+  const id = clean(restaurantId);
+  if (!id) return { attempted: false };
+  if (!supabaseConfigured) {
+    ensureDemo();
+    demo.restaurantCapacityOverrides = (demo.restaurantCapacityOverrides || []).filter((item) => clean(item.restaurant_id) !== id);
+    demo.restaurantTables = (demo.restaurantTables || []).filter((item) => clean(item.restaurant_id) !== id);
+    demo.restaurantDiningAreas = (demo.restaurantDiningAreas || []).filter((item) => clean(item.restaurant_id) !== id);
+    demo.restaurantUsers = (demo.restaurantUsers || []).filter((item) => clean(item.restaurant_id) !== id);
+    demo.partnerInvitations = (demo.partnerInvitations || []).filter((item) => clean(item.restaurant_id) !== id);
+    demo.restaurants = (demo.restaurants || []).filter((item) => clean(item.id) !== id);
+    return { attempted: true, mode: "demo", deleted: true };
+  }
+  const result = { attempted: true, deleted: false, archived: false };
+  for (const table of ["restaurant_service_capacity_overrides", "restaurant_tables", "restaurant_dining_areas", "restaurant_users", "partner_invitations"]) {
+    await supabaseFetch(`/rest/v1/${table}?restaurant_id=eq.${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      service: true,
+      headers: { Prefer: "return=minimal" }
+    }).catch(() => null);
+  }
+  await supabaseFetch(`/rest/v1/restaurants?id=eq.${encodeURIComponent(id)}`, {
+    method: "DELETE",
+    service: true,
+    headers: { Prefer: "return=minimal" }
+  }).then(() => {
+    result.deleted = true;
+  }).catch(async () => {
+    const archivePatch = await filterSupabaseTablePayload("restaurants", {
+      status: "suspended",
+      onboarding_status: "archived",
+      visible_on_guest_site: false,
+      status_reason: clean(reason || "Restaurant creation rolled back after a child operation failed."),
+      updated_at: nowIso()
+    });
+    await supabaseFetch(`/rest/v1/restaurants?id=eq.${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      service: true,
+      headers: { Prefer: "return=minimal" },
+      body: archivePatch
+    }).then(() => {
+      result.archived = true;
+    }).catch(() => null);
+  });
+  await createAuditLog({
+    profile,
+    action: "restaurant_create_rolled_back",
+    entityType: "restaurant",
+    entityId: id,
+    headers,
+    success: false,
+    metadata: { restaurant_id: id, reason: clean(reason || "Restaurant creation child operation failed."), rollback_result: result }
+  });
+  return result;
+}
+
+function restaurantCreateFailureResponse(error, fallbackCode = "RESTAURANT_CREATE_FAILED") {
+  return json(error.status || 502, {
+    error: error.message || "Restaurant creation could not be completed.",
+    code: error.code || fallbackCode,
+    partial_success: false
+  });
+}
+
+async function finalizeCreatedRestaurant({
+  profile,
+  body,
+  headers,
+  createdRestaurant,
+  duplicateCandidates = [],
+  overrideReason = ""
+}) {
+  let restaurant = createdRestaurant;
+  let capacity = null;
+  let partnerAccess = null;
+  const restaurantId = clean(restaurant?.id);
+  if (!restaurantId) return json(502, { error: "Restaurant was not returned after creation.", code: "RESTAURANT_CREATE_READBACK_FAILED", partial_success: false });
+  try {
+    if (restaurantCreateHasCapacityPayload(body)) {
+      const capacityResponse = await adminRestaurantCapacity("POST", { ...body, restaurant_id: restaurantId }, headers, new URLSearchParams());
+      if (capacityResponse.status >= 400) {
+        const error = new Error(capacityResponse.body?.error || "Restaurant capacity could not be created.");
+        error.status = capacityResponse.status;
+        error.code = capacityResponse.body?.code || "RESTAURANT_CAPACITY_CREATE_FAILED";
+        throw error;
+      }
+      capacity = capacityResponse.body?.capacity || null;
+      if (capacityResponse.body?.restaurant?.id) restaurant = capacityResponse.body.restaurant;
+    }
+
+    partnerAccess = await createRestaurantOnboardingPartnerAccess(body, restaurant, headers);
+    if (partnerAccess?.status === "failed") {
+      const error = new Error(partnerAccess.error || "Partner access could not be created.");
+      error.status = 502;
+      error.code = partnerAccess.code || "PARTNER_INVITATION_FAILED";
+      throw error;
+    }
+
+    const readbackRows = supabaseConfigured
+      ? await supabaseFetch(`/rest/v1/restaurants?id=eq.${encodeURIComponent(restaurantId)}&select=*&limit=1`, { service: true }).catch(() => [])
+      : demo.restaurants.filter((item) => clean(item.id) === restaurantId);
+    const persistedRestaurant = readbackRows?.[0] || null;
+    if (!persistedRestaurant?.id) {
+      const error = new Error("Restaurant was created but is not queryable by the admin endpoint.");
+      error.status = 502;
+      error.code = "RESTAURANT_CREATE_READBACK_FAILED";
+      throw error;
+    }
+
+    await createAuditLog({
+      profile,
+      action: duplicateCandidates.length ? "restaurant_created_duplicate_override" : "restaurant_created",
+      entityType: "restaurant",
+      entityId: persistedRestaurant.id,
+      headers,
+      newValue: persistedRestaurant,
+      metadata: {
+        restaurant_id: persistedRestaurant.id,
+        duplicate_candidates: duplicateCandidates,
+        override_reason: overrideReason,
+        partner_access_status: partnerAccess?.status || "not_requested",
+        capacity_configured: Boolean(capacity)
+      }
+    });
+    return json(201, { restaurant: persistedRestaurant, partner_access: partnerAccess, capacity, persisted: true });
+  } catch (error) {
+    await rollbackCreatedRestaurantOnboarding(restaurantId, profile, headers, error.message);
+    return restaurantCreateFailureResponse(error);
+  }
 }
 
 function offerConditionPayload(body = {}) {
@@ -11642,10 +24881,12 @@ function offerPayload(body, restaurantId, options = {}) {
   }
   if (body.status && allowedOfferStatuses.has(body.status)) payload.status = body.status;
   if (options.full) {
-    payload.title_en ||= "Discounted table";
+    const fallbackTitle = clean(payload.title_en || payload.title_es || payload.title_hu || body.title || body.title_primary);
+    const fallbackDescription = clean(payload.description_en || payload.description_es || payload.description_hu || body.description || body.description_primary);
+    payload.title_en ||= fallbackTitle || "Discounted table";
     payload.title_es ||= "";
     payload.title_hu ||= "";
-    payload.description_en ||= "";
+    payload.description_en ||= fallbackDescription || "";
     payload.description_es ||= "";
     payload.description_hu ||= "";
     payload.discount_type ||= "percent";
@@ -11700,8 +24941,219 @@ async function adminContent(method, body, headers) {
   return json(405, { error: "Method not allowed." });
 }
 
-async function adminRestaurants(method, body, headers, query) {
+function legalAcceptanceCounts(consents = []) {
+  const counts = {};
+  for (const row of consents) {
+    if (normalizeLegalConsentStatus(row.status) !== "accepted") continue;
+    const key = `${clean(row.document_type)}:${clean(row.document_version)}:${normalizeLanguage(row.language || "en")}`;
+    counts[key] = (counts[key] || 0) + 1;
+  }
+  return counts;
+}
+
+function adminLegalDocumentRow(row = {}, counts = {}) {
+  const key = `${clean(row.document_type)}:${clean(row.version)}:${normalizeLanguage(row.language || "en")}`;
+  return {
+    ...row,
+    acceptance_count: counts[key] || 0,
+    immutable: clean(row.status) === "published"
+  };
+}
+
+function legalDocumentPayload(body = {}) {
+  const type = clean(body.document_type);
+  const language = normalizeLanguage(body.language || "en");
+  if (!legalDocumentTypes.has(type)) {
+    const error = new Error("Unsupported legal document type.");
+    error.status = 400;
+    throw error;
+  }
+  const version = clean(body.version || LEGAL_DOCUMENT_VERSION);
+  const title = clean(body.title || legalDocumentTitle(type, language));
+  const content = clean(body.content);
+  const contentUrl = clean(body.content_url || legalDocumentUrl(type, version, language));
+  if (!version || !title || (!content && !contentUrl)) {
+    const error = new Error("Document type, version, title, and content or content URL are required.");
+    error.status = 400;
+    throw error;
+  }
+  const status = clean(body.status || (boolValue(body.publish_current) ? "published" : "draft"));
+  if (!["draft", "published", "archived"].includes(status)) {
+    const error = new Error("Unsupported legal document status.");
+    error.status = 400;
+    throw error;
+  }
+  const now = nowIso();
+  return {
+    document_type: type,
+    version,
+    language,
+    title,
+    content,
+    content_url: contentUrl,
+    status,
+    published_at: status === "published" ? (body.published_at || now) : null,
+    effective_at: body.effective_at || (status === "published" ? now : null),
+    is_current: boolValue(body.is_current ?? body.publish_current),
+    updated_at: now
+  };
+}
+
+async function adminLegalDocuments(method, body, headers, query) {
   await requireProfile(headers, ["admin"]);
+  if (!supabaseConfigured) {
+    ensureDemo();
+    if (method === "GET") {
+      const counts = legalAcceptanceCounts(demo.userLegalConsents);
+      return json(200, {
+        mode: "demo",
+        documents: demo.legalDocuments.map((row) => adminLegalDocumentRow(row, counts)),
+        counts
+      });
+    }
+    if (method === "POST") {
+      const payload = legalDocumentPayload(body);
+      const existing = demo.legalDocuments.find((item) =>
+        item.document_type === payload.document_type
+        && item.version === payload.version
+        && normalizeLanguage(item.language) === payload.language
+      );
+      if (existing?.status === "published") return json(409, { error: "Published legal versions are immutable. Create a new version instead." });
+      if (payload.is_current) {
+        demo.legalDocuments.forEach((item) => {
+          if (item.document_type === payload.document_type && normalizeLanguage(item.language) === payload.language) item.is_current = false;
+        });
+      }
+      const row = existing || { id: crypto.randomUUID(), created_at: nowIso() };
+      Object.assign(row, payload, { updated_at: nowIso() });
+      if (!existing) demo.legalDocuments.unshift(row);
+      const counts = legalAcceptanceCounts(demo.userLegalConsents);
+      return json(existing ? 200 : 201, { mode: "demo", document: adminLegalDocumentRow(row, counts) });
+    }
+    if (method === "PATCH") {
+      const id = clean(body.id || query.get("id"));
+      const row = demo.legalDocuments.find((item) => item.id === id);
+      if (!row) return json(404, { error: "Legal document not found." });
+      const action = clean(body.action || "publish");
+      if (action === "publish") {
+        if (boolValue(body.is_current ?? body.publish_current ?? true)) {
+          demo.legalDocuments.forEach((item) => {
+            if (item.document_type === row.document_type && normalizeLanguage(item.language) === normalizeLanguage(row.language)) item.is_current = false;
+          });
+          row.is_current = true;
+        }
+        row.status = "published";
+        row.published_at ||= nowIso();
+        row.effective_at = body.effective_at || row.effective_at || nowIso();
+        row.updated_at = nowIso();
+      } else if (action === "mark_current") {
+        if (row.status !== "published") return json(409, { error: "Only published documents can be current." });
+        demo.legalDocuments.forEach((item) => {
+          if (item.document_type === row.document_type && normalizeLanguage(item.language) === normalizeLanguage(row.language)) item.is_current = false;
+        });
+        row.is_current = true;
+        row.updated_at = nowIso();
+      } else if (action === "archive") {
+        row.status = "archived";
+        row.is_current = false;
+        row.updated_at = nowIso();
+      } else {
+        return json(400, { error: "Unsupported legal document action." });
+      }
+      const counts = legalAcceptanceCounts(demo.userLegalConsents);
+      return json(200, { mode: "demo", document: adminLegalDocumentRow(row, counts) });
+    }
+    return json(405, { error: "Method not allowed." });
+  }
+
+  if (method === "GET") {
+    const [documents, consents] = await Promise.all([
+      supabaseFetch("/rest/v1/legal_documents?select=*&order=document_type.asc,language.asc,created_at.desc", { service: true }).catch(() => []),
+      supabaseFetch("/rest/v1/user_legal_consents?select=document_type,document_version,language,status&limit=5000", { service: true }).catch(() => [])
+    ]);
+    const counts = legalAcceptanceCounts(consents || []);
+    return json(200, { mode: "supabase", documents: (documents || []).map((row) => adminLegalDocumentRow(row, counts)), counts });
+  }
+
+  if (method === "POST") {
+    const payload = legalDocumentPayload(body);
+    const existingRows = await supabaseFetch(`/rest/v1/legal_documents?select=*&document_type=eq.${encodeURIComponent(payload.document_type)}&version=eq.${encodeURIComponent(payload.version)}&language=eq.${encodeURIComponent(payload.language)}&limit=1`, { service: true }).catch(() => []);
+    const existing = existingRows?.[0];
+    if (existing?.status === "published") return json(409, { error: "Published legal versions are immutable. Create a new version instead." });
+    if (payload.is_current) {
+      await supabaseFetch(`/rest/v1/legal_documents?document_type=eq.${encodeURIComponent(payload.document_type)}&language=eq.${encodeURIComponent(payload.language)}&is_current=eq.true`, {
+        method: "PATCH",
+        service: true,
+        body: { is_current: false, updated_at: nowIso() }
+      }).catch(() => null);
+    }
+    const rows = existing?.id
+      ? await supabaseFetch(`/rest/v1/legal_documents?id=eq.${encodeURIComponent(existing.id)}&select=*`, {
+        method: "PATCH",
+        service: true,
+        headers: { Prefer: "return=representation" },
+        body: payload
+      })
+      : await supabaseFetch("/rest/v1/legal_documents?select=*", {
+        method: "POST",
+        service: true,
+        headers: { Prefer: "return=representation" },
+        body: payload
+      });
+    return json(existing ? 200 : 201, { mode: "supabase", document: adminLegalDocumentRow(rows?.[0] || payload) });
+  }
+
+  if (method === "PATCH") {
+    const id = clean(body.id || query.get("id"));
+    if (!id) return json(400, { error: "Legal document id is required." });
+    const rows = await supabaseFetch(`/rest/v1/legal_documents?select=*&id=eq.${encodeURIComponent(id)}&limit=1`, { service: true });
+    const row = rows?.[0];
+    if (!row) return json(404, { error: "Legal document not found." });
+    const action = clean(body.action || "publish");
+    let patch = {};
+    if (action === "publish") {
+      const makeCurrent = boolValue(body.is_current ?? body.publish_current ?? true);
+      if (makeCurrent) {
+        await supabaseFetch(`/rest/v1/legal_documents?document_type=eq.${encodeURIComponent(row.document_type)}&language=eq.${encodeURIComponent(row.language)}&is_current=eq.true`, {
+          method: "PATCH",
+          service: true,
+          body: { is_current: false, updated_at: nowIso() }
+        }).catch(() => null);
+      }
+      patch = {
+        status: "published",
+        published_at: row.published_at || nowIso(),
+        effective_at: body.effective_at || row.effective_at || nowIso(),
+        is_current: makeCurrent,
+        updated_at: nowIso()
+      };
+    } else if (action === "mark_current") {
+      if (row.status !== "published") return json(409, { error: "Only published documents can be current." });
+      await supabaseFetch(`/rest/v1/legal_documents?document_type=eq.${encodeURIComponent(row.document_type)}&language=eq.${encodeURIComponent(row.language)}&is_current=eq.true`, {
+        method: "PATCH",
+        service: true,
+        body: { is_current: false, updated_at: nowIso() }
+      }).catch(() => null);
+      patch = { is_current: true, updated_at: nowIso() };
+    } else if (action === "archive") {
+      patch = { status: "archived", is_current: false, updated_at: nowIso() };
+    } else {
+      return json(400, { error: "Unsupported legal document action." });
+    }
+    const updated = await supabaseFetch(`/rest/v1/legal_documents?id=eq.${encodeURIComponent(id)}&select=*`, {
+      method: "PATCH",
+      service: true,
+      headers: { Prefer: "return=representation" },
+      body: patch
+    });
+    return json(200, { mode: "supabase", document: adminLegalDocumentRow(updated?.[0] || { ...row, ...patch }) });
+  }
+
+  return json(405, { error: "Method not allowed." });
+}
+
+async function adminRestaurants(method, body, headers, query) {
+  const { profile } = await requireProfile(headers, ["admin"]);
 
   if (!supabaseConfigured) {
     ensureDemo();
@@ -11711,132 +25163,999 @@ async function adminRestaurants(method, body, headers, query) {
         if (order) return order;
         return clean(a.name).localeCompare(clean(b.name)) || clean(a.created_at).localeCompare(clean(b.created_at));
       });
-      return json(200, { restaurants });
+      return json(200, {
+        restaurants: buildRestaurantAdminRows(restaurants, {
+          offers: demo.offers,
+          reservations: demo.reservations,
+          restaurantUsers: demo.restaurantUsers || [],
+          invitations: demo.partnerInvitations || [],
+          diningAreas: demo.restaurantDiningAreas || [],
+          tables: demo.restaurantTables || [],
+          capacityOverrides: demo.restaurantCapacityOverrides || []
+        })
+      });
     }
     if (method === "POST") {
+      const duplicateCandidates = await findRestaurantDuplicateCandidates(body);
+      const overrideReason = duplicateOverrideReason(body);
+      if (duplicateCandidates.length && !body.duplicate_override) {
+        await createAuditLog({
+          profile,
+          action: "restaurant_duplicate_warning",
+          entityType: "restaurant",
+          entityId: "",
+          headers,
+          success: false,
+          metadata: { matched_candidates: duplicateCandidates, message: "Possible duplicate restaurant creation blocked pending admin override." }
+        });
+        return json(409, {
+          error: "Possible duplicate restaurant found. Review the matches and provide an override reason to continue.",
+          code: "DUPLICATE_RESTAURANT_POSSIBLE",
+          duplicates: duplicateCandidates,
+          requires_override: true
+        });
+      }
+      if (duplicateCandidates.length && !overrideReason) return json(400, { error: "An override reason is required to create a possible duplicate restaurant.", code: "DUPLICATE_OVERRIDE_REASON_REQUIRED" });
+      const rawPayload = restaurantPayload(body, { full: true });
+      const slugConflict = await restaurantSlugConflict(rawPayload.slug);
+      if (slugConflict) return json(409, { error: "Restaurant slug is already in use.", code: "RESTAURANT_SLUG_EXISTS", conflict: { id: slugConflict.id, name: slugConflict.name } });
       const item = {
         id: crypto.randomUUID(),
-        ...restaurantPayload(body, { full: true }),
+        ...rawPayload,
         views_count: 0,
         created_at: nowIso(),
         updated_at: nowIso()
       };
       demo.restaurants.unshift(item);
-      return json(201, { restaurant: item });
+      return await finalizeCreatedRestaurant({
+        profile,
+        body,
+        headers,
+        createdRestaurant: item,
+        duplicateCandidates,
+        overrideReason
+      });
     }
     if (method === "PATCH") {
       const item = demo.restaurants.find((restaurant) => restaurant.id === clean(body.id || query.get("id")));
       if (!item) return json(404, { error: "Restaurant not found." });
-      Object.assign(item, restaurantPayload(body), { updated_at: nowIso() });
-      return json(200, { restaurant: item });
+      const relatedTables = (demo.restaurantTables || []).filter((table) => clean(table.restaurant_id) === clean(item.id));
+      const assignedPartnerCount = (demo.restaurantUsers || []).filter((user) => clean(user.restaurant_id) === clean(item.id) && clean(user.status) === "active").length;
+      const lifecycle = body.status !== undefined || body.onboarding_status !== undefined
+        ? validateRestaurantLifecycleTransition(item, body, { actorId: profile.id, tables: relatedTables, assigned_partner_count: assignedPartnerCount })
+        : null;
+      const patch = { ...restaurantPayload(body), ...(lifecycle?.patch || {}) };
+      const slugConflict = patch.slug ? await restaurantSlugConflict(patch.slug, item.id) : null;
+      if (slugConflict) return json(409, { error: "Restaurant slug is already in use.", code: "RESTAURANT_SLUG_EXISTS", conflict: { id: slugConflict.id, name: slugConflict.name } });
+      const previous = { ...item };
+      Object.assign(item, patch, { updated_at: nowIso() });
+      await createAuditLog({
+        profile,
+        action: lifecycle ? "restaurant_status_transition" : "restaurant_updated",
+        entityType: "restaurant",
+        entityId: item.id,
+        headers,
+        previousValue: previous,
+        newValue: item,
+        metadata: { restaurant_id: item.id, previous_status: restaurantLifecycleStatus(previous), next_status: restaurantLifecycleStatus(item), reason: clean(body.status_reason || body.reason || "") }
+      });
+      if (lifecycle) {
+        await createRestaurantStatusHistory({
+          profile,
+          restaurantId: item.id,
+          previousStatus: restaurantLifecycleStatus(previous),
+          newStatus: restaurantLifecycleStatus(item),
+          reason: clean(body.status_reason || body.reason || ""),
+          changedFields: Object.keys(patch),
+          headers,
+          metadata: { action: "restaurant_status_transition" },
+          isTestData: boolValue(item.is_test_data || item.is_test_restaurant)
+        });
+      }
+      return json(200, { restaurant: restaurantAdminSummary(item, { active_table_count: relatedTables.length }), activation_readiness: lifecycle?.readiness || restaurantReadinessChecks(item) });
     }
   } else {
     if (method === "GET") {
-      const rows = await supabaseFetch("/rest/v1/restaurants?select=*&order=sort_order.asc.nullslast,name.asc,created_at.desc", { service: true });
-      return json(200, { restaurants: rows || [] });
+      const [rows, offers, reservations, restaurantUsers, invitations, diningAreas, tables, capacityOverrides] = await Promise.all([
+        supabaseFetch("/rest/v1/restaurants?select=*&order=sort_order.asc.nullslast,name.asc,created_at.desc", { service: true }),
+        supabaseFetch("/rest/v1/offers?select=restaurant_id,status,offer_date", { service: true }).catch(() => []),
+        supabaseFetch("/rest/v1/reservations?select=restaurant_id,status,booking_status,reservation_date", { service: true }).catch(() => []),
+        supabaseFetch("/rest/v1/restaurant_users?select=restaurant_id,status", { service: true }).catch(() => []),
+        supabaseFetch("/rest/v1/partner_invitations?select=restaurant_id,status,expires_at", { service: true }).catch(() => []),
+        supabaseFetch("/rest/v1/restaurant_dining_areas?select=restaurant_id,status,capacity", { service: true }).catch(() => []),
+        supabaseFetch("/rest/v1/restaurant_tables?select=restaurant_id,status,max_capacity,is_accessible,seating_type", { service: true }).catch(() => []),
+        supabaseFetch("/rest/v1/restaurant_service_capacity_overrides?select=restaurant_id,status", { service: true }).catch(() => [])
+      ]);
+      return json(200, { restaurants: buildRestaurantAdminRows(rows || [], { offers, reservations, restaurantUsers, invitations, diningAreas, tables, capacityOverrides }) });
     }
     if (method === "POST") {
+      const duplicateCandidates = await findRestaurantDuplicateCandidates(body);
+      const overrideReason = duplicateOverrideReason(body);
+      if (duplicateCandidates.length && !body.duplicate_override) {
+        await createAuditLog({
+          profile,
+          action: "restaurant_duplicate_warning",
+          entityType: "restaurant",
+          entityId: "",
+          headers,
+          success: false,
+          metadata: { matched_candidates: duplicateCandidates, message: "Possible duplicate restaurant creation blocked pending admin override." }
+        });
+        return json(409, {
+          error: "Possible duplicate restaurant found. Review the matches and provide an override reason to continue.",
+          code: "DUPLICATE_RESTAURANT_POSSIBLE",
+          duplicates: duplicateCandidates,
+          requires_override: true
+        });
+      }
+      if (duplicateCandidates.length && !overrideReason) return json(400, { error: "An override reason is required to create a possible duplicate restaurant.", code: "DUPLICATE_OVERRIDE_REASON_REQUIRED" });
+      const payload = await preparedRestaurantPayload(body, { full: true });
+      const slugConflict = payload.slug ? await restaurantSlugConflict(payload.slug) : null;
+      if (slugConflict) return json(409, { error: "Restaurant slug is already in use.", code: "RESTAURANT_SLUG_EXISTS", conflict: { id: slugConflict.id, name: slugConflict.name } });
       const rows = await supabaseFetch("/rest/v1/restaurants?select=*", {
         method: "POST",
         service: true,
         headers: { Prefer: "return=representation" },
-        body: restaurantPayload(body, { full: true })
+        body: payload
       });
-      return json(201, { restaurant: rows?.[0] });
+      const insertedRestaurant = rows?.[0] || null;
+      if (!insertedRestaurant?.id) return json(502, { error: "Restaurant was not returned after creation.", code: "RESTAURANT_CREATE_READBACK_FAILED" });
+      const readbackRows = await supabaseFetch(`/rest/v1/restaurants?id=eq.${encodeURIComponent(insertedRestaurant.id)}&select=*&limit=1`, { service: true }).catch(() => []);
+      const createdRestaurant = readbackRows?.[0] || null;
+      if (!createdRestaurant?.id) return json(502, { error: "Restaurant was created but is not queryable by the admin list endpoint yet.", code: "RESTAURANT_CREATE_READBACK_FAILED" });
+      return await finalizeCreatedRestaurant({
+        profile,
+        body,
+        headers,
+        createdRestaurant,
+        duplicateCandidates,
+        overrideReason
+      });
     }
     if (method === "PATCH") {
       const id = clean(body.id || query.get("id"));
+      const previousRows = await supabaseFetch(`/rest/v1/restaurants?id=eq.${encodeURIComponent(id)}&select=*&limit=1`, { service: true }).catch(() => []);
+      const previous = previousRows?.[0];
+      if (!previous) return json(404, { error: "Restaurant not found." });
+      const [relatedTables, restaurantUsers] = await Promise.all([
+        supabaseFetch(`/rest/v1/restaurant_tables?select=*&restaurant_id=eq.${encodeURIComponent(id)}`, { service: true }).catch(() => []),
+        supabaseFetch(`/rest/v1/restaurant_users?select=restaurant_id,status&restaurant_id=eq.${encodeURIComponent(id)}`, { service: true }).catch(() => [])
+      ]);
+      const lifecycle = body.status !== undefined || body.onboarding_status !== undefined
+        ? validateRestaurantLifecycleTransition(previous, body, {
+          actorId: profile.id,
+          tables: relatedTables || [],
+          assigned_partner_count: (restaurantUsers || []).filter((user) => clean(user.status) === "active").length
+        })
+        : null;
+      const payload = await filterSupabaseTablePayload("restaurants", {
+        ...restaurantPayload(body),
+        ...(lifecycle?.patch || {})
+      });
+      const slugConflict = payload.slug ? await restaurantSlugConflict(payload.slug, id) : null;
+      if (slugConflict) return json(409, { error: "Restaurant slug is already in use.", code: "RESTAURANT_SLUG_EXISTS", conflict: { id: slugConflict.id, name: slugConflict.name } });
       const rows = await supabaseFetch(`/rest/v1/restaurants?id=eq.${encodeURIComponent(id)}&select=*`, {
         method: "PATCH",
         service: true,
         headers: { Prefer: "return=representation" },
-        body: restaurantPayload(body)
+        body: payload
       });
-      return json(200, { restaurant: rows?.[0] });
+      await createAuditLog({
+        profile,
+        action: lifecycle ? "restaurant_status_transition" : "restaurant_updated",
+        entityType: "restaurant",
+        entityId: rows?.[0]?.id || id,
+        headers,
+        previousValue: previous || null,
+        newValue: rows?.[0],
+        metadata: { restaurant_id: rows?.[0]?.id || id, previous_status: restaurantLifecycleStatus(previous), next_status: restaurantLifecycleStatus(rows?.[0] || payload), reason: clean(body.status_reason || body.reason || "") }
+      });
+      if (lifecycle) {
+        await createRestaurantStatusHistory({
+          profile,
+          restaurantId: rows?.[0]?.id || id,
+          previousStatus: restaurantLifecycleStatus(previous),
+          newStatus: restaurantLifecycleStatus(rows?.[0] || payload),
+          reason: clean(body.status_reason || body.reason || ""),
+          changedFields: Object.keys(payload),
+          headers,
+          metadata: { action: "restaurant_status_transition" },
+          isTestData: boolValue(rows?.[0]?.is_test_data || rows?.[0]?.is_test_restaurant || previous?.is_test_data || previous?.is_test_restaurant)
+        });
+      }
+      return json(200, { restaurant: rows?.[0], activation_readiness: lifecycle?.readiness || restaurantReadinessChecks(rows?.[0] || previous) });
     }
   }
 
   return json(405, { error: "Method not allowed." });
 }
 
-async function adminPartners(method, body, headers) {
+function restaurantDetailView(restaurant = {}, context = {}) {
+  const diningAreas = context.diningAreas || [];
+  const tables = context.tables || [];
+  const capacityOverrides = context.capacityOverrides || [];
+  const capacity = restaurantCapacitySummary(diningAreas, tables, capacityOverrides);
+  const partnerAccess = context.partnerAccess || [];
+  const invitations = context.invitations || [];
+  const readiness = restaurantReadinessChecks(restaurant, {
+    tables,
+    assigned_partner_count: partnerAccess.filter((item) => clean(item.status || "active") === "active").length
+  });
+  return {
+    restaurant: restaurantAdminSummary(restaurant, { ...capacity, assigned_partner_count: partnerAccess.length, pending_invitation_count: invitations.filter((item) => effectivePartnerInvitationStatus(item) === "pending").length }),
+    readiness,
+    capacity,
+    dining_areas: diningAreas,
+    tables,
+    capacity_overrides: capacityOverrides,
+    partner_access: partnerAccess,
+    invitations,
+    offers: context.offers || [],
+    reservations: context.reservations || [],
+    audit_logs: context.auditLogs || [],
+    status_history: context.statusHistory || [],
+    system_status: {
+      lifecycle_status: restaurantLifecycleStatus(restaurant),
+      test_data: boolValue(restaurant.is_test_data || restaurant.is_test_restaurant),
+      automatic_table_allocation_enabled: false,
+      latest_status_change: (context.statusHistory || [])[0] || null
+    }
+  };
+}
+
+async function adminRestaurantDetail(method, body, headers, query) {
   await requireProfile(headers, ["admin"]);
+  if (method !== "GET") return json(405, { error: "Method not allowed." });
+  const id = clean(query.get("id") || body.id);
+  if (!id) return json(400, { error: "Restaurant id is required." });
+  if (!supabaseConfigured) {
+    ensureDemo();
+    const restaurant = demo.restaurants.find((item) => clean(item.id) === id);
+    if (!restaurant) return json(404, { error: "Restaurant not found." });
+    return json(200, restaurantDetailView(restaurant, {
+      diningAreas: (demo.restaurantDiningAreas || []).filter((item) => clean(item.restaurant_id) === id),
+      tables: (demo.restaurantTables || []).filter((item) => clean(item.restaurant_id) === id),
+      capacityOverrides: (demo.restaurantCapacityOverrides || []).filter((item) => clean(item.restaurant_id) === id),
+      partnerAccess: (demo.restaurantUsers || []).filter((item) => clean(item.restaurant_id) === id),
+      invitations: (demo.partnerInvitations || []).filter((item) => clean(item.restaurant_id) === id),
+      offers: (demo.offers || []).filter((item) => clean(item.restaurant_id) === id),
+      reservations: (demo.reservations || []).filter((item) => clean(item.restaurant_id) === id),
+      statusHistory: (demo.restaurantStatusHistory || []).filter((item) => clean(item.restaurant_id) === id),
+      auditLogs: (demo.appErrorLogs || []).filter((item) => item.area === "audit")
+        .map((item) => ({ ...(item.details || {}), id: item.id, created_at: item.created_at }))
+        .filter((item) => clean(item.restaurant_id || item.metadata?.restaurant_id || item.entity_id) === id)
+    }));
+  }
+  const [restaurants, diningAreas, tables, capacityOverrides, partnerAccess, invitations, offers, reservations, auditLogs, statusHistory] = await Promise.all([
+    supabaseFetch(`/rest/v1/restaurants?select=*&id=eq.${encodeURIComponent(id)}&limit=1`, { service: true }),
+    supabaseFetch(`/rest/v1/restaurant_dining_areas?select=*&restaurant_id=eq.${encodeURIComponent(id)}&order=sort_order.asc,name.asc`, { service: true }).catch(() => []),
+    supabaseFetch(`/rest/v1/restaurant_tables?select=*&restaurant_id=eq.${encodeURIComponent(id)}&order=table_identifier.asc`, { service: true }).catch(() => []),
+    supabaseFetch(`/rest/v1/restaurant_service_capacity_overrides?select=*&restaurant_id=eq.${encodeURIComponent(id)}&order=effective_date.asc.nullslast,day_of_week.asc.nullslast,start_time.asc.nullslast`, { service: true }).catch(() => []),
+    supabaseFetch(`/rest/v1/restaurant_users?select=*&restaurant_id=eq.${encodeURIComponent(id)}&order=updated_at.desc`, { service: true }).catch(() => []),
+    supabaseFetch(`/rest/v1/partner_invitations?select=id,email,full_name,restaurant_id,restaurant_role,status,invited_at,expires_at,accepted_at,revoked_at,is_test_data&restaurant_id=eq.${encodeURIComponent(id)}&order=invited_at.desc`, { service: true }).catch(() => []),
+    supabaseFetch(`/rest/v1/offers?select=*&restaurant_id=eq.${encodeURIComponent(id)}&order=offer_date.desc`, { service: true }).catch(() => []),
+    supabaseFetch(`/rest/v1/reservations?select=*&restaurant_id=eq.${encodeURIComponent(id)}&order=created_at.desc&limit=50`, { service: true }).catch(() => []),
+    supabaseFetch(`/rest/v1/audit_logs?select=*&restaurant_id=eq.${encodeURIComponent(id)}&order=created_at.desc&limit=50`, { service: true }).catch(() => []),
+    supabaseFetch(`/rest/v1/restaurant_status_history?select=*&restaurant_id=eq.${encodeURIComponent(id)}&order=created_at.desc&limit=50`, { service: true }).catch(() => [])
+  ]);
+  const restaurant = restaurants?.[0];
+  if (!restaurant) return json(404, { error: "Restaurant not found." });
+  return json(200, restaurantDetailView(restaurant, { diningAreas, tables, capacityOverrides, partnerAccess, invitations, offers, reservations, auditLogs, statusHistory }));
+}
+
+function compactSupabaseRow(row = {}) {
+  return Object.fromEntries(Object.entries(row).filter(([key, value]) => {
+    if (key === "id" && (value === undefined || value === null || value === "")) return false;
+    return value !== undefined && value !== "";
+  }));
+}
+
+async function adminRestaurantCapacity(method, body, headers, query) {
+  const { profile } = await requireProfile(headers, ["admin"]);
+  if (!["POST", "PATCH"].includes(method)) return json(405, { error: "Method not allowed." });
+  const restaurantId = clean(body.restaurant_id || body.id || query.get("restaurant_id"));
+  if (!restaurantId) return json(400, { error: "Restaurant id is required." });
+  if (!supabaseConfigured) {
+    ensureDemo();
+    const restaurant = demo.restaurants.find((item) => clean(item.id) === restaurantId);
+    if (!restaurant) return json(404, { error: "Restaurant not found." });
+    const areas = sanitizedDiningAreas(body.dining_areas, restaurantId, restaurant);
+    const tables = sanitizedRestaurantTables(body.tables, restaurantId, restaurant);
+    const overrides = sanitizedCapacityOverrides(body.capacity_overrides, restaurantId, restaurant);
+    const upsertBy = (collection, rows, identity) => {
+      for (const row of rows) {
+        const existing = collection.find((item) => identity(item) === identity(row));
+        const payload = { ...row, id: row.id || existing?.id || crypto.randomUUID(), created_at: existing?.created_at || nowIso(), updated_at: nowIso() };
+        if (existing) Object.assign(existing, payload);
+        else collection.push(payload);
+      }
+    };
+    upsertBy(demo.restaurantDiningAreas, areas, (item) => `${clean(item.restaurant_id)}|${clean(item.code)}`);
+    upsertBy(demo.restaurantTables, tables, (item) => `${clean(item.restaurant_id)}|${clean(item.table_identifier)}`);
+    upsertBy(demo.restaurantCapacityOverrides, overrides, (item) => `${clean(item.restaurant_id)}|${clean(item.dining_area_id)}|${clean(item.service_period_key)}|${clean(item.day_of_week)}|${clean(item.effective_date)}|${clean(item.start_time)}|${clean(item.end_time)}`);
+    const summary = restaurantCapacitySummary(
+      demo.restaurantDiningAreas.filter((item) => clean(item.restaurant_id) === restaurantId),
+      demo.restaurantTables.filter((item) => clean(item.restaurant_id) === restaurantId),
+      demo.restaurantCapacityOverrides.filter((item) => clean(item.restaurant_id) === restaurantId)
+    );
+    Object.assign(restaurant, {
+      restaurant_total_capacity: summary.restaurant_total_capacity,
+      capacity: summary.restaurant_total_capacity || restaurant.capacity,
+      table_capacity: summary.active_table_count || restaurant.table_capacity,
+      table_configuration_status: summary.table_configuration_status,
+      capacity_configuration: { automatic_table_allocation_enabled: false, updated_at: nowIso() },
+      updated_at: nowIso()
+    });
+    await createAuditLog({
+      profile,
+      action: "restaurant_capacity_configured",
+      entityType: "restaurant",
+      entityId: restaurantId,
+      headers,
+      newValue: summary,
+      metadata: { restaurant_id: restaurantId, automatic_table_allocation_enabled: false }
+    });
+    return json(200, { restaurant, capacity: summary });
+  }
+
+  const restaurantRows = await supabaseFetch(`/rest/v1/restaurants?select=*&id=eq.${encodeURIComponent(restaurantId)}&limit=1`, { service: true });
+  const restaurant = restaurantRows?.[0];
+  if (!restaurant) return json(404, { error: "Restaurant not found." });
+  const [areaColumns, tableColumns, overrideColumns] = await Promise.all([
+    supabaseTableColumns("restaurant_dining_areas"),
+    supabaseTableColumns("restaurant_tables"),
+    supabaseTableColumns("restaurant_service_capacity_overrides")
+  ]);
+  if (!areaColumns.size || !tableColumns.size || !overrideColumns.size) {
+    return json(503, { error: "Restaurant capacity schema is not available. Apply migration 0054 first.", code: "RESTAURANT_CAPACITY_SCHEMA_MISSING" });
+  }
+  const areas = sanitizedDiningAreas(body.dining_areas, restaurantId, restaurant);
+  const tables = sanitizedRestaurantTables(body.tables, restaurantId, restaurant);
+  const overrides = sanitizedCapacityOverrides(body.capacity_overrides, restaurantId, restaurant);
+  const filterRows = async (tableName, rows) => Promise.all(rows.map(async (row) => compactSupabaseRow(await filterSupabaseTablePayload(tableName, row))));
+  const [areaPayloads, tablePayloads, overridePayloads] = await Promise.all([
+    filterRows("restaurant_dining_areas", areas),
+    filterRows("restaurant_tables", tables),
+    filterRows("restaurant_service_capacity_overrides", overrides)
+  ]);
+  if (areaPayloads.length) {
+    await supabaseFetch("/rest/v1/restaurant_dining_areas?on_conflict=restaurant_id,code", {
+      method: "POST",
+      service: true,
+      headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+      body: areaPayloads
+    });
+  }
+  if (tablePayloads.length) {
+    await supabaseFetch("/rest/v1/restaurant_tables?on_conflict=restaurant_id,table_identifier", {
+      method: "POST",
+      service: true,
+      headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+      body: tablePayloads
+    });
+  }
+  if (overridePayloads.length) {
+    const nullableFilter = (field, value) => value
+      ? `${field}=eq.${encodeURIComponent(value)}`
+      : `${field}=is.null`;
+    for (const row of overridePayloads) {
+      const identity = [
+        `restaurant_id=eq.${encodeURIComponent(row.restaurant_id)}`,
+        nullableFilter("dining_area_id", row.dining_area_id),
+        `service_period_key=eq.${encodeURIComponent(row.service_period_key)}`,
+        nullableFilter("day_of_week", row.day_of_week),
+        nullableFilter("effective_date", row.effective_date),
+        nullableFilter("start_time", row.start_time),
+        nullableFilter("end_time", row.end_time)
+      ].join("&");
+      const existing = await supabaseFetch(`/rest/v1/restaurant_service_capacity_overrides?select=id&${identity}&limit=1`, { service: true }).catch(() => []);
+      if (existing?.[0]?.id) {
+        await supabaseFetch(`/rest/v1/restaurant_service_capacity_overrides?id=eq.${encodeURIComponent(existing[0].id)}`, {
+          method: "PATCH",
+          service: true,
+          headers: { Prefer: "return=minimal" },
+          body: row
+        });
+      } else {
+        await supabaseFetch("/rest/v1/restaurant_service_capacity_overrides", {
+          method: "POST",
+          service: true,
+          headers: { Prefer: "return=minimal" },
+          body: row
+        });
+      }
+    }
+  }
+  const [allAreas, allTables, allOverrides] = await Promise.all([
+    supabaseFetch(`/rest/v1/restaurant_dining_areas?select=*&restaurant_id=eq.${encodeURIComponent(restaurantId)}`, { service: true }).catch(() => []),
+    supabaseFetch(`/rest/v1/restaurant_tables?select=*&restaurant_id=eq.${encodeURIComponent(restaurantId)}`, { service: true }).catch(() => []),
+    supabaseFetch(`/rest/v1/restaurant_service_capacity_overrides?select=*&restaurant_id=eq.${encodeURIComponent(restaurantId)}`, { service: true }).catch(() => [])
+  ]);
+  const summary = restaurantCapacitySummary(allAreas || [], allTables || [], allOverrides || []);
+  const restaurantPatch = await filterSupabaseTablePayload("restaurants", {
+    restaurant_total_capacity: summary.restaurant_total_capacity,
+    capacity: summary.restaurant_total_capacity || restaurant.capacity,
+    table_capacity: summary.active_table_count || restaurant.table_capacity,
+    table_configuration_status: summary.table_configuration_status,
+    capacity_configuration: { automatic_table_allocation_enabled: false, updated_at: nowIso() },
+    updated_at: nowIso()
+  });
+  const updatedRestaurant = await supabaseFetch(`/rest/v1/restaurants?id=eq.${encodeURIComponent(restaurantId)}&select=*`, {
+    method: "PATCH",
+    service: true,
+    headers: { Prefer: "return=representation" },
+    body: restaurantPatch
+  });
+  await createAuditLog({
+    profile,
+    action: "restaurant_capacity_configured",
+    entityType: "restaurant",
+    entityId: restaurantId,
+    headers,
+    previousValue: restaurant,
+    newValue: summary,
+    metadata: { restaurant_id: restaurantId, automatic_table_allocation_enabled: false }
+  });
+  return json(200, { restaurant: updatedRestaurant?.[0] || { ...restaurant, ...restaurantPatch }, capacity: summary });
+}
+
+async function adminAuditLogs(method, body, headers, query) {
+  await requireProfile(headers, ["admin"]);
+  if (method !== "GET") return json(405, { error: "Method not allowed." });
+  const restaurantId = clean(query.get("restaurant_id"));
+  const limit = Math.max(1, Math.min(100, Math.trunc(numberOr(query.get("limit"), 25))));
+  if (!supabaseConfigured) {
+    ensureDemo();
+    const rows = (demo.appErrorLogs || [])
+      .filter((item) => item.area === "audit")
+      .map((item) => ({ ...(item.details || {}), id: item.id, created_at: item.created_at }))
+      .filter((item) => !restaurantId || clean(item.restaurant_id || item.metadata?.restaurant_id) === restaurantId || clean(item.entity_id) === restaurantId)
+      .slice(0, limit);
+    return json(200, { audit_logs: rows });
+  }
+  const fetchLimit = restaurantId ? Math.min(500, limit * 10) : limit;
+  const path = `/rest/v1/audit_logs?select=*&order=created_at.desc&limit=${fetchLimit}`;
+  const rows = await supabaseFetch(path, { service: true }).catch(() => []);
+  const filteredRows = restaurantId
+    ? (rows || []).filter((item) => {
+        const metadata = item?.metadata && typeof item.metadata === "object" ? item.metadata : {};
+        return clean(item?.restaurant_id) === restaurantId
+          || clean(metadata.restaurant_id || metadata.restaurantId) === restaurantId
+          || clean(item?.entity_id) === restaurantId;
+      }).slice(0, limit)
+    : (rows || []);
+  return json(200, { audit_logs: filteredRows });
+}
+
+function normalizeRestaurantAccessStatus(value = "") {
+  const status = clean(value || "active");
+  return ["invited", "active", "disabled", "revoked", "expired"].includes(status) ? status : "active";
+}
+
+function restaurantAccessPatchForAction(action = "", body = {}) {
+  const normalizedAction = clean(action);
+  const patch = { updated_at: nowIso() };
+  if (normalizedAction === "change_restaurant_role" || normalizedAction === "update_restaurant_access") {
+    if (body.restaurant_role !== undefined || body.role !== undefined) patch.role = normalizeRestaurantUserRole(body.restaurant_role || body.role);
+    if (body.status !== undefined) patch.status = normalizeRestaurantAccessStatus(body.status);
+  } else if (normalizedAction === "remove_restaurant_access") {
+    patch.status = "revoked";
+    patch.revoked_at = nowIso();
+  } else if (normalizedAction === "deactivate_restaurant_access") {
+    patch.status = "disabled";
+  } else if (normalizedAction === "reactivate_restaurant_access") {
+    patch.status = "active";
+    patch.revoked_at = null;
+  } else {
+    return null;
+  }
+  if (Object.keys(patch).length === 1) {
+    const error = new Error("No restaurant access change was requested.");
+    error.status = 400;
+    error.code = "RESTAURANT_ACCESS_PATCH_EMPTY";
+    throw error;
+  }
+  return patch;
+}
+
+async function adminPartners(method, body, headers) {
+  const { profile: actorProfile } = await requireProfile(headers, ["admin"]);
   if (!supabaseConfigured) {
     ensureDemo();
     if (method === "GET") {
-      return json(200, { partners: demo.profiles.filter((profile) => roleMatches(profile.role, ["partner"])) });
+      return json(200, { partners: partnerAdminListRows(demo.profiles.filter((profile) => roleMatches(profile.role, ["partner"])), demo.partnerInvitations) });
     }
     if (method === "POST") {
       const email = lower(body.email);
-      const password = String(body.password || "");
       const fullName = clean(body.full_name || body.name || email);
       const restaurantId = nullableClean(body.restaurant_id);
-      if (!email || !password || !restaurantId) return json(400, { error: "Email, password, and restaurant are required." });
-      if (demo.users.some((item) => item.email === email)) return json(409, { error: "Account already exists." });
-      const id = crypto.randomUUID();
-      demo.users.push({ id, email, password });
-      const profile = { id, email, full_name: fullName, role: "partner", restaurant_id: restaurantId, created_at: nowIso(), updated_at: nowIso() };
-      demo.profiles.push(profile);
+      const restaurantRole = normalizeRestaurantUserRole(body.restaurant_role || body.role);
+      if (!email || !restaurantId) return json(400, { error: "Email and restaurant are required." });
+      const invitationToken = generatePartnerInvitationToken();
+      const tokenHash = partnerInvitationTokenHash(invitationToken);
+      const existingProfile = demo.profiles.find((item) => lower(item.email) === email);
+      const id = existingProfile?.id || crypto.randomUUID();
+      const profile = existingProfile || { id, email, full_name: fullName, role: "partner", restaurant_id: restaurantId, created_at: nowIso(), updated_at: nowIso(), is_test_data: true, status: "invited", invitation_status: "pending" };
+      if (!existingProfile) demo.profiles.push(profile);
+      Object.assign(profile, { role: "partner", restaurant_id: restaurantId, invitation_status: "pending", invited_at: nowIso(), updated_at: nowIso() });
+      const assignment = (demo.restaurantUsers || []).find((item) => item.restaurant_id === restaurantId && lower(item.email) === email);
+      const assignmentPayload = {
+        id: assignment?.id || crypto.randomUUID(),
+        restaurant_id: restaurantId,
+        user_id: existingProfile?.id || null,
+        email,
+        full_name: fullName,
+        role: restaurantRole,
+        status: existingProfile ? "active" : "invited",
+        invited_by: actorProfile.id,
+        invited_at: nowIso(),
+        is_test_data: true,
+        created_at: assignment?.created_at || nowIso(),
+        updated_at: nowIso()
+      };
+      if (assignment) Object.assign(assignment, assignmentPayload);
+      else demo.restaurantUsers.push(assignmentPayload);
+      demo.partnerInvitations.unshift({
+        id: crypto.randomUUID(),
+        restaurant_id: restaurantId,
+        email,
+        full_name: fullName,
+        restaurant_role: restaurantRole,
+        status: "pending",
+        token_hash: tokenHash,
+        invited_by: actorProfile.id,
+        invited_at: nowIso(),
+        expires_at: new Date(Date.now() + 7 * 86400000).toISOString(),
+        is_test_data: true,
+        created_at: nowIso(),
+        updated_at: nowIso()
+      });
       const restaurant = demo.restaurants.find((item) => item.id === restaurantId);
-      if (restaurant) restaurant.owner_user_id = id;
-      return json(201, { partner: clientProfile(profile) });
+      if (restaurant && restaurantRole === "owner" && existingProfile) restaurant.owner_user_id = id;
+      const invitationEmail = await sendRestaurantPartnerInvitationEmail({
+        email,
+        partnerName: fullName,
+        restaurantName: restaurant?.name || restaurantId,
+        lang: profile.preferred_language || "en",
+        userId: existingProfile?.id || "",
+        restaurantId,
+        invitationToken
+      });
+      await createAuditLog({
+        profile: actorProfile,
+        action: "partner_invitation_created",
+        entityType: "partner_invitation",
+        entityId: demo.partnerInvitations[0].id,
+        targetUserId: existingProfile?.id || null,
+        targetRole: "partner",
+        headers,
+        newValue: { email, restaurant_id: restaurantId, restaurant_role: restaurantRole, status: "pending" },
+        metadata: { restaurant_id: restaurantId, email_hash: hashEmailValue(email), restaurant_role: restaurantRole }
+      });
+      return json(201, {
+        partner: clientProfile({ ...profile, invitation_id: demo.partnerInvitations[0].id, restaurant_role: restaurantRole, invitation_status: "pending" }),
+        invitation: { id: demo.partnerInvitations[0].id, status: "pending", expires_at: demo.partnerInvitations[0].expires_at, restaurant_role: restaurantRole },
+        emails: [invitationEmail],
+        email_delivery: emailDeliverySummary([invitationEmail])
+      });
     }
     if (method === "PATCH") {
+      const action = clean(body.action);
+      if (action === "revoke_invitation" || action === "resend_invitation") {
+        const invitation = demo.partnerInvitations.find((item) => item.id === clean(body.id));
+        if (!invitation) return json(404, { error: "Partner invitation not found." });
+        if (action === "revoke_invitation") {
+          if (invitation.status !== "pending") return json(409, { error: "Only pending invitations can be revoked." });
+          invitation.status = "revoked";
+          invitation.revoked_at = nowIso();
+          invitation.updated_at = nowIso();
+          const assignment = demo.restaurantUsers.find((item) => item.restaurant_id === invitation.restaurant_id && lower(item.email) === lower(invitation.email));
+          if (assignment) Object.assign(assignment, { status: "revoked", revoked_at: nowIso(), updated_at: nowIso() });
+          const profile = demo.profiles.find((item) => lower(item.email) === lower(invitation.email) && clean(item.restaurant_id) === clean(invitation.restaurant_id));
+          if (profile) Object.assign(profile, { invitation_status: "revoked", updated_at: nowIso() });
+          await createAuditLog({
+            profile: actorProfile,
+            action: "partner_invitation_revoked",
+            entityType: "partner_invitation",
+            entityId: invitation.id,
+            targetRole: "partner",
+            headers,
+            previousValue: { status: "pending" },
+            newValue: { status: "revoked" },
+            metadata: { restaurant_id: invitation.restaurant_id, email_hash: hashEmailValue(invitation.email) }
+          });
+          return json(200, { invitation: { id: invitation.id, status: "revoked" } });
+        }
+        if (!["pending", "expired"].includes(clean(invitation.status))) return json(409, { error: "Only pending or expired invitations can be resent." });
+        const invitationToken = generatePartnerInvitationToken();
+        invitation.token_hash = partnerInvitationTokenHash(invitationToken);
+        invitation.status = "pending";
+        invitation.expires_at = new Date(Date.now() + 7 * 86400000).toISOString();
+        invitation.invited_at = nowIso();
+        invitation.updated_at = nowIso();
+        const assignment = demo.restaurantUsers.find((item) => item.restaurant_id === invitation.restaurant_id && lower(item.email) === lower(invitation.email));
+        if (assignment) Object.assign(assignment, { status: "invited", revoked_at: null, invited_at: nowIso(), updated_at: nowIso() });
+        const profile = demo.profiles.find((item) => lower(item.email) === lower(invitation.email) && clean(item.restaurant_id) === clean(invitation.restaurant_id));
+        if (profile) Object.assign(profile, { invitation_status: "pending", invited_at: nowIso(), updated_at: nowIso() });
+        const restaurant = demo.restaurants.find((item) => item.id === invitation.restaurant_id);
+        const invitationEmail = await sendRestaurantPartnerInvitationEmail({
+          email: invitation.email,
+          partnerName: invitation.full_name || invitation.email,
+          restaurantName: restaurant?.name || invitation.restaurant_id,
+          lang: restaurant?.preferred_language || "en",
+          restaurantId: invitation.restaurant_id,
+          invitationToken
+        });
+        await createAuditLog({
+          profile: actorProfile,
+          action: "partner_invitation_resent",
+          entityType: "partner_invitation",
+          entityId: invitation.id,
+          targetRole: "partner",
+          headers,
+          newValue: { status: "pending", expires_at: invitation.expires_at },
+          metadata: { restaurant_id: invitation.restaurant_id, email_hash: hashEmailValue(invitation.email), restaurant_role: invitation.restaurant_role }
+        });
+        return json(200, {
+          invitation: { id: invitation.id, status: "pending", expires_at: invitation.expires_at, restaurant_role: invitation.restaurant_role },
+          emails: [invitationEmail],
+          email_delivery: emailDeliverySummary([invitationEmail])
+        });
+      }
+      const restaurantAccessPatch = restaurantAccessPatchForAction(action, body);
+      if (restaurantAccessPatch) {
+        const assignment = demo.restaurantUsers.find((item) =>
+          clean(item.id) === clean(body.id)
+          || (
+            clean(item.restaurant_id) === clean(body.restaurant_id)
+            && (
+              (body.email && lower(item.email) === lower(body.email))
+              || (body.user_id && clean(item.user_id) === clean(body.user_id))
+            )
+          )
+        );
+        if (!assignment) return json(404, { error: "Restaurant access assignment not found." });
+        const previous = { ...assignment };
+        Object.assign(assignment, restaurantAccessPatch, { updated_at: nowIso() });
+        const profile = demo.profiles.find((item) => clean(item.id) === clean(assignment.user_id) || lower(item.email) === lower(assignment.email));
+        if (profile && restaurantAccessPatch.status === "revoked" && clean(profile.restaurant_id) === clean(assignment.restaurant_id)) profile.restaurant_id = null;
+        if (profile && restaurantAccessPatch.status === "active" && !profile.restaurant_id) profile.restaurant_id = assignment.restaurant_id;
+        await createAuditLog({
+          profile: actorProfile,
+          action: `restaurant_access_${action}`,
+          entityType: "restaurant_user",
+          entityId: assignment.id,
+          targetUserId: assignment.user_id || profile?.id || null,
+          targetRole: "partner",
+          headers,
+          previousValue: previous,
+          newValue: assignment,
+          metadata: { restaurant_id: assignment.restaurant_id, restaurant_role: assignment.role, reason: clean(body.reason || body.audit_reason || "") }
+        });
+        return json(200, { restaurant_access: assignment, partner: profile ? clientProfile(profile) : null });
+      }
       const profile = demo.profiles.find((item) => item.id === clean(body.id));
       if (!profile) return json(404, { error: "Partner profile not found." });
+      if (clean(body.id) === clean(actorProfile.id) && body.role !== undefined) return json(403, { error: "You cannot change your own role." });
       if (body.restaurant_id !== undefined) profile.restaurant_id = nullableClean(body.restaurant_id);
-      if (body.role) profile.role = normalizeRole(body.role);
+      if (body.role) {
+        const requestedRole = normalizeRole(body.role);
+        if (["admin", "super_admin"].includes(requestedRole) && !isSuperAdminProfile(actorProfile)) return json(403, { error: "Only Super Admin can assign administrator roles." });
+        profile.role = requestedRole === "super_admin" ? "super_admin" : requestedRole === "admin" ? "admin" : "partner";
+      }
       if (body.full_name !== undefined) profile.full_name = clean(body.full_name);
+      await createAuditLog({
+        profile: actorProfile,
+        action: "partner_profile_updated",
+        entityType: "profile",
+        entityId: profile.id,
+        targetUserId: profile.id,
+        targetRole: profile.role,
+        headers,
+        newValue: clientProfile(profile),
+        metadata: { restaurant_id: profile.restaurant_id }
+      });
       return json(200, { partner: clientProfile(profile) });
     }
   } else {
     if (method === "GET") {
       const rows = await supabaseFetch("/rest/v1/profiles?select=*&role=in.(partner,restaurant)&order=created_at.desc", { service: true });
-      return json(200, { partners: (rows || []).map(clientProfile) });
+      const invitations = await supabaseFetch("/rest/v1/partner_invitations?select=id,email,full_name,restaurant_id,restaurant_role,status,invited_at,expires_at,is_test_data&order=invited_at.desc", { service: true }).catch(() => []);
+      return json(200, { partners: partnerAdminListRows(rows || [], invitations || []) });
     }
     if (method === "POST") {
       const email = lower(body.email);
-      const password = String(body.password || "");
       const fullName = clean(body.full_name || body.name || email);
       const restaurantId = nullableClean(body.restaurant_id);
-      if (!email || !password || !restaurantId) return json(400, { error: "Email, password, and restaurant are required." });
-      const authUser = await supabaseFetch("/auth/v1/admin/users", {
-        method: "POST",
-        service: true,
-        body: {
-          email,
-          password,
-          email_confirm: true,
-          user_metadata: { full_name: fullName }
-        }
-      });
-      const userId = authUser?.id || authUser?.user?.id;
-      if (!userId) return json(500, { error: "Could not create Supabase user." });
+      const restaurantRole = normalizeRestaurantUserRole(body.restaurant_role || body.role);
+      if (!email || !restaurantId) return json(400, { error: "Email and restaurant are required." });
+      const invitationToken = generatePartnerInvitationToken();
+      const tokenHash = partnerInvitationTokenHash(invitationToken);
+      const existingProfiles = await supabaseFetch(`/rest/v1/profiles?select=*&email=eq.${encodeURIComponent(email)}&limit=1`, { service: true }).catch(() => []);
+      const existingProfile = existingProfiles?.[0] || null;
+      const userId = existingProfile?.id || null;
       const profiles = await supabaseFetch("/rest/v1/profiles?on_conflict=id&select=*", {
         method: "POST",
         service: true,
         headers: { Prefer: "resolution=merge-duplicates,return=representation" },
-        body: {
-          id: userId,
+        body: await filterSupabaseTablePayload("profiles", {
+          id: userId || crypto.randomUUID(),
           email,
           full_name: fullName,
           role: "partner",
-          restaurant_id: restaurantId
+          restaurant_id: restaurantId,
+          invitation_status: "pending",
+          invited_at: nowIso()
+        })
+      }).catch(() => existingProfile ? [existingProfile] : []);
+      const invitedProfile = profiles?.[0] || existingProfile || null;
+      await supabaseFetch("/rest/v1/restaurant_users?on_conflict=restaurant_id,email&select=*", {
+        method: "POST",
+        service: true,
+        headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+        body: {
+          restaurant_id: restaurantId,
+          user_id: invitedProfile?.id || null,
+          email,
+          full_name: fullName,
+          role: restaurantRole,
+          status: invitedProfile?.id ? "active" : "invited",
+          invited_by: actorProfile.id,
+          invited_at: nowIso(),
+          is_test_data: boolValue(body.is_test_data)
         }
-      });
+      }).catch(() => null);
+      const invitationPayload = {
+        restaurant_id: restaurantId,
+        email,
+        full_name: fullName,
+        restaurant_role: restaurantRole,
+        status: "pending",
+        token_hash: tokenHash,
+        invited_by: actorProfile.id,
+        expires_at: new Date(Date.now() + 7 * 86400000).toISOString(),
+        invited_at: nowIso(),
+        updated_at: nowIso(),
+        is_test_data: boolValue(body.is_test_data),
+        metadata: { source: "admin_partner_invitation" }
+      };
+      const pendingInvitations = await supabaseFetch(
+        `/rest/v1/partner_invitations?select=id,email,status,expires_at,restaurant_role&restaurant_id=eq.${encodeURIComponent(restaurantId)}&status=eq.pending&order=invited_at.desc&limit=100`,
+        { service: true }
+      ).catch(() => []);
+      const existingInvitations = (pendingInvitations || []).filter((item) => lower(item.email) === email);
+      const invitationRows = existingInvitations?.[0]?.id
+        ? await supabaseFetch(`/rest/v1/partner_invitations?id=eq.${encodeURIComponent(existingInvitations[0].id)}&select=id,status,expires_at,restaurant_role`, {
+          method: "PATCH",
+          service: true,
+          headers: { Prefer: "return=representation" },
+          body: {
+            token_hash: tokenHash,
+            expires_at: invitationPayload.expires_at,
+            invited_at: invitationPayload.invited_at,
+            updated_at: invitationPayload.updated_at,
+            restaurant_role: restaurantRole,
+            full_name: fullName,
+            is_test_data: invitationPayload.is_test_data,
+            metadata: invitationPayload.metadata
+          }
+        })
+        : await supabaseFetch("/rest/v1/partner_invitations?select=id,status,expires_at,restaurant_role", {
+          method: "POST",
+          service: true,
+          headers: { Prefer: "return=representation" },
+          body: {
+          restaurant_id: restaurantId,
+          email,
+          full_name: fullName,
+          restaurant_role: restaurantRole,
+          status: "pending",
+          token_hash: tokenHash,
+          invited_by: actorProfile.id,
+          expires_at: new Date(Date.now() + 7 * 86400000).toISOString(),
+          is_test_data: boolValue(body.is_test_data),
+          metadata: { source: "admin_partner_invitation" }
+          }
+        }).catch(async (error) => {
+          const raw = `${error?.message || ""} ${JSON.stringify(error?.detail || {})}`;
+          if (!/duplicate|partner_invitations_restaurant_id_email_status/i.test(raw)) throw error;
+          const rows = await supabaseFetch(
+            `/rest/v1/partner_invitations?select=id,email,status,expires_at,restaurant_role&restaurant_id=eq.${encodeURIComponent(restaurantId)}&status=eq.pending&order=invited_at.desc&limit=100`,
+            { service: true }
+          ).catch(() => []);
+          const existing = (rows || []).find((item) => lower(item.email) === email);
+          if (!existing?.id) throw error;
+          return await supabaseFetch(`/rest/v1/partner_invitations?id=eq.${encodeURIComponent(existing.id)}&select=id,status,expires_at,restaurant_role`, {
+            method: "PATCH",
+            service: true,
+            headers: { Prefer: "return=representation" },
+            body: {
+              token_hash: tokenHash,
+              expires_at: invitationPayload.expires_at,
+              invited_at: invitationPayload.invited_at,
+              updated_at: invitationPayload.updated_at,
+              restaurant_role: restaurantRole,
+              full_name: fullName,
+              is_test_data: invitationPayload.is_test_data,
+              metadata: invitationPayload.metadata
+            }
+          });
+        });
+      if (!invitationRows?.[0]?.id) {
+        return json(500, { error: "Could not create a valid partner invitation. No email was sent.", code: "PARTNER_INVITATION_NOT_SAVED" });
+      }
       await supabaseFetch(`/rest/v1/restaurants?id=eq.${encodeURIComponent(restaurantId)}`, {
         method: "PATCH",
         service: true,
         headers: { Prefer: "return=minimal" },
-        body: { owner_user_id: userId }
+        body: restaurantRole === "owner" && invitedProfile?.id ? { owner_user_id: invitedProfile.id } : {}
+      }).catch(() => null);
+      const restaurants = await supabaseFetch(`/rest/v1/restaurants?select=id,name,preferred_language&id=eq.${encodeURIComponent(restaurantId)}&limit=1`, { service: true }).catch(() => []);
+      const restaurant = restaurants?.[0] || {};
+      const invitationEmail = await sendRestaurantPartnerInvitationEmail({
+        email,
+        partnerName: fullName,
+        restaurantName: restaurant.name || restaurantId,
+        lang: restaurant.preferred_language || invitedProfile?.preferred_language || "en",
+        userId: invitedProfile?.id || "",
+        restaurantId,
+        invitationToken
       });
-      return json(201, { partner: clientProfile(profiles?.[0]) });
+      await createAuditLog({
+        profile: actorProfile,
+        action: "partner_invitation_created",
+        entityType: "partner_invitation",
+        entityId: invitationRows?.[0]?.id,
+        targetUserId: invitedProfile?.id || null,
+        targetRole: "partner",
+        headers,
+        newValue: { email, restaurant_id: restaurantId, restaurant_role: restaurantRole, status: "pending" },
+        metadata: { restaurant_id: restaurantId, email_hash: hashEmailValue(email), restaurant_role: restaurantRole }
+      });
+      return json(201, {
+        partner: clientProfile({ ...(invitedProfile || { email, full_name: fullName, role: "partner", restaurant_id: restaurantId }), invitation_id: invitationRows?.[0]?.id, restaurant_role: restaurantRole, invitation_status: "pending" }),
+        invitation: invitationRows?.[0] || { status: "pending", restaurant_role: restaurantRole },
+        emails: [invitationEmail],
+        email_delivery: emailDeliverySummary([invitationEmail])
+      });
     }
     if (method === "PATCH") {
+      const action = clean(body.action);
+      if (action === "revoke_invitation" || action === "resend_invitation") {
+        const id = clean(body.id);
+        const invitations = await supabaseFetch(`/rest/v1/partner_invitations?select=*&id=eq.${encodeURIComponent(id)}&limit=1`, { service: true }).catch(() => []);
+        const invitation = invitations?.[0];
+        if (!invitation) return json(404, { error: "Partner invitation not found." });
+        if (action === "revoke_invitation") {
+          if (clean(invitation.status) !== "pending") return json(409, { error: "Only pending invitations can be revoked." });
+          await supabaseFetch(`/rest/v1/partner_invitations?id=eq.${encodeURIComponent(id)}`, {
+            method: "PATCH",
+            service: true,
+            headers: { Prefer: "return=minimal" },
+            body: { status: "revoked", revoked_at: nowIso(), updated_at: nowIso() }
+          });
+          await supabaseFetch(`/rest/v1/restaurant_users?restaurant_id=eq.${encodeURIComponent(invitation.restaurant_id)}&email=eq.${encodeURIComponent(lower(invitation.email))}&status=eq.invited`, {
+            method: "PATCH",
+            service: true,
+            headers: { Prefer: "return=minimal" },
+            body: { status: "revoked", revoked_at: nowIso(), updated_at: nowIso() }
+          }).catch(() => null);
+          await supabaseFetch(`/rest/v1/profiles?email=eq.${encodeURIComponent(lower(invitation.email))}&restaurant_id=eq.${encodeURIComponent(invitation.restaurant_id)}`, {
+            method: "PATCH",
+            service: true,
+            headers: { Prefer: "return=minimal" },
+            body: await filterSupabaseTablePayload("profiles", { invitation_status: "revoked", updated_at: nowIso() })
+          }).catch(() => null);
+          await createAuditLog({
+            profile: actorProfile,
+            action: "partner_invitation_revoked",
+            entityType: "partner_invitation",
+            entityId: id,
+            targetRole: "partner",
+            headers,
+            previousValue: invitation,
+            newValue: { status: "revoked" },
+            metadata: { restaurant_id: invitation.restaurant_id, email_hash: hashEmailValue(invitation.email) }
+          });
+          return json(200, { invitation: { id, status: "revoked" } });
+        }
+        if (!["pending", "expired"].includes(clean(invitation.status))) return json(409, { error: "Only pending or expired invitations can be resent." });
+        const invitationToken = generatePartnerInvitationToken();
+        const tokenHash = partnerInvitationTokenHash(invitationToken);
+        const expiresAt = new Date(Date.now() + 7 * 86400000).toISOString();
+        const updated = await supabaseFetch(`/rest/v1/partner_invitations?id=eq.${encodeURIComponent(id)}&select=id,email,full_name,restaurant_id,restaurant_role,status,expires_at`, {
+          method: "PATCH",
+          service: true,
+          headers: { Prefer: "return=representation" },
+          body: { status: "pending", token_hash: tokenHash, expires_at: expiresAt, invited_at: nowIso(), updated_at: nowIso() }
+        });
+        await supabaseFetch(`/rest/v1/restaurant_users?restaurant_id=eq.${encodeURIComponent(invitation.restaurant_id)}&email=eq.${encodeURIComponent(lower(invitation.email))}`, {
+          method: "PATCH",
+          service: true,
+          headers: { Prefer: "return=minimal" },
+          body: { status: "invited", revoked_at: null, invited_at: nowIso(), updated_at: nowIso() }
+        }).catch(() => null);
+        await supabaseFetch(`/rest/v1/profiles?email=eq.${encodeURIComponent(lower(invitation.email))}&restaurant_id=eq.${encodeURIComponent(invitation.restaurant_id)}`, {
+          method: "PATCH",
+          service: true,
+          headers: { Prefer: "return=minimal" },
+          body: await filterSupabaseTablePayload("profiles", { invitation_status: "pending", invited_at: nowIso(), updated_at: nowIso() })
+        }).catch(() => null);
+        const restaurants = await supabaseFetch(`/rest/v1/restaurants?select=id,name,preferred_language&id=eq.${encodeURIComponent(invitation.restaurant_id)}&limit=1`, { service: true }).catch(() => []);
+        const restaurant = restaurants?.[0] || {};
+        const invitationEmail = await sendRestaurantPartnerInvitationEmail({
+          email: invitation.email,
+          partnerName: invitation.full_name || invitation.email,
+          restaurantName: restaurant.name || invitation.restaurant_id,
+          lang: restaurant.preferred_language || "en",
+          restaurantId: invitation.restaurant_id,
+          invitationToken
+        });
+        await createAuditLog({
+          profile: actorProfile,
+          action: "partner_invitation_resent",
+          entityType: "partner_invitation",
+          entityId: id,
+          targetRole: "partner",
+          headers,
+          previousValue: invitation,
+          newValue: updated?.[0] || { status: "pending", expires_at: expiresAt },
+          metadata: { restaurant_id: invitation.restaurant_id, email_hash: hashEmailValue(invitation.email), restaurant_role: invitation.restaurant_role }
+        });
+        return json(200, {
+          invitation: updated?.[0] || { id, status: "pending", expires_at: expiresAt, restaurant_role: invitation.restaurant_role },
+          emails: [invitationEmail],
+          email_delivery: emailDeliverySummary([invitationEmail])
+        });
+      }
+      const restaurantAccessPatch = restaurantAccessPatchForAction(action, body);
+      if (restaurantAccessPatch) {
+        const assignmentId = clean(body.id);
+        const restaurantId = clean(body.restaurant_id);
+        const assignmentFilters = assignmentId
+          ? `id=eq.${encodeURIComponent(assignmentId)}`
+          : `restaurant_id=eq.${encodeURIComponent(restaurantId)}${body.email ? `&email=eq.${encodeURIComponent(lower(body.email))}` : ""}${body.user_id ? `&user_id=eq.${encodeURIComponent(clean(body.user_id))}` : ""}`;
+        const assignments = await supabaseFetch(`/rest/v1/restaurant_users?select=*&${assignmentFilters}&limit=1`, { service: true }).catch(() => []);
+        const assignment = assignments?.[0];
+        if (!assignment) return json(404, { error: "Restaurant access assignment not found." });
+        const patch = await filterSupabaseTablePayload("restaurant_users", restaurantAccessPatch);
+        const rows = await supabaseFetch(`/rest/v1/restaurant_users?id=eq.${encodeURIComponent(assignment.id)}&select=*`, {
+          method: "PATCH",
+          service: true,
+          headers: { Prefer: "return=representation" },
+          body: patch
+        });
+        if (restaurantAccessPatch.status === "revoked" && assignment.user_id) {
+          await supabaseFetch(`/rest/v1/profiles?id=eq.${encodeURIComponent(assignment.user_id)}&restaurant_id=eq.${encodeURIComponent(assignment.restaurant_id)}`, {
+            method: "PATCH",
+            service: true,
+            headers: { Prefer: "return=minimal" },
+            body: await filterSupabaseTablePayload("profiles", { restaurant_id: null, updated_at: nowIso() })
+          }).catch(() => null);
+        }
+        await createAuditLog({
+          profile: actorProfile,
+          action: `restaurant_access_${action}`,
+          entityType: "restaurant_user",
+          entityId: assignment.id,
+          targetUserId: assignment.user_id || null,
+          targetRole: "partner",
+          headers,
+          previousValue: assignment,
+          newValue: rows?.[0] || { ...assignment, ...patch },
+          metadata: { restaurant_id: assignment.restaurant_id, restaurant_role: rows?.[0]?.role || patch.role || assignment.role, reason: clean(body.reason || body.audit_reason || "") }
+        });
+        return json(200, { restaurant_access: rows?.[0] || { ...assignment, ...patch } });
+      }
       const id = clean(body.id);
+      if (id === clean(actorProfile.id) && body.role !== undefined) return json(403, { error: "You cannot change your own role." });
       const update = {};
       if (body.restaurant_id !== undefined) update.restaurant_id = nullableClean(body.restaurant_id);
-      if (body.role) update.role = normalizeRole(body.role);
+      if (body.role) {
+        const requestedRole = normalizeRole(body.role);
+        if (["admin", "super_admin"].includes(requestedRole) && !isSuperAdminProfile(actorProfile)) return json(403, { error: "Only Super Admin can assign administrator roles." });
+        update.role = requestedRole === "super_admin" ? "super_admin" : requestedRole === "admin" ? "admin" : "partner";
+      }
       if (body.full_name !== undefined) update.full_name = clean(body.full_name);
       const rows = await supabaseFetch(`/rest/v1/profiles?id=eq.${encodeURIComponent(id)}&select=*`, {
         method: "PATCH",
@@ -11844,45 +26163,337 @@ async function adminPartners(method, body, headers) {
         headers: { Prefer: "return=representation" },
         body: update
       });
+      await createAuditLog({
+        profile: actorProfile,
+        action: "partner_profile_updated",
+        entityType: "profile",
+        entityId: id,
+        targetUserId: id,
+        targetRole: rows?.[0]?.role || update.role,
+        headers,
+        newValue: rows?.[0],
+        metadata: { restaurant_id: rows?.[0]?.restaurant_id || update.restaurant_id }
+      });
       return json(200, { partner: clientProfile(rows?.[0]) });
     }
   }
   return json(405, { error: "Method not allowed." });
 }
 
-async function adminImpersonatePartner(method, body, headers) {
-  if (method !== "POST") return json(405, { error: "Method not allowed." });
-  const { profile } = await requireProfile(headers, ["admin"]);
-  if (normalizeRole(profile.role) !== "super_admin") return json(403, { error: "Only super admins can view as a partner." });
+async function partnerInvitationAuth(method, body, query = new URLSearchParams()) {
+  if (!["GET", "POST"].includes(method)) return json(405, { error: "Method not allowed." });
+  const token = clean(body.token || body.invitation_token || body.invitationToken || query.get("token"));
+  if (!token) return json(400, { error: "Invitation token is required." });
+  const tokenHash = partnerInvitationTokenHash(token);
+  const limit = rateLimitEmailRequest(`partner-invitation:${tokenHash.slice(0, 24)}`, { limit: 8, windowMs: 15 * 60 * 1000 });
+  if (limit.limited) return json(429, { error: "Too many invitation attempts. Please try again later.", code: "INVITATION_RATE_LIMITED", retry_after: limit.retryAfterSeconds }, { "retry-after": String(limit.retryAfterSeconds) });
 
-  const partnerId = clean(body.partner_id || body.id);
-  const restaurantId = clean(body.restaurant_id);
-  if (!partnerId && !restaurantId) return json(400, { error: "Partner or restaurant is required." });
+  const now = new Date();
+  const normalizeInvitation = (invitation = {}) => ({
+    id: invitation.id,
+    email: invitation.email,
+    full_name: invitation.full_name,
+    restaurant_id: invitation.restaurant_id,
+    restaurant_role: normalizeRestaurantUserRole(invitation.restaurant_role || invitation.role),
+    status: clean(invitation.status || "pending"),
+    expires_at: invitation.expires_at
+  });
 
   if (!supabaseConfigured) {
     ensureDemo();
-    const partner = demo.profiles.find((item) => roleMatches(item.role, ["partner"]) && (partnerId ? item.id === partnerId : item.restaurant_id === restaurantId));
-    if (!partner) return json(404, { error: "Partner profile not found." });
-    return json(200, {
-      mode: "demo",
-      access_token: signedProfileToken(partner, "impersonate", { impersonated_by: profile.id }),
-      profile: clientProfile(partner),
-      impersonated_by: profile.id
+    const invitation = demo.partnerInvitations.find((item) => item.token_hash === tokenHash);
+    if (!invitation || invitation.status !== "pending" || new Date(invitation.expires_at) <= now) return json(410, { error: "This invitation is invalid or expired.", code: "INVITATION_INVALID_OR_EXPIRED" });
+    if (method === "GET") return json(200, { invitation: normalizeInvitation(invitation) });
+    const password = String(body.password || "");
+    const confirmPassword = String(body.confirm_password || body.confirmPassword || "");
+    if (!isStrongSignupPassword(password)) return json(400, { error: "Use a stronger password." });
+    if (password !== confirmPassword) return json(400, { error: "Passwords must match." });
+    if (!boolValue(body.partner_terms_consent || body.partner_legal_consent || body.terms_consent)) {
+      return json(400, { error: "Partner Terms and Privacy Policy acceptance is required.", code: "PARTNER_TERMS_REQUIRED" });
+    }
+    let profile = demo.profiles.find((item) => lower(item.email) === lower(invitation.email));
+    let user = demo.users.find((item) => lower(item.email) === lower(invitation.email));
+    if (!user) {
+      user = { id: profile?.id || crypto.randomUUID(), email: lower(invitation.email), password, is_test_data: invitation.is_test_data === true };
+      demo.users.push(user);
+    } else {
+      user.password = password;
+    }
+    if (profile && profile.id !== user.id) user.id = profile.id;
+    if (!profile) {
+      profile = { id: user.id, email: user.email, full_name: invitation.full_name || user.email, role: "partner", restaurant_id: invitation.restaurant_id, preferred_language: "en", status: "active", is_test_data: invitation.is_test_data === true };
+      demo.profiles.push(profile);
+    }
+    Object.assign(profile, { role: "partner", restaurant_id: invitation.restaurant_id, status: "active", invitation_status: "accepted", updated_at: nowIso() });
+    const assignment = demo.restaurantUsers.find((item) => item.restaurant_id === invitation.restaurant_id && lower(item.email) === lower(invitation.email));
+    if (assignment) Object.assign(assignment, { user_id: user.id, status: "active", accepted_at: nowIso(), updated_at: nowIso() });
+    invitation.status = "accepted";
+    invitation.accepted_by = user.id;
+    invitation.accepted_at = nowIso();
+    invitation.updated_at = nowIso();
+    await createAuditLog({
+      profile,
+      action: "partner_invitation_accepted",
+      entityType: "partner_invitation",
+      entityId: invitation.id,
+      targetUserId: user.id,
+      targetRole: "partner",
+      previousValue: { status: "pending", restaurant_role: invitation.restaurant_role, expires_at: invitation.expires_at },
+      newValue: { status: "accepted", user_id: user.id },
+      metadata: { restaurant_id: invitation.restaurant_id, email_hash: hashEmailValue(invitation.email), restaurant_role: invitation.restaurant_role, partner_terms_accepted: true, terms_version: TERMS_VERSION, privacy_policy_version: PRIVACY_POLICY_VERSION }
     });
+    return json(200, { profile: clientProfile(profile), invitation: normalizeInvitation(invitation) });
   }
 
-  const filters = partnerId
-    ? `id=eq.${encodeURIComponent(partnerId)}`
-    : `restaurant_id=eq.${encodeURIComponent(restaurantId)}`;
-  const rows = await supabaseFetch(`/rest/v1/profiles?select=*&role=in.(partner,restaurant)&${filters}&limit=1`, { service: true });
-  const partner = clientProfile(rows?.[0]);
-  if (!partner) return json(404, { error: "Partner profile not found." });
-  return json(200, {
-    mode: "supabase",
-    access_token: signedProfileToken(partner, "impersonate", { impersonated_by: profile.id }),
-    profile: partner,
-    impersonated_by: profile.id
+  const invitations = await supabaseFetch(`/rest/v1/partner_invitations?select=*&token_hash=eq.${encodeURIComponent(tokenHash)}&limit=1`, { service: true }).catch(() => []);
+  const invitation = invitations?.[0];
+  if (!invitation || clean(invitation.status) !== "pending" || new Date(invitation.expires_at) <= now) {
+    return json(410, { error: "This invitation is invalid or expired.", code: "INVITATION_INVALID_OR_EXPIRED" });
+  }
+  if (method === "GET") return json(200, { invitation: normalizeInvitation(invitation) });
+  const password = String(body.password || "");
+  const confirmPassword = String(body.confirm_password || body.confirmPassword || "");
+  if (!isStrongSignupPassword(password)) return json(400, { error: "Use a stronger password." });
+  if (password !== confirmPassword) return json(400, { error: "Passwords must match." });
+  if (!boolValue(body.partner_terms_consent || body.partner_legal_consent || body.terms_consent)) {
+    return json(400, { error: "Partner Terms and Privacy Policy acceptance is required.", code: "PARTNER_TERMS_REQUIRED" });
+  }
+
+  let authUser = null;
+  try {
+    authUser = await supabaseFetch("/auth/v1/admin/users", {
+      method: "POST",
+      service: true,
+      body: {
+        email: lower(invitation.email),
+        password,
+        email_confirm: true,
+        user_metadata: { full_name: invitation.full_name || invitation.email }
+      }
+    });
+  } catch (error) {
+    const profiles = await supabaseFetch(`/rest/v1/profiles?select=*&email=eq.${encodeURIComponent(lower(invitation.email))}&limit=1`, { service: true }).catch(() => []);
+    authUser = profiles?.[0]?.id ? { id: profiles[0].id } : null;
+    if (!authUser?.id) throw error;
+    await supabaseFetch(`/auth/v1/admin/users/${encodeURIComponent(authUser.id)}`, {
+      method: "PUT",
+      service: true,
+      body: {
+        password,
+        email_confirm: true,
+        user_metadata: { full_name: invitation.full_name || invitation.email }
+      }
+    });
+  }
+  const userId = authUser?.id || authUser?.user?.id;
+  if (!userId) return json(500, { error: "Could not create partner account." });
+  const profiles = await supabaseFetch("/rest/v1/profiles?on_conflict=id&select=*", {
+    method: "POST",
+    service: true,
+    headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+    body: await filterSupabaseTablePayload("profiles", {
+      id: userId,
+      email: lower(invitation.email),
+      full_name: invitation.full_name || invitation.email,
+      role: "partner",
+      restaurant_id: invitation.restaurant_id,
+      status: "active",
+      invitation_status: "accepted",
+      is_test_data: invitation.is_test_data === true
+    })
   });
+  await supabaseFetch(`/rest/v1/restaurant_users?restaurant_id=eq.${encodeURIComponent(invitation.restaurant_id)}&email=eq.${encodeURIComponent(lower(invitation.email))}`, {
+    method: "PATCH",
+    service: true,
+    headers: { Prefer: "return=minimal" },
+    body: { user_id: userId, status: "active", accepted_at: nowIso(), updated_at: nowIso() }
+  }).catch(() => null);
+  await supabaseFetch(`/rest/v1/partner_invitations?id=eq.${encodeURIComponent(invitation.id)}`, {
+    method: "PATCH",
+    service: true,
+    headers: { Prefer: "return=minimal" },
+    body: { status: "accepted", accepted_by: userId, accepted_at: nowIso(), updated_at: nowIso() }
+  });
+  await createAuditLog({
+    profile: profiles?.[0],
+    action: "partner_invitation_accepted",
+    entityType: "partner_invitation",
+    entityId: invitation.id,
+    targetUserId: userId,
+    targetRole: "partner",
+    previousValue: { status: "pending", restaurant_role: invitation.restaurant_role, expires_at: invitation.expires_at },
+    newValue: { status: "accepted", user_id: userId },
+    metadata: { restaurant_id: invitation.restaurant_id, email_hash: hashEmailValue(invitation.email), restaurant_role: invitation.restaurant_role, partner_terms_accepted: true, terms_version: TERMS_VERSION, privacy_policy_version: PRIVACY_POLICY_VERSION }
+  });
+  return json(200, { profile: clientProfile(profiles?.[0]), invitation: normalizeInvitation({ ...invitation, status: "accepted" }) });
+}
+
+function canAdminViewAsTarget(actorProfile = {}, targetProfile = {}) {
+  if (isSuperAdminProfile(actorProfile)) return true;
+  if (!isAdminProfile(actorProfile)) return false;
+  return ["guest", "partner"].includes(normalizeRole(targetProfile?.role));
+}
+
+function impersonationResponse({ mode, actorProfile, targetProfile, reason, writeMode = false, headers = {} }) {
+  const sessionId = crypto.randomUUID();
+  const accessToken = signedProfileToken(targetProfile, "impersonate", {
+    impersonated_by: actorProfile.id,
+    impersonation_session_id: sessionId,
+    impersonation_mode: writeMode ? "write" : "read",
+    impersonation_reason: clean(reason),
+    impersonation_started_at: nowIso()
+  });
+  return {
+    mode,
+    access_token: accessToken,
+    profile: {
+      ...clientProfile(targetProfile),
+      impersonation: {
+        session_id: sessionId,
+        actor_user_id: actorProfile.id,
+        mode: writeMode ? "write" : "read",
+        reason: clean(reason)
+      }
+    },
+    impersonated_by: actorProfile.id,
+    impersonation_session_id: sessionId,
+    impersonation_mode: writeMode ? "write" : "read"
+  };
+}
+
+async function adminImpersonateAccount(method, body, headers, query = new URLSearchParams()) {
+  if (method !== "POST") return json(405, { error: "Method not allowed." });
+  const { profile } = await requireProfile(headers, ["admin"]);
+
+  const targetRole = normalizeRole(body.target_role || query.get("target_role") || "");
+  const targetId = clean(body.target_user_id || body.user_id || body.partner_id || body.guest_id || body.id || query.get("id"));
+  const targetEmail = lower(body.target_email || body.email || query.get("email"));
+  const restaurantId = clean(body.restaurant_id);
+  const reason = clean(body.reason || body.impersonation_reason);
+  const writeMode = boolValue(body.write_mode);
+  const writeModeConfirmed = boolValue(body.write_mode_confirmed || body.confirm_write_mode || body.confirmed_write_mode);
+  if (!targetId && !targetEmail && !restaurantId) return json(400, { error: "Target account or restaurant is required." });
+  if (writeMode && !reason) {
+    await createAuditLog({
+      profile,
+      action: "impersonation_start_denied",
+      entityType: "profile",
+      entityId: targetId || restaurantId || targetEmail,
+      targetRole,
+      headers,
+      success: false,
+      metadata: { reason: "write_mode_reason_required", write_mode: true }
+    });
+    return json(400, { error: "A reason is required for write-mode view-as access.", code: "IMPERSONATION_REASON_REQUIRED" });
+  }
+  if (writeMode && !writeModeConfirmed) {
+    await createAuditLog({
+      profile,
+      action: "impersonation_start_denied",
+      entityType: "profile",
+      entityId: targetId || restaurantId || targetEmail,
+      targetRole,
+      headers,
+      success: false,
+      metadata: { reason, denial_reason: "write_mode_confirmation_required", write_mode: true }
+    });
+    return json(400, { error: "Write-mode view-as access requires explicit confirmation.", code: "IMPERSONATION_WRITE_CONFIRMATION_REQUIRED" });
+  }
+
+  if (!supabaseConfigured) {
+    ensureDemo();
+    const target = demo.profiles.find((item) => {
+      if (targetId && item.id !== targetId) return false;
+      if (targetEmail && lower(item.email) !== targetEmail) return false;
+      if (restaurantId && item.restaurant_id !== restaurantId) return false;
+      if (targetRole && normalizeRole(item.role) !== targetRole) return false;
+      return true;
+    });
+    if (!target) return json(404, { error: "Target account not found." });
+    if (!canAdminViewAsTarget(profile, target)) {
+      await createAuditLog({
+        profile,
+        action: "impersonation_start_denied",
+        entityType: "profile",
+        entityId: target.id,
+        targetUserId: target.id,
+        targetRole: target.role,
+        headers,
+        success: false,
+        metadata: { reason, write_mode: writeMode }
+      });
+      return json(403, { error: "You are not allowed to view as this account." });
+    }
+    const payload = impersonationResponse({ mode: "demo", actorProfile: profile, targetProfile: target, reason, writeMode, headers });
+    await createAuditLog({
+      profile,
+      action: "impersonation_started",
+      entityType: "profile",
+      entityId: target.id,
+      targetUserId: target.id,
+      targetRole: target.role,
+      headers,
+      metadata: { impersonation_session_id: payload.impersonation_session_id, reason, write_mode: writeMode }
+    });
+    return json(200, payload);
+  }
+
+  const filters = [];
+  if (targetId) filters.push(`id=eq.${encodeURIComponent(targetId)}`);
+  if (targetEmail) filters.push(`email=eq.${encodeURIComponent(targetEmail)}`);
+  if (restaurantId) filters.push(`restaurant_id=eq.${encodeURIComponent(restaurantId)}`);
+  if (targetRole) filters.push(`role=eq.${encodeURIComponent(targetRole === "partner" ? "partner" : targetRole)}`);
+  const rows = await supabaseFetch(`/rest/v1/profiles?select=*&${filters.join("&")}&limit=1`, { service: true });
+  const target = clientProfile(rows?.[0]);
+  if (!target) return json(404, { error: "Target account not found." });
+  if (!canAdminViewAsTarget(profile, target)) {
+    await createAuditLog({
+      profile,
+      action: "impersonation_start_denied",
+      entityType: "profile",
+      entityId: target.id,
+      targetUserId: target.id,
+      targetRole: target.role,
+      headers,
+      success: false,
+      metadata: { reason, write_mode: writeMode }
+    });
+    return json(403, { error: "You are not allowed to view as this account." });
+  }
+  const payload = impersonationResponse({ mode: "supabase", actorProfile: profile, targetProfile: target, reason, writeMode, headers });
+  await createAuditLog({
+    profile,
+    action: "impersonation_started",
+    entityType: "profile",
+    entityId: target.id,
+    targetUserId: target.id,
+    targetRole: target.role,
+    headers,
+    metadata: { impersonation_session_id: payload.impersonation_session_id, reason, write_mode: writeMode }
+  });
+  return json(200, payload);
+}
+
+async function adminImpersonatePartner(method, body, headers) {
+  return adminImpersonateAccount(method, { ...body, target_role: "partner" }, headers);
+}
+
+async function adminImpersonationEnd(method, body, headers) {
+  if (method !== "POST") return json(405, { error: "Method not allowed." });
+  const { profile } = await requireProfile(headers, ["admin"]);
+  const sessionId = clean(body.impersonation_session_id || body.session_id);
+  const targetUserId = nullableClean(body.target_user_id);
+  await createAuditLog({
+    profile,
+    action: "impersonation_ended",
+    entityType: "profile",
+    entityId: targetUserId,
+    targetUserId,
+    targetRole: body.target_role,
+    headers,
+    metadata: { impersonation_session_id: sessionId, reason: clean(body.reason || "administrator_returned") }
+  });
+  return json(200, { ended: true, impersonation_session_id: sessionId });
 }
 
 async function adminOffers(method, body, headers) {
@@ -12032,49 +26643,476 @@ async function adminStats(headers) {
       }
     });
   }
-  const stats = await supabaseFetch("/rest/v1/rpc/admin_dashboard_stats", { method: "POST", service: true, body: {} });
+  const fallbackStats = async () => {
+    const [restaurants, profiles, offers, reservations, followers] = await Promise.all([
+      supabaseFetch("/rest/v1/restaurants?select=id,status", { service: true }).catch(() => []),
+      supabaseFetch("/rest/v1/profiles?select=id,role", { service: true }).catch(() => []),
+      supabaseFetch("/rest/v1/offers?select=id,status", { service: true }).catch(() => []),
+      supabaseFetch("/rest/v1/reservations?select=id,status,party_size", { service: true }).catch(() => []),
+      supabaseFetch("/rest/v1/restaurant_followers?select=id,notification_enabled", { service: true }).catch(() => [])
+    ]);
+    const normalizedReservations = (reservations || []).map((item) => ({
+      ...item,
+      status: normalizeReservationStatus(item.status)
+    }));
+    return {
+      restaurants_total: restaurants?.length || 0,
+      restaurants_pending: (restaurants || []).filter((item) => clean(item.status) === "pending").length,
+      partners_total: (profiles || []).filter((item) => roleMatches(item.role, ["partner"])).length,
+      offers_active: (offers || []).filter((item) => clean(item.status) === "active").length,
+      reservations_total: normalizedReservations.length,
+      reservations_pending: normalizedReservations.filter((item) => item.status === "pending").length,
+      reservations_accepted: normalizedReservations.filter((item) => item.status === "accepted").length,
+      reservations_rejected: normalizedReservations.filter((item) => item.status === "rejected").length,
+      seats_reserved: normalizedReservations.reduce((sum, item) => sum + numberOr(item.party_size, 0), 0),
+      views_total: 0,
+      favorites_total: (followers || []).filter((item) => item.notification_enabled !== false).length
+    };
+  };
+  const stats = await supabaseFetch("/rest/v1/rpc/admin_dashboard_stats", { method: "POST", service: true, body: {} })
+    .catch((error) => {
+      if (String(error?.code || "").startsWith("PGRST") || /schema cache|function/i.test(error?.message || "")) {
+        return fallbackStats();
+      }
+      throw error;
+    });
   return json(200, { stats });
 }
 
 async function getPartnerRestaurant(profile, query, body = {}) {
   const requestedRestaurantId = clean(query?.get("restaurant_id") || body.restaurant_id);
   const canAccessAnyRestaurant = roleMatches(profile.role, ["admin"]);
-  if (!canAccessAnyRestaurant && requestedRestaurantId && requestedRestaurantId !== clean(profile.restaurant_id)) {
+  const forbiddenRestaurantAccess = () => {
     const error = new Error("You are not allowed to access another restaurant profile.");
     error.status = 403;
-    throw error;
-  }
+    return error;
+  };
+  const restaurantAssignmentRows = async () => {
+    if (canAccessAnyRestaurant) return [];
+    if (!supabaseConfigured) {
+      ensureDemo();
+      return (demo.restaurantUsers || []).filter((item) => {
+        const active = clean(item.status || "active") === "active";
+        return active && (clean(item.user_id) === clean(profile.id) || lower(item.email) === lower(profile.email));
+      });
+    }
+    const filters = [
+      `user_id.eq.${encodeURIComponent(profile.id)}`,
+      `email.eq.${encodeURIComponent(lower(profile.email))}`
+    ].join(",");
+    return await supabaseFetch(`/rest/v1/restaurant_users?select=restaurant_id,role,status&or=(${filters})&status=eq.active`, { service: true }).catch(() => []);
+  };
+  const assignments = await restaurantAssignmentRows();
+  const assignedRestaurantIds = new Set(assignments.map((item) => clean(item.restaurant_id)).filter(Boolean));
+  const firstAssignedRestaurantId = [...assignedRestaurantIds][0] || "";
   const requestedId = canAccessAnyRestaurant
     ? clean(requestedRestaurantId || profile.restaurant_id)
-    : clean(profile.restaurant_id);
+    : clean(profile.restaurant_id || firstAssignedRestaurantId);
+  const hasAssignedRestaurantAccess = (restaurant = {}) => canAccessAnyRestaurant
+    || clean(profile.restaurant_id) === clean(restaurant.id)
+    || clean(restaurant.owner_user_id) === clean(profile.id)
+    || assignedRestaurantIds.has(clean(restaurant.id));
+  const restaurantAssignmentRole = (restaurant = {}) => {
+    if (canAccessAnyRestaurant || clean(restaurant.owner_user_id) === clean(profile.id)) return "owner";
+    const assignment = assignments.find((item) => clean(item.restaurant_id) === clean(restaurant.id));
+    if (assignment) return normalizeRestaurantUserRole(assignment.role || "read_only");
+    if (clean(profile.restaurant_id) === clean(restaurant.id)) return "owner";
+    return "read_only";
+  };
+  const withRestaurantAccessRole = (restaurant = {}) => {
+    restaurant.partner_access_role = restaurantAssignmentRole(restaurant);
+    return restaurant;
+  };
 
   if (!supabaseConfigured) {
     ensureDemo();
-    const restaurant = requestedId
-      ? demo.restaurants.find((item) => item.id === requestedId)
+    const targetId = requestedRestaurantId || requestedId;
+    const restaurant = targetId
+      ? demo.restaurants.find((item) => item.id === targetId)
       : demo.restaurants.find((item) => item.owner_user_id === profile.id);
     if (!restaurant) {
+      if (!canAccessAnyRestaurant && requestedRestaurantId) {
+        throw forbiddenRestaurantAccess();
+      }
       const error = new Error("Restaurant profile is not linked to this account.");
       error.status = 404;
       throw error;
     }
-    return restaurant;
+    if (!hasAssignedRestaurantAccess(restaurant)) {
+      throw forbiddenRestaurantAccess();
+    }
+    return withRestaurantAccessRole(restaurant);
   }
 
   let filter = "";
-  if (requestedId) {
-    filter = `id=eq.${encodeURIComponent(requestedId)}`;
+  const targetId = requestedRestaurantId || requestedId;
+  if (targetId) {
+    filter = `id=eq.${encodeURIComponent(targetId)}`;
   } else {
     filter = `owner_user_id=eq.${encodeURIComponent(profile.id)}`;
   }
   const rows = await supabaseFetch(`/rest/v1/restaurants?select=*&${filter}&limit=1`, { service: true });
   const restaurant = rows?.[0];
   if (!restaurant) {
+    if (!canAccessAnyRestaurant && requestedRestaurantId) {
+      throw forbiddenRestaurantAccess();
+    }
     const error = new Error("Restaurant profile is not linked to this account.");
     error.status = 404;
     throw error;
   }
-  return restaurant;
+  if (!hasAssignedRestaurantAccess(restaurant)) {
+    throw forbiddenRestaurantAccess();
+  }
+  return withRestaurantAccessRole(restaurant);
+}
+
+function requireRestaurantAccessRole(restaurant = {}, allowedRoles = []) {
+  const role = normalizeRestaurantUserRole(restaurant.partner_access_role || "read_only");
+  if (allowedRoles.includes(role)) return;
+  const error = new Error("This restaurant role is not allowed to perform this action.");
+  error.status = 403;
+  throw error;
+}
+
+async function listReservationAlertsForRestaurant(restaurantId = "", options = {}) {
+  const id = clean(restaurantId);
+  await processDueReservationAlertEscalations(id).catch(() => null);
+  const includeAcknowledged = Boolean(options.includeAcknowledged);
+  if (!supabaseConfigured) {
+    ensureDemo();
+    return demo.reservationAlerts
+      .filter((row) => row.restaurant_id === id)
+      .filter((row) => includeAcknowledged || !row.acknowledged_at)
+      .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))
+      .slice(0, Number(options.limit || 25))
+      .map(clientReservationAlert);
+  }
+  const columns = await supabaseTableColumns("reservation_alerts");
+  if (!columns.has("restaurant_id")) return [];
+  const ackFilter = includeAcknowledged ? "" : "&acknowledged_at=is.null";
+  const rows = await supabaseFetch(`/rest/v1/reservation_alerts?select=*&restaurant_id=eq.${encodeURIComponent(id)}${ackFilter}&order=created_at.desc&limit=${Math.max(1, Math.min(100, Number(options.limit || 25)))}`, { service: true }).catch(() => []);
+  return (rows || []).map(clientReservationAlert);
+}
+
+async function listReservationAlertDeliveriesForRestaurant(restaurantId = "", options = {}) {
+  const id = clean(restaurantId);
+  if (!id) return [];
+  if (!supabaseConfigured) {
+    ensureDemo();
+    return demo.reservationAlertDeliveries
+      .filter((row) => row.restaurant_id === id)
+      .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))
+      .slice(0, Number(options.limit || 50))
+      .map(clientReservationAlertDelivery);
+  }
+  const columns = await supabaseTableColumns("reservation_alert_deliveries");
+  if (!columns.has("restaurant_id")) return [];
+  const rows = await supabaseFetch(`/rest/v1/reservation_alert_deliveries?select=*&restaurant_id=eq.${encodeURIComponent(id)}&order=created_at.desc&limit=${Math.max(1, Math.min(100, Number(options.limit || 50)))}`, { service: true }).catch(() => []);
+  return (rows || []).map(clientReservationAlertDelivery);
+}
+
+async function acknowledgementForAlert(alert = {}, profile = null, headers = {}) {
+  if (!alert?.id) return null;
+  const row = {
+    id: crypto.randomUUID(),
+    alert_id: alert.id,
+    reservation_id: alert.reservation_id || null,
+    restaurant_id: alert.restaurant_id,
+    acknowledged_by: profile?.id || null,
+    acknowledgement_type: "dashboard",
+    note: "",
+    created_at: nowIso()
+  };
+  if (!supabaseConfigured) {
+    ensureDemo();
+    const existing = demo.reservationAlertAcknowledgements.find((item) => item.alert_id === alert.id && item.acknowledged_by === profile?.id);
+    if (!existing) demo.reservationAlertAcknowledgements.unshift(row);
+    return existing || row;
+  }
+  const columns = await supabaseTableColumns("reservation_alert_acknowledgements");
+  if (!columns.has("alert_id")) return null;
+  const rows = await supabaseFetch("/rest/v1/reservation_alert_acknowledgements?on_conflict=alert_id,acknowledged_by,acknowledgement_type&select=*", {
+    method: "POST",
+    service: true,
+    headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+    body: await filterSupabaseTablePayload("reservation_alert_acknowledgements", row)
+  }).catch(() => []);
+  await createAuditLog({
+    profile,
+    action: "reservation_alert_acknowledged",
+    entityType: "reservation_alert",
+    entityId: alert.id,
+    headers,
+    metadata: {
+      restaurant_id: alert.restaurant_id,
+      reservation_id: alert.reservation_id || "",
+      alert_status: "acknowledged"
+    }
+  }).catch(() => null);
+  return rows?.[0] || row;
+}
+
+async function acknowledgeReservationAlert(restaurantId = "", alertId = "", profile = null, headers = {}) {
+  const id = clean(alertId);
+  if (!id) return json(400, { error: "Alert id is required." });
+  let alert = null;
+  if (!supabaseConfigured) {
+    ensureDemo();
+    alert = demo.reservationAlerts.find((row) => row.id === id && row.restaurant_id === restaurantId);
+  } else {
+    const rows = await supabaseFetch(`/rest/v1/reservation_alerts?select=*&id=eq.${encodeURIComponent(id)}&restaurant_id=eq.${encodeURIComponent(restaurantId)}&limit=1`, { service: true }).catch(() => []);
+    alert = rows?.[0] || null;
+  }
+  if (!alert) return json(404, { error: "Reservation alert was not found." });
+  const ack = await acknowledgementForAlert(alert, profile, headers);
+  const patched = await patchAlertRecord(alert, {
+    status: "acknowledged",
+    acknowledged_at: alert.acknowledged_at || nowIso(),
+    acknowledged_by: profile?.id || null
+  });
+  await saveAlertDeliveryRecord({
+    alert_id: alert.id,
+    reservation_id: alert.reservation_id || null,
+    restaurant_id: alert.restaurant_id,
+    channel: "dashboard",
+    recipient_user_id: profile?.id || null,
+    provider: "smarttable_dashboard",
+    idempotency_key: hashEmailValue(`reservation-alert-ack:${alert.id}:${profile?.id || "unknown"}`),
+    status: "acknowledged",
+    acknowledged_at: nowIso()
+  }).catch(() => null);
+  return json(200, {
+    alert: clientReservationAlert(patched),
+    acknowledgement: ack,
+    message: "Reservation alert acknowledged. The reservation status was not changed."
+  });
+}
+
+async function createTestReservationAlert(restaurant = {}, profile = null, headers = {}) {
+  const limit = scopedRateLimit(reservationAlertRateLimitBuckets, `test-alert:${restaurant.id}:${profile?.id || clientIpAddress(headers)}`, {
+    limit: RESERVATION_ALERT_TEST_LIMIT,
+    windowMs: RESERVATION_ALERT_TEST_WINDOW_MS
+  });
+  if (limit) {
+    await createAuditLog({
+      profile,
+      action: "reservation_alert_test_rate_limited",
+      entityType: "restaurant",
+      entityId: restaurant.id,
+      headers,
+      success: false,
+      metadata: { restaurant_id: restaurant.id, retry_after_seconds: limit.retryAfterSeconds }
+    }).catch(() => null);
+    return json(429, { error: limit.error, code: limit.code, retry_after: limit.retryAfterSeconds }, {
+      "retry-after": String(limit.retryAfterSeconds)
+    });
+  }
+  const now = new Date();
+  const testRow = {
+    reservation_id: "",
+    restaurant_id: restaurant.id,
+    restaurant_name: restaurant.name || "Restaurant",
+    offer_title: "Test alert",
+    discount_percent: 20,
+    party_size: 2,
+    reservation_date: now.toISOString().slice(0, 10),
+    reservation_time: "19:00",
+    reference: `TEST-${String(Date.now()).slice(-6)}`,
+    created_at: nowIso()
+  };
+  const preferences = await getRestaurantNotificationPreferences(restaurant.id);
+  const alert = await upsertReservationAlert(testRow, preferences, { alertType: "test_reservation_alert" });
+  if (alert?.id) {
+    await saveAlertDeliveryRecord({
+      alert_id: alert.id,
+      reservation_id: null,
+      restaurant_id: restaurant.id,
+      channel: "dashboard",
+      provider: "smarttable_dashboard",
+      idempotency_key: hashEmailValue(`reservation-alert-test-dashboard:${alert.id}`),
+      status: "sent",
+      sent_at: nowIso()
+    }).catch(() => null);
+    if (preferences.push_enabled !== false) await sendPushForReservationAlert(alert).catch(() => null);
+    await createAuditLog({
+      profile,
+      action: "reservation_alert_test_sent",
+      entityType: "reservation_alert",
+      entityId: alert.id,
+      headers,
+      metadata: { restaurant_id: restaurant.id }
+    }).catch(() => null);
+  }
+  return json(202, {
+    alert: alert ? clientReservationAlert(alert) : clientReservationAlert({ ...testRow, id: `local-${Date.now()}`, safe_payload: reservationAlertPayload(testRow), status: "sent", created_at: nowIso() }),
+    push: pushService.getStatus()
+  });
+}
+
+function pwaInstallInstructions() {
+  return {
+    ios_ipados: "Open SmartTable Partner in Safari, tap Share, then Add to Home Screen. iOS and iPadOS web push works only after the web app is added to the Home Screen.",
+    android_chrome: "Open the Partner Dashboard in Chrome, use the install prompt or browser menu, then allow notifications.",
+    chrome_edge_desktop: "Use the install icon in the address bar or browser menu, then allow notifications.",
+    notifications: "Keep at least one restaurant tablet or manager device registered and online during service."
+  };
+}
+
+async function partnerNotificationSettings(method, body, headers, query) {
+  const { profile } = await requireProfile(headers, ["partner", "admin"]);
+  const restaurant = await getPartnerRestaurant(profile, query, body);
+  const restaurantId = restaurant.id;
+
+  if (method === "GET") {
+    const preferences = await getRestaurantNotificationPreferences(restaurantId);
+    const devices = await listRestaurantDevices(restaurantId);
+    return json(200, {
+      preferences: clientRestaurantNotificationPreferences(preferences),
+      devices: devices.map(clientPartnerDevice),
+      push: pushService.getStatus(),
+      sms: smsService.diagnostics(),
+      voice: voiceService.diagnostics(),
+      poll_seconds: RESERVATION_ALERT_POLL_SECONDS,
+      instructions: pwaInstallInstructions()
+    });
+  }
+
+  if (method === "PATCH") {
+    requireRestaurantAccessRole(restaurant, ["owner", "manager"]);
+    const saved = await saveRestaurantNotificationPreferences(restaurantId, body, profile, headers);
+    return json(200, { preferences: clientRestaurantNotificationPreferences(saved) });
+  }
+
+  if (method === "POST") {
+    const action = clean(body.action || "register_push_device");
+    if (action === "register_push_device") {
+      requireRestaurantAccessRole(restaurant, ["owner", "manager", "reservation_staff", "marketing_staff", "read_only"]);
+      return await registerPartnerDeviceSubscription(restaurantId, body, profile, headers);
+    }
+    if (action === "remove_device") {
+      requireRestaurantAccessRole(restaurant, ["owner", "manager"]);
+      return await removePartnerDeviceSubscription(restaurantId, body.device_id || body.id, profile, headers);
+    }
+    if (action === "send_test_alert") {
+      requireRestaurantAccessRole(restaurant, ["owner", "manager", "reservation_staff"]);
+      return await createTestReservationAlert(restaurant, profile, headers);
+    }
+    return json(400, { error: "Unsupported notification settings action." });
+  }
+
+  return json(405, { error: "Method not allowed." });
+}
+
+async function partnerReservationAlerts(method, body, headers, query) {
+  const { profile } = await requireProfile(headers, ["partner", "admin"]);
+  const restaurant = await getPartnerRestaurant(profile, query, body);
+  const restaurantId = restaurant.id;
+  if (method === "GET") {
+    const alerts = await listReservationAlertsForRestaurant(restaurantId, {
+      includeAcknowledged: boolValue(query.get("include_acknowledged") || query.get("includeAcknowledged")),
+      limit: query.get("limit") || 25
+    });
+    const deliveries = await listReservationAlertDeliveriesForRestaurant(restaurantId, { limit: 50 });
+    const unacknowledged = alerts.filter((alert) => !alert.acknowledged_at && normalizeAlertStatus(alert.status) !== "acknowledged");
+    return json(200, {
+      alerts,
+      deliveries,
+      pending_count: unacknowledged.length,
+      poll_seconds: RESERVATION_ALERT_POLL_SECONDS,
+      push: pushService.getStatus()
+    });
+  }
+  if (method === "PATCH") {
+    requireRestaurantAccessRole(restaurant, ["owner", "manager", "reservation_staff", "marketing_staff", "read_only"]);
+    const action = clean(body.action || "acknowledge");
+    if (action !== "acknowledge") return json(400, { error: "Unsupported reservation alert action." });
+    return await acknowledgeReservationAlert(restaurantId, body.alert_id || body.id, profile, headers);
+  }
+  return json(405, { error: "Method not allowed." });
+}
+
+async function adminReservationAlerts(method, body, headers, query) {
+  const { profile } = await requireProfile(headers, ["admin"]);
+  if (method === "GET") {
+    if (!supabaseConfigured) {
+      ensureDemo();
+      const restaurants = demo.restaurants;
+      return json(200, {
+        preferences: demo.restaurantNotificationPreferences.map(clientRestaurantNotificationPreferences),
+        devices: demo.partnerDeviceSubscriptions.map(clientPartnerDevice),
+        alerts: demo.reservationAlerts.map(clientReservationAlert),
+        deliveries: demo.reservationAlertDeliveries.slice(0, 50).map(clientReservationAlertDelivery),
+        restaurants_without_push_device: restaurants.filter((restaurant) => !demo.partnerDeviceSubscriptions.some((device) => device.restaurant_id === restaurant.id && device.status === "active")).map((restaurant) => ({ id: restaurant.id, name: restaurant.name })),
+        offline_devices_over_24h: demo.partnerDeviceSubscriptions.map(clientPartnerDevice).filter((device) => device.offline_more_than_24h),
+        push: pushService.getStatus(),
+        sms: smsService.diagnostics(),
+        voice: voiceService.diagnostics()
+      });
+    }
+    const [preferences, devices, alerts, deliveries, restaurants] = await Promise.all([
+      supabaseFetch("/rest/v1/restaurant_notification_preferences?select=*&order=updated_at.desc&limit=200", { service: true }).catch(() => []),
+      supabaseFetch("/rest/v1/partner_device_subscriptions?select=*&order=last_active_at.desc&limit=200", { service: true }).catch(() => []),
+      supabaseFetch("/rest/v1/reservation_alerts?select=*&order=created_at.desc&limit=100", { service: true }).catch(() => []),
+      supabaseFetch("/rest/v1/reservation_alert_deliveries?select=*&order=created_at.desc&limit=100", { service: true }).catch(() => []),
+      supabaseFetch("/rest/v1/restaurants?select=id,name,status&order=name.asc&limit=500", { service: true }).catch(() => [])
+    ]);
+    const activeDeviceRestaurantIds = new Set((devices || []).filter((device) => device.status === "active").map((device) => device.restaurant_id));
+    return json(200, {
+      preferences: (preferences || []).map(clientRestaurantNotificationPreferences),
+      devices: (devices || []).map(clientPartnerDevice),
+      alerts: (alerts || []).map(clientReservationAlert),
+      deliveries: (deliveries || []).map(clientReservationAlertDelivery),
+      restaurants_without_push_device: (restaurants || []).filter((restaurant) => !activeDeviceRestaurantIds.has(restaurant.id)),
+      offline_devices_over_24h: (devices || []).map(clientPartnerDevice).filter((device) => device.offline_more_than_24h),
+      push: pushService.getStatus(),
+      sms: smsService.diagnostics(),
+      voice: voiceService.diagnostics()
+    });
+  }
+  if (method === "PATCH") {
+    const restaurantId = clean(body.restaurant_id);
+    if (!restaurantId) return json(400, { error: "Restaurant id is required." });
+    const rows = supabaseConfigured
+      ? await supabaseFetch(`/rest/v1/restaurants?select=*&id=eq.${encodeURIComponent(restaurantId)}&limit=1`, { service: true }).catch(() => [])
+      : demo.restaurants.filter((restaurant) => restaurant.id === restaurantId);
+    const restaurant = rows?.[0];
+    if (!restaurant) return json(404, { error: "Restaurant not found." });
+    const saved = await saveRestaurantNotificationPreferences(restaurantId, body, profile, headers);
+    return json(200, { preferences: clientRestaurantNotificationPreferences(saved) });
+  }
+  if (method === "POST") {
+    const action = clean(body.action);
+    if (action === "send_test_alert") {
+      const restaurantId = clean(body.restaurant_id);
+      const rows = supabaseConfigured
+        ? await supabaseFetch(`/rest/v1/restaurants?select=*&id=eq.${encodeURIComponent(restaurantId)}&limit=1`, { service: true }).catch(() => [])
+        : demo.restaurants.filter((restaurant) => restaurant.id === restaurantId);
+      const restaurant = rows?.[0];
+      if (!restaurant) return json(404, { error: "Restaurant not found." });
+      return await createTestReservationAlert(restaurant, profile, headers);
+    }
+    return json(400, { error: "Unsupported reservation alert action." });
+  }
+  return json(405, { error: "Method not allowed." });
+}
+
+async function systemReservationAlertProcessor(method, body = {}, headers = {}) {
+  if (!["POST", "GET"].includes(method)) return json(405, { error: "Method not allowed." });
+  const authHeader = headerValue(headers, "authorization");
+  const bearerSecret = authHeader.toLowerCase().startsWith("bearer ") ? authHeader.slice(7) : "";
+  const suppliedSecret = clean(headerValue(headers, "x-smarttable-alert-secret") || body.secret || bearerSecret);
+  if (RESERVATION_ALERT_WORKER_SECRET) {
+    const valid = crypto.timingSafeEqual(
+      Buffer.from(hashEmailValue(suppliedSecret)),
+      Buffer.from(hashEmailValue(RESERVATION_ALERT_WORKER_SECRET))
+    );
+    if (!valid) return json(401, { error: "Invalid alert worker credential." });
+  } else {
+    await requireProfile(headers, ["admin"]);
+  }
+  const result = await processDueReservationAlertEscalations(clean(body.restaurant_id));
+  return json(200, { ok: true, result });
 }
 
 async function partnerProfile(method, body, headers, query) {
@@ -12085,6 +27123,7 @@ async function partnerProfile(method, body, headers, query) {
   if (!supabaseConfigured) {
     if (method === "GET") return json(200, { restaurant: withEmailDiagnostics(restaurant) });
     if (method === "PATCH") {
+      requireRestaurantAccessRole(restaurant, ["owner", "manager"]);
       Object.assign(restaurant, restaurantPayload(body), { updated_at: nowIso() });
       await createAdminNotification({
         type: "partner_profile_updated",
@@ -12100,6 +27139,7 @@ async function partnerProfile(method, body, headers, query) {
   } else {
     if (method === "GET") return json(200, { restaurant: withEmailDiagnostics(restaurant) });
     if (method === "PATCH") {
+      requireRestaurantAccessRole(restaurant, ["owner", "manager"]);
       const rows = await supabaseFetch(`/rest/v1/restaurants?id=eq.${encodeURIComponent(restaurant.id)}&select=*`, {
         method: "PATCH",
         service: true,
@@ -12148,10 +27188,32 @@ async function partnerStats(headers, query) {
       }
     });
   }
+  const fallbackStats = async () => {
+    const [reservations, followers] = await Promise.all([
+      supabaseFetch(`/rest/v1/reservations?select=id,status,party_size&restaurant_id=eq.${encodeURIComponent(restaurant.id)}`, { service: true }).catch(() => []),
+      supabaseFetch(`/rest/v1/restaurant_followers?select=id,notification_enabled&restaurant_id=eq.${encodeURIComponent(restaurant.id)}`, { service: true }).catch(() => [])
+    ]);
+    const normalizedReservations = (reservations || []).map((item) => ({
+      ...item,
+      status: normalizeReservationStatus(item.status)
+    }));
+    return {
+      views: 0,
+      bookings: normalizedReservations.length,
+      accepted: normalizedReservations.filter((row) => row.status === "accepted").length,
+      rejected: normalizedReservations.filter((row) => row.status === "rejected").length,
+      favorites_total: (followers || []).filter((item) => item.notification_enabled !== false).length
+    };
+  };
   const stats = await supabaseFetch("/rest/v1/rpc/partner_dashboard_stats", {
     method: "POST",
     service: true,
     body: { p_restaurant_id: restaurant.id }
+  }).catch((error) => {
+    if (String(error?.code || "").startsWith("PGRST") || /schema cache|function/i.test(error?.message || "")) {
+      return fallbackStats();
+    }
+    throw error;
   });
   const activeOffersRows = await supabaseFetch(`/rest/v1/offers?select=id&restaurant_id=eq.${encodeURIComponent(restaurant.id)}&status=eq.active`, { service: true }).catch(() => []);
   const views = numberOr(stats?.views, 0);
@@ -12167,6 +27229,1189 @@ async function partnerStats(headers, query) {
   });
 }
 
+function analyticsPercent(numerator, denominator) {
+  const top = Number(numerator);
+  const bottom = Number(denominator);
+  if (!Number.isFinite(top) || !Number.isFinite(bottom) || bottom <= 0) return top > 0 ? 100 : 0;
+  return Math.round((top / bottom) * 1000) / 10;
+}
+
+function analyticsQueryValue(query, ...names) {
+  for (const name of names) {
+    const value = clean(query?.get?.(name));
+    if (value) return value;
+  }
+  return "";
+}
+
+function analyticsDateKey(value = new Date(), timezone = "UTC") {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  try {
+    const parts = new Intl.DateTimeFormat("en-CA", {
+      timeZone: timezone || "UTC",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit"
+    }).formatToParts(date);
+    const byType = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+    return `${byType.year}-${byType.month}-${byType.day}`;
+  } catch {
+    return date.toISOString().slice(0, 10);
+  }
+}
+
+function analyticsDateAdd(dateKey = "", days = 0) {
+  const date = new Date(`${dateKey || new Date().toISOString().slice(0, 10)}T00:00:00Z`);
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
+}
+
+function analyticsMonthKey(dateKey = "") {
+  return clean(dateKey).slice(0, 7);
+}
+
+function analyticsDateRange(query, timezone = "UTC") {
+  const today = analyticsDateKey(new Date(), timezone);
+  const range = lower(analyticsQueryValue(query, "range", "date_range") || "30d");
+  const explicitFrom = analyticsQueryValue(query, "from", "date_from", "start_date");
+  const explicitTo = analyticsQueryValue(query, "to", "date_to", "end_date");
+  if (range === "custom" || explicitFrom || explicitTo) {
+    return {
+      from: explicitFrom || analyticsDateAdd(today, -29),
+      to: explicitTo || today,
+      label: "custom"
+    };
+  }
+  if (range === "today") return { from: today, to: today, label: "today" };
+  if (range === "yesterday") {
+    const yesterday = analyticsDateAdd(today, -1);
+    return { from: yesterday, to: yesterday, label: "yesterday" };
+  }
+  if (range === "7d" || range === "7" || range === "week") return { from: analyticsDateAdd(today, -6), to: today, label: "7d" };
+  if (range === "90d" || range === "90") return { from: analyticsDateAdd(today, -89), to: today, label: "90d" };
+  if (range === "year" || range === "365d") return { from: `${today.slice(0, 4)}-01-01`, to: today, label: "year" };
+  return { from: analyticsDateAdd(today, -29), to: today, label: "30d" };
+}
+
+function analyticsWeekKey(dateKey = "") {
+  const date = new Date(`${dateKey || new Date().toISOString().slice(0, 10)}T00:00:00Z`);
+  const start = dateStartOfWeek(date);
+  return start.toISOString().slice(0, 10);
+}
+
+function analyticsReservationDate(row = {}, timezone = "UTC") {
+  return clean(row.reservation_date || row.offer_date || row.date || (row.created_at ? analyticsDateKey(row.created_at, timezone) : ""));
+}
+
+function analyticsReservationTime(row = {}) {
+  return clean(row.reservation_time || row.offer_time || row.start_time || row.time || "");
+}
+
+function analyticsHour(row = {}, timezone = "UTC") {
+  const explicitTime = analyticsReservationTime(row);
+  const hour = Number(explicitTime.slice(0, 2));
+  if (Number.isFinite(hour)) return Math.max(0, Math.min(23, hour));
+  if (!row.created_at) return 0;
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: timezone || "UTC",
+      hour: "2-digit",
+      hourCycle: "h23"
+    }).formatToParts(new Date(row.created_at));
+    return Math.max(0, Math.min(23, Number(parts.find((part) => part.type === "hour")?.value || 0)));
+  } catch {
+    return Number(new Date(row.created_at).getUTCHours()) || 0;
+  }
+}
+
+function analyticsWeekday(dateKey = "") {
+  const date = new Date(`${dateKey || new Date().toISOString().slice(0, 10)}T00:00:00Z`);
+  return Number.isNaN(date.getTime()) ? 0 : date.getUTCDay();
+}
+
+function analyticsStatus(row = {}) {
+  return normalizeReservationStatus(clean(row.status || row.booking_status || "requested"));
+}
+
+function analyticsQueryWeekday(value = "") {
+  const normalized = lower(value);
+  if (!normalized) return null;
+  const names = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
+  if (names.includes(normalized)) return names.indexOf(normalized);
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) && parsed >= 0 && parsed <= 6 ? parsed : null;
+}
+
+function filterAnalyticsRowsForQuery(rows = {}, query, restaurant = {}) {
+  const timezone = clean(restaurant.primary_timezone || restaurant.timezone || "America/New_York");
+  const range = analyticsDateRange(query, timezone);
+  const rawOfferId = analyticsQueryValue(query, "offer_id", "offer");
+  const offerId = lower(rawOfferId) === "all" ? "" : rawOfferId;
+  const rawStatus = analyticsQueryValue(query, "reservation_status", "status");
+  const status = lower(rawStatus) === "all" ? "" : lower(rawStatus);
+  const partySize = Number(analyticsQueryValue(query, "party_size"));
+  const minPartySize = Number(analyticsQueryValue(query, "min_party_size"));
+  const maxPartySize = Number(analyticsQueryValue(query, "max_party_size"));
+  const weekday = analyticsQueryWeekday(analyticsQueryValue(query, "weekday"));
+  const hourValue = analyticsQueryValue(query, "hour");
+  const hour = hourValue && lower(hourValue) !== "all" ? Number(hourValue) : Number.NaN;
+  const reservationMatches = (row = {}) => {
+    const date = analyticsReservationDate(row, timezone);
+    if (date && (date < range.from || date > range.to)) return false;
+    if (offerId && clean(row.offer_id) !== offerId) return false;
+    if (status && status !== "all" && analyticsStatus(row) !== status) return false;
+    const size = numberOr(row.party_size, 0);
+    if (Number.isFinite(partySize) && partySize > 0 && size !== partySize) return false;
+    if (Number.isFinite(minPartySize) && minPartySize > 0 && size < minPartySize) return false;
+    if (Number.isFinite(maxPartySize) && maxPartySize > 0 && size > maxPartySize) return false;
+    if (weekday !== null && analyticsWeekday(date) !== weekday) return false;
+    if (Number.isFinite(hour) && hour >= 0 && hour <= 23 && analyticsHour(row, timezone) !== hour) return false;
+    return true;
+  };
+  const eventMatches = (row = {}) => {
+    const date = row.created_at ? analyticsDateKey(row.created_at, timezone) : "";
+    return !date || (date >= range.from && date <= range.to);
+  };
+  const offerMatches = (row = {}) => {
+    if (offerId && clean(row.id) !== offerId) return false;
+    return true;
+  };
+  return {
+    ...rows,
+    filters: {
+      range,
+      offer_id: offerId || "all",
+      reservation_status: status || "all",
+      party_size: Number.isFinite(partySize) && partySize > 0 ? partySize : null,
+      min_party_size: Number.isFinite(minPartySize) && minPartySize > 0 ? minPartySize : null,
+      max_party_size: Number.isFinite(maxPartySize) && maxPartySize > 0 ? maxPartySize : null,
+      weekday,
+      hour: Number.isFinite(hour) && hour >= 0 && hour <= 23 ? hour : null
+    },
+    offers: (rows.offers || []).filter(offerMatches),
+    reservations: (rows.reservations || []).filter(reservationMatches),
+    followers: (rows.followers || []).filter(eventMatches),
+    viewEvents: (rows.viewEvents || []).filter(eventMatches),
+    activityEvents: (rows.activityEvents || []).filter(eventMatches)
+  };
+}
+
+function restaurantMatchesAdminAnalyticsFilters(restaurant = {}, analytics = {}, query) {
+  const country = lower(analyticsQueryValue(query, "country", "country_code"));
+  const city = lower(analyticsQueryValue(query, "city"));
+  const restaurantId = clean(analyticsQueryValue(query, "restaurant_id", "restaurant"));
+  const status = lower(analyticsQueryValue(query, "restaurant_status", "status"));
+  const subscription = lower(analyticsQueryValue(query, "subscription", "subscription_status"));
+  if (restaurantId && clean(restaurant.id) !== restaurantId) return false;
+  if (country && country !== "all" && lower(restaurant.country || restaurant.country_code) !== country) return false;
+  if (city && city !== "all" && lower(restaurant.city || restaurant.market || restaurant.district) !== city) return false;
+  if (status && status !== "all" && lower(restaurant.status) !== status) return false;
+  if (subscription && subscription !== "all" && lower(analytics?.billing?.status || analytics?.billing_status || "no_subscription") !== subscription) return false;
+  return true;
+}
+
+function analyticsGuestKey(row = {}) {
+  return lower(row.guest_id || row.profile_key || row.guest_email || row.guest_name || "");
+}
+
+function analyticsOfferTitle(offer = {}) {
+  return clean(offer.title_en || offer.offer_title || offer.title || offer.name || "SmartTable offer");
+}
+
+function analyticsOfferDiscount(offer = {}) {
+  return numberOr(offer.discount_value, numberOr(offer.discount_percent, 0));
+}
+
+function emptyBucketSeries(keys = []) {
+  return Object.fromEntries(keys.map((key) => [key, 0]));
+}
+
+function countByDate(rows = [], options = {}) {
+  const { timezone = "UTC", dateKeys = [], dateField = null } = options;
+  const counts = emptyBucketSeries(dateKeys);
+  for (const row of rows) {
+    const key = dateField
+      ? clean(row[dateField] || (row.created_at ? analyticsDateKey(row.created_at, timezone) : ""))
+      : analyticsReservationDate(row, timezone);
+    if (!key) continue;
+    counts[key] = (counts[key] || 0) + 1;
+  }
+  return Object.entries(counts).map(([date, count]) => ({ date, count }));
+}
+
+function countByWeek(rows = [], dateKeys = [], timezone = "UTC") {
+  const counts = emptyBucketSeries(dateKeys);
+  for (const row of rows) {
+    const week = analyticsWeekKey(analyticsReservationDate(row, timezone));
+    if (!week) continue;
+    counts[week] = (counts[week] || 0) + 1;
+  }
+  return Object.entries(counts).map(([week, count]) => ({ week, count }));
+}
+
+function countByMonth(rows = [], monthKeys = [], timezone = "UTC") {
+  const counts = emptyBucketSeries(monthKeys);
+  for (const row of rows) {
+    const month = analyticsMonthKey(analyticsReservationDate(row, timezone));
+    if (!month) continue;
+    counts[month] = (counts[month] || 0) + 1;
+  }
+  return Object.entries(counts).map(([month, count]) => ({ month, count }));
+}
+
+function analyticsDistribution(rows = [], timezone = "UTC") {
+  const byHour = emptyBucketSeries([...Array(24)].map((_, index) => String(index)));
+  const byDay = emptyBucketSeries([...Array(7)].map((_, index) => String(index)));
+  const heatmap = [];
+  for (let day = 0; day < 7; day += 1) {
+    for (let hour = 0; hour < 24; hour += 1) heatmap.push({ day, hour, count: 0 });
+  }
+  for (const row of rows) {
+    const date = analyticsReservationDate(row, timezone);
+    const day = analyticsWeekday(date);
+    const hour = analyticsHour(row, timezone);
+    byHour[String(hour)] = (byHour[String(hour)] || 0) + 1;
+    byDay[String(day)] = (byDay[String(day)] || 0) + 1;
+    const bucket = heatmap.find((item) => item.day === day && item.hour === hour);
+    if (bucket) bucket.count += 1;
+  }
+  return {
+    by_hour: Object.entries(byHour).map(([hour, count]) => ({ hour: Number(hour), count })),
+    by_day: Object.entries(byDay).map(([day, count]) => ({ day: Number(day), count })),
+    heatmap
+  };
+}
+
+function analyticsBestBucket(rows = [], field, timezone = "UTC") {
+  const counts = new Map();
+  for (const row of rows) {
+    const key = field === "hour" ? analyticsHour(row, timezone) : analyticsWeekday(analyticsReservationDate(row, timezone));
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+  const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  return sorted.length ? sorted[0][0] : null;
+}
+
+function analyticsProfileCompleteness(restaurant = {}) {
+  const fields = [
+    "name",
+    "contact_email",
+    "reservation_email",
+    "phone",
+    "address",
+    "district",
+    "city",
+    "cuisine",
+    "cuisine_type",
+    "description",
+    "description_en",
+    "opening_hours",
+    "timezone",
+    "primary_timezone",
+    "card_image",
+    "cover_image",
+    "logo_url"
+  ];
+  const completed = fields.filter((field) => {
+    const value = restaurant[field];
+    return Array.isArray(value) ? value.length > 0 : clean(value);
+  }).length;
+  return Math.round((completed / fields.length) * 100);
+}
+
+function analyticsImagesUploaded(restaurant = {}) {
+  const gallery = Array.isArray(restaurant.gallery_images) ? restaurant.gallery_images : [];
+  return [restaurant.logo_url, restaurant.card_image, restaurant.cover_image, restaurant.hero_image_url, ...gallery].filter((value) => clean(value)).length;
+}
+
+function analyticsHealthGrade(score) {
+  if (score >= 95) return "A+";
+  if (score >= 85) return "A";
+  if (score >= 75) return "B";
+  if (score >= 60) return "C";
+  if (score >= 45) return "D";
+  return "E";
+}
+
+function buildRestaurantHealthScore(restaurant = {}, context = {}) {
+  const reservations = context.reservations || [];
+  const offers = context.offers || [];
+  const reviews = context.reviews || [];
+  const billing = context.billing || {};
+  const statuses = reservations.map(analyticsStatus);
+  const accepted = statuses.filter((status) => ["accepted", "confirmed", "completed"].includes(status)).length;
+  const cancelled = statuses.filter((status) => ["cancelled", "canceled", "rejected", "declined"].includes(status)).length;
+  const noShows = statuses.filter((status) => status === "no_show").length;
+  const total = reservations.length;
+  const reviewRatings = reviews.map((row) => numberOr(row.rating, numberOr(row.overall_rating, 0))).filter(Boolean);
+  const responseDurations = reservations
+    .filter((row) => row.accepted_at || row.rejected_at || row.cancelled_at || row.status_changed_at)
+    .map((row) => {
+      const changed = new Date(row.accepted_at || row.rejected_at || row.cancelled_at || row.status_changed_at).getTime();
+      const created = new Date(row.created_at || row.requested_at || row.updated_at).getTime();
+      return Number.isFinite(changed) && Number.isFinite(created) ? (changed - created) / 36e5 : null;
+    })
+    .filter(Number.isFinite);
+  const components = [
+    { key: "profile_completeness", label: "Profile completeness", score: analyticsProfileCompleteness(restaurant), weight: 16 },
+    { key: "images_uploaded", label: "Images uploaded", score: Math.min(100, analyticsImagesUploaded(restaurant) * 25), weight: 8 },
+    { key: "opening_hours_completed", label: "Opening hours completed", score: clean(restaurant.opening_hours) || arrayFrom(restaurant.service_periods).length ? 100 : 35, weight: 8 },
+    { key: "reservation_settings", label: "Reservation settings", score: restaurant.min_party_size || restaurant.max_party_size || restaurant.reservation_acceptance_mode ? 100 : 45, weight: 8 },
+    { key: "response_speed", label: "Response speed", score: responseDurations.length ? Math.max(20, Math.min(100, 100 - Math.round((average(responseDurations) || 0) * 5))) : 60, weight: 10 },
+    { key: "accepted_reservations", label: "Accepted reservations", score: total ? analyticsPercent(accepted, total) : 55, weight: 10 },
+    { key: "cancelled_reservations", label: "Canceled reservations", score: total ? Math.max(0, 100 - analyticsPercent(cancelled, total)) : 75, weight: 8 },
+    { key: "no_show_rate", label: "No-show rate", score: total ? Math.max(0, 100 - analyticsPercent(noShows, total) * 2) : 80, weight: 8 },
+    { key: "offers_activity", label: "Offers activity", score: Math.min(100, offers.filter((offer) => clean(offer.status) === "active").length * 20), weight: 8 },
+    { key: "guest_ratings", label: "Guest ratings", score: reviewRatings.length ? Math.round(((average(reviewRatings) || 0) / 5) * 100) : 65, weight: 7 },
+    { key: "partner_activity", label: "Partner activity", score: restaurant.updated_at && (Date.now() - new Date(restaurant.updated_at).getTime()) < 1000 * 60 * 60 * 24 * 30 ? 90 : 55, weight: 5 },
+    { key: "subscription_status", label: "Subscription status", score: billing.can_use_partner_features || ["trialing", "active"].includes(clean(billing.status)) ? 100 : ["past_due"].includes(clean(billing.status)) ? 65 : 50, weight: 4 }
+  ];
+  const weighted = components.reduce((sum, item) => sum + item.score * item.weight, 0);
+  const totalWeight = components.reduce((sum, item) => sum + item.weight, 0);
+  const score = Math.round(weighted / totalWeight);
+  return {
+    score,
+    grade: analyticsHealthGrade(score),
+    components: components.map(({ key, label, score: componentScore, weight }) => ({ key, label, score: Math.round(componentScore), weight }))
+  };
+}
+
+function buildRuleBasedRestaurantRecommendations(restaurant = {}, analytics = {}, data = {}) {
+  const cards = analytics.cards || {};
+  const charts = analytics.charts || {};
+  const health = analytics.health_score || {};
+  const offerAnalytics = analytics.offer_analytics || [];
+  const recommendations = [];
+  const add = (key, message, severity = "medium", action = "") => {
+    recommendations.push({ key, severity, message, action, source: "rules" });
+  };
+  const profileComponent = health.components?.find((item) => item.key === "profile_completeness");
+  const imageComponent = health.components?.find((item) => item.key === "images_uploaded");
+  const responseComponent = health.components?.find((item) => item.key === "response_speed");
+  const cancellationRate = numberOr(cards.cancellation_rate, 0);
+  const noShowRate = numberOr(cards.no_show_rate, 0);
+  const activeOffers = (data.offers || []).filter((offer) => clean(offer.status) === "active");
+  if (!profileComponent || profileComponent.score < 85) {
+    add("complete_profile", "Complete your profile so guests can understand the restaurant before requesting a table.", "high", "Add missing profile, cuisine, contact, hours, and description fields.");
+  }
+  if (!clean(restaurant.description_en || restaurant.description || restaurant.full_description)) {
+    add("improve_profile_description", "Improve profile description.", "medium", "Add a clear public description with cuisine, atmosphere, and reservation expectations.");
+  }
+  if (!imageComponent || imageComponent.score < 75) {
+    add("upload_more_photos", "Upload more photos.", "medium", "Add logo, cover, card, and gallery images.");
+  }
+  if (activeOffers.length < 2) {
+    add("create_another_offer", "Create another offer.", "medium", "Add at least one additional active lunch or dinner offer.");
+  }
+  const dayRows = charts.reservation_day_distribution || [];
+  const monday = dayRows.find((row) => row.day === 1)?.count || 0;
+  const friday = dayRows.find((row) => row.day === 5)?.count || 0;
+  if (friday > monday && monday <= Math.max(1, Math.round(friday * 0.35))) {
+    add("monday_low_bookings", "Monday has low bookings.", "medium", "Consider a focused Monday offer or reminder to interested guests.");
+  }
+  if (friday > 0 && friday >= Math.max(...dayRows.map((row) => row.count || 0))) {
+    add("friday_best", "Friday performs best.", "low", "Keep Friday inventory visible and protect availability in strong windows.");
+  }
+  if (responseComponent && responseComponent.score < 65) {
+    add("response_time_high", "Response time is high.", "high", "Review pending reservations more often or enable partner notifications.");
+  }
+  const lunchOffers = activeOffers.filter((offer) => {
+    const time = clean(offer.start_time || offer.offer_time);
+    const hour = Number(time.slice(0, 2));
+    return Number.isFinite(hour) && hour >= 11 && hour <= 15;
+  });
+  if (!lunchOffers.length) {
+    add("enable_lunch", "Enable lunch.", "low", "Add a lunch offer if the restaurant serves lunch.");
+  }
+  if (!clean(restaurant.parking_info || restaurant.accessibility_info) && !(data.tables || []).some((table) => table.seating_type === "outdoor")) {
+    add("add_outdoor_seating", "Add outdoor seating.", "low", "If available, mark outdoor or accessible seating in the restaurant profile.");
+  }
+  const tuesday = dayRows.find((row) => row.day === 2)?.count || 0;
+  if (tuesday <= Math.max(1, Math.round((cards.total_reservations || 0) / 28))) {
+    add("increase_discount_tuesday", "Increase discount Tuesday.", "low", "Try a limited Tuesday offer with a clearer discount or narrower time window.");
+  }
+  if (!restaurant.email && !restaurant.contact_email && !restaurant.reservation_email) {
+    add("enable_notifications", "Enable notifications.", "high", "Add a reservation notification email so requests are not missed.");
+  }
+  if (cancellationRate >= 20) {
+    add("improve_cancellation_rate", "Improve cancellation rate.", "high", "Review cancellation policy, confirmation copy, and response timing.");
+  }
+  if (noShowRate >= 10) {
+    add("improve_no_show_rate", "Improve no-show rate.", "medium", "Use clearer arrival instructions and reminder copy.");
+  }
+  const weakOffer = offerAnalytics.find((offer) => offer.views >= 10 && offer.conversion_rate < 5);
+  if (weakOffer) {
+    add("improve_offer_conversion", `${weakOffer.title} has low conversion.`, "medium", "Refresh the offer title, time window, image, or discount.");
+  }
+  return recommendations.slice(0, 10);
+}
+
+function buildRestaurantAnalytics(restaurant = {}, data = {}) {
+  const timezone = clean(restaurant.primary_timezone || restaurant.timezone || "America/New_York");
+  const reservations = (data.reservations || []).map((row) => ({ ...row, status: analyticsStatus(row) }));
+  const offers = data.offers || [];
+  const followers = (data.followers || []).filter((row) => row.notification_enabled !== false);
+  const reviews = data.reviews || [];
+  const viewEvents = data.viewEvents || [];
+  const activityEvents = data.activityEvents || [];
+  const billing = data.billing || {};
+  const today = analyticsDateKey(new Date(), timezone);
+  const todayStart = new Date(`${today}T00:00:00Z`);
+  const weekStart = dateStartOfWeek(todayStart).toISOString().slice(0, 10);
+  const monthStart = dateStartOfMonth(todayStart).toISOString().slice(0, 10);
+  const previousMonthDate = new Date(`${monthStart}T00:00:00Z`);
+  previousMonthDate.setUTCMonth(previousMonthDate.getUTCMonth() - 1);
+  const previousMonth = previousMonthDate.toISOString().slice(0, 7);
+  const currentMonth = analyticsMonthKey(today);
+  const last30DateKeys = [...Array(30)].map((_, index) => analyticsDateAdd(today, index - 29));
+  const last12WeekKeys = [...Array(12)].map((_, index) => analyticsDateAdd(weekStart, (index - 11) * 7));
+  const monthKeys = [...Array(12)].map((_, index) => {
+    const date = new Date(`${currentMonth}-01T00:00:00Z`);
+    date.setUTCMonth(date.getUTCMonth() - (11 - index));
+    return date.toISOString().slice(0, 7);
+  });
+
+  const byDate = (row) => analyticsReservationDate(row, timezone);
+  const todayReservations = reservations.filter((row) => byDate(row) === today);
+  const thisWeekReservations = reservations.filter((row) => byDate(row) >= weekStart);
+  const thisMonthReservations = reservations.filter((row) => analyticsMonthKey(byDate(row)) === currentMonth);
+  const previousMonthReservations = reservations.filter((row) => analyticsMonthKey(byDate(row)) === previousMonth);
+  const cancelled = reservations.filter((row) => ["cancelled", "canceled", "rejected", "declined"].includes(row.status));
+  const noShows = reservations.filter((row) => row.status === "no_show");
+  const partySizes = reservations.map((row) => numberOr(row.party_size, 0)).filter(Boolean);
+  const leadTimes = reservations.map((row) => {
+    const date = analyticsReservationDate(row, timezone);
+    const time = analyticsReservationTime(row) || "00:00";
+    const reservedAt = new Date(`${date}T${time}`).getTime();
+    const createdAt = new Date(row.created_at || row.requested_at || row.updated_at).getTime();
+    return Number.isFinite(reservedAt) && Number.isFinite(createdAt) ? Math.max(0, (reservedAt - createdAt) / 36e5) : null;
+  }).filter(Number.isFinite);
+  const guestCounts = new Map();
+  for (const row of reservations) {
+    const key = analyticsGuestKey(row);
+    if (!key) continue;
+    guestCounts.set(key, (guestCounts.get(key) || 0) + 1);
+  }
+  const returningGuests = [...guestCounts.values()].filter((count) => count > 1).length;
+  const newGuests = [...guestCounts.values()].filter((count) => count === 1).length;
+  const profileViews = numberOr(restaurant.views_count, 0) || viewEvents.length;
+  const offerViewEvents = activityEvents.filter((event) => ["offer_viewed", "offer_impression", "newest_restaurant_clicked", "restaurant_detail_opened"].includes(clean(event.event_type)));
+  const offerClickEvents = activityEvents.filter((event) => ["offer_clicked", "reserve_clicked", "ai_recommendation_reserve_clicked"].includes(clean(event.event_type)));
+  const offerViews = offerViewEvents.length || profileViews;
+  const offerClicks = offerClickEvents.length;
+  const distribution = analyticsDistribution(reservations, timezone);
+  const favoriteTrend = countByDate(followers, { timezone, dateKeys: last30DateKeys, dateField: "created_at" });
+  const profileViewsTrend = countByDate(viewEvents, { timezone, dateKeys: last30DateKeys, dateField: "created_at" });
+  const returningGuestTrend = last30DateKeys.map((date) => {
+    const seen = new Map();
+    const rows = reservations.filter((row) => analyticsReservationDate(row, timezone) <= date);
+    for (const row of rows) {
+      const key = analyticsGuestKey(row);
+      if (key) seen.set(key, (seen.get(key) || 0) + 1);
+    }
+    return { date, count: [...seen.values()].filter((count) => count > 1).length };
+  });
+
+  const reservationsByOffer = new Map();
+  for (const row of reservations) {
+    const offerId = clean(row.offer_id);
+    if (!offerId) continue;
+    if (!reservationsByOffer.has(offerId)) reservationsByOffer.set(offerId, []);
+    reservationsByOffer.get(offerId).push(row);
+  }
+  const offerAnalytics = offers.map((offer) => {
+    const offerReservations = reservationsByOffer.get(clean(offer.id)) || [];
+    const offerEvents = activityEvents.filter((event) => clean(event.entity_id || event.properties?.offer_id || event.metadata?.offer_id) === clean(offer.id));
+    const views = numberOr(offer.views_count, 0) || offerEvents.filter((event) => clean(event.event_type).includes("view")).length;
+    const clicks = numberOr(offer.click_count, 0) || offerEvents.filter((event) => clean(event.event_type).includes("click") || clean(event.event_type).includes("reserve")).length;
+    return {
+      offer_id: offer.id,
+      title: analyticsOfferTitle(offer),
+      status: clean(offer.status || "active"),
+      discount_percent: analyticsOfferDiscount(offer),
+      views,
+      clicks,
+      reservations: offerReservations.length,
+      conversion_rate: analyticsPercent(offerReservations.length, views || clicks || profileViews),
+      favorite_additions: followers.filter((row) => row.created_at && offer.created_at && new Date(row.created_at) >= new Date(offer.created_at)).length,
+      average_reservation_size: average(offerReservations.map((row) => numberOr(row.party_size, 0)).filter(Boolean)) || 0,
+      cancellation_rate: analyticsPercent(offerReservations.filter((row) => ["cancelled", "canceled", "rejected", "declined"].includes(row.status)).length, offerReservations.length),
+      revenue_placeholder: "Revenue is not tracked in SmartTable BASIC.",
+      best_hour: analyticsBestBucket(offerReservations, "hour", timezone),
+      best_weekday: analyticsBestBucket(offerReservations, "weekday", timezone)
+    };
+  });
+
+  const cards = {
+    todays_reservations: todayReservations.length,
+    this_week: thisWeekReservations.length,
+    this_month: thisMonthReservations.length,
+    total_reservations: reservations.length,
+    reservation_growth: analyticsPercent(thisMonthReservations.length - previousMonthReservations.length, previousMonthReservations.length),
+    total_profile_views: profileViews,
+    offer_views: offerViews,
+    favorites: followers.length,
+    reservation_conversion_rate: analyticsPercent(reservations.length, offerViews || profileViews),
+    returning_guests: returningGuests,
+    new_guests: newGuests,
+    average_party_size: average(partySizes) || 0,
+    cancellation_rate: analyticsPercent(cancelled.length, reservations.length),
+    no_show_rate: analyticsPercent(noShows.length, reservations.length),
+    average_booking_lead_time_hours: average(leadTimes) || 0
+  };
+
+  const analytics = {
+    restaurant_id: restaurant.id,
+    restaurant_name: restaurant.name,
+    timezone,
+    generated_at: nowIso(),
+    privacy: "aggregate_only_no_guest_pii",
+    filters: data.filters || {},
+    cards,
+    charts: {
+      daily_reservations: countByDate(reservations, { timezone, dateKeys: last30DateKeys }),
+      weekly_reservations: countByWeek(reservations, last12WeekKeys, timezone),
+      monthly_reservations: countByMonth(reservations, monthKeys, timezone),
+      offer_performance: offerAnalytics.map((offer) => ({ offer_id: offer.offer_id, title: offer.title, reservations: offer.reservations, views: offer.views, clicks: offer.clicks, conversion_rate: offer.conversion_rate })),
+      top_performing_offers: [...offerAnalytics].sort((a, b) => b.reservations - a.reservations || b.conversion_rate - a.conversion_rate).slice(0, 5),
+      reservation_heatmap: distribution.heatmap,
+      reservation_hour_distribution: distribution.by_hour,
+      reservation_day_distribution: distribution.by_day,
+      profile_views: profileViewsTrend,
+      favorites_trend: favoriteTrend,
+      returning_guest_trend: returningGuestTrend
+    },
+    offer_analytics: offerAnalytics,
+    health_score: buildRestaurantHealthScore(restaurant, { reservations, offers, reviews, billing })
+  };
+  analytics.recommendations = buildRuleBasedRestaurantRecommendations(restaurant, analytics, data);
+  return analytics;
+}
+
+async function loadRestaurantAnalyticsRows(restaurant = {}) {
+  if (!supabaseConfigured) {
+    ensureDemo();
+    return {
+      offers: demo.offers.filter((offer) => offer.restaurant_id === restaurant.id),
+      reservations: reservationOverviewRows().filter((row) => row.restaurant_id === restaurant.id),
+      followers: demo.restaurantFollowers.filter((row) => row.restaurant_id === restaurant.id),
+      reviews: demo.restaurantReviews.filter((row) => row.restaurant_id === restaurant.id && (!row.status || row.status === "approved")),
+      viewEvents: [],
+      activityEvents: demo.analyticsEvents.filter((row) => row.restaurant_id === restaurant.id || row.properties?.restaurant_id === restaurant.id),
+      billing: await getRestaurantBillingAccess(restaurant.id).catch(() => ({}))
+    };
+  }
+  const restaurantId = encodeURIComponent(restaurant.id);
+  const [offers, reservations, followers, reviews, viewEvents, activityEvents, billing] = await Promise.all([
+    supabaseFetch(`/rest/v1/offers?select=*&restaurant_id=eq.${restaurantId}&order=offer_date.desc,start_time.desc&limit=1000`, { service: true }).catch(() => []),
+    supabaseFetch(`/rest/v1/reservation_overview?select=*&restaurant_id=eq.${restaurantId}&order=created_at.desc&limit=5000`, { service: true }).catch(async () => {
+      return await supabaseFetch(`/rest/v1/reservations?select=*&restaurant_id=eq.${restaurantId}&order=created_at.desc&limit=5000`, { service: true }).catch(() => []);
+    }),
+    supabaseFetch(`/rest/v1/restaurant_followers?select=*&restaurant_id=eq.${restaurantId}&limit=5000`, { service: true }).catch(() => []),
+    supabaseFetch(`/rest/v1/restaurant_reviews?select=*&restaurant_id=eq.${restaurantId}&status=eq.approved&limit=1000`, { service: true }).catch(() => []),
+    supabaseFetch(`/rest/v1/restaurant_view_events?select=created_at,restaurant_id&restaurant_id=eq.${restaurantId}&order=created_at.desc&limit=5000`, { service: true }).catch(() => []),
+    supabaseFetch(`/rest/v1/analytics_events?select=*&restaurant_id=eq.${restaurantId}&order=created_at.desc&limit=5000`, { service: true }).catch(() => []),
+    getRestaurantBillingAccess(restaurant.id).catch(() => ({}))
+  ]);
+  return { offers, reservations, followers, reviews, viewEvents, activityEvents, billing };
+}
+
+function analyticsRestaurantMap(restaurants = []) {
+  return new Map((restaurants || []).filter((restaurant) => restaurant?.id).map((restaurant) => [
+    restaurant.id,
+    {
+      offers: [],
+      reservations: [],
+      followers: [],
+      reviews: [],
+      viewEvents: [],
+      activityEvents: [],
+      billing: {}
+    }
+  ]));
+}
+
+function addAnalyticsRowsByRestaurant(map, key, rows = []) {
+  for (const row of rows || []) {
+    const restaurantId = row.restaurant_id || row.restaurant?.id || row.restaurants?.id;
+    if (!restaurantId || !map.has(restaurantId)) continue;
+    map.get(restaurantId)[key].push(row);
+  }
+}
+
+async function loadRestaurantAnalyticsRowsByRestaurant(restaurants = []) {
+  const map = analyticsRestaurantMap(restaurants);
+  if (!map.size) return map;
+  if (!supabaseConfigured) {
+    ensureDemo();
+    addAnalyticsRowsByRestaurant(map, "offers", demo.offers);
+    addAnalyticsRowsByRestaurant(map, "reservations", reservationOverviewRows());
+    addAnalyticsRowsByRestaurant(map, "followers", demo.restaurantFollowers);
+    addAnalyticsRowsByRestaurant(map, "reviews", demo.restaurantReviews.filter((row) => !row.status || row.status === "approved"));
+    addAnalyticsRowsByRestaurant(map, "activityEvents", demo.analyticsEvents);
+    for (const restaurant of restaurants || []) {
+      if (!restaurant?.id || !map.has(restaurant.id)) continue;
+      map.get(restaurant.id).billing = await getRestaurantBillingAccess(restaurant.id).catch(() => ({}));
+    }
+    return map;
+  }
+  const ids = [...map.keys()];
+  const inList = ids.map((id) => encodeURIComponent(id)).join(",");
+  const [offers, reservations, followers, reviews, viewEvents, activityEvents, subscriptions] = await Promise.all([
+    supabaseFetch(`/rest/v1/offers?select=*&restaurant_id=in.(${inList})&order=offer_date.desc,start_time.desc&limit=5000`, { service: true }).catch(() => []),
+    supabaseFetch(`/rest/v1/reservation_overview?select=*&restaurant_id=in.(${inList})&order=created_at.desc&limit=5000`, { service: true }).catch(async () => {
+      return await supabaseFetch(`/rest/v1/reservations?select=*&restaurant_id=in.(${inList})&order=created_at.desc&limit=5000`, { service: true }).catch(() => []);
+    }),
+    supabaseFetch(`/rest/v1/restaurant_followers?select=*&restaurant_id=in.(${inList})&limit=5000`, { service: true }).catch(() => []),
+    supabaseFetch(`/rest/v1/restaurant_reviews?select=*&restaurant_id=in.(${inList})&status=eq.approved&limit=5000`, { service: true }).catch(() => []),
+    supabaseFetch(`/rest/v1/restaurant_view_events?select=created_at,restaurant_id&restaurant_id=in.(${inList})&order=created_at.desc&limit=5000`, { service: true }).catch(() => []),
+    supabaseFetch(`/rest/v1/analytics_events?select=*&restaurant_id=in.(${inList})&order=created_at.desc&limit=5000`, { service: true }).catch(() => []),
+    supabaseFetch(`/rest/v1/restaurant_subscriptions?select=*,subscription_plans(*)&restaurant_id=in.(${inList})&order=created_at.desc&limit=5000`, { service: true }).catch(() => [])
+  ]);
+  addAnalyticsRowsByRestaurant(map, "offers", offers);
+  addAnalyticsRowsByRestaurant(map, "reservations", reservations);
+  addAnalyticsRowsByRestaurant(map, "followers", followers);
+  addAnalyticsRowsByRestaurant(map, "reviews", reviews);
+  addAnalyticsRowsByRestaurant(map, "viewEvents", viewEvents);
+  addAnalyticsRowsByRestaurant(map, "activityEvents", activityEvents);
+  for (const restaurant of restaurants || []) {
+    if (!restaurant?.id || !map.has(restaurant.id)) continue;
+    const subscription = (subscriptions || []).find((row) => row.restaurant_id === restaurant.id) || null;
+    const mergedPlans = mergeFixedMonthlyPlans(subscription?.subscription_plans ? [subscription.subscription_plans] : [], { includeInactive: true });
+    const plan = mergedPlans.find((item) => item.id === subscription?.plan_id || item.internal_name === normalizeInternalPlanName(subscription?.internal_plan || subscription?.subscription_plans?.internal_name)) || subscription?.subscription_plans || null;
+    map.get(restaurant.id).billing = {
+      ...billingAccessSummary(subscription, plan, { restaurant }),
+      enforcement_mode: BILLING_ENFORCEMENT_MODE,
+      mode: "supabase"
+    };
+  }
+  return map;
+}
+
+function analyticsMetricExportLabel(key = "") {
+  const labels = {
+    todays_reservations: "Today's reservations",
+    this_week: "This week",
+    this_month: "This month",
+    total_reservations: "Total reservations",
+    reservation_growth: "Reservation growth",
+    total_profile_views: "Total profile views",
+    offer_views: "Offer views",
+    favorites: "Favorites",
+    reservation_conversion_rate: "Reservation conversion rate",
+    returning_guests: "Returning guests",
+    new_guests: "New guests",
+    average_party_size: "Average party size",
+    cancellation_rate: "Cancellation rate",
+    no_show_rate: "No-show rate",
+    average_booking_lead_time_hours: "Average booking lead time",
+    restaurants: "Restaurants",
+    active_restaurants: "Active restaurants",
+    draft_restaurants: "Draft restaurants",
+    suspended_restaurants: "Suspended restaurants",
+    archived_restaurants: "Archived restaurants",
+    new_restaurants: "New restaurants",
+    trial_restaurants: "Trial restaurants",
+    paid_restaurants: "Paid restaurants"
+  };
+  return labels[key] || clean(key).replace(/_/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function analyticsPercentText(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return clean(value);
+  return `${Math.round(number * 10) / 10}%`;
+}
+
+function analyticsExportDisplayValue(key, value) {
+  if (["reservation_growth", "reservation_conversion_rate", "cancellation_rate", "no_show_rate", "conversion_rate"].includes(key)) {
+    return analyticsPercentText(value);
+  }
+  if (key === "average_booking_lead_time_hours") {
+    const number = Number(value);
+    return Number.isFinite(number) ? `${Math.round(number * 10) / 10} hours` : clean(value);
+  }
+  return value;
+}
+
+function spreadsheetSafeText(value = "") {
+  const text = String(value ?? "");
+  return /^[=+\-@]/.test(text) ? `'${text}` : text;
+}
+
+function csvCell(value) {
+  const text = spreadsheetSafeText(value);
+  return `"${text.replaceAll('"', '""')}"`;
+}
+
+function analyticsCsv(rows = []) {
+  return `\uFEFF${rows.map((row) => row.map(csvCell).join(",")).join("\r\n")}\r\n`;
+}
+
+function analyticsFileSlug(value = "analytics") {
+  return lower(value)
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 70) || "analytics";
+}
+
+function analyticsRestaurantExportName(restaurant = {}, analytics = {}) {
+  return clean(restaurant.display_name || restaurant.public_display_name || restaurant.name || analytics.restaurant_name || "SmartTable restaurant");
+}
+
+function analyticsExportFilenameBase(analytics = {}, scope = "partner", restaurant = {}) {
+  const stamp = new Date().toISOString().slice(0, 10);
+  const name = scope === "partner"
+    ? analyticsRestaurantExportName(restaurant, analytics)
+    : scope === "superadmin"
+      ? "platform"
+      : "admin";
+  return `smarttable-${analyticsFileSlug(name)}-analytics-${stamp}`;
+}
+
+function analyticsExportFilterRows(filters = {}) {
+  const range = filters.range || {};
+  const rows = [
+    ["Reporting period", range.label || "custom", `${range.from || ""} to ${range.to || ""}`],
+    ["Offer", filters.offer_id || "all", ""],
+    ["Reservation status", filters.reservation_status || filters.status || "all", ""],
+    ["Party size", filters.party_size || "all", ""],
+    ["Minimum party size", filters.min_party_size || "all", ""],
+    ["Maximum party size", filters.max_party_size || "all", ""],
+    ["Weekday", filters.weekday ?? "all", ""],
+    ["Hour", filters.hour ?? "all", ""],
+    ["Country", filters.country || "all", ""],
+    ["City", filters.city || "all", ""],
+    ["Restaurant", filters.restaurant_id || "all", ""],
+    ["Subscription", filters.subscription || "all", ""]
+  ];
+  return rows.filter((row) => row.some((cell) => clean(cell) && clean(cell) !== "all"));
+}
+
+function analyticsOfferTitleById(offers = []) {
+  return new Map((offers || []).map((offer) => [clean(offer.id), analyticsOfferTitle(offer)]));
+}
+
+function analyticsReservationExportRows(reservations = [], offers = []) {
+  const offerTitles = analyticsOfferTitleById(offers);
+  const header = ["Date", "Time", "Status", "Party size", "Offer", "Reference", "Created at"];
+  const rows = (reservations || []).map((row) => [
+    analyticsReservationDate(row),
+    analyticsReservationTime(row),
+    analyticsStatus(row),
+    numberOr(row.party_size, 0) || "",
+    offerTitles.get(clean(row.offer_id)) || clean(row.offer_title || row.offer_name || ""),
+    clean(row.reference || row.reservation_reference || row.reservation_id || row.id),
+    clean(row.created_at || row.requested_at || "")
+  ]);
+  return [header, ...(rows.length ? rows : [["No data for selected filters", "", "", "", "", "", ""]])];
+}
+
+function analyticsOfferExportRows(offerAnalytics = []) {
+  const header = ["Offer name", "Views", "Clicks", "Reservations", "Conversion", "Average party size", "Cancellation rate", "Status"];
+  const rows = (offerAnalytics || []).map((offer) => [
+    offer.title,
+    numberOr(offer.views, 0),
+    numberOr(offer.clicks, 0),
+    numberOr(offer.reservations, 0),
+    analyticsPercentText(offer.conversion_rate),
+    Math.round(numberOr(offer.average_reservation_size, 0) * 10) / 10,
+    analyticsPercentText(offer.cancellation_rate),
+    offer.status || ""
+  ]);
+  return [header, ...(rows.length ? rows : [["No data for selected filters", "", "", "", "", "", "", ""]])];
+}
+
+function analyticsDailyExportRows(dailyRows = []) {
+  const header = ["Date", "Reservations"];
+  const rows = (dailyRows || []).map((row) => [row.date || "", numberOr(row.count, 0)]);
+  return [header, ...(rows.length ? rows : [["No data for selected filters", ""]])];
+}
+
+function analyticsSummaryExportRows(analytics = {}, scope = "partner", restaurant = {}) {
+  const filters = analyticsExportFilterRows(analytics.filters || {});
+  const rows = [
+    ["Report item", "Value", "Notes"],
+    ["Restaurant", analyticsRestaurantExportName(restaurant, analytics), scope],
+    ["Generated at", analytics.generated_at || nowIso(), analytics.timezone || "UTC"],
+    ["Privacy", analytics.privacy || "aggregate_only_no_guest_pii", "Guest email addresses and phone numbers are omitted."],
+    ...filters.map((row) => [`Filter: ${row[0]}`, row[1], row[2] || ""])
+  ];
+  for (const [key, value] of Object.entries(analytics.cards || {})) {
+    rows.push([analyticsMetricExportLabel(key), analyticsExportDisplayValue(key, value), ""]);
+  }
+  if (analytics.health_score) {
+    rows.push(["Restaurant Health Score", `${analytics.health_score.score || 0}/100`, analytics.health_score.grade || ""]);
+  }
+  if (!Object.values(analytics.cards || {}).some((value) => Number(value) > 0)) {
+    rows.push(["No data for selected filters", "", "The export is valid, but the selected filters returned no matching activity."]);
+  }
+  return rows;
+}
+
+function analyticsCsvRows(analytics = {}, scope = "partner", restaurant = {}, rawRows = {}) {
+  const rows = [["Section", "Name", "Value", "Details"]];
+  for (const row of analyticsSummaryExportRows(analytics, scope, restaurant).slice(1)) {
+    rows.push(["Summary", row[0], row[1], row[2]]);
+  }
+  for (const row of analyticsReservationExportRows(rawRows.reservations || [], rawRows.offers || []).slice(1)) {
+    rows.push(["Reservations", row[0], row[2], `Time: ${row[1]} | Party size: ${row[3]} | Offer: ${row[4]} | Reference: ${row[5]}`]);
+  }
+  for (const row of analyticsOfferExportRows(analytics.offer_analytics || []).slice(1)) {
+    rows.push(["Offers", row[0], row[3], `Views: ${row[1]} | Clicks: ${row[2]} | Conversion: ${row[4]} | Status: ${row[7]}`]);
+  }
+  for (const row of analyticsDailyExportRows(analytics.charts?.daily_reservations || []).slice(1)) {
+    rows.push(["Daily analytics", row[0], row[1], "Reservations"]);
+  }
+  return rows;
+}
+
+function xlsxCell(value, header = false) {
+  const number = typeof value === "number" && Number.isFinite(value);
+  return {
+    value: number ? value : spreadsheetSafeText(value),
+    type: number ? Number : String,
+    fontWeight: header ? "bold" : undefined
+  };
+}
+
+function xlsxSheet(rows = []) {
+  return rows.map((row, index) => row.map((cell) => xlsxCell(cell, index === 0)));
+}
+
+function xlsxColumns(rows = []) {
+  const maxColumns = Math.max(1, ...rows.map((row) => row.length));
+  return Array.from({ length: maxColumns }, (_, columnIndex) => {
+    const width = Math.min(36, Math.max(12, ...rows.map((row) => String(row[columnIndex] ?? "").length + 2)));
+    return { width };
+  });
+}
+
+async function analyticsXlsx(analytics = {}, scope = "partner", restaurant = {}, rawRows = {}) {
+  const sheets = [
+    analyticsSummaryExportRows(analytics, scope, restaurant),
+    analyticsReservationExportRows(rawRows.reservations || [], rawRows.offers || []),
+    analyticsOfferExportRows(analytics.offer_analytics || []),
+    analyticsDailyExportRows(analytics.charts?.daily_reservations || [])
+  ];
+  return await writeXlsxFile(sheets.map(xlsxSheet), {
+    buffer: true,
+    sheets: ["Summary", "Reservations", "Offers", "Daily analytics"],
+    columns: sheets.map(xlsxColumns),
+    fontFamily: "Arial",
+    fontSize: 12,
+    stickyRowsCount: 1
+  });
+}
+
+function pdfAscii(value = "") {
+  return String(value ?? "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^\x20-\x7E]/g, "?");
+}
+
+function pdfEscape(value = "") {
+  return pdfAscii(value).replace(/[\\()]/g, (match) => `\\${match}`);
+}
+
+function pdfWrapLine(value = "", max = 92) {
+  const words = pdfAscii(value).split(/\s+/);
+  const lines = [];
+  let current = "";
+  for (const word of words) {
+    const next = current ? `${current} ${word}` : word;
+    if (next.length > max && current) {
+      lines.push(current);
+      current = word;
+    } else {
+      current = next;
+    }
+  }
+  if (current) lines.push(current);
+  return lines.length ? lines : [""];
+}
+
+function analyticsPdfLines(analytics = {}, scope = "partner", restaurant = {}, rawRows = {}) {
+  const filters = analyticsExportFilterRows(analytics.filters || {});
+  const lines = [
+    "SmartTable Analytics Report",
+    `Restaurant: ${analyticsRestaurantExportName(restaurant, analytics)}`,
+    `Reporting period: ${analytics.filters?.range?.from || ""} to ${analytics.filters?.range?.to || ""}`,
+    `Generated: ${analytics.generated_at || nowIso()} (${analytics.timezone || "UTC"})`,
+    "Privacy: guest email addresses, phone numbers, credentials, tokens, and private consent data are omitted.",
+    "",
+    "Applied filters:"
+  ];
+  for (const row of filters) lines.push(`- ${row[0]}: ${row[1]} ${row[2] || ""}`.trim());
+  lines.push("", "Summary metrics:");
+  for (const [key, value] of Object.entries(analytics.cards || {})) {
+    lines.push(`- ${analyticsMetricExportLabel(key)}: ${analyticsExportDisplayValue(key, value)}`);
+  }
+  lines.push("", "Reservations summary:");
+  const reservations = rawRows.reservations || [];
+  if (!reservations.length) lines.push("- No data for selected filters");
+  else {
+    const byStatus = reservations.reduce((map, row) => {
+      const status = analyticsStatus(row);
+      map.set(status, (map.get(status) || 0) + 1);
+      return map;
+    }, new Map());
+    for (const [status, count] of byStatus.entries()) lines.push(`- ${status}: ${count}`);
+  }
+  lines.push("", "Offer performance summary:");
+  const offers = analytics.offer_analytics || [];
+  if (!offers.length) lines.push("- No data for selected filters");
+  else {
+    for (const offer of offers.slice(0, 12)) {
+      lines.push(`- ${offer.title}: ${offer.reservations} reservations, ${analyticsPercentText(offer.conversion_rate)} conversion, ${offer.status}`);
+    }
+  }
+  return lines.flatMap((line) => pdfWrapLine(line));
+}
+
+function analyticsPdf(analytics = {}, scope = "partner", restaurant = {}, rawRows = {}) {
+  const lines = analyticsPdfLines(analytics, scope, restaurant, rawRows);
+  const linesPerPage = 42;
+  const pages = [];
+  for (let index = 0; index < lines.length; index += linesPerPage) {
+    pages.push(lines.slice(index, index + linesPerPage));
+  }
+  const objects = [
+    "1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj",
+    `2 0 obj << /Type /Pages /Kids [${pages.map((_, index) => `${4 + index * 2} 0 R`).join(" ")}] /Count ${pages.length} >> endobj`,
+    "3 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj"
+  ];
+  pages.forEach((pageLines, index) => {
+    const pageRef = 4 + index * 2;
+    const contentRef = pageRef + 1;
+    const stream = pageLines.map((line, lineIndex) => {
+      const size = lineIndex === 0 && index === 0 ? 16 : 10;
+      return `BT /F1 ${size} Tf 50 ${760 - lineIndex * 16} Td (${pdfEscape(line).slice(0, 130)}) Tj ET`;
+    }).join("\n");
+    objects.push(`${pageRef} 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents ${contentRef} 0 R >> endobj`);
+    objects.push(`${contentRef} 0 obj << /Length ${Buffer.byteLength(stream, "utf8")} >> stream\n${stream}\nendstream endobj`);
+  });
+  let offset = Buffer.byteLength("%PDF-1.4\n", "utf8");
+  const xref = ["0000000000 65535 f "];
+  const body = objects.map((object) => {
+    xref.push(String(offset).padStart(10, "0") + " 00000 n ");
+    offset += Buffer.byteLength(`${object}\n`, "utf8");
+    return object;
+  }).join("\n");
+  const xrefStart = Buffer.byteLength(`%PDF-1.4\n${body}\n`, "utf8");
+  return `%PDF-1.4\n${body}\nxref\n0 ${objects.length + 1}\n${xref.join("\n")}\ntrailer << /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefStart}\n%%EOF`;
+}
+
+async function analyticsExportResponse(analytics = {}, scope = "partner", format = "json", options = {}) {
+  const normalized = lower(format || "json");
+  if (!["csv", "excel", "xlsx", "pdf"].includes(normalized)) return null;
+  const restaurant = options.restaurant || {};
+  const rawRows = options.rawRows || {};
+  const filenameBase = analyticsExportFilenameBase(analytics, scope, restaurant);
+  if (normalized === "csv") {
+    return fileResponse(200, analyticsCsv(analyticsCsvRows(analytics, scope, restaurant, rawRows)), `${filenameBase}.csv`, "text/csv; charset=utf-8");
+  }
+  if (normalized === "excel" || normalized === "xlsx") {
+    const workbook = await analyticsXlsx(analytics, scope, restaurant, rawRows);
+    return fileResponse(200, workbook, `${filenameBase}.xlsx`, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  }
+  return fileResponse(200, analyticsPdf(analytics, scope, restaurant, rawRows), `${filenameBase}.pdf`, "application/pdf");
+}
+
+function analyticsPositiveInteger(value, fallback, options = {}) {
+  const number = Math.trunc(Number(value));
+  const minimum = options.min ?? 1;
+  const maximum = options.max ?? 100;
+  if (!Number.isFinite(number)) return fallback;
+  return Math.max(minimum, Math.min(maximum, number));
+}
+
+function paginateAnalyticsOffers(analytics = {}, query) {
+  const rows = analytics.offer_analytics || [];
+  const pageSize = analyticsPositiveInteger(analyticsQueryValue(query, "offer_page_size", "page_size"), 25, { min: 5, max: 100 });
+  const totalPages = Math.max(1, Math.ceil(rows.length / pageSize));
+  const page = analyticsPositiveInteger(analyticsQueryValue(query, "offer_page", "page"), 1, { min: 1, max: totalPages });
+  analytics.offer_pagination = {
+    page,
+    page_size: pageSize,
+    total: rows.length,
+    total_pages: totalPages
+  };
+  analytics.offer_analytics = rows.slice((page - 1) * pageSize, page * pageSize);
+  return analytics;
+}
+
+async function partnerAnalytics(headers, query) {
+  const { profile } = await requireProfile(headers, ["partner", "admin"]);
+  const restaurant = await getPartnerRestaurant(profile, query);
+  const rows = filterAnalyticsRowsForQuery(await loadRestaurantAnalyticsRows(restaurant), query, restaurant);
+  const fullAnalytics = buildRestaurantAnalytics(restaurant, rows);
+  const exportResponse = await analyticsExportResponse(fullAnalytics, "partner", analyticsQueryValue(query, "export", "format"), { restaurant, rawRows: rows });
+  if (exportResponse) return exportResponse;
+  const analytics = paginateAnalyticsOffers(fullAnalytics, query);
+  return json(200, {
+    mode: supabaseConfigured ? "supabase" : "demo",
+    analytics
+  });
+}
+
+async function adminAnalytics(headers, query) {
+  const { profile } = await requireProfile(headers, ["admin"]);
+  const superadminScope = isSuperAdminProfile(profile) && lower(analyticsQueryValue(query, "scope")) === "superadmin";
+  const restaurants = !supabaseConfigured
+    ? (ensureDemo(), demo.restaurants)
+    : await supabaseFetch("/rest/v1/restaurants?select=*&order=updated_at.desc&limit=1000", { service: true }).catch(() => []);
+  const analyticsRowsByRestaurant = await loadRestaurantAnalyticsRowsByRestaurant(restaurants || []);
+  const rawDatasets = (restaurants || []).map((restaurant) => {
+    const rows = filterAnalyticsRowsForQuery(analyticsRowsByRestaurant.get(restaurant.id), query, restaurant);
+    const analytics = buildRestaurantAnalytics(restaurant, rows);
+    analytics.billing = rows.billing || {};
+    return { restaurant, analytics };
+  });
+  const datasets = rawDatasets
+    .filter(({ restaurant, analytics }) => restaurantMatchesAdminAnalyticsFilters(restaurant, analytics, query))
+    .map(({ analytics }) => analytics);
+  const filteredRestaurants = rawDatasets
+    .filter(({ restaurant, analytics }) => restaurantMatchesAdminAnalyticsFilters(restaurant, analytics, query))
+    .map(({ restaurant }) => restaurant);
+  const cards = datasets.reduce((summary, row) => {
+    summary.restaurants += 1;
+    summary.total_reservations += row.cards.total_reservations;
+    summary.this_month += row.cards.this_month;
+    summary.total_profile_views += row.cards.total_profile_views;
+    summary.offer_views += row.cards.offer_views;
+    summary.favorites += row.cards.favorites;
+    summary.no_show_count += Math.round((row.cards.no_show_rate / 100) * row.cards.total_reservations);
+    summary.cancelled_count += Math.round((row.cards.cancellation_rate / 100) * row.cards.total_reservations);
+    return summary;
+  }, {
+    restaurants: 0,
+    total_reservations: 0,
+    this_month: 0,
+    total_profile_views: 0,
+    offer_views: 0,
+    favorites: 0,
+    no_show_count: 0,
+    cancelled_count: 0
+  });
+  const statusCounts = filteredRestaurants.reduce((summary, restaurant) => {
+    const status = lower(restaurant.status || "unknown");
+    summary[status] = (summary[status] || 0) + 1;
+    return summary;
+  }, {});
+  cards.reservation_conversion_rate = analyticsPercent(cards.total_reservations, cards.offer_views || cards.total_profile_views);
+  cards.cancellation_rate = analyticsPercent(cards.cancelled_count, cards.total_reservations);
+  cards.no_show_rate = analyticsPercent(cards.no_show_count, cards.total_reservations);
+  cards.active_restaurants = statusCounts.active || statusCounts.approved || 0;
+  cards.draft_restaurants = statusCounts.draft || 0;
+  cards.suspended_restaurants = statusCounts.suspended || 0;
+  cards.archived_restaurants = statusCounts.archived || 0;
+  cards.new_restaurants = filteredRestaurants.filter((restaurant) => restaurant.created_at && new Date(restaurant.created_at).getTime() >= Date.now() - 1000 * 60 * 60 * 24 * 30).length;
+  cards.trial_restaurants = datasets.filter((row) => clean(row.billing?.status) === "trialing").length;
+  cards.paid_restaurants = datasets.filter((row) => ["active", "past_due"].includes(clean(row.billing?.status))).length;
+  cards.revenue_placeholder = "Revenue is not tracked in SmartTable BASIC analytics.";
+  const mergeSeries = (key, field) => {
+    const counts = new Map();
+    for (const row of datasets) {
+      for (const item of row.charts[key] || []) {
+        const bucket = item[field];
+        counts.set(bucket, (counts.get(bucket) || 0) + numberOr(item.count, 0));
+      }
+    }
+    return [...counts.entries()].sort((a, b) => String(a[0]).localeCompare(String(b[0]))).map(([bucket, count]) => ({ [field]: bucket, count }));
+  };
+  const topRestaurants = [...datasets]
+    .sort((a, b) => b.cards.total_reservations - a.cards.total_reservations || b.cards.reservation_conversion_rate - a.cards.reservation_conversion_rate)
+    .slice(0, 10)
+    .map((row) => ({
+      restaurant_id: row.restaurant_id,
+      restaurant_name: row.restaurant_name,
+      reservations: row.cards.total_reservations,
+      profile_views: row.cards.total_profile_views,
+      conversion_rate: row.cards.reservation_conversion_rate,
+      health_score: row.health_score.score,
+      grade: row.health_score.grade
+    }));
+  const reservationsByDimension = (fieldNames = []) => {
+    const counts = new Map();
+    for (const { restaurant, analytics } of rawDatasets) {
+      if (!restaurantMatchesAdminAnalyticsFilters(restaurant, analytics, query)) continue;
+      const key = fieldNames.map((field) => clean(restaurant[field])).find(Boolean) || "Unknown";
+      counts.set(key, (counts.get(key) || 0) + analytics.cards.total_reservations);
+    }
+    return [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([name, count]) => ({ name, count }));
+  };
+  const profiles = superadminScope
+    ? (!supabaseConfigured
+        ? (ensureDemo(), demo.profiles || [])
+        : await supabaseFetch("/rest/v1/profiles?select=role,selected_language,city,created_at&order=created_at.desc&limit=5000", { service: true }).catch(() => []))
+    : [];
+  const subscriptions = superadminScope
+    ? (!supabaseConfigured
+        ? (ensureDemo(), demo.subscriptions || [])
+        : await supabaseFetch("/rest/v1/restaurant_subscriptions?select=subscription_status,internal_plan,created_at,current_period_start,current_period_end&order=created_at.desc&limit=5000", { service: true }).catch(() => []))
+    : [];
+  const auditRows = !supabaseConfigured
+    ? (ensureDemo(), demo.appErrorLogs || []).filter((row) => row.area === "audit").slice(0, 20)
+    : await supabaseFetch("/rest/v1/audit_logs?select=action,actor_role,entity_type,created_at&order=created_at.desc&limit=20", { service: true }).catch(() => []);
+  const platform = superadminScope ? {
+    countries: reservationsByDimension(["country", "country_code"]),
+    cities: reservationsByDimension(["city", "district"]),
+    languages: [...profiles.reduce((map, row) => {
+      const key = clean(row.selected_language || "unknown");
+      map.set(key, (map.get(key) || 0) + 1);
+      return map;
+    }, new Map()).entries()].map(([language, count]) => ({ language, count })),
+    reservations: cards.total_reservations,
+    restaurant_growth: countByMonth(filteredRestaurants, [], "UTC"),
+    user_growth: countByMonth(profiles, [], "UTC"),
+    subscription_growth: countByMonth(subscriptions, [], "UTC"),
+    platform_usage: auditRows.length,
+    average_conversion: cards.reservation_conversion_rate,
+    largest_cities: reservationsByDimension(["city", "district"]).slice(0, 10),
+    top_restaurants: topRestaurants,
+    health_score_average: datasets.length ? Math.round(datasets.reduce((sum, row) => sum + row.health_score.score, 0) / datasets.length) : 0
+  } : null;
+  const analytics = {
+    generated_at: nowIso(),
+    privacy: "aggregate_only_no_guest_pii",
+    filters: {
+      range: analyticsDateRange(query, "UTC"),
+      country: analyticsQueryValue(query, "country", "country_code") || "all",
+      city: analyticsQueryValue(query, "city") || "all",
+      restaurant_id: analyticsQueryValue(query, "restaurant_id", "restaurant") || "all",
+      status: analyticsQueryValue(query, "restaurant_status", "status") || "all",
+      subscription: analyticsQueryValue(query, "subscription", "subscription_status") || "all"
+    },
+    cards,
+    charts: {
+      daily_reservations: mergeSeries("daily_reservations", "date"),
+      weekly_reservations: mergeSeries("weekly_reservations", "week"),
+      monthly_reservations: mergeSeries("monthly_reservations", "month"),
+      reservations_by_city: reservationsByDimension(["city", "district"]),
+      reservations_by_country: reservationsByDimension(["country", "country_code"]),
+      top_restaurants: topRestaurants,
+      top_performing_offers: datasets.flatMap((row) => row.charts.top_performing_offers.map((offer) => ({ ...offer, restaurant_name: row.restaurant_name })))
+        .sort((a, b) => b.reservations - a.reservations || b.conversion_rate - a.conversion_rate)
+        .slice(0, 10),
+      system_activity: auditRows
+    },
+    restaurant_health: topRestaurants,
+    platform
+  };
+  const exportResponse = await analyticsExportResponse(analytics, superadminScope ? "superadmin" : "admin", analyticsQueryValue(query, "export", "format"));
+  if (exportResponse) return exportResponse;
+  return json(200, {
+    mode: supabaseConfigured ? "supabase" : "demo",
+    scope: superadminScope ? "superadmin" : "admin",
+    analytics
+  });
+}
+
 function safeFileName(filename) {
   const base = clean(filename).replace(/[^a-zA-Z0-9._-]/g, "-").replace(/-+/g, "-");
   return base || "image";
@@ -12176,6 +28421,7 @@ async function partnerStorageSignUpload(method, body, headers, query) {
   if (method !== "POST") return json(405, { error: "Method not allowed." });
   const { profile } = await requireProfile(headers, ["partner", "admin"]);
   const restaurant = await getPartnerRestaurant(profile, query, body);
+  requireRestaurantAccessRole(restaurant, ["owner", "manager"]);
   const kind = clean(body.kind || "gallery");
   if (!["cover", "gallery", "offer", "icon", "card"].includes(kind)) return json(400, { error: "Invalid upload kind." });
   const contentType = clean(body.content_type || body.contentType || "image/jpeg");
@@ -12242,6 +28488,10 @@ async function partnerOffers(method, body, headers, query) {
   const { profile } = await requireProfile(headers, ["partner", "admin"]);
   const restaurant = await getPartnerRestaurant(profile, query, body);
   const restaurantId = restaurant.id;
+  if (["POST", "PATCH", "DELETE"].includes(method)) {
+    requireRestaurantAccessRole(restaurant, ["owner", "manager", "marketing_staff"]);
+    await requirePartnerBillingMutationAccess(restaurantId);
+  }
 
   if (!supabaseConfigured) {
     ensureDemo();
@@ -12508,6 +28758,10 @@ async function partnerReservations(method, body, headers, query) {
   const { profile } = await requireProfile(headers, ["partner", "admin"]);
   const restaurant = await getPartnerRestaurant(profile, query, body);
   const restaurantId = restaurant.id;
+  if (method === "PATCH") {
+    requireRestaurantAccessRole(restaurant, ["owner", "manager", "reservation_staff"]);
+    await requirePartnerBillingMutationAccess(restaurantId);
+  }
 
   if (method === "GET") {
     if (!supabaseConfigured) {
@@ -12537,6 +28791,52 @@ async function partnerReservations(method, body, headers, query) {
     if (clean(body.action) === "send_post_visit_email") {
       const email = await sendPostVisitEmailForReservation(id, restaurantId);
       return json(200, { ok: isEmailAccepted(email), email, email_delivery: emailDeliverySummary([email]) });
+    }
+    const visitAction = clean(body.action);
+    const partnerVisitActionMap = {
+      mark_arrived: "arrived",
+      mark_visit_completed: "finished",
+      mark_no_show: "did_not_attend"
+    };
+    if (partnerVisitActionMap[visitAction]) {
+      const currentRow = !supabaseConfigured
+        ? reservationOverviewRows().find((item) => item.reservation_id === id && item.restaurant_id === restaurantId)
+        : (await supabaseFetch(`/rest/v1/reservation_overview?select=*&reservation_id=eq.${encodeURIComponent(id)}&restaurant_id=eq.${encodeURIComponent(restaurantId)}`, { service: true }))?.[0];
+      if (!currentRow) return json(404, { error: "Reservation not found." });
+      const currentStatus = normalizeReservationStatus(currentRow.status);
+      if (visitAction === "mark_arrived" && !["accepted", "completed"].includes(currentStatus)) {
+        return json(409, { error: "Arrival can be confirmed only for accepted or completed reservations." });
+      }
+      let row = currentRow;
+      if (visitAction === "mark_visit_completed" && currentStatus !== "completed") {
+        row = await updateReservationStatus(id, "completed", restaurantId, {
+          actorUserId: profile.id,
+          actorRole: profile.role
+        });
+      }
+      if (visitAction === "mark_no_show" && currentStatus !== "no_show") {
+        row = await updateReservationStatus(id, "no_show", restaurantId, {
+          actorUserId: profile.id,
+          actorRole: profile.role
+        });
+      }
+      const lifecycleAction = partnerVisitActionMap[visitAction];
+      const updated = await patchReservationVisitState(id, postVisitLifecyclePatch(lifecycleAction, "partner", row || currentRow));
+      if (visitAction === "mark_visit_completed") {
+        await createPostVisitNotificationEvent(updated || row, "review_invitation_ready", "in_app", { source: "partner_completed_visit" });
+      }
+      await createAuditLog({
+        profile,
+        action: `partner_${visitAction}`,
+        entityType: "reservation",
+        entityId: id,
+        metadata: {
+          restaurant_id: restaurantId,
+          reservation_id: id,
+          reference: currentRow.reference || ""
+        }
+      });
+      return json(200, { reservation: updated || row });
     }
     const status = clean(body.status);
     if (!status) {
@@ -12608,15 +28908,45 @@ export async function handleApiRequest(input) {
     pathname = `/${url.searchParams.get("path") || ""}`;
   }
   pathname = pathname.replace(/^\/api\/?/, "/");
-  const method = input.method || "GET";
+  const method = String(input.method || "GET").toUpperCase();
   const body = input.body || {};
   const headers = input.headers || {};
 
   try {
     if (method === "GET" && pathname === "/health") {
-      return json(200, { ok: true, mode: supabaseConfigured ? "supabase" : "demo", publicBaseUrl: PUBLIC_BASE_URL });
+      const health = await runtimeHealthPayload();
+      return json(health.ok ? 200 : 503, health);
+    }
+    if (method === "OPTIONS") {
+      return json(204, "", { allow: "GET,HEAD,POST,PATCH,DELETE,OPTIONS" });
+    }
+    if (requestPayloadTooLarge(body)) {
+      return json(413, { error: "Request body is too large.", code: "REQUEST_TOO_LARGE" });
+    }
+    const csrfError = csrfOriginError(method, pathname, headers);
+    if (csrfError) {
+      return json(403, csrfError);
+    }
+    const rateLimit = mutationRateLimit(method, pathname, headers);
+    if (rateLimit) {
+      return json(429, { error: rateLimit.error, code: rateLimit.code, retry_after: rateLimit.retryAfterSeconds }, {
+        "retry-after": String(rateLimit.retryAfterSeconds)
+      });
+    }
+    if (!["GET", "HEAD", "OPTIONS"].includes(method) && pathname !== "/auth/logout" && isReadOnlyImpersonationToken(headers)) {
+      throw readOnlyImpersonationError(method, pathname);
+    }
+    if (IS_PRODUCTION_RUNTIME && !productionConfigurationReady()) {
+      return json(503, {
+        error: "Service temporarily unavailable.",
+        code: "PRODUCTION_CONFIGURATION_INCOMPLETE"
+      });
     }
     if (pathname === "/webhooks/resend") return await emailProviderWebhook(method, body, headers);
+    if (pathname === "/webhooks/stripe") return await stripeWebhook(method, body, headers);
+    if (pathname === "/webhooks/sms/twilio") return await smsProviderWebhook(method, body, headers);
+    if (pathname === "/webhooks/voice/twilio") return await voiceProviderWebhook(method, body, headers);
+    if (pathname === "/system/reservation-alerts/process") return await systemReservationAlertProcessor(method, body, headers);
     if (method === "GET" && pathname === "/system/feature-status") {
       const platformSettings = await getPlatformSettings();
       return json(200, {
@@ -12630,10 +28960,13 @@ export async function handleApiRequest(input) {
     if (method === "GET" && pathname === "/system/checklists") return await systemChecklists();
     if (method === "POST" && pathname === "/auth/login") return await login(body);
     if (pathname === "/auth/logout") return await authLogout(method, body, headers);
-    if (method === "POST" && pathname === "/auth/signup-guest") return await signupGuest(body);
+    if (method === "POST" && pathname === "/auth/signup-guest") return await signupGuest(body, headers);
     if (pathname === "/auth/forgot-password") return await forgotPassword(method, body);
-    if (pathname === "/auth/reset-password") return await resetPassword(method, body);
+    if (pathname === "/auth/reset-password") return await resetPassword(method, body, headers);
+    if (pathname === "/auth/callback") return await authCallback(method, body);
+    if (pathname === "/auth/resend-verification") return await publicResendVerification(method, body, headers);
     if (pathname === "/auth/verification") return await authVerification(method, body, headers);
+    if (pathname === "/auth/partner-invitation") return await partnerInvitationAuth(method, body, url.searchParams);
     if (pathname === "/auth/language") return await updateLanguagePreference(method, body, headers);
     if (pathname === "/auth/security") return await guestSecurity(method, body, headers);
     if (method === "GET" && pathname === "/auth/me") {
@@ -12641,19 +28974,28 @@ export async function handleApiRequest(input) {
       return json(200, { profile: clientProfile(profile) });
     }
     if (method === "GET" && pathname === "/public/content") return await listPublicContent(url.searchParams);
-    if (method === "GET" && pathname === "/public/config") return await listPublicConfig();
+    if (method === "GET" && pathname === "/public/config") return await listPublicConfig(url.searchParams);
     if (method === "GET" && pathname === "/public/offers") return await listPublicOffers(url.searchParams);
+    if (method === "GET" && pathname === "/public/restaurants") return await listPublicRestaurants(url.searchParams);
+    if (method === "GET" && pathname === "/public/restaurants/reviews") return await publicRestaurantReviews(url.searchParams);
+    if (method === "GET" && pathname === "/public/food-feed") return await publicFoodFeed(url.searchParams);
     if (method === "GET" && pathname === "/public/restaurants/newest") return await listNewestRestaurants(url.searchParams);
     if (method === "GET" && pathname === "/public/rewards/context") return await publicRewardsContext(url.searchParams);
     if (method === "POST" && pathname === "/public/follow") return await followRestaurant(body);
-    if (method === "POST" && pathname === "/public/reviews") return await createReview(body);
+    if (pathname === "/post-visit/action") return await postVisitAction(method, body, headers, url.searchParams);
     if (pathname === "/analytics/events") return await analyticsEvent(method, body);
     if (pathname === "/guest/account") return await guestAccount(method, body, headers);
     if (pathname === "/guest/reservations") return await guestReservations(method, body, headers);
+    if (pathname === "/guest/reviews/verified") return await guestVerifiedReview(method, body, headers, url.searchParams);
+    if (pathname === "/guest/reviews/photos/sign-upload") return await guestReviewPhotoSignUpload(method, body, headers);
     if (pathname === "/guest/favorites") return await guestFavorites(method, body, headers, url.searchParams);
+    if (pathname === "/guest/food-feed-favorites") return await guestFoodFeedFavorites(method, body, headers, url.searchParams);
     if (pathname === "/guest/notifications") return await guestNotifications(method, body, headers, url.searchParams);
     if (pathname === "/guest/preferences") return await guestPreferences(method, body, headers);
+    if (pathname === "/guest/communications") return await guestCommunications(method, body, headers);
     if (pathname === "/guest/privacy") return await guestPrivacy(method, body, headers);
+    if (pathname === "/guest/privacy/export-download") return await guestPrivacyExportDownload(method, url.searchParams);
+    if (pathname === "/notifications") return await userNotifications(method, body, headers);
     if (pathname === "/ai/preferences") return await aiPreferences(method, body, headers, url.searchParams);
     if (pathname === "/ai/events") return await aiEvent(method, body, headers);
     if (method === "GET" && pathname === "/ai/recommendations") return await aiRecommendations(url.searchParams, headers);
@@ -12668,11 +29010,18 @@ export async function handleApiRequest(input) {
     if (pathname === "/ai/trends") return await aiTrends(method, body, headers, url.searchParams);
     if (method === "POST" && pathname === "/reservations") return await createReservation(body, headers);
     if (pathname === "/admin/content") return await adminContent(method, body, headers);
+    if (pathname === "/admin/legal-documents") return await adminLegalDocuments(method, body, headers, url.searchParams);
     if (pathname === "/admin/restaurants") return await adminRestaurants(method, body, headers, url.searchParams);
+    if (pathname === "/admin/restaurant-detail") return await adminRestaurantDetail(method, body, headers, url.searchParams);
+    if (pathname === "/admin/restaurant-capacity") return await adminRestaurantCapacity(method, body, headers, url.searchParams);
+    if (pathname === "/admin/audit-logs") return await adminAuditLogs(method, body, headers, url.searchParams);
     if (pathname === "/admin/partners") return await adminPartners(method, body, headers);
     if (pathname === "/admin/impersonate-partner") return await adminImpersonatePartner(method, body, headers);
+    if (pathname === "/admin/impersonate-account") return await adminImpersonateAccount(method, body, headers, url.searchParams);
+    if (pathname === "/admin/impersonation/end") return await adminImpersonationEnd(method, body, headers);
     if (pathname === "/admin/offers") return await adminOffers(method, body, headers);
-    if (pathname === "/admin/reviews") return await adminReviews(method, body, headers);
+    if (pathname === "/admin/food-feed") return await adminFoodFeed(method, body, headers);
+    if (pathname === "/admin/reviews") return await adminReviews(method, body, headers, url.searchParams);
     if (pathname === "/admin/photo-reward-submissions") return await adminPhotoRewardSubmissions(method, body, headers);
     if (pathname === "/admin/notifications") return await adminNotifications(method, body, headers);
     if (pathname === "/admin/settings/platform-mode") return await adminPlatformSettings(method, body, headers);
@@ -12681,27 +29030,70 @@ export async function handleApiRequest(input) {
     if (pathname === "/admin/errors") return await adminMonitoring(method, headers);
     if (pathname === "/admin/email-diagnostics") return await adminEmailDiagnostics(method, headers, url.searchParams);
     if (pathname === "/admin/email-queue") return await adminEmailQueue(method, body, headers, url.searchParams);
-    if (pathname === "/admin/billing") return await adminBilling(method, headers);
+    if (pathname === "/admin/reservation-alerts") return await adminReservationAlerts(method, body, headers, url.searchParams);
+    if (pathname === "/admin/billing") return await adminBilling(method, body, headers, url.searchParams);
+    if (method === "GET" && (pathname === "/admin/analytics" || pathname === "/admin/analytics/export")) return await adminAnalytics(headers, url.searchParams);
+    if (pathname === "/admin/campaigns") return await messageCampaigns(method, body, headers, url.searchParams, "admin");
+    if (pathname === "/admin/system-messages") return await adminSystemMessages(method, body, headers, url.searchParams);
     if (pathname === "/privacy/requests") return await privacyRequests(method, body, headers);
     if (pathname === "/admin/reservations") return await adminReservations(method, body, headers, url.searchParams);
     if (method === "GET" && pathname === "/admin/stats") return await adminStats(headers);
     if (pathname === "/partner/profile") return await partnerProfile(method, body, headers, url.searchParams);
+    if (pathname === "/partner/billing") return await partnerBilling(method, body, headers, url.searchParams);
+    if (pathname === "/partner/campaigns") return await messageCampaigns(method, body, headers, url.searchParams, "partner");
+    if (pathname === "/partner/sms-campaigns") return await partnerSmsCampaigns(method, body, headers, url.searchParams);
     if (pathname === "/partner/integrations") return await integrationHub(method, body, headers, url.searchParams, "partner");
     if (pathname === "/integrations/import-reservations") return await reservationDataImport(method, body, headers, url.searchParams);
     if (pathname === "/partner/storage/sign-upload") return await partnerStorageSignUpload(method, body, headers, url.searchParams);
+    if (pathname === "/partner/notification-settings") return await partnerNotificationSettings(method, body, headers, url.searchParams);
+    if (pathname === "/partner/reservation-alerts") return await partnerReservationAlerts(method, body, headers, url.searchParams);
+    if (pathname === "/partner/reviews") return await partnerReviews(method, body, headers, url.searchParams);
+    if (pathname === "/partner/food-feed") return await partnerFoodFeed(method, body, headers, url.searchParams);
     if (pathname === "/partner/offers" || pathname === "/restaurant/offers") return await partnerOffers(method, body, headers, url.searchParams);
     if (pathname === "/partner/photo-reward-submissions") return await partnerPhotoRewardSubmissions(method, body, headers, url.searchParams);
     if (pathname === "/partner/reservations" || pathname === "/restaurant/reservations") return await partnerReservations(method, body, headers, url.searchParams);
     if (method === "GET" && pathname === "/partner/stats") return await partnerStats(headers, url.searchParams);
+    if (method === "GET" && (pathname === "/partner/analytics" || pathname === "/partner/analytics/export")) return await partnerAnalytics(headers, url.searchParams);
     return json(404, { error: "API endpoint not found." });
   } catch (error) {
-    const payload = { error: error.message || "Server error." };
+    const status = error.status || 500;
+    logSafeServerEvent("api_request_failed", {
+      method,
+      path: pathname,
+      status,
+      code: error.code || "API_ERROR"
+    });
+    if (status === 401 || status === 403) {
+      await createAuditLog({
+        profile: null,
+        action: "authorization_failed",
+        entityType: "api_route",
+        entityId: pathname,
+        headers,
+        success: false,
+        metadata: {
+          method,
+          path: pathname,
+          code: error.code || "API_ERROR",
+          reason: error.message
+        }
+      }).catch(() => null);
+    }
+    const payload = {
+      error: IS_PRODUCTION_RUNTIME && status >= 500
+        ? "Server error."
+        : error.message || "Server error."
+    };
     if (error.code) payload.code = error.code;
     if (error.details?.send_after) payload.send_after = error.details.send_after;
-    return json(error.status || 500, payload);
+    return json(status, payload);
   }
 }
 
 export function isSupabaseConfigured() {
   return supabaseConfigured;
+}
+
+export async function getRuntimeHealth() {
+  return runtimeHealthPayload();
 }

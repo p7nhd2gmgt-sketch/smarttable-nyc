@@ -6,41 +6,53 @@
     <title>SmartTable | Discounted New York restaurant reservations</title>
     <meta name="description" content="Book discounted restaurant tables across New York and send reservation requests directly to restaurants.">
     <meta name="robots" content="index, follow">
-    <meta property="og:site_name" content="Smarttable.com">
+    <meta property="og:site_name" content="SmartTable">
     <meta property="og:title" content="SmartTable | Discounted New York restaurant reservations">
     <meta property="og:description" content="Discounted restaurant reservations and table offers for New York.">
     <meta property="og:type" content="website">
-    <meta property="og:url" content="https://smarttable.com/">
-    <meta property="og:image" content="https://smarttable.com/assets/restaurant-hero.png">
+    <meta property="og:url" content="https://www.smarttablenyc.com/">
+    <meta property="og:image" content="https://www.smarttablenyc.com/assets/restaurant-hero.png">
     <meta name="twitter:card" content="summary_large_image">
     <meta name="theme-color" content="#0f735d">
-    <link rel="canonical" href="https://smarttable.com/">
+    <script>
+      (() => {
+        try {
+          const stored = localStorage.getItem("smarttable.theme");
+          const theme = stored === "dark" || stored === "light"
+            ? stored
+            : (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+          document.documentElement.dataset.theme = theme;
+        } catch { document.documentElement.dataset.theme = "light"; }
+      })();
+    </script>
+    <link rel="canonical" href="https://www.smarttablenyc.com/">
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg">
     <link rel="manifest" href="/site.webmanifest">
-    <link rel="stylesheet" href="/styles.css?v=guest-account-1">
+    <link rel="stylesheet" href="/styles.css?v=dark-theme-20260823-1">
     <script type="application/ld+json">
       {
         "@context": "https://schema.org",
         "@graph": [
           {
             "@type": "Organization",
-            "@id": "https://smarttable.com/#organization",
+            "@id": "https://www.smarttablenyc.com/#organization",
             "name": "SmartTable",
-            "url": "https://smarttable.com/"
+            "url": "https://www.smarttablenyc.com/"
           },
           {
             "@type": "WebSite",
-            "@id": "https://smarttable.com/#website",
-            "url": "https://smarttable.com/",
+            "@id": "https://www.smarttablenyc.com/#website",
+            "url": "https://www.smarttablenyc.com/",
             "name": "SmartTable",
             "publisher": {
-              "@id": "https://smarttable.com/#organization"
+              "@id": "https://www.smarttablenyc.com/#organization"
             }
           },
           {
             "@type": "WebApplication",
-            "@id": "https://smarttable.com/#app",
+            "@id": "https://www.smarttablenyc.com/#app",
             "name": "SmartTable",
-            "url": "https://smarttable.com/",
+            "url": "https://www.smarttablenyc.com/",
             "applicationCategory": "LifestyleApplication",
             "operatingSystem": "Any",
             "description": "Discounted restaurant reservations and table offers for New York."
@@ -53,33 +65,164 @@
     <a class="skip-link" href="#app">Skip to main content</a>
     <div class="shell">
       <header class="topbar">
-        <a class="brand" href="/" aria-label="Smarttable.com home">
-          <span class="brand-mark">ST</span>
-          <span>
-            <strong>SmartTable</strong>
-            <small>Discounted restaurant reservations</small>
-          </span>
-        </a>
+        <div class="brand-cluster">
+          <a class="brand" href="/" aria-label="SmartTable home">
+            <span class="brand-mark">ST</span>
+            <span>
+              <strong>SmartTable</strong>
+              <small>Discounted restaurant reservations</small>
+            </span>
+          </a>
+          <div class="brand-utilities">
+            <div class="city-selector" data-city-selector>
+              <button
+                class="city-selector__button"
+                id="citySelectorButton"
+                type="button"
+                aria-haspopup="listbox"
+                aria-expanded="false"
+                aria-controls="citySelectorMenu"
+                aria-label="City: New York"
+              >
+                <span class="city-selector__pin" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
+                    <path d="M12 21s6-5.35 6-11a6 6 0 1 0-12 0c0 5.65 6 11 6 11Z"></path>
+                    <circle cx="12" cy="10" r="2.25"></circle>
+                  </svg>
+                </span>
+                <span class="city-selector__current" data-city-selector-current>New York</span>
+                <span class="city-selector__chevron" aria-hidden="true">&#9662;</span>
+              </button>
+              <div
+                class="city-selector__menu"
+                id="citySelectorMenu"
+                role="listbox"
+                aria-label="Choose city"
+                tabindex="-1"
+                hidden
+              ></div>
+            </div>
+            <button
+              class="header-search-toggle"
+              id="headerSearchButton"
+              type="button"
+              aria-expanded="false"
+              aria-controls="headerSearchPanel"
+              aria-label="Search restaurants"
+            >
+              <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
+                <circle cx="10.75" cy="10.75" r="6.75"></circle>
+                <path d="m16 16 4 4"></path>
+              </svg>
+            </button>
+          </div>
+        </div>
 
         <nav class="top-actions" aria-label="Primary navigation">
           <button class="ghost-button" id="guestNav" type="button">Offers</button>
+          <button class="ghost-button" id="restaurantsNav" type="button">Restaurants</button>
+          <button class="ghost-button" id="foodFeedNav" type="button">What to Eat</button>
           <button class="ghost-button" id="aiConciergeNav" type="button" hidden>AI Concierge</button>
-          <button class="ghost-button" id="adminNav" type="button">Admin</button>
-          <button class="ghost-button" id="restaurantNav" type="button">Partner</button>
           <button class="ghost-button" id="signupNav" type="button">Sign Up</button>
-          <span class="language-switcher" aria-label="Language switcher">
-            <button class="ghost-button" id="langEn" data-lang="en" type="button">English &#x1F1FA;&#x1F1F8;</button>
-            <button class="ghost-button" id="langEs" data-lang="es" type="button">Espa&#241;ol &#x1F1EA;&#x1F1F8;</button>
-            <button class="ghost-button" id="langHu" data-lang="hu" type="button">Magyar &#x1F1ED;&#x1F1FA;</button>
-          </span>
+          <button class="ghost-button admin-dashboard-nav" id="adminDashboardNav" type="button" hidden>Admin Dashboard</button>
           <button class="primary-button" id="sessionButton" type="button">Login</button>
+          <button class="ghost-button theme-toggle" id="themeToggleButton" type="button" aria-label="Use dark mode" title="Use dark mode"><span aria-hidden="true">☾</span></button>
+          <div class="language-selector" data-language-selector>
+            <button
+              class="ghost-button language-selector__button"
+              id="languageSelectorButton"
+              type="button"
+              aria-haspopup="listbox"
+              aria-expanded="false"
+              aria-controls="languageSelectorMenu"
+              aria-label="Language: English"
+            >
+              <span class="sr-only" data-language-selector-label>Language</span>
+              <span class="language-selector__code" data-language-selector-code>EN</span>
+              <span class="sr-only" data-language-selector-current>English</span>
+              <span class="language-selector__chevron" aria-hidden="true">&#9662;</span>
+            </button>
+            <div
+              class="language-selector__menu"
+              id="languageSelectorMenu"
+              role="listbox"
+              aria-label="Choose language"
+              tabindex="-1"
+              hidden
+            ></div>
+          </div>
         </nav>
+        <section class="header-search-panel" id="headerSearchPanel" data-header-search-panel hidden></section>
       </header>
 
       <main id="app" class="app-shell" aria-live="polite" tabindex="-1"></main>
     </div>
 
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
-    <script src="/app.js?v=guest-account-1" type="module"></script>
+    <script>
+      (() => {
+        const productionHosts = new Set(["smarttablenyc.com", "www.smarttablenyc.com"]);
+        const sensitiveQueryKeys = new Set([
+          "token",
+          "code",
+          "access_token",
+          "refresh_token",
+          "email",
+          "phone",
+          "reservation_id",
+          "user_id",
+          "guest_id"
+        ]);
+        const excludedPrefixes = [
+          "/admin",
+          "/superadmin",
+          "/partner",
+          "/api",
+          "/auth",
+          "/login",
+          "/forgot-password",
+          "/reset-password",
+          "/verify-email",
+          "/signup/check-email",
+          "/signup/welcome",
+          "/account",
+          "/guest/rewards",
+          "/guest/privacy",
+          "/review/verified",
+          "/post-visit/action",
+          "/internal",
+          "/diagnostics",
+          "/qa"
+        ];
+        function normalizedAnalyticsPath(value) {
+          try {
+            const url = new URL(value || window.location.href, window.location.origin);
+            if (!productionHosts.has(url.hostname)) return null;
+            const pathname = url.pathname.replace(/\/+$/, "") || "/";
+            if (excludedPrefixes.some((prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`))) return null;
+            for (const key of url.searchParams.keys()) {
+              if (sensitiveQueryKeys.has(String(key).toLowerCase())) return null;
+            }
+            return `${url.origin}${pathname === "/" ? "/" : pathname}`;
+          } catch {
+            return null;
+          }
+        }
+        const initialUrl = normalizedAnalyticsPath(window.location.href);
+        if (!initialUrl) return;
+        window.va = window.va || function () { (window.vaq = window.vaq || []).push(arguments); };
+        window.va("beforeSend", (event) => {
+          const cleanUrl = normalizedAnalyticsPath(event && event.url);
+          if (!cleanUrl) return null;
+          return { ...event, url: cleanUrl };
+        });
+        const script = document.createElement("script");
+        script.defer = true;
+        script.src = "/_vercel/insights/script.js";
+        script.setAttribute("data-smarttable-analytics", "vercel-web-analytics");
+        document.head.appendChild(script);
+      })();
+    </script>
+    <script src="/app.js?v=dark-theme-20260823-1" type="module"></script>
   </body>
 </html>

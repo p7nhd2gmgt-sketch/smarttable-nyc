@@ -4,12 +4,30 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import "./src/env-loader.js";
 import { handleApiRequest } from "./src/app-core.js";
+import { strictSecurityHeaders } from "./src/security-headers.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const publicDir = path.join(__dirname, "public");
 const port = Number(process.env.PORT || 4173);
-const publicSiteUrl = (process.env.PUBLIC_SITE_URL || "https://smarttable.com").replace(/\/+$/, "");
+function canonicalPublicSiteUrl(value = "") {
+  const raw = String(value || "").trim().replace(/\/+$/, "");
+  if (!raw) return "";
+  try {
+    const parsed = new URL(raw);
+    if (parsed.hostname.toLowerCase() === "smarttablenyc.com") {
+      parsed.hostname = "www.smarttablenyc.com";
+      return parsed.toString().replace(/\/+$/, "");
+    }
+  } catch {
+    return raw;
+  }
+  return raw;
+}
+const publicSiteUrl = canonicalPublicSiteUrl(process.env.PUBLIC_BASE_URL || process.env.PUBLIC_SITE_URL || "https://www.smarttablenyc.com");
+const runtimeEnvironment = String(process.env.SMARTTABLE_ENV || process.env.APP_ENV || process.env.VERCEL_ENV || process.env.NODE_ENV || "development").toLowerCase();
+const isProductionRuntime = ["production", "prod"].includes(runtimeEnvironment);
+const MAX_JSON_BODY_BYTES = Math.max(16 * 1024, Number(process.env.MAX_JSON_BODY_BYTES || 256 * 1024));
 
 const contentTypes = {
   ".html": "text/html; charset=utf-8",
@@ -18,6 +36,7 @@ const contentTypes = {
   ".png": "image/png",
   ".jpg": "image/jpeg",
   ".webp": "image/webp",
+  ".svg": "image/svg+xml; charset=utf-8",
   ".json": "application/json; charset=utf-8",
   ".txt": "text/plain; charset=utf-8",
   ".xml": "application/xml; charset=utf-8",
@@ -25,13 +44,7 @@ const contentTypes = {
 };
 
 function securityHeaders(extra = {}) {
-  return {
-    "x-content-type-options": "nosniff",
-    "x-frame-options": "DENY",
-    "referrer-policy": "strict-origin-when-cross-origin",
-    "permissions-policy": "camera=(), microphone=(), payment=()",
-    ...extra
-  };
+  return strictSecurityHeaders(extra);
 }
 
 function escapeHtml(value = "") {
@@ -54,12 +67,22 @@ function slugify(value = "") {
 function isNoIndexPath(pathname = "") {
   return [
     "/admin",
+    "/superadmin",
     "/partner",
     "/restaurant",
     "/account",
     "/login",
+    "/signup/check-email",
+    "/signup/welcome",
     "/forgot-password",
     "/reset-password",
+    "/verify-email",
+    "/auth/callback",
+    "/ai",
+    "/ai-concierge",
+    "/ai-preferences",
+    "/partner-ai-demand",
+    "/admin-ai-controls",
     "/guest/rewards/photo-upload"
   ].some((prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`));
 }
@@ -102,6 +125,14 @@ function routeMeta(pathname = "/") {
       noindex: false
     };
   }
+  if (cleanPath === "/signup/welcome") {
+    return {
+      title: "Email confirmed | SmartTable",
+      description: "Your SmartTable account is ready.",
+      canonicalPath,
+      noindex: true
+    };
+  }
   if (cleanPath === "/terms") {
     return {
       title: "SmartTable Terms and Conditions",
@@ -114,6 +145,46 @@ function routeMeta(pathname = "/") {
     return {
       title: "SmartTable Privacy Policy",
       description: "Read how SmartTable protects guest, restaurant, reservation, consent, and notification data.",
+      canonicalPath,
+      noindex: false
+    };
+  }
+  if (cleanPath === "/cookies") {
+    return {
+      title: "SmartTable Cookie Policy",
+      description: "Read how SmartTable uses essential cookies and local storage for secure sessions, language preferences, and reservation workflows.",
+      canonicalPath,
+      noindex: false
+    };
+  }
+  if (cleanPath === "/reservation-policy") {
+    return {
+      title: "SmartTable Reservation and Cancellation Policy",
+      description: "Read how SmartTable handles reservation requests, confirmations, cancellations, lateness, no-shows, discounts, and standard bookings.",
+      canonicalPath,
+      noindex: false
+    };
+  }
+  if (cleanPath === "/review-policy") {
+    return {
+      title: "SmartTable Verified Reviews and Photo Policy",
+      description: "Read how SmartTable handles verified guest reviews, ratings, photo uploads, moderation, complaints, and removal requests.",
+      canonicalPath,
+      noindex: false
+    };
+  }
+  if (cleanPath === "/partner-terms") {
+    return {
+      title: "SmartTable Restaurant Partner Terms",
+      description: "Read the SmartTable restaurant partner terms for restaurant profiles, staff access, offers, reservations, guest data, reviews, billing, and compliance.",
+      canonicalPath,
+      noindex: false
+    };
+  }
+  if (cleanPath === "/accessibility") {
+    return {
+      title: "SmartTable Accessibility Statement",
+      description: "Read SmartTable's accessibility statement for guests, restaurant partners, and administrators.",
       canonicalPath,
       noindex: false
     };
@@ -182,8 +253,17 @@ async function serveRobots(res) {
     "Disallow: /restaurant",
     "Disallow: /account",
     "Disallow: /login",
+    "Disallow: /signup/check-email",
+    "Disallow: /signup/welcome",
     "Disallow: /forgot-password",
     "Disallow: /reset-password",
+    "Disallow: /verify-email",
+    "Disallow: /auth/callback",
+    "Disallow: /ai",
+    "Disallow: /ai-concierge",
+    "Disallow: /ai-preferences",
+    "Disallow: /partner-ai-demand",
+    "Disallow: /admin-ai-controls",
     "Disallow: /guest/rewards/photo-upload",
     `Sitemap: ${publicSiteUrl}/sitemap.xml`,
     ""
@@ -196,7 +276,7 @@ async function serveRobots(res) {
 }
 
 async function serveSitemap(res) {
-  const staticPaths = ["/", "/restaurants", "/offers", "/signup", "/terms", "/privacy", "/contact"];
+  const staticPaths = ["/", "/restaurants", "/offers", "/signup", "/terms", "/privacy", "/cookies", "/reservation-policy", "/review-policy", "/partner-terms", "/accessibility", "/contact", "/help"];
   const restaurantPaths = (await publicRestaurantSlugs()).map((slug) => `/restaurants/${slug}`);
   const urls = [...staticPaths, ...restaurantPaths].map((pathname) => `
   <url>
@@ -216,10 +296,29 @@ async function serveSitemap(res) {
 }
 
 async function parseJson(req) {
+  const contentType = String(req.headers["content-type"] || "").toLowerCase();
+  const declaredLength = Number(req.headers["content-length"] || 0);
+  if (declaredLength > MAX_JSON_BODY_BYTES) {
+    const error = new Error("Request body is too large.");
+    error.status = 413;
+    throw error;
+  }
   const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
+  let totalBytes = 0;
+  for await (const chunk of req) {
+    totalBytes += chunk.length;
+    if (totalBytes > MAX_JSON_BODY_BYTES) {
+      const error = new Error("Request body is too large.");
+      error.status = 413;
+      throw error;
+    }
+    chunks.push(chunk);
+  }
   if (!chunks.length) return {};
   const rawBody = Buffer.concat(chunks).toString("utf8");
+  if (contentType.includes("application/x-www-form-urlencoded")) {
+    return { ...Object.fromEntries(new URLSearchParams(rawBody)), __rawBody: rawBody };
+  }
   const parsed = JSON.parse(rawBody);
   if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
     return { ...parsed, __rawBody: rawBody };
@@ -276,19 +375,27 @@ const server = http.createServer(async (req, res) => {
         body: await parseJson(req)
       });
       res.writeHead(result.status, securityHeaders(result.headers));
-      res.end(typeof result.body === "string" ? result.body : JSON.stringify(result.body));
+      const body = result.body;
+      res.end(Buffer.isBuffer(body) || body instanceof Uint8Array ? Buffer.from(body) : (typeof body === "string" ? body : JSON.stringify(body)));
     } else {
       await serveStatic(req, res, url.pathname);
     }
   } catch (error) {
-    res.writeHead(500, securityHeaders({ "content-type": "application/json; charset=utf-8" }));
-    res.end(JSON.stringify({ error: error.message || "Server error." }));
+    const status = error.status || 500;
+    console.error(JSON.stringify({
+      event: "http_request_failed",
+      timestamp: new Date().toISOString(),
+      environment: runtimeEnvironment,
+      status
+    }));
+    res.writeHead(status, securityHeaders({ "content-type": "application/json; charset=utf-8" }));
+    res.end(JSON.stringify({ error: isProductionRuntime && status >= 500 ? "Server error." : error.message || "Server error." }));
   }
 });
 
 server.listen(port, () => {
-  console.log(`Smarttable.com running at http://localhost:${port}`);
-  if (!process.env.RESEND_API_KEY) {
+  console.log(`SmartTable running at http://localhost:${port}`);
+  if (!isProductionRuntime && !process.env.RESEND_API_KEY) {
     console.log("Email provider not configured: outbound emails will be logged as failed until RESEND_API_KEY is set.");
   }
 });

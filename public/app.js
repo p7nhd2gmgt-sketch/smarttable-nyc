@@ -7,7 +7,7 @@ import {
   normalizeLanguage,
   normalizePlatformMode
 } from "./shared-contracts.js";
-import { requestJson } from "./api-client.js";
+import { requestJson, sessionAuthHeaders } from "./api-client.js";
 import { adminDashboardLayout } from "./admin/layout.js";
 import { guestHeroLayout } from "./guest/layout.js";
 import { partnerDashboardLayout } from "./partner/layout.js";
@@ -19,6 +19,25 @@ function initialLanguage() {
   if (stored) return normalizeLanguage(stored);
   const browserLang = normalizeLanguage(navigator.language || navigator.languages?.[0] || "en");
   return browserLang === "hu" ? "hu" : browserLang === "es" ? "es" : "en";
+}
+
+function currentTheme() {
+  return document.documentElement.dataset.theme === "dark" ? "dark" : "light";
+}
+
+function applyTheme(theme, { persist = true } = {}) {
+  const next = theme === "dark" ? "dark" : "light";
+  document.documentElement.dataset.theme = next;
+  if (persist) localStorage.setItem("smarttable.theme", next);
+  const button = document.querySelector("#themeToggleButton");
+  const dark = next === "dark";
+  const label = dark ? "Use light mode" : "Use dark mode";
+  if (button) {
+    button.setAttribute("aria-label", label);
+    button.setAttribute("title", label);
+    button.querySelector("span").textContent = dark ? "☀" : "☾";
+  }
+  document.querySelector('meta[name="theme-color"]')?.setAttribute("content", dark ? "#101713" : "#0f735d");
 }
 
 function readStoredJson(storage, key) {
@@ -33,6 +52,83 @@ function readStoredJson(storage, key) {
 function clearStoredSession() {
   localStorage.removeItem("smarttable.session");
   sessionStorage.removeItem("smarttable.session");
+}
+
+const AUTH_BROWSER_STATE_RESET_VERSION = "2026-07-31-auth-routing-5";
+
+function isAuthStateResetRoute(pathname = window.location.pathname) {
+  const path = String(pathname || "").replace(/\/+$/, "") || "/";
+  if (path === "/login") return !state.session;
+  return ["/partner", "/admin", "/superadmin"].includes(path) && !state.session;
+}
+
+function clearOriginCookies() {
+  const host = window.location.hostname;
+  for (const rawCookie of document.cookie.split(";")) {
+    const name = rawCookie.split("=")[0]?.trim();
+    if (!name) continue;
+    const expired = `${encodeURIComponent(name)}=; expires=Thu, 01 Jan 1970 00:00:00 GMT; max-age=0; path=/; SameSite=Lax; Secure`;
+    document.cookie = expired;
+    if (host) document.cookie = `${expired}; domain=${host}`;
+    if (host.startsWith("www.")) document.cookie = `${expired}; domain=.${host.slice(4)}`;
+  }
+}
+
+async function clearAuthBrowserStateForEntryRoute() {
+  if (!isAuthStateResetRoute()) return;
+  const savedTheme = localStorage.getItem("smarttable.theme");
+  state.session = null;
+  clearOriginCookies();
+  try {
+    localStorage.clear();
+    if (savedTheme) localStorage.setItem("smarttable.theme", savedTheme);
+  } catch {
+    clearStoredSession();
+  }
+  try {
+    sessionStorage.clear();
+  } catch {
+    // Ignore private-mode storage failures.
+  }
+  try {
+    if ("indexedDB" in window && typeof indexedDB.databases === "function") {
+      const databases = await indexedDB.databases();
+      await Promise.all((databases || [])
+        .map((database) => database?.name)
+        .filter(Boolean)
+        .map((name) => new Promise((resolve) => {
+          const request = indexedDB.deleteDatabase(name);
+          request.onsuccess = request.onerror = request.onblocked = () => resolve();
+        })));
+    }
+  } catch {
+    // IndexedDB cleanup is best-effort.
+  }
+  try {
+    if ("caches" in window) {
+      const keys = await caches.keys();
+      await Promise.all(keys.map((key) => caches.delete(key)));
+    }
+  } catch {
+    // Cache Storage cleanup is best-effort.
+  }
+  try {
+    if ("serviceWorker" in navigator) {
+      const registrations = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(registrations
+        .filter((registration) => {
+          try {
+            return new URL(registration.scope).origin === window.location.origin;
+          } catch {
+            return false;
+          }
+        })
+        .map((registration) => registration.unregister()));
+    }
+  } catch {
+    // Service worker cleanup is best-effort.
+  }
+  window.__smartTableAuthStateResetVersion = AUTH_BROWSER_STATE_RESET_VERSION;
 }
 
 function demoTokenExpiry(accessToken = "") {
@@ -81,15 +177,76 @@ function storedSession() {
   return session || null;
 }
 
+const LANGUAGE_SHORT_LABELS = {
+  en: "English",
+  es: "Espa\u00f1ol",
+  hu: "Magyar"
+};
+
+const HEADER_CITY_OPTIONS = [
+  { code: "nyc", labelKey: "city_new_york", fallback: "New York", active: true },
+  { code: "budapest", labelKey: "city_budapest", fallback: "Budapest", active: false }
+];
+
+const HEADER_SEARCH_SHORTCUTS = [
+  { action: "tonight", icon: "moon", labelKey: "header_search_tonight", fallback: "Book tonight" },
+  { action: "discounts", icon: "discount", labelKey: "header_search_discounts", fallback: "Top discounts" },
+  { action: "newest", icon: "sparkles", labelKey: "header_search_newest", fallback: "Newest restaurants" },
+  { action: "food-feed", icon: "dish", labelKey: "header_search_food_feed", fallback: "What to Eat" },
+  { action: "query", query: "Italian", icon: "fork", labelKey: "header_search_italian", fallback: "Italian" },
+  { action: "query", query: "Caf\u00e9", icon: "cup", labelKey: "header_search_cafe", fallback: "Caf\u00e9s" },
+  { action: "query", query: "West Village", icon: "pin", labelKey: "header_search_west_village", fallback: "West Village" },
+  { action: "query", query: "Manhattan", icon: "map", labelKey: "header_search_manhattan", fallback: "Manhattan" }
+];
+
+const PENDING_SIGNUP_EMAIL_STORAGE_KEY = "smarttable.pendingSignupEmail";
+
+function readPendingSignupEmail() {
+  try {
+    return String(sessionStorage.getItem(PENDING_SIGNUP_EMAIL_STORAGE_KEY) || "").trim();
+  } catch {
+    return "";
+  }
+}
+
+function savePendingSignupEmail(email) {
+  try {
+    const cleanEmail = String(email || "").trim();
+    if (cleanEmail) sessionStorage.setItem(PENDING_SIGNUP_EMAIL_STORAGE_KEY, cleanEmail);
+    else sessionStorage.removeItem(PENDING_SIGNUP_EMAIL_STORAGE_KEY);
+  } catch {
+    // Session storage can be unavailable in hardened browsers; the form still works.
+  }
+}
+
 const state = {
   mode: "guest",
   lang: initialLanguage(),
+  citySelectorOpen: false,
+  headerSearchOpen: false,
+  headerSearchQuery: "",
+  languageSelectorOpen: false,
   translations: {},
   fallbackTranslations: {},
   apiMode: "loading",
   session: storedSession(),
+  authDiagnostics: {
+    requestStatus: "not attempted",
+    sessionPresent: false,
+    resolvedRole: "",
+    selectedRedirectRoute: "",
+    errorCode: ""
+  },
   signup: null,
   signupSuccess: null,
+  signupCheckEmail: {
+    email: "",
+    submitting: false,
+    sent: false,
+    error: "",
+    cooldownUntil: 0
+  },
+  guestAccountWelcomeDismissed: false,
   guestLogin: {
     showPassword: false,
     submitting: false,
@@ -105,10 +262,48 @@ const state = {
     showConfirmPassword: false,
     success: false
   },
+  guestAuthCallback: {
+    processedKey: "",
+    status: "idle",
+    message: "",
+    errorCode: "",
+    email: "",
+    resendSubmitting: false,
+    resendSent: false,
+    resendError: "",
+    resendCooldownUntil: 0
+  },
+  postVisitAction: {
+    loading: false,
+    submitting: false,
+    error: "",
+    context: null,
+    completed: false
+  },
+  verifiedReview: {
+    loading: false,
+    submitting: false,
+    error: "",
+    context: null,
+    submitted: false,
+    uploadStatus: "",
+    photoFiles: [],
+    photoPreviews: [],
+    form: {
+      food_rating: "",
+      service_rating: "",
+      atmosphere_rating: "",
+      written_review: "",
+      visit_duration_minutes: "",
+      visit_duration_confirmed: false
+    }
+  },
   guestAccount: null,
   guestReservations: [],
   guestFavorites: [],
+  guestFoodFeedFavorites: [],
   guestNotifications: [],
+  guestCommunications: null,
   guestPrivacy: null,
   reservationSubmitting: false,
   guestAccountTab: "overview",
@@ -118,11 +313,55 @@ const state = {
     date: "",
     search: ""
   },
+  partnerAnalyticsFilters: {
+    date_range: "30d",
+    from: "",
+    to: "",
+    offer_id: "all",
+    reservation_status: "all",
+    party_size: "",
+    weekday: "all",
+    hour: "all",
+    offer_page: "1",
+    offer_page_size: "25"
+  },
+  partnerOfferAnalyticsSort: {
+    key: "reservations",
+    direction: "desc"
+  },
   adminReservationFilters: {
     status: "all",
     date: "",
     search: ""
   },
+  adminAnalyticsFilters: {
+    date_range: "30d",
+    from: "",
+    to: "",
+    country: "all",
+    city: "all",
+    restaurant_id: "all",
+    status: "all",
+    subscription: "all"
+  },
+  adminRestaurantFilters: {
+    search: "",
+    status: "all",
+    city: "all",
+    country: "all",
+    district: "all",
+    testData: "all",
+    sort: "updated_desc"
+  },
+  adminRestaurantPage: 1,
+  adminRestaurantPageSize: 10,
+  adminRestaurantHighlightId: "",
+  adminRestaurantDetailId: "",
+  adminRestaurantDetail: null,
+  adminRestaurantDetailTab: "overview",
+  adminAuditRestaurantId: "",
+  adminAuditLogs: [],
+  adminBillingFilter: "all",
   guestPreferenceErrors: {},
   guestSecurity: {
     showCurrentPassword: false,
@@ -131,6 +370,10 @@ const state = {
     changeSubmitting: false,
     deletionSubmitting: false,
     exportSubmitting: false,
+    signOutCurrentSubmitting: false,
+    signOutAllSubmitting: false,
+    signOutAllConfirmOpen: false,
+    signOutAllError: "",
     message: ""
   },
   showAccountMenu: false,
@@ -141,6 +384,8 @@ const state = {
   featureStatus: [],
   offers: [],
   config: {},
+  runtimeHealth: null,
+  runtimeHealthError: "",
   platformMode: "basic",
   aiDemoVisibility: false,
   showAiModeBadge: true,
@@ -176,7 +421,7 @@ const state = {
     time: "",
     partySize: "",
     restaurantName: "",
-    availableOnly: true,
+    availableOnly: false,
     sort: "recommended"
   },
   reservationModal: null,
@@ -184,27 +429,90 @@ const state = {
   modalScrollY: 0,
   modalReturnFocusSelector: "",
   followModal: null,
-  reviewModal: null,
   reservationSuccess: null,
+  publicRestaurants: [],
+  foodFeed: {
+    videos: [],
+    loading: false,
+    loaded: false,
+    error: "",
+    requestKey: "",
+    cycle: 0,
+    location: null,
+    locationStatus: "idle",
+    radiusMiles: 10,
+    favoritesLoaded: false,
+    favoriteOwnerId: ""
+  },
+  publicReviewCache: {},
+  reviewLightbox: null,
   newestRestaurants: [],
   restaurants: [],
   reservations: [],
   partners: [],
   adminOffers: [],
   adminReviews: [],
+  adminFoodFeedVideos: [],
+  adminReviewFilters: {
+    search: "",
+    restaurant_id: "all",
+    country: "all",
+    city: "all",
+    status: "all",
+    photo_status: "all",
+    page: "1",
+    page_size: "25"
+  },
+  adminReviewPagination: {
+    page: 1,
+    page_size: 25,
+    total: 0,
+    total_pages: 1
+  },
   notifications: [],
   unreadNotifications: 0,
   adminIntegrations: null,
   adminFeatureFlags: [],
   adminErrors: null,
   adminBilling: null,
+  adminAnalytics: null,
+  adminReservationAlerts: null,
+  adminSystemMessages: null,
   systemChecklists: null,
   privacyRequests: [],
+  adminLegalDocuments: [],
+  adminLegalCounts: {},
   showNotifications: false,
   contentSearch: "",
   contentEditKey: null,
   partnerProfile: null,
   partnerStats: null,
+  partnerAnalytics: null,
+  partnerReviews: [],
+  partnerFoodFeedVideos: [],
+  partnerFoodFeedUpload: {
+    pending: false,
+    error: "",
+    previewUrl: ""
+  },
+  partnerBilling: null,
+  partnerCampaigns: null,
+  partnerSmsCampaigns: null,
+  partnerReservationAlerts: [],
+  partnerAlertDeliveries: [],
+  partnerReservationAlertCount: 0,
+  partnerAlertSettings: null,
+  partnerAlertDevices: [],
+  partnerAlertInstructions: {},
+  partnerAlertPush: null,
+  partnerAlertSms: null,
+  partnerAlertVoice: null,
+  partnerAlertPollSeconds: 5,
+  partnerAlertSoundUnlocked: false,
+  partnerAlertSaving: false,
+  partnerAlertRegistering: false,
+  partnerAlertTesting: false,
+  partnerAlertAckPending: "",
   partnerAiRecommendation: null,
   partnerIntegrations: null,
   partnerImports: null,
@@ -223,10 +531,19 @@ const state = {
 const app = document.querySelector("#app");
 const toast = document.querySelector("#toast");
 const sessionButton = document.querySelector("#sessionButton");
+const adminDashboardNav = document.querySelector("#adminDashboardNav");
 const signupNav = document.querySelector("#signupNav");
+let authCallbackCooldownTimer = null;
+let partnerAlertPollTimer = null;
+let partnerAlertSoundRepeatTimer = null;
+let partnerAlertAudioContext = null;
+const RESERVATION_ALERT_VIBRATION_PATTERN = [250, 100, 250, 100, 500];
+const RESERVATION_ALERT_SOUND_REPEAT_MS = 20_000;
+let adminRestaurantHighlightTimer = null;
+let foodFeedObserver = null;
 
 function hasGuestModalOpen() {
-  return Boolean(state.reservationModal || state.restaurantDetail || state.followModal || state.reviewModal || state.reservationSuccess || state.aiWizardOpen);
+  return Boolean(state.reservationModal || state.restaurantDetail || state.followModal || state.reservationSuccess || state.aiWizardOpen);
 }
 
 function safeCssValue(value) {
@@ -241,6 +558,7 @@ function modalReturnSelector(trigger) {
   if (trigger.dataset.newestRestaurant) return `[data-newest-restaurant="${safeCssValue(restaurantId)}"]`;
   if (trigger.dataset.favoriteDetail) return `[data-favorite-detail="${safeCssValue(restaurantId)}"]`;
   if (trigger.dataset.openReserve) return `[data-open-reserve="${safeCssValue(trigger.dataset.openReserve)}"][data-restaurant="${safeCssValue(restaurantId)}"]`;
+  if (trigger.dataset.openStandardReserve) return `[data-open-standard-reserve="${safeCssValue(trigger.dataset.openStandardReserve)}"][data-restaurant="${safeCssValue(restaurantId)}"]`;
   return "";
 }
 
@@ -287,17 +605,23 @@ function syncGuestModalState() {
 }
 
 function closeGuestModal() {
+  const closingRestaurantDetailModal = Boolean(state.restaurantDetail && document.querySelector(".restaurant-detail-modal"));
   state.reservationModal = null;
   state.restaurantDetail = null;
   state.followModal = null;
-  state.reviewModal = null;
   state.reservationSuccess = null;
   state.aiWizardOpen = false;
-  if (window.location.pathname.startsWith("/restaurants/")) history.pushState(null, "", "/restaurants");
+  if (closingRestaurantDetailModal && window.location.pathname.startsWith("/restaurants/")) history.pushState(null, "", "/restaurants");
   renderGuest();
 }
 
 function handleGuestModalKeydown(event) {
+  if (state.reviewLightbox && event.key === "Escape") {
+    event.preventDefault();
+    state.reviewLightbox = null;
+    renderGuest(currentPublicGuestRoute());
+    return;
+  }
   const modal = document.querySelector("#app .modal-backdrop .modal-card");
   if (!modal || !hasGuestModalOpen()) return;
   if (event.key === "Escape") {
@@ -346,13 +670,13 @@ const aiWizardOptions = {
 };
 
 const signupSteps = [
-  { key: "account", labelKey: "signup_step_account", fallback: "Account" },
-  { key: "location", labelKey: "signup_step_location", fallback: "Location" },
-  { key: "preferences", labelKey: "signup_step_preferences", fallback: "Food and drink preferences" },
-  { key: "habits", labelKey: "signup_step_habits", fallback: "Dining habits" },
-  { key: "budget", labelKey: "signup_step_budget", fallback: "Budget and discounts" },
-  { key: "notifications", labelKey: "signup_step_notifications", fallback: "Notifications" },
-  { key: "consent", labelKey: "signup_step_consent", fallback: "Review and consent" }
+  { key: "account", labelKey: "signup_step_account", fallback: "Account", shortLabelKey: "signup_step_short_account", shortFallback: "Account" },
+  { key: "location", labelKey: "signup_step_location", fallback: "Location", shortLabelKey: "signup_step_short_location", shortFallback: "Location" },
+  { key: "consent", labelKey: "signup_step_consent", fallback: "Review and consent", shortLabelKey: "signup_step_short_consent", shortFallback: "Review" },
+  { key: "preferences", labelKey: "signup_step_preferences", fallback: "Food and drink preferences", shortLabelKey: "signup_step_short_preferences", shortFallback: "Food" },
+  { key: "habits", labelKey: "signup_step_habits", fallback: "Dining habits", shortLabelKey: "signup_step_short_habits", shortFallback: "Habits" },
+  { key: "budget", labelKey: "signup_step_budget", fallback: "Budget and discounts", shortLabelKey: "signup_step_short_budget", shortFallback: "Budget" },
+  { key: "notifications", labelKey: "signup_step_notifications", fallback: "Notifications", shortLabelKey: "signup_step_short_notifications", shortFallback: "Alerts" }
 ];
 
 const signupAnalyticsEvents = new Set([
@@ -434,7 +758,7 @@ const signupOptionGroups = {
     "Group dinner", "Brunch", "Quick meal", "Drinks after work", "Late-night dining", "Outdoor dining", "Rooftop",
     "Live music", "Sports bar", "Quiet atmosphere", "Trendy locations", "Hidden gems"
   ],
-  companions: ["Alone", "Partner", "Family", "Friends", "Coworkers", "Groups", "Varies"],
+  companions: ["Solo", "Couple", "Family", "Friends", "Business", "Other"],
   party_size: ["1", "2", "3-4", "5-6", "7 or more", "Varies"],
   transportation: ["Walking", "Driving", "Public transportation", "Taxi or rideshare", "No preference"],
   preferred_days: ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
@@ -460,8 +784,78 @@ const signupOptionGroups = {
     "New menu items", "Last-minute discounted tables", "Weekend recommendations", "Birthday or anniversary suggestions",
     "SmartTable news and marketing"
   ],
-  notification_channels: ["Email"],
+  notification_channels: ["Email", "SMS"],
   notification_frequency: ["Immediately", "Daily summary", "Weekly summary", "Only important reservation messages"]
+};
+
+const otherCityValue = "__other_city__";
+const noNeighborhoodPreference = "No preference";
+const smsNotificationChannel = "SMS";
+
+const signupLocationCatalog = {
+  US: {
+    labelKey: "signup_country_us",
+    fallback: "United States",
+    defaultUnit: "miles",
+    states: {
+      NY: {
+        labelKey: "signup_state_ny",
+        fallback: "New York",
+        cities: ["New York City", "Brooklyn", "Queens", "Bronx", "Staten Island"],
+        neighborhoods: ["Manhattan", "West Village", "SoHo", "Nolita", "Chelsea", "Tribeca", "Upper West Side", "Upper East Side", "Williamsburg", "DUMBO", "Long Island City"]
+      },
+      NJ: {
+        labelKey: "signup_state_nj",
+        fallback: "New Jersey",
+        cities: ["Jersey City", "Hoboken", "Newark"],
+        neighborhoods: ["Jersey City", "Hoboken"]
+      },
+      CT: {
+        labelKey: "signup_state_ct",
+        fallback: "Connecticut",
+        cities: ["Stamford", "Greenwich", "Norwalk"],
+        neighborhoods: ["Stamford", "Greenwich"]
+      }
+    }
+  },
+  HU: {
+    labelKey: "signup_country_hu",
+    fallback: "Hungary",
+    defaultUnit: "kilometers",
+    states: {
+      BU: {
+        labelKey: "signup_state_budapest",
+        fallback: "Budapest",
+        cities: ["Budapest"],
+        neighborhoods: ["District V", "District VI", "District VII", "District XIII", "Buda Castle", "Ujlipotvaros"]
+      },
+      PE: {
+        labelKey: "signup_state_pest",
+        fallback: "Pest County",
+        cities: ["Szentendre", "Budaors", "Dunakeszi"],
+        neighborhoods: ["Pest County"]
+      }
+    }
+  },
+  ES: {
+    labelKey: "signup_country_es",
+    fallback: "Spain",
+    defaultUnit: "kilometers",
+    states: {
+      MD: {
+        labelKey: "signup_state_madrid",
+        fallback: "Madrid",
+        cities: ["Madrid"],
+        neighborhoods: ["Centro", "Salamanca", "Chamberi"]
+      },
+      CT: {
+        labelKey: "signup_state_catalonia",
+        fallback: "Catalonia",
+        cities: ["Barcelona"],
+        neighborhoods: ["Eixample", "Gracia", "Gothic Quarter"]
+      }
+    }
+  }
 };
 
 function escapeHtml(value) {
@@ -475,6 +869,23 @@ function escapeHtml(value) {
 
 function escapeAttr(value) {
   return escapeHtml(value);
+}
+
+function cleanString(value) {
+  return String(value ?? "").trim();
+}
+
+function safeInternalNavigationUrl(value = "") {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  if (/^\/(?!\/)/.test(raw)) return raw;
+  try {
+    const parsed = new URL(raw, window.location.origin);
+    if (parsed.origin !== window.location.origin) return "";
+    return `${parsed.pathname}${parsed.search}${parsed.hash}`;
+  } catch {
+    return "";
+  }
 }
 
 function showToast(message) {
@@ -635,27 +1046,61 @@ function currentProtectedAreaRoute() {
   const path = window.location.pathname.replace(/\/+$/, "") || "/";
   const hash = window.location.hash;
   const partnerTargets = {
-    "/partner": "",
-    "/partner/offers": "#partner-deals",
-    "/partner/reservations": "#partner-reservations",
-    "/partner/profile": "#partner-profile",
-    "/partner/analytics": "#partner-weekly-level",
-    "/partner/settings": "#partner-settings"
+    "/partner": "#partner-tab-panel-overview",
+    "/partner/offers": "#partner-tab-panel-offers",
+    "/partner/food-feed": "#partner-tab-panel-food-feed",
+    "/partner/reservations": "#partner-tab-panel-reservations",
+    "/partner/profile": "#partner-tab-panel-profile",
+    "/partner/capacity": "#partner-tab-panel-capacity",
+    "/partner/availability": "#partner-tab-panel-availability",
+    "/partner/notifications": "#partner-tab-panel-notifications",
+    "/partner/reviews": "#partner-tab-panel-reviews",
+    "/partner/billing": "#partner-tab-panel-billing",
+    "/partner/analytics": "#partner-tab-panel-analytics",
+    "/partner/settings": "#partner-tab-panel-profile"
   };
   const adminTargets = {
-    "/admin": "#admin-stats",
-    "/admin/restaurants": "#admin-restaurants",
-    "/admin/offers": "#admin-offers",
-    "/admin/users": "#admin-partners",
-    "/admin/notifications": "#admin-notifications",
-    "/admin/content": "#admin-content",
-    "/admin/platform-settings": "#admin-platform-settings"
+    "/admin": "#admin-tab-panel-overview",
+    "/admin/restaurants": "#admin-tab-panel-restaurants",
+    "/admin/partners": "#admin-tab-panel-partners",
+    "/admin/reservations": "#admin-tab-panel-reservations",
+    "/admin/offers": "#admin-tab-panel-offers",
+    "/admin/food-feed": "#admin-tab-panel-food-feed",
+    "/admin/users": "#admin-tab-panel-partners",
+    "/admin/notifications": "#admin-tab-panel-notifications",
+    "/admin/payments": "#admin-tab-panel-payments",
+    "/admin/reports": "#admin-tab-panel-reports",
+    "/admin/reviews": "#admin-tab-panel-reviews",
+    "/admin/settings": "#admin-tab-panel-settings",
+    "/admin/audit": "#admin-tab-panel-audit",
+    "/admin/content": "#admin-tab-panel-settings",
+    "/admin/platform-settings": "#admin-tab-panel-settings",
+    "/admin/analytics": "#admin-tab-panel-reports"
+  };
+  const superAdminTargets = {
+    "/superadmin": "#superadmin-tab-panel-overview",
+    "/superadmin/restaurants": "#superadmin-tab-panel-restaurants",
+    "/superadmin/partners": "#superadmin-tab-panel-partners",
+    "/superadmin/reservations": "#superadmin-tab-panel-reservations",
+    "/superadmin/offers": "#superadmin-tab-panel-offers",
+    "/superadmin/food-feed": "#superadmin-tab-panel-food-feed",
+    "/superadmin/users": "#superadmin-tab-panel-partners",
+    "/superadmin/notifications": "#superadmin-tab-panel-notifications",
+    "/superadmin/payments": "#superadmin-tab-panel-payments",
+    "/superadmin/reports": "#superadmin-tab-panel-reports",
+    "/superadmin/reviews": "#superadmin-tab-panel-reviews",
+    "/superadmin/settings": "#superadmin-tab-panel-settings",
+    "/superadmin/audit": "#superadmin-tab-panel-audit",
+    "/superadmin/analytics": "#superadmin-tab-panel-reports"
   };
   if (path === "/account" || path.startsWith("/account/") || hash === "#guest-account") {
     return { area: "guest", mode: "guest", loginRole: "guest" };
   }
   if (path === "/admin" || path.startsWith("/admin/") || /^#admin(?:-|$)/.test(hash)) {
     return { area: "admin", mode: "admin", loginRole: "admin", target: adminTargets[path] || hash || "#admin-stats" };
+  }
+  if (path === "/superadmin" || path.startsWith("/superadmin/")) {
+    return { area: "superadmin", mode: "admin", loginRole: "admin", target: superAdminTargets[path] || "#admin-platform-settings" };
   }
   if (path === "/partner" || path.startsWith("/partner/") || path.startsWith("/restaurant/") || /^#partner(?:-|$)/.test(hash)) {
     return { area: "partner", mode: "partner", loginRole: "partner", target: partnerTargets[path] || hash || "" };
@@ -668,10 +1113,12 @@ function hasProtectedAreaAccess(area) {
   if (area === "guest") return role === "guest";
   if (area === "partner") return role === "partner";
   if (area === "admin") return isAdminRole(role);
+  if (area === "superadmin") return role === "super_admin";
   return false;
 }
 
 function protectedAreaLabel(area) {
+  if (area === "superadmin") return t("protected_area_superadmin", "superadmin dashboard");
   if (area === "admin") return t("protected_area_admin", "admin dashboard");
   if (area === "partner") return t("protected_area_partner", "partner dashboard");
   return t("protected_area_guest", "guest account");
@@ -796,6 +1243,7 @@ async function loadTranslations() {
 function t(key, fallback = "") {
   for (const value of [state.content[key], state.translations[key], state.fallbackTranslations[key]]) {
     if (value === undefined || value === null) continue;
+    if (typeof value === "string" && !value.trim()) continue;
     if (state.lang !== "en" && fallback && value === fallback) continue;
     return value;
   }
@@ -859,19 +1307,138 @@ function translateRenderedStaticText(root = app) {
   });
 }
 
+function bindReviewPhotoFallbacks(root = app) {
+  root.querySelectorAll("[data-review-photo-img]").forEach((image) => {
+    const markFailed = () => image.closest("article")?.classList.add("image-failed");
+    image.addEventListener("error", markFailed, { once: true });
+    if (image.complete && image.naturalWidth === 0) markFailed();
+  });
+}
+
 function finalizeRenderedLanguage() {
+  bindReviewPhotoFallbacks(app);
   translateRenderedStaticText(app);
   updateChromeText();
 }
 
 function normalizeRole(role) {
   const value = String(role || "guest").trim().toLowerCase();
-  return value === "restaurant" || value === "restaurant_partner" ? "partner" : value;
+  if (["owner", "restaurant_owner", "restaurant", "restaurant_partner"].includes(value)) return "partner";
+  if (["superadmin", "super-admin"].includes(value)) return "super_admin";
+  return value;
 }
 
 function isAdminRole(role) {
   const normalized = normalizeRole(role);
   return normalized === "admin" || normalized === "super_admin";
+}
+
+function appModeForRole(role) {
+  const normalized = normalizeRole(role);
+  if (isAdminRole(normalized)) return "admin";
+  if (normalized === "partner") return "partner";
+  return "guest";
+}
+
+function defaultDashboardRouteForRole(role) {
+  const normalized = normalizeRole(role);
+  if (normalized === "super_admin") return "/superadmin";
+  if (normalized === "admin") return "/admin";
+  if (normalized === "partner") return "/partner";
+  return "/account";
+}
+
+function adminDashboardRouteForRole(role) {
+  const normalized = normalizeRole(role);
+  if (normalized === "super_admin") return safeStoredDashboardRoute("superadmin", "/superadmin");
+  return safeStoredDashboardRoute("admin", "/admin");
+}
+
+function updateAdminDashboardNav(session = currentSession()) {
+  if (!adminDashboardNav) return;
+  const role = normalizeRole(session?.profile?.role || "");
+  const visible = role === "admin" || role === "super_admin";
+  adminDashboardNav.hidden = !visible;
+  adminDashboardNav.toggleAttribute("data-authenticated-admin-nav", visible);
+  if (!visible) {
+    adminDashboardNav.removeAttribute("data-dashboard-route");
+    adminDashboardNav.removeAttribute("aria-label");
+    adminDashboardNav.textContent = t("admin_dashboard_return_button", "Back to Admin Dashboard");
+    return;
+  }
+  const superAdmin = role === "super_admin";
+  const fullLabel = superAdmin
+    ? t("superadmin_dashboard_return_button", "Back to Super Admin Dashboard")
+    : t("admin_dashboard_return_button", "Back to Admin Dashboard");
+  const compactLabel = t("admin_dashboard_return_button_compact", "Admin");
+  adminDashboardNav.dataset.dashboardRoute = adminDashboardRouteForRole(role);
+  adminDashboardNav.setAttribute("aria-label", fullLabel);
+  adminDashboardNav.innerHTML = `
+    <span class="admin-dashboard-nav__full">${escapeHtml(fullLabel)}</span>
+    <span class="admin-dashboard-nav__compact" aria-hidden="true">${escapeHtml(compactLabel)}</span>
+  `;
+}
+
+function updateAuthDiagnostics(update = {}) {
+  state.authDiagnostics = {
+    ...state.authDiagnostics,
+    ...update
+  };
+}
+
+function canRenderLoginDiagnostics() {
+  const health = state.runtimeHealth || {};
+  return health.production_runtime !== true
+    && health.runtime_mode !== "production"
+    && health.environment !== "production"
+    && health.login_diagnostics_enabled === true;
+}
+
+function protectedAreaForPath(pathname = "") {
+  const path = String(pathname || "").replace(/\/+$/, "") || "/";
+  if (path === "/account" || path.startsWith("/account/")) return "guest";
+  if (path === "/partner" || path.startsWith("/partner/") || path.startsWith("/restaurant/")) return "partner";
+  if (path === "/superadmin" || path.startsWith("/superadmin/")) return "superadmin";
+  if (path === "/admin" || path.startsWith("/admin/")) return "admin";
+  return "";
+}
+
+function roleCanAccessArea(role, area) {
+  const normalized = normalizeRole(role);
+  if (area === "guest") return normalized === "guest";
+  if (area === "partner") return normalized === "partner";
+  if (area === "admin") return isAdminRole(normalized);
+  if (area === "superadmin") return normalized === "super_admin";
+  return true;
+}
+
+function postLoginRedirectForRole(role, fallback = defaultDashboardRouteForRole(role)) {
+  const redirect = String(state.postLoginRedirect || "").trim();
+  if (!redirect || !redirect.startsWith("/") || redirect.startsWith("//")) return fallback;
+  const path = redirect.split(/[?#]/)[0] || "/";
+  const area = protectedAreaForPath(path);
+  if (area && !roleCanAccessArea(role, area)) return fallback;
+  return redirect;
+}
+
+async function completeAuthenticatedLogin(payload, options = {}) {
+  payload.profile.role = normalizeRole(payload.profile.role);
+  saveSession(payload, { remember: options.remember !== false });
+  await applyProfileLanguagePreference(payload);
+  state.mode = appModeForRole(payload.profile.role);
+  const redirect = postLoginRedirectForRole(payload.profile.role, options.redirectFallback || defaultDashboardRouteForRole(payload.profile.role));
+  updateAuthDiagnostics({
+    requestStatus: "HTTP 200",
+    sessionPresent: true,
+    resolvedRole: payload.profile.role,
+    selectedRedirectRoute: redirect,
+    errorCode: ""
+  });
+  state.postLoginRedirect = "";
+  history.pushState(null, "", redirect);
+  await renderCurrentMode();
+  showToast(t("logged_in_toast", "Logged in."));
+  return payload;
 }
 
 function currentSession() {
@@ -892,7 +1459,13 @@ function isGuestSession() {
 }
 
 function isAuthError(error) {
-  return error?.status === 401 || /invalid|expired|authentication/i.test(error?.message || "");
+  const status = Number(error?.status || error?.payload?.status || 0);
+  const code = String(error?.payload?.code || error?.payload?.error_code || error?.code || "").toUpperCase();
+  if (status === 401) return true;
+  if (status === 403 && /AUTH|JWT|TOKEN|SESSION/.test(code)) return true;
+  if (["AUTH_SESSION_EXPIRED", "JWT_EXPIRED", "TOKEN_EXPIRED", "INVALID_TOKEN", "INVALID_JWT"].includes(code)) return true;
+  const message = String(error?.message || "").toLowerCase();
+  return /\b(authentication required|invalid or expired session|session expired|token expired|jwt expired)\b/.test(message);
 }
 
 function persistCurrentSession() {
@@ -916,6 +1489,11 @@ function saveSession(session, options = {}) {
   } else {
     clearStoredSession();
   }
+  updateAuthDiagnostics({
+    sessionPresent: Boolean(state.session),
+    resolvedRole: normalizeRole(state.session?.profile?.role || "")
+  });
+  updateAdminDashboardNav(state.session);
   updateSessionButton();
 }
 
@@ -955,15 +1533,298 @@ async function persistLanguagePreference() {
 }
 
 async function setLanguage(lang, options = {}) {
-  state.lang = normalizeLanguage(lang);
+  const nextLanguage = normalizeLanguage(lang);
+  state.languageSelectorOpen = false;
+  if (state.lang === nextLanguage) {
+    localStorage.setItem("smarttable.lang", state.lang);
+    updateLanguageSelector();
+    return;
+  }
+  state.lang = nextLanguage;
   localStorage.setItem("smarttable.lang", state.lang);
   if (options.persist !== false) await persistLanguagePreference();
   await renderCurrentMode();
 }
 
+function languageShortLabel(lang = state.lang) {
+  const normalized = normalizeLanguage(lang);
+  return LANGUAGE_SHORT_LABELS[normalized] || LANGUAGE_SHORT_LABELS.en;
+}
+
+function languageOptionLabel(lang = state.lang) {
+  const normalized = normalizeLanguage(lang);
+  return supportedLanguages[normalized]?.label || languageShortLabel(normalized);
+}
+
+function languageOptionButtons() {
+  return Array.from(document.querySelectorAll("[data-language-option]"));
+}
+
+function focusLanguageOption(lang = state.lang) {
+  const option = document.querySelector(`[data-language-option="${safeCssValue(lang)}"]`) || languageOptionButtons()[0];
+  option?.focus();
+}
+
+function moveLanguageOptionFocus(direction) {
+  const options = languageOptionButtons();
+  if (!options.length) return;
+  const currentIndex = Math.max(0, options.indexOf(document.activeElement));
+  const nextIndex = (currentIndex + direction + options.length) % options.length;
+  options[nextIndex].focus();
+}
+
+function updateLanguageSelector() {
+  const root = document.querySelector("[data-language-selector]");
+  if (!root) return;
+  const button = root.querySelector("#languageSelectorButton");
+  const menu = root.querySelector("#languageSelectorMenu");
+  const label = root.querySelector("[data-language-selector-label]");
+  const current = root.querySelector("[data-language-selector-current]");
+  const code = root.querySelector("[data-language-selector-code]");
+  const selectorLabel = t("language_selector_label", "Language");
+  const menuLabel = t("language_selector_menu_label", "Choose language");
+  const currentLabel = languageShortLabel(state.lang);
+
+  root.classList.toggle("open", state.languageSelectorOpen);
+  root.setAttribute("aria-label", selectorLabel);
+  if (label) label.textContent = selectorLabel;
+  if (current) current.textContent = currentLabel;
+  if (code) code.textContent = normalizeLanguage(state.lang).toUpperCase();
+  if (button) {
+    button.setAttribute("aria-expanded", state.languageSelectorOpen ? "true" : "false");
+    button.setAttribute("aria-label", `${selectorLabel}: ${currentLabel}`);
+  }
+  if (!menu) return;
+  menu.hidden = !state.languageSelectorOpen;
+  menu.setAttribute("aria-label", menuLabel);
+  menu.innerHTML = Object.keys(supportedLanguages).map((lang) => {
+    const active = state.lang === lang;
+    return `
+      <button
+        class="language-selector__option ${active ? "active" : ""}"
+        id="language-option-${escapeAttr(lang)}"
+        type="button"
+        role="option"
+        data-language-option="${escapeAttr(lang)}"
+        aria-selected="${active ? "true" : "false"}"
+      >
+        <span class="language-selector__check" aria-hidden="true">${active ? "\u2713" : ""}</span>
+        <span>${escapeHtml(languageOptionLabel(lang))}</span>
+      </button>
+    `;
+  }).join("");
+}
+
+function cityOptionButtons() {
+  return Array.from(document.querySelectorAll("[data-city-option]:not([disabled])"));
+}
+
+function headerSearchIcon(name = "search") {
+  const icons = {
+    search: '<circle cx="10.75" cy="10.75" r="6.75"></circle><path d="m16 16 4 4"></path>',
+    map: '<path d="m3 6 5-2 8 2 5-2v14l-5 2-8-2-5 2V6Z"></path><path d="M8 4v14M16 6v14"></path>',
+    moon: '<path d="M19 15.5A8 8 0 0 1 8.5 5a8 8 0 1 0 10.5 10.5Z"></path>',
+    discount: '<circle cx="8" cy="8" r="2"></circle><circle cx="16" cy="16" r="2"></circle><path d="m7 17 10-10"></path>',
+    sparkles: '<path d="m12 3 1.2 3.8L17 8l-3.8 1.2L12 13l-1.2-3.8L7 8l3.8-1.2L12 3ZM18.5 13l.7 2.3 2.3.7-2.3.7-.7 2.3-.7-2.3-2.3-.7 2.3-.7.7-2.3Z"></path>',
+    dish: '<path d="M4 15h16M6 15a6 6 0 0 1 12 0M12 6V4M3 19h18"></path>',
+    fork: '<path d="M7 3v7M4.5 3v4.5A2.5 2.5 0 0 0 7 10v11M9.5 3v4.5A2.5 2.5 0 0 1 7 10M16 3v18M16 3c3 2 4 5 4 8h-4"></path>',
+    cup: '<path d="M5 7h12v6a5 5 0 0 1-5 5h-2a5 5 0 0 1-5-5V7ZM17 9h1.5a2.5 2.5 0 0 1 0 5H17M4 21h15"></path>',
+    pin: '<path d="M12 21s6-5.35 6-11a6 6 0 1 0-12 0c0 5.65 6 11 6 11Z"></path><circle cx="12" cy="10" r="2.25"></circle>'
+  };
+  return `<svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">${icons[name] || icons.search}</svg>`;
+}
+
+function headerSearchPanelMarkup() {
+  const filters = state.filters;
+  const neighborhoods = filterOptionValues("district");
+  const cuisines = filterOptionValues("cuisine");
+  return `
+    <div class="header-search-panel__inner">
+      <form class="header-offer-search guest-form-card offers-filters" id="headerOfferSearchForm" role="search">
+        <div class="header-offer-search__head">
+          <div>
+            <span class="section-kicker">${escapeHtml(t("guest_search_kicker", "FIND A TABLE"))}</span>
+            <h2>${escapeHtml(t("guest_search_title", "Search discounted restaurant offers"))}</h2>
+          </div>
+          <button class="header-search-close" data-header-search-close type="button" aria-label="${escapeAttr(t("header_search_close", "Close search"))}">
+            <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"></path></svg>
+          </button>
+        </div>
+        <div class="guest-field-grid header-offer-search__fields">
+          <label class="guest-field header-offer-search__restaurant">${escapeHtml(t("filter_restaurant_name_label", "Restaurant name"))}<input id="headerOfferRestaurantName" name="restaurantName" value="${escapeAttr(filters.restaurantName)}" placeholder="${escapeAttr(t("restaurant_search_placeholder", "Restaurant name"))}" autocomplete="off"></label>
+          <label class="guest-field">${escapeHtml(t("filter_date_label", "Date"))}<input name="date" type="date" value="${escapeAttr(filters.date)}"></label>
+          <label class="guest-field">${escapeHtml(t("filter_time_label", "Time"))}<input name="time" type="time" value="${escapeAttr(filters.time)}"></label>
+          <label class="guest-field">${escapeHtml(t("filter_party_size_label", "Party size"))}<input name="partySize" type="number" min="1" value="${escapeAttr(filters.partySize)}" placeholder="2" inputmode="numeric"></label>
+          ${optionSelect("neighborhood", t("filter_neighborhood_label", "Neighborhood"), filters.neighborhood, neighborhoods, t("all_neighborhoods_label", "All neighborhoods"))}
+          ${optionSelect("cuisine", t("filter_cuisine_label", "Cuisine"), filters.cuisine, cuisines, t("all_cuisines_label", "All cuisines"))}
+          <label class="guest-select">
+            ${escapeHtml(t("filter_discount_label", "Minimum discount"))}
+            <select name="discount">
+              <option value="">${escapeHtml(t("any_discount_label", "Any discount"))}</option>
+              ${["10", "15", "20", "25", "30", "40", "50"].map((discount) => `<option value="${discount}" ${String(filters.discount) === discount ? "selected" : ""}>${discount}%+</option>`).join("")}
+            </select>
+          </label>
+        </div>
+        <div class="guest-button-row header-offer-search__actions">
+          <button class="guest-primary-action" type="submit">${escapeHtml(t("search_offers_button", "Search Offers"))}</button>
+          <button class="guest-secondary-action" data-header-search-clear type="button">${escapeHtml(t("clear_filters_button", "Clear"))}</button>
+        </div>
+      </form>
+    </div>
+  `;
+}
+
+function updateHeaderSearch() {
+  const root = document.querySelector(".topbar");
+  const button = document.querySelector("#headerSearchButton");
+  const panel = document.querySelector("#headerSearchPanel");
+  const searchLabel = t("header_search_label", "Search restaurants");
+  root?.classList.toggle("search-open", state.headerSearchOpen);
+  if (button) {
+    button.setAttribute("aria-expanded", state.headerSearchOpen ? "true" : "false");
+    button.setAttribute("aria-label", state.headerSearchOpen ? t("header_search_close", "Close search") : searchLabel);
+  }
+  if (!panel) return;
+  panel.hidden = !state.headerSearchOpen;
+  panel.setAttribute("aria-label", t("header_search_panel_label", "Restaurant search options"));
+  panel.innerHTML = headerSearchPanelMarkup();
+}
+
+function openHeaderSearch() {
+  state.headerSearchOpen = true;
+  closeCitySelector();
+  closeLanguageSelector();
+  updateHeaderSearch();
+  window.setTimeout(() => document.querySelector("#headerOfferRestaurantName")?.focus(), 0);
+}
+
+function closeHeaderSearch(options = {}) {
+  if (!state.headerSearchOpen) return;
+  state.headerSearchOpen = false;
+  updateHeaderSearch();
+  if (options.focusButton) document.querySelector("#headerSearchButton")?.focus();
+}
+
+async function runHeaderSearchAction(action = "search", query = "") {
+  let route = "/restaurants";
+  const cleanedQuery = String(query || "").trim();
+  if (action === "restaurants") {
+    state.filters.restaurantName = "";
+    state.headerSearchQuery = "";
+  } else if (action === "offers") {
+    route = "/offers";
+  } else if (action === "tonight") {
+    state.filters.date = new Date().toISOString().slice(0, 10);
+    state.filters.availableOnly = true;
+    state.filters.sort = "soonest";
+    route = "/offers";
+  } else if (action === "discounts") {
+    state.filters.availableOnly = true;
+    state.filters.sort = "highest_discount";
+    route = "/offers";
+  } else if (action === "newest") {
+    state.filters.sort = "newest";
+  } else if (action === "food-feed") {
+    route = "/food-feed";
+  } else {
+    state.filters.restaurantName = cleanedQuery;
+    state.headerSearchQuery = cleanedQuery;
+    if (cleanedQuery) route = `/restaurants?search=${encodeURIComponent(cleanedQuery)}`;
+  }
+  closeHeaderSearch();
+  history.pushState(null, "", route);
+  state.mode = "guest";
+  await renderCurrentMode();
+}
+
+function updateCitySelector() {
+  const root = document.querySelector("[data-city-selector]");
+  if (!root) return;
+  const button = root.querySelector("#citySelectorButton");
+  const menu = root.querySelector("#citySelectorMenu");
+  const current = root.querySelector("[data-city-selector-current]");
+  const selectorLabel = t("city_selector_label", "City");
+  const menuLabel = t("city_selector_menu_label", "Choose city");
+  const activeCity = HEADER_CITY_OPTIONS.find((city) => city.active) || HEADER_CITY_OPTIONS[0];
+  const activeCityLabel = t(activeCity.labelKey, activeCity.fallback);
+
+  root.classList.toggle("open", state.citySelectorOpen);
+  if (current) current.textContent = activeCityLabel;
+  if (button) {
+    button.setAttribute("aria-expanded", state.citySelectorOpen ? "true" : "false");
+    button.setAttribute("aria-label", `${selectorLabel}: ${activeCityLabel}`);
+  }
+  if (!menu) return;
+  menu.hidden = !state.citySelectorOpen;
+  menu.setAttribute("aria-label", menuLabel);
+  menu.innerHTML = HEADER_CITY_OPTIONS.map((city) => {
+    const cityLabel = t(city.labelKey, city.fallback);
+    const statusLabel = city.active
+      ? t("city_available_now", "Available now")
+      : t("city_coming_soon", "Coming soon");
+    return `
+      <button
+        class="city-selector__option ${city.active ? "active" : "upcoming"}"
+        type="button"
+        role="option"
+        data-city-option="${escapeAttr(city.code)}"
+        aria-selected="${city.active ? "true" : "false"}"
+        ${city.active ? "" : "disabled aria-disabled=\"true\""}
+      >
+        <span class="city-selector__option-copy">
+          <strong>${escapeHtml(cityLabel)}</strong>
+          <small>${escapeHtml(statusLabel)}</small>
+        </span>
+        <span class="city-selector__check" aria-hidden="true">${city.active ? "\u2713" : ""}</span>
+      </button>
+    `;
+  }).join("");
+}
+
+function openCitySelector(options = {}) {
+  state.citySelectorOpen = true;
+  closeHeaderSearch();
+  closeLanguageSelector();
+  updateCitySelector();
+  if (options.focusCurrent) cityOptionButtons()[0]?.focus();
+}
+
+function closeCitySelector(options = {}) {
+  if (!state.citySelectorOpen) return;
+  state.citySelectorOpen = false;
+  updateCitySelector();
+  if (options.focusButton) document.querySelector("#citySelectorButton")?.focus();
+}
+
+function openLanguageSelector(options = {}) {
+  state.languageSelectorOpen = true;
+  closeHeaderSearch();
+  closeCitySelector();
+  updateLanguageSelector();
+  if (options.focusCurrent) focusLanguageOption(state.lang);
+  if (options.focusLast) {
+    const optionsList = languageOptionButtons();
+    optionsList[optionsList.length - 1]?.focus();
+  }
+}
+
+function closeLanguageSelector(options = {}) {
+  if (!state.languageSelectorOpen) return;
+  state.languageSelectorOpen = false;
+  updateLanguageSelector();
+  if (options.focusButton) document.querySelector("#languageSelectorButton")?.focus();
+}
+
+async function selectLanguageFromSelector(lang) {
+  closeLanguageSelector();
+  await setLanguage(lang);
+  document.querySelector("#languageSelectorButton")?.focus();
+}
+
 function updateSessionButton() {
   if (!sessionButton) return;
   const session = currentSession();
+  updateAdminDashboardNav(session);
   if (!session) {
     sessionButton.textContent = t("login_button", "Login");
     sessionButton.setAttribute("aria-expanded", "false");
@@ -979,10 +1840,22 @@ function updateSessionButton() {
   renderAccountMenu(state.showAccountMenu && isGuestSession());
 }
 
+function updateShellRouteClass() {
+  const path = window.location.pathname || "/";
+  const dashboardRoute = path === "/partner" || path.startsWith("/partner/")
+    || path === "/admin" || path.startsWith("/admin/")
+    || path === "/superadmin" || path.startsWith("/superadmin/");
+  document.body.classList.toggle("dashboard-route", dashboardRoute);
+  document.body.classList.toggle("food-feed-route", path === "/food-feed");
+}
+
 function clearGuestPrivateState() {
   state.guestAccount = null;
   state.guestReservations = [];
   state.guestFavorites = [];
+  state.guestFoodFeedFavorites = [];
+  state.foodFeed.favoritesLoaded = false;
+  state.foodFeed.favoriteOwnerId = "";
   state.guestNotifications = [];
   state.guestPrivacy = null;
   state.guestSecurity.message = "";
@@ -1027,56 +1900,64 @@ function renderAccountMenu(open = state.showAccountMenu && isGuestSession()) {
   });
 }
 
-async function signOut() {
-  trackGuestAccountEvent("logout", { session_scope: "current" }, { keepalive: true });
-  if (state.session?.access_token) {
+async function signOut(options = {}) {
+  const redirectTo = options.redirectTo || "/";
+  const scope = options.scope || "current";
+  trackGuestAccountEvent("logout", { session_scope: scope }, { keepalive: true });
+  if (!options.skipServer && state.session?.access_token) {
     await api("/auth/logout", {
       method: "POST",
-      body: JSON.stringify({ scope: "current" })
+      body: JSON.stringify({ scope })
     }).catch(() => null);
   }
   saveSession(null);
   clearGuestPrivateState();
-  history.pushState(null, "", "/");
+  history.pushState(null, "", redirectTo);
   state.mode = "guest";
   await renderCurrentMode();
-  showToast(t("logged_out_toast", "Logged out."));
+  showToast(options.toast || t("logged_out_toast", "Logged out."));
 }
 
 function updateChromeText() {
   document.documentElement.lang = state.lang;
   const skipLink = document.querySelector(".skip-link");
   if (skipLink) skipLink.textContent = t("skip_to_content", "Skip to main content");
-  document.querySelector(".brand")?.setAttribute("aria-label", t("brand_home_label", "Smarttable.com home"));
+  document.querySelector(".brand")?.setAttribute("aria-label", t("brand_home_label", "SmartTable home"));
   document.querySelector(".top-actions")?.setAttribute("aria-label", t("primary_navigation_label", "Primary navigation"));
-  document.querySelector(".language-switcher")?.setAttribute("aria-label", t("language_switcher_label", "Language switcher"));
-  Object.entries(supportedLanguages).forEach(([lang, config]) => {
-    const button = document.querySelector(`[data-lang="${lang}"]`);
-    if (!button) return;
-    button.textContent = config.label;
-    button.classList.toggle("active", state.lang === lang);
-    button.setAttribute("aria-pressed", state.lang === lang ? "true" : "false");
-  });
+  updateHeaderSearch();
+  updateCitySelector();
+  updateLanguageSelector();
   document.querySelector(".brand strong").textContent = isBasicMode() ? t("basic_brand_title", "SmartTable") : t("brand_title", "SmartTable AI");
   document.querySelector(".brand small").textContent = isBasicMode() ? t("basic_brand_subtitle", "Discounted restaurant reservations") : t("brand_subtitle", "The AI Revenue Operating System for Restaurants");
   document.querySelector("#guestNav").textContent = t("nav_offers", "Offers");
+  document.querySelector("#restaurantsNav").textContent = t("nav_restaurants", "Restaurants");
+  document.querySelector("#foodFeedNav").textContent = t("nav_food_feed", "What to Eat");
   if (signupNav) {
     signupNav.textContent = t("signup_nav_button", "Sign Up");
     signupNav.hidden = Boolean(state.session);
   }
   const aiNav = document.querySelector("#aiConciergeNav");
   if (aiNav) {
-    aiNav.hidden = !canShowFeature("ai.concierge", { allowDemo: true });
+    aiNav.hidden = !canShowFeature("ai.concierge", { audience: "guest", public: true });
     aiNav.textContent = t("ai_concierge_nav_label", "AI Concierge");
   }
-  document.querySelector("#adminNav").textContent = t("nav_admin", "Super Admin");
-  document.querySelector("#restaurantNav").textContent = t("nav_partner", "Partner");
+  const adminNav = document.querySelector("#adminNav");
+  if (adminNav) {
+    adminNav.textContent = t("nav_admin", "Super Admin");
+    adminNav.hidden = !isAdminRole(state.session?.profile?.role);
+  }
+  const restaurantNav = document.querySelector("#restaurantNav");
+  if (restaurantNav) {
+    restaurantNav.textContent = t("nav_partner", "Partner");
+    restaurantNav.hidden = normalizeRole(state.session?.profile?.role) !== "partner";
+  }
+  updateAdminDashboardNav();
   updateSessionButton();
 }
 
 function publicRouteMeta() {
   const path = window.location.pathname.replace(/\/+$/, "") || "/";
-  const noindexPrefixes = ["/admin", "/partner", "/restaurant", "/account", "/login", "/forgot-password", "/reset-password", "/guest/rewards/photo-upload"];
+  const noindexPrefixes = ["/admin", "/superadmin", "/partner", "/restaurant", "/account", "/login", "/signup/check-email", "/signup/welcome", "/forgot-password", "/reset-password", "/verify-email", "/auth/callback", "/post-visit/action", "/review/verified", "/ai", "/ai-concierge", "/ai-preferences", "/partner-ai-demand", "/admin-ai-controls", "/guest/rewards/photo-upload"];
   const noindex = noindexPrefixes.some((prefix) => path === prefix || path.startsWith(`${prefix}/`));
   if (path === "/restaurants") {
     return {
@@ -1094,6 +1975,14 @@ function publicRouteMeta() {
       noindex
     };
   }
+  if (path === "/food-feed") {
+    return {
+      title: t("food_feed_seo_title", "What to Eat | Discover nearby dishes on SmartTable"),
+      description: t("food_feed_seo_description", "Swipe through short food videos, discover nearby restaurants, and book a table on SmartTable."),
+      canonicalPath: "/food-feed",
+      noindex
+    };
+  }
   if (path.startsWith("/restaurants/")) {
     const restaurant = findPublicRestaurantBySlug(decodeURIComponent(path.slice("/restaurants/".length)));
     const name = restaurant?.name || restaurant?.restaurant_name || t("restaurant_label", "Restaurant");
@@ -1108,16 +1997,24 @@ function publicRouteMeta() {
   if (path === "/signup") {
     return {
       title: t("signup_seo_title", "Create a SmartTable guest account"),
-      description: t("signup_seo_description", "Create your SmartTable guest profile and save restaurant, cuisine, budget, notification, and reservation preferences."),
+      description: t("signup_seo_description", "Create your SmartTable guest account quickly and personalize your restaurant preferences later."),
       canonicalPath: "/signup",
       noindex: false
     };
   }
-  if (path === "/terms" || path === "/privacy" || path === "/contact" || path === "/help") {
+  if (path === "/signup/welcome") {
+    return {
+      title: t("signup_welcome_confirmed_title", "Email confirmed"),
+      description: t("signup_welcome_confirmed_body", "Your SmartTable account is ready."),
+      canonicalPath: "/signup/welcome",
+      noindex: true
+    };
+  }
+  if (publicInfoRouteConfig[path]) {
     const config = publicInfoRouteConfig[path] || {};
     return {
       title: t(config.titleKey || "basic_seo_title", config.fallbackTitle || "SmartTable"),
-      description: t(config.bodyKey || "basic_seo_meta_description", config.fallbackBody || "SmartTable public information."),
+      description: publicInfoSummary(config) || t("basic_seo_meta_description", "SmartTable public information."),
       canonicalPath: path,
       noindex: false
     };
@@ -1134,11 +2031,33 @@ function publicRouteMeta() {
   };
 }
 
+function publicBaseUrl() {
+  const configured = String(state.config?.public_base_url || "").replace(/\/+$/, "");
+  if (configured) return configured;
+  const origin = String(window.location?.origin || "").replace(/\/+$/, "");
+  if (origin && !/^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(?::|$)/i.test(origin)) return origin;
+  return "https://www.smarttablenyc.com";
+}
+
+function isLocalBrowserRuntime() {
+  const hostname = String(window.location?.hostname || "").toLowerCase();
+  return ["localhost", "127.0.0.1", "::1"].includes(hostname) || hostname.endsWith(".localhost");
+}
+
+function isProductionApiRuntime() {
+  const runtime = String(state.config?.runtime_mode || state.config?.environment || "").toLowerCase();
+  return Boolean(state.config?.production_runtime) || runtime === "production";
+}
+
+function canShowDemoCredentials() {
+  return state.apiMode === "demo" && isLocalBrowserRuntime() && !isProductionApiRuntime();
+}
+
 function updateMeta() {
   const meta = publicRouteMeta();
   const title = meta.title;
   const description = meta.description;
-  const canonical = `https://smarttable.com${meta.canonicalPath === "/" ? "/" : meta.canonicalPath}`;
+  const canonical = `${publicBaseUrl()}${meta.canonicalPath === "/" ? "/" : meta.canonicalPath}`;
   document.title = title;
   document.querySelector('meta[name="description"]')?.setAttribute("content", description);
   document.querySelector('meta[name="robots"]')?.setAttribute("content", meta.noindex ? "noindex, nofollow" : "index, follow");
@@ -1209,10 +2128,20 @@ function contentTemplate(key, fallback, values = {}) {
   return t(key, fallback).replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (_, name) => values[name] ?? "");
 }
 
+function parseDisplayDate(value, dateOnly = false) {
+  if (!value) return null;
+  const raw = String(value);
+  const date = dateOnly && /^\d{4}-\d{2}-\d{2}$/.test(raw)
+    ? new Date(`${raw}T00:00:00`)
+    : new Date(raw);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
 function formatDate(date, startTime, endTime) {
   const language = supportedLanguages[state.lang] || supportedLanguages.en;
-  const dateLabel = date
-    ? new Intl.DateTimeFormat(language.locale, { month: "short", day: "numeric", year: "numeric" }).format(new Date(`${date}T00:00:00`))
+  const parsedDate = parseDisplayDate(date, true);
+  const dateLabel = parsedDate
+    ? new Intl.DateTimeFormat(language.locale, { month: "short", day: "numeric", year: "numeric" }).format(parsedDate)
     : t("flexible_date_label", "Flexible date");
   const atLabel = t("time_at_label", "at");
   return `${dateLabel} ${atLabel} ${startTime || t("time_tbd_label", "TBD")}${endTime ? `-${endTime}` : ""}`;
@@ -1223,8 +2152,37 @@ function discountLabel(offer) {
   return `${offer.discount_value} off`;
 }
 
-function statCard(label, value) {
-  return `<article class="stat-card"><span>${escapeHtml(uiText(label))}</span><strong>${escapeHtml(uiText(value ?? 0))}</strong></article>`;
+function statCard(label, value, description = "", options = {}) {
+  const labelText = uiText(label);
+  const valueText = value === null || value === undefined || value === "" ? "—" : uiText(value);
+  const descriptionText = description ? uiText(description) : "";
+  const classes = ["stat-card", options.className].filter(Boolean).join(" ");
+  const keyAttr = options.key ? ` data-kpi-key="${escapeAttr(options.key)}"` : "";
+  const accessibleName = [labelText, valueText, descriptionText].filter(Boolean).join(", ");
+  return `<article class="${escapeAttr(classes)}" data-kpi-card${keyAttr} aria-label="${escapeAttr(accessibleName)}">
+    <span class="stat-card__label">${escapeHtml(labelText)}</span>
+    <strong class="stat-card__value">${escapeHtml(valueText)}</strong>
+    ${descriptionText ? `<p class="stat-card__description">${escapeHtml(descriptionText)}</p>` : ""}
+  </article>`;
+}
+
+function visibleTranslation(key, fallback = "") {
+  for (const value of [state.content[key], state.translations[key], state.fallbackTranslations[key]]) {
+    if (value === undefined || value === null) continue;
+    if (typeof value === "string" && !value.trim()) continue;
+    if (state.lang !== "en" && fallback && value === fallback) continue;
+    return value;
+  }
+  return translateLiteral(fallback);
+}
+
+function kpiStatCard(labelKey, labelFallback, value, descriptionKey, descriptionFallback, options = {}) {
+  return statCard(
+    visibleTranslation(labelKey, labelFallback),
+    value,
+    visibleTranslation(descriptionKey, descriptionFallback),
+    options
+  );
 }
 
 function asArray(value) {
@@ -1241,14 +2199,20 @@ function defaultSignupData() {
     password: "",
     confirm_password: "",
     phone: "",
+    country: "US",
     city: "",
+    city_select: "",
+    other_city: "",
     region: "",
     postal_code: "",
-    preferred_neighborhoods: [],
+    preferred_neighborhoods: [noNeighborhoodPreference],
+    travel_distance_value: "",
+    travel_distance_unit: "miles",
     travel_distance_miles: "",
     transportation_method: "",
     transportation_methods: [],
     cuisines: [],
+    custom_cuisine: "",
     food_categories: [],
     dietary_needs: [],
     allergy_notes: "",
@@ -1271,6 +2235,8 @@ function defaultSignupData() {
     notification_channels: [],
     notification_preferences: [],
     notification_frequency: "",
+    sms_country_code: "+1",
+    sms_phone_number: "",
     event_recommendations_interest: "",
     future_calendar_interest: "",
     transactional_email_consent: false,
@@ -1278,7 +2244,8 @@ function defaultSignupData() {
     marketing_consent: false,
     allergy_acknowledgement: false,
     privacy_consent: false,
-    terms_consent: false
+    terms_consent: false,
+    legal_consent: false
   };
 }
 
@@ -1301,9 +2268,69 @@ function ensureSignupState() {
   return state.signup;
 }
 
+function authCallbackParams() {
+  const params = new URLSearchParams(window.location.search || "");
+  const hash = String(window.location.hash || "").replace(/^#/, "");
+  if (hash && hash.includes("=")) {
+    const hashParams = new URLSearchParams(hash);
+    hashParams.forEach((value, key) => {
+      if (!params.has(key)) params.set(key, value);
+    });
+  }
+  return params;
+}
+
+function hasAuthCallbackParams() {
+  const params = authCallbackParams();
+  return [
+    "code",
+    "access_token",
+    "refresh_token",
+    "error",
+    "error_code",
+    "error_description",
+    "token",
+    "token_hash",
+    "type"
+  ].some((key) => params.has(key));
+}
+
+function authCallbackCooldownSeconds() {
+  const until = Number(state.guestAuthCallback?.resendCooldownUntil || 0);
+  return Math.max(0, Math.ceil((until - Date.now()) / 1000));
+}
+
+function setAuthCallbackCooldown(seconds = 0) {
+  const value = Math.max(0, Number(seconds) || 0);
+  state.guestAuthCallback.resendCooldownUntil = value ? Date.now() + (value * 1000) : 0;
+}
+
+function authCallbackCooldownLabel(seconds = 0) {
+  return t("auth_callback_resend_cooldown", "You can request another confirmation email in {{seconds}} seconds.").replace("{{seconds}}", String(Math.max(1, Number(seconds) || 1)));
+}
+
+function scheduleAuthCallbackCooldownRefresh(seconds = 0) {
+  if (authCallbackCooldownTimer) {
+    window.clearTimeout(authCallbackCooldownTimer);
+    authCallbackCooldownTimer = null;
+  }
+  if (seconds > 0) {
+    authCallbackCooldownTimer = window.setTimeout(() => {
+      authCallbackCooldownTimer = null;
+      if (currentGuestAccountRoute() === "auth-callback") renderAuthCallback();
+    }, 1000);
+  }
+}
+
 function currentGuestAccountRoute() {
   const path = window.location.pathname.replace(/\/+$/, "") || "/";
   const hash = window.location.hash;
+  if (path === "/auth/callback" || (path === "/" && hasAuthCallbackParams())) return "auth-callback";
+  if (path === "/post-visit/action") return "post-visit-action";
+  if (path === "/review/verified") return "verified-review";
+  if (path === "/partner/invite") return "partner-invite";
+  if (path === "/signup/check-email") return "signup-check-email";
+  if (path === "/signup/welcome") return "signup-welcome";
   if (path === "/signup" || hash === "#guest-signup") return "signup";
   if (path === "/login" || hash === "#guest-login") return "login";
   if (path === "/forgot-password" || hash === "#forgot-password") return "forgot-password";
@@ -1317,24 +2344,22 @@ const guestAccountRouteTabs = {
   "/account": "overview",
   "/account/reservations": "reservations",
   "/account/favorites": "favorites",
-  "/account/profile": "profile",
+  "/account/profile": "account",
   "/account/preferences": "preferences",
   "/account/notifications": "notifications",
-  "/account/reviews": "reviews",
-  "/account/security": "security",
-  "/account/privacy": "security"
+  "/account/reviews": "reservations",
+  "/account/security": "account",
+  "/account/privacy": "account"
 };
 
 const guestAccountTabRoutes = {
   overview: "/account",
   reservations: "/account/reservations",
   favorites: "/account/favorites",
-  profile: "/account/profile",
   preferences: "/account/preferences",
   notifications: "/account/notifications",
-  reviews: "/account/reviews",
-  security: "/account/security",
-  privacy: "/account/security"
+  account: "/account/privacy",
+  privacy: "/account/privacy"
 };
 
 function applyGuestAccountRouteTab() {
@@ -1347,30 +2372,136 @@ function routeForGuestAccountTab(tab) {
   return guestAccountTabRoutes[tab] || "/account";
 }
 
+const LEGAL_LAST_UPDATED = "2026-08-13T00:00:00.000Z";
+
 const publicInfoRouteConfig = {
   "/terms": {
     titleKey: "terms_page_title",
     fallbackTitle: "Terms and Conditions",
-    bodyKey: "terms_page_body",
-    fallbackBody: "Use SmartTable responsibly. Restaurant reservations are requests until the restaurant confirms them."
+    summaryKey: "terms_page_body",
+    fallbackSummary: "Use SmartTable responsibly. Restaurant reservations are requests until the restaurant confirms them.",
+    sections: [
+      ["SmartTable's role", "SmartTable is an online restaurant reservation marketplace. We help guests discover restaurant availability, discounted table offers, standard reservation options, and verified guest reviews. SmartTable is not the restaurant, food provider, employer of restaurant staff, or payment processor for in-restaurant purchases."],
+      ["Accounts and eligibility", "Guests and restaurant partners must provide accurate account information and keep login credentials secure. You may not use another person's account, submit false information, interfere with the service, scrape the platform, or attempt to bypass role-based access controls."],
+      ["Reservations", "A reservation request is not final until the restaurant accepts it or the service clearly marks it as confirmed. Restaurants remain responsible for seating, service, menu availability, accessibility accommodations, special requests, and honoring any offer terms that they publish or approve."],
+      ["Discounted offers and standard bookings", "Discounts apply only to the offer terms shown at the time of booking, including date, time, party size, availability, excluded items, and any restaurant-specific conditions. SmartTable may also support standard reservations without a discount where the restaurant has enabled that option."],
+      ["Cancellations, lateness, and no-shows", "Guests should cancel as early as possible when they cannot attend. Restaurants may mark a guest as late, arrived, completed, cancelled, declined, or no-show according to the reservation workflow. Repeated abuse, false bookings, or disruptive conduct may result in account restrictions."],
+      ["Reviews and photos", "Verified reviews are intended to reflect genuine SmartTable visits. Reviews, ratings, and photos must be honest, lawful, and based on the guest's own experience. We may moderate, reject, remove, or restrict content that is fraudulent, unsafe, private, discriminatory, obscene, irrelevant, or otherwise violates the review policy."],
+      ["Messages and notifications", "SmartTable may send transactional messages needed for account, reservation, partner invitation, review, security, and service operation. Optional marketing communications require the consent settings available in the account where applicable."],
+      ["Partner subscriptions", "Restaurant partner subscription and billing terms are governed by the partner terms, the active plan shown to the restaurant, and the Stripe checkout or billing portal flow once enabled. A checkout redirect alone does not create platform access unless the subscription status is verified by the server."],
+      ["Availability and changes", "We may update, pause, restrict, or discontinue parts of the service for maintenance, security, legal compliance, or business reasons. We try to keep public information accurate, but restaurant data may change and should be verified by the restaurant for operational accuracy."],
+      ["Contact", "For account, reservation, privacy, accessibility, or legal questions, contact SmartTable support at support@smarttablenyc.com. For urgent day-of-visit issues, contact the restaurant directly when restaurant contact details are provided."]
+    ]
   },
   "/privacy": {
     titleKey: "privacy_page_title",
     fallbackTitle: "Privacy Policy",
-    bodyKey: "privacy_page_body",
-    fallbackBody: "SmartTable protects guest profile, preference, reservation, and consent data. Restaurants only receive operational booking details needed to serve a reservation."
+    summaryKey: "privacy_page_body",
+    fallbackSummary: "SmartTable protects guest profile, preference, reservation, and consent data. Restaurants only receive operational booking details needed to serve a reservation. SmartTable uses privacy-conscious aggregate website analytics to understand public page usage, referrers, countries, devices, operating systems, browsers, and reliability trends. Admin, partner, account, API, authentication callback, password reset, signed review, private reservation, QA, and diagnostic routes are excluded from SmartTable visitor analytics, and URLs with sensitive query parameters are not transmitted. SmartTable does not intentionally send passwords, tokens, guest emails, phone numbers, reservation references, or private booking data to visitor analytics. Contact SmartTable support with privacy questions.",
+    sections: [
+      ["Information we collect", "We collect information needed to run SmartTable, such as account name, email address, optional phone number, password handled by Supabase Auth, guest preferences, restaurant profile information, partner assignments, reservation requests, reservation status history, notifications, reviews, ratings, uploaded review photos, support messages, and consent records."],
+      ["How we use information", "We use information to create accounts, authenticate users, process reservation requests, send transactional messages, support partner operations, display public restaurant content, publish moderated verified reviews, protect the service, maintain audit records, comply with law, and improve reliability."],
+      ["What restaurants can see", "Restaurants receive the operational reservation details needed to serve a booking, such as guest name, party size, date, time, status, and relevant notes submitted for the reservation. Private preference profiles, passwords, tokens, internal security records, and unrelated guest account data are not shown to restaurants."],
+      ["Service providers", "SmartTable uses trusted service providers to operate the platform, including Supabase for database and authentication, Vercel for hosting and application delivery, Resend for transactional email where configured, Stripe for billing where configured, and Twilio or another provider for SMS only when enabled. Providers receive only the information needed for their service."],
+      ["Analytics", "SmartTable may use privacy-conscious aggregate visitor analytics on public pages. Admin, partner, account, API, authentication callback, password reset, signed review, private reservation, QA, and diagnostic routes are excluded. URLs containing sensitive query parameters are not intentionally transmitted."],
+      ["Reviews and photos", "Published reviews may show a shortened public display name, ratings, written review text, visit duration category where provided, and moderated photos. Public review displays do not include guest email, phone number, reservation reference, authentication ID, exact arrival or departure timestamps, or internal moderation notes."],
+      ["Retention and deletion", "We keep information for as long as needed to operate the service, maintain security, preserve audit integrity, comply with legal obligations, resolve disputes, and support restaurant operations. Guests may request access, export, correction, or deletion through account privacy tools or by contacting support."],
+      ["Security", "We use authentication, role-based access controls, server-side authorization, row-level security expectations, encrypted transport, and operational safeguards. No internet service can be guaranteed perfectly secure, so users should protect their account credentials and report suspicious activity."],
+      ["Contact", "For privacy requests or questions, contact support@smarttablenyc.com."]
+    ]
+  },
+  "/cookies": {
+    titleKey: "cookie_page_title",
+    fallbackTitle: "Cookie Policy",
+    summaryKey: "cookie_page_body",
+    fallbackSummary: "SmartTable uses essential cookies and local storage for secure sessions, language preference, accessibility settings, and reservation workflows. Optional marketing technologies require separate consent.",
+    sections: [
+      ["Essential storage", "SmartTable uses cookies, localStorage, sessionStorage, and browser storage where needed for secure login sessions, language preference, route state, anti-abuse protections, and reservation workflows."],
+      ["Analytics", "SmartTable may use privacy-conscious aggregate analytics on public pages only. Sensitive and authenticated routes are excluded from visitor analytics."],
+      ["Marketing technologies", "SmartTable does not require marketing cookies for basic use. Optional marketing or retargeting technologies should be enabled only after appropriate consent and policy updates."],
+      ["Your choices", "You can control browser cookies and storage through your browser settings. Disabling essential storage may prevent login, reservation, language, and account features from working correctly."]
+    ]
+  },
+  "/reservation-policy": {
+    titleKey: "reservation_policy_page_title",
+    fallbackTitle: "Reservation and Cancellation Policy",
+    summaryKey: "reservation_policy_page_body",
+    fallbackSummary: "SmartTable reservation requests are handled between guests and restaurants, with clear rules for confirmation, cancellation, lateness, no-shows, discounts, and standard bookings.",
+    sections: [
+      ["Reservation requests", "Submitting a request does not guarantee a table until the restaurant accepts it or SmartTable clearly shows the reservation as confirmed. Guests should check their account and email for reservation status updates."],
+      ["Restaurant confirmation", "Restaurants are responsible for accepting, declining, managing, and honoring reservations according to their real capacity, hours, table settings, service periods, and published offer terms."],
+      ["Guest cancellation", "Guests should cancel through SmartTable as soon as they know they cannot attend. Late cancellations may be visible to the restaurant and may affect future platform access if the account repeatedly abuses the system."],
+      ["Lateness and no-show", "Restaurants may mark guests as arrived, no-show, or completed according to what happens during the visit. A guest who cannot attend should cancel instead of leaving the reservation unanswered."],
+      ["Discount terms", "Discounts apply only to the specific offer shown at booking and may depend on date, time, party size, remaining availability, menu exclusions, tax, tip, beverages, or other restaurant conditions shown in the offer."],
+      ["Standard reservations", "Where a restaurant supports standard reservations, no discount is promised unless an active discounted offer is selected and confirmed."],
+      ["Problems during a visit", "For urgent day-of-visit seating or service issues, contact the restaurant directly. For platform support, account questions, or unresolved complaints, contact SmartTable support at support@smarttablenyc.com."]
+    ]
+  },
+  "/review-policy": {
+    titleKey: "review_policy_page_title",
+    fallbackTitle: "Verified Reviews and Photo Policy",
+    summaryKey: "review_policy_page_body",
+    fallbackSummary: "SmartTable reviews are tied to eligible completed reservations and may include ratings, written feedback, and moderated guest photos.",
+    sections: [
+      ["Verified review eligibility", "Guests may submit a verified SmartTable review only for their own eligible completed reservation where attendance or completion was confirmed and no prior review exists for that reservation."],
+      ["Honest reviews only", "Reviews must reflect the guest's genuine experience. Fake reviews, paid sentiment, reviews from people who did not attend, impersonation, review manipulation, and undisclosed conflicts are not allowed."],
+      ["Moderation", "SmartTable may moderate, publish, reject, remove, restore, or restrict reviews and photos to protect guests, restaurants, privacy, safety, and platform integrity. Moderation should not suppress reviews merely because they are negative."],
+      ["Prohibited content", "Do not post private information, threats, hate speech, harassment, sexually explicit content, irrelevant material, spam, malware, intellectual-property violations, or photos of people without appropriate permission."],
+      ["Photo uploads", "Uploaded review photos must be connected to the guest's verified reservation. Approved photos may appear below the review they belong to and may also appear in a restaurant-level guest photo area if that feature is enabled."],
+      ["License to display", "By submitting a review or photo, the guest gives SmartTable permission to host, resize, moderate, display, and distribute that content within SmartTable services in connection with restaurants, reviews, and platform promotion, subject to privacy and moderation rules."],
+      ["Complaints and removal requests", "To report a review or photo, contact support@smarttablenyc.com with the restaurant name, approximate date, and reason. Do not send passwords, tokens, or sensitive private documents by email."]
+    ]
+  },
+  "/partner-terms": {
+    titleKey: "partner_terms_page_title",
+    fallbackTitle: "Restaurant Partner Terms",
+    summaryKey: "partner_terms_page_body",
+    fallbackSummary: "Restaurant partners are responsible for accurate restaurant information, availability, offers, reservations, staff access, and lawful use of SmartTable.",
+    sections: [
+      ["Restaurant information", "Partners must keep restaurant name, address, contact details, cuisine, images, hours, capacity, availability, reservation settings, and public offer details accurate and lawful."],
+      ["Partner access", "Only authorized restaurant staff may use partner access. Owners and managers are responsible for inviting staff, assigning appropriate roles, removing users who should no longer have access, and protecting account credentials."],
+      ["Offers and reservations", "Partners are responsible for honoring confirmed reservations and published offer terms. Partners should not publish misleading availability, fake discounts, or offers they do not intend to honor."],
+      ["Guest data", "Partner users may use guest reservation information only to serve and manage SmartTable bookings. Partners may not export, sell, misuse, or contact guests for unrelated marketing unless a lawful consent and SmartTable-supported workflow exists."],
+      ["Reviews", "Partners may view verified reviews according to platform rules but may not edit guest ratings, rewrite guest review text, remove guest photos, or suppress negative reviews outside the moderation process."],
+      ["Billing", "Where paid partner subscriptions are enabled, fees, renewals, cancellation, payment failures, access restrictions, and billing portal actions are controlled by the active SmartTable plan and Stripe billing workflow."],
+      ["Compliance and suspension", "SmartTable may suspend, restrict, archive, or remove restaurant access for safety, fraud, nonpayment, legal risk, inaccurate data, abuse, or violation of these terms."],
+      ["Support", "For partner support, contact support@smarttablenyc.com."]
+    ]
+  },
+  "/accessibility": {
+    titleKey: "accessibility_page_title",
+    fallbackTitle: "Accessibility Statement",
+    summaryKey: "accessibility_page_body",
+    fallbackSummary: "SmartTable aims to make its public marketplace, guest account, and restaurant partner workflows usable across devices and assistive technologies.",
+    sections: [
+      ["Our commitment", "SmartTable aims to provide a usable experience for guests, restaurant partners, and administrators across desktop, tablet, and mobile devices, including people who use keyboard navigation, screen readers, zoom, or other assistive technologies."],
+      ["Practical standards", "We use accessible labels, focus states, semantic controls, responsive layouts, readable contrast, and form validation patterns. We treat accessibility as an ongoing operational requirement rather than a one-time checklist."],
+      ["Known limitations", "Some restaurant-provided content, uploaded images, third-party email clients, browser extensions, maps, or device-specific behaviors may not be fully controlled by SmartTable. We continue to improve these areas as the platform grows."],
+      ["Feedback", "If you have trouble using SmartTable or need accessibility assistance, contact support@smarttablenyc.com with the page, device, browser, and a short description of the issue."]
+    ]
   },
   "/contact": {
     titleKey: "contact_page_title",
     fallbackTitle: "Contact SmartTable",
-    bodyKey: "contact_page_body",
-    fallbackBody: "For help with a reservation, contact the restaurant directly when your visit is soon. For SmartTable support, use the contact details configured by the platform admin."
+    summaryKey: "contact_page_body",
+    fallbackSummary: "For help with a reservation, contact the restaurant directly when your visit is soon. For SmartTable support, use the contact details configured by the platform admin.",
+    sections: [
+      ["Guest reservation help", "For urgent seating, delay, arrival, or day-of-visit issues, contact the restaurant directly when contact details are available. For SmartTable account or reservation workflow help, contact support@smarttablenyc.com."],
+      ["Restaurant partner support", "For partner invitations, restaurant profile access, reservation management, billing readiness, or staff role questions, contact support@smarttablenyc.com."],
+      ["Privacy, legal, accessibility, and review complaints", "Send privacy requests, legal notices, accessibility feedback, review complaints, or photo removal requests to support@smarttablenyc.com. Include enough context to identify the restaurant or review without sending passwords, tokens, or sensitive documents."]
+    ]
   },
   "/help": {
     titleKey: "help_page_title",
     fallbackTitle: "Help",
-    bodyKey: "help_page_body",
-    fallbackBody: "Browse restaurants, choose an active offer, and submit a reservation request. The restaurant confirms or declines the request."
+    summaryKey: "help_page_body",
+    fallbackSummary: "Browse restaurants, choose an active offer, and submit a reservation request. The restaurant confirms or declines the request.",
+    sections: [
+      ["How SmartTable works", "Guests browse restaurants, choose a discounted offer or standard reservation option where available, and submit a reservation request. The restaurant confirms or declines the request."],
+      ["After booking", "Guests can view reservation status in their account. Restaurants manage pending, accepted, declined, cancelled, arrived, completed, and no-show states from the partner dashboard."],
+      ["Reviews", "After an eligible completed SmartTable visit, the guest may receive a verified review invitation. Reviews can include food, service, and atmosphere ratings, optional written feedback, visit duration, and moderated photos."],
+      ["Need help?", "Contact support@smarttablenyc.com for platform support."]
+    ]
   }
 };
 
@@ -1393,6 +2524,7 @@ function currentPublicGuestRoute() {
   if (path === "/" || path === "") return { kind: "home" };
   if (path === "/guest/rewards/photo-upload") return { kind: "rewards" };
   if (path === "/restaurants") return { kind: "restaurants", target: "#guest-restaurants" };
+  if (path === "/food-feed") return { kind: "food-feed" };
   if (path.startsWith("/restaurants/")) return { kind: "restaurant-detail", slug: decodeURIComponent(path.slice("/restaurants/".length)) };
   if (path === "/offers") return { kind: "offers", target: "#guest-offers" };
   if (publicInfoRouteConfig[path]) return { kind: "info", path, ...publicInfoRouteConfig[path] };
@@ -1403,6 +2535,7 @@ function findPublicRestaurantBySlug(slug) {
   const target = slugify(slug);
   const candidates = [
     ...groupRestaurants(),
+    ...state.publicRestaurants.map(normalizeNewestRestaurant),
     ...state.newestRestaurants.map(normalizeNewestRestaurant)
   ];
   return candidates.find((restaurant) => restaurantRouteSlug(restaurant) === target || slugify(restaurant.id) === target);
@@ -1415,20 +2548,106 @@ function publicRouteTarget(route) {
   }, 80);
 }
 
+function publicFooter() {
+  const footerLinks = [
+    { href: "/#guest-info", label: t("footer_about_link", "About") },
+    { href: "/contact", label: t("nav_contact", "Contact") },
+    { href: "/help", label: t("footer_help_center_link", "Help Center") },
+    { href: "/privacy", label: t("legal_doc_privacy", "Privacy Policy") },
+    { href: "/terms", label: t("legal_doc_terms", "Terms of Service") },
+    { href: "/reservation-policy", label: t("legal_doc_reservations", "Reservation Policy") },
+    { href: "/review-policy", label: t("legal_doc_reviews", "Review Policy") },
+    { href: "/partner-terms", label: t("legal_doc_partner_terms", "Partner Terms") },
+    { href: "/cookies", label: t("legal_doc_cookie", "Cookie Policy") },
+    { href: "/accessibility", label: t("legal_doc_accessibility", "Accessibility") },
+    { href: "/partner", label: t("footer_for_restaurants_link", "For Restaurants"), className: "footer-partner-link" }
+  ];
+  return `
+    <footer class="site-footer">
+      <span class="site-footer__text">${escapeHtml(t("footer_text", "SmartTable serves New York restaurants and guests."))}</span>
+      <nav class="site-footer__nav" aria-label="${escapeAttr(t("footer_navigation_label", "Footer navigation"))}">
+        ${footerLinks.map((link) => `<a class="${escapeAttr(link.className || "")}" href="${escapeAttr(link.href)}">${escapeHtml(link.label)}</a>`).join("")}
+      </nav>
+    </footer>
+  `;
+}
+
+function publicInfoSummary(route = {}) {
+  return t(route.summaryKey || route.bodyKey || "public_info_page_body", route.fallbackSummary || route.fallbackBody || "");
+}
+
+function publicInfoSectionKey(route = {}, index, suffix) {
+  const routeName = String(route.path || "public-info")
+    .replace(/^\/+|\/+$/g, "")
+    .replace(/[^a-z0-9]+/gi, "_");
+  return `legal_${routeName}_section_${index + 1}_${suffix}`;
+}
+
+function localizedLegalDate() {
+  const locale = state.lang === "hu" ? "hu-HU" : state.lang === "es" ? "es-ES" : "en-US";
+  return new Intl.DateTimeFormat(locale, {
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+    timeZone: "UTC"
+  }).format(new Date(LEGAL_LAST_UPDATED));
+}
+
+function publicInfoSections(route = {}) {
+  const sections = Array.isArray(route.sections) ? route.sections : [];
+  if (!sections.length) return "";
+  return `
+    <div class="legal-document-sections">
+      ${sections.map((section, index) => {
+        const title = Array.isArray(section) ? section[0] : section.title;
+        const body = Array.isArray(section) ? section[1] : section.body;
+        const localizedTitle = t(publicInfoSectionKey(route, index, "title"), title);
+        const localizedBody = t(publicInfoSectionKey(route, index, "body"), body);
+        return `
+          <article class="legal-document-section">
+            <h3 data-no-i18n>${escapeHtml(localizedTitle)}</h3>
+            <p data-no-i18n>${escapeHtml(localizedBody)}</p>
+          </article>
+        `;
+      }).join("")}
+    </div>
+  `;
+}
+
+function legalRelatedLinks(currentPath = "") {
+  const links = [
+    ["/terms", t("legal_doc_terms", "Terms of Service")],
+    ["/privacy", t("legal_doc_privacy", "Privacy Policy")],
+    ["/reservation-policy", t("legal_doc_reservations", "Reservation Policy")],
+    ["/review-policy", t("legal_doc_reviews", "Review Policy")],
+    ["/partner-terms", t("legal_doc_partner_terms", "Partner Terms")],
+    ["/cookies", t("legal_doc_cookie", "Cookie Policy")],
+    ["/accessibility", t("legal_doc_accessibility", "Accessibility")]
+  ].filter(([href]) => href !== currentPath);
+  return `
+    <nav class="legal-related-links" aria-label="${escapeAttr(t("legal_related_links_label", "Related legal pages"))}">
+      ${links.map(([href, label]) => `<a href="${escapeAttr(href)}">${escapeHtml(label)}</a>`).join("")}
+    </nav>
+  `;
+}
+
 function renderPublicGuestInfoPage(route) {
   app.innerHTML = `
     ${layoutHero(`
-      <section class="login-card public-info-page-card">
+      <section class="login-card public-info-page-card legal-document" data-public-info-path="${escapeAttr(route.path || "")}">
         <span class="section-kicker">${escapeHtml(t("smarttable_public_page_kicker", "SmartTable"))}</span>
         <h2>${escapeHtml(t(route.titleKey, route.fallbackTitle))}</h2>
-        <p class="muted">${escapeHtml(t(route.bodyKey, route.fallbackBody))}</p>
+        <p class="muted legal-document-summary">${escapeHtml(publicInfoSummary(route))}</p>
+        <p class="legal-document-updated" data-no-i18n>${escapeHtml(t("legal_last_updated_label", "Last updated"))}: ${escapeHtml(localizedLegalDate())}</p>
+        ${publicInfoSections(route)}
+        ${legalRelatedLinks(route.path)}
         <div class="button-row">
           <button class="primary-button" id="publicInfoRestaurants" type="button">${escapeHtml(t("explore_restaurants_button", "Explore Restaurants"))}</button>
           <button class="ghost-button" id="publicInfoOffers" type="button">${escapeHtml(t("nav_offers", "Offers"))}</button>
         </div>
       </section>
     `)}
-    <footer class="site-footer">${escapeHtml(t("footer_text", "Smarttable.com serves New York restaurants and guests."))}</footer>
+    ${publicFooter()}
   `;
   finalizeRenderedLanguage();
   document.querySelector("#publicInfoRestaurants")?.addEventListener("click", async () => {
@@ -1467,11 +2686,108 @@ function optionLabel(value) {
   return t(`option_${String(value).toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "")}`, value);
 }
 
+function choiceKey(value) {
+  const normalized = String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
+  if (normalized === "alone" || normalized === "single_solo") return "single_solo";
+  return normalized;
+}
+
+function optionValueSelected(selectedValues, option) {
+  const optionKey = choiceKey(option);
+  return asArray(selectedValues).some((value) => choiceKey(value) === optionKey);
+}
+
+function countryConfig(countryCode = "US") {
+  return signupLocationCatalog[countryCode] || signupLocationCatalog.US;
+}
+
+function countryLabel(countryCode = "US") {
+  const config = countryConfig(countryCode);
+  return t(config.labelKey, config.fallback);
+}
+
+function regionConfig(countryCode = "US", regionCode = "") {
+  return countryConfig(countryCode).states?.[regionCode] || null;
+}
+
+function regionLabel(countryCode = "US", regionCode = "") {
+  const config = regionConfig(countryCode, regionCode);
+  return config ? t(config.labelKey, config.fallback) : regionCode;
+}
+
+function cityOptionsFor(countryCode = "US", regionCode = "") {
+  return regionConfig(countryCode, regionCode)?.cities || [];
+}
+
+function isListedCity(countryCode = "US", regionCode = "", city = "") {
+  const normalized = String(city || "").trim().toLowerCase();
+  return cityOptionsFor(countryCode, regionCode).some((option) => option.toLowerCase() === normalized);
+}
+
+function travelDistanceUnitForCountry(countryCode = "US") {
+  return countryConfig(countryCode).defaultUnit || "miles";
+}
+
+function normalizeDistanceToMiles(value, unit = "miles") {
+  const distance = Number(String(value || "").replace(",", "."));
+  if (!Number.isFinite(distance) || distance <= 0) return "";
+  return unit === "kilometers" ? String(Math.round(distance * 0.621371 * 10) / 10) : String(distance);
+}
+
+function isValidInternationalPhone(countryCode = "", phone = "") {
+  const combined = `${countryCode || ""}${phone || ""}`.replace(/[^\d+]/g, "");
+  return /^\+[1-9]\d{7,14}$/.test(combined);
+}
+
+function normalizeSignupNeighborhoods(values = []) {
+  const selected = asArray(values).filter(Boolean);
+  if (selected.some((value) => choiceKey(value) === choiceKey(noNeighborhoodPreference))) return [noNeighborhoodPreference];
+  return selected.filter((value) => choiceKey(value) !== choiceKey(noNeighborhoodPreference));
+}
+
+function signupLocationSuggestion(latitude, longitude) {
+  if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return null;
+  if (latitude >= 40.45 && latitude <= 40.95 && longitude >= -74.35 && longitude <= -73.65) {
+    const isBrooklyn = latitude < 40.74 && longitude > -74.05;
+    const isQueens = latitude < 40.82 && longitude > -73.96;
+    return {
+      country: "US",
+      region: "NY",
+      city_select: isBrooklyn ? "Brooklyn" : isQueens ? "Queens" : "New York City",
+      city: isBrooklyn ? "Brooklyn" : isQueens ? "Queens" : "New York City",
+      preferred_neighborhoods: isBrooklyn ? ["Williamsburg"] : ["Manhattan"]
+    };
+  }
+  if (latitude >= 47.35 && latitude <= 47.65 && longitude >= 18.85 && longitude <= 19.25) {
+    return {
+      country: "HU",
+      region: "BU",
+      city_select: "Budapest",
+      city: "Budapest",
+      preferred_neighborhoods: ["District V"]
+    };
+  }
+  return null;
+}
+
+function refreshFinalSignupSubmitState() {
+  const signup = ensureSignupState();
+  const form = document.querySelector("#guestSignupForm");
+  if (!form || signupSteps[signup.step]?.key !== "consent") return;
+  const button = form.querySelector('button[type="submit"]');
+  if (button) button.disabled = !isSignupReadyToCreate();
+}
+
 const noFavoriteRestaurantOption = "I do not have a favorite SmartTable restaurant yet";
 
 function signupStepTitle(index = ensureSignupState().step) {
   const step = signupSteps[index] || signupSteps[0];
   return t(step.labelKey, step.fallback);
+}
+
+function signupStepNavLabel(index) {
+  const step = signupSteps[index] || signupSteps[0];
+  return t(step.shortLabelKey, step.shortFallback || step.fallback);
 }
 
 function passwordStrength(password = "") {
@@ -1493,7 +2809,7 @@ function isValidEmail(value) {
 
 function isValidPhone(value) {
   const digits = String(value || "").replace(/\D/g, "");
-  return digits.length >= 7 && digits.length <= 20;
+  return /^\+[1-9]\d{7,14}$/.test(String(value || "").replace(/[^\d+]/g, "")) || (digits.length >= 7 && digits.length <= 20);
 }
 
 function signupValidationMessage(key) {
@@ -1528,7 +2844,7 @@ function selectedOptionSummary(value, limit = 4) {
 function signupNeighborhoodOptions() {
   const fromRestaurants = filterOptionValues("district");
   const fallback = ["West Village", "SoHo", "Nolita", "Chelsea", "Tribeca", "Upper West Side", "Upper East Side", "Williamsburg", "DUMBO", "Long Island City"];
-  return [...new Set([...fromRestaurants, ...fallback])];
+  return [...new Set([noNeighborhoodPreference, ...fromRestaurants, ...fallback])];
 }
 
 function signupReviewCard(stepIndex, titleKey, fallback, strong, small = "") {
@@ -1552,6 +2868,30 @@ function signupConsentCheckbox(name, labelHtml, checked = false) {
   `;
 }
 
+function legalDocAnchor(href, labelKey, fallback) {
+  return `<a href="${escapeAttr(href)}" target="_blank" rel="noreferrer">${escapeHtml(t(labelKey, fallback))}</a>`;
+}
+
+function guestLegalConsentLabelHtml() {
+  return `${escapeHtml(t("signup_legal_package_prefix", "I have read and agree to the SmartTable"))} ${legalDocAnchor("/terms", "signup_legal_terms_link", "Terms of Service")}, ${legalDocAnchor("/privacy", "signup_legal_privacy_link", "Privacy Policy")}, ${legalDocAnchor("/reservation-policy", "signup_legal_reservations_link", "Reservation Policy")}, ${escapeHtml(t("signup_legal_package_and", "and"))} ${legalDocAnchor("/review-policy", "signup_legal_reviews_link", "Review Policy")}.`;
+}
+
+function partnerLegalConsentLabelHtml() {
+  return `${escapeHtml(t("partner_invite_legal_consent_prefix", "I have read and agree to the SmartTable"))} ${legalDocAnchor("/partner-terms", "partner_invite_partner_terms_link", "Partner Terms")} ${escapeHtml(t("signup_legal_package_and", "and"))} ${legalDocAnchor("/privacy", "partner_invite_privacy_link", "Privacy Policy")}.`;
+}
+
+function legalPackageAccepted(data = ensureSignupState().data) {
+  return Boolean(data.legal_consent || (data.terms_consent && data.privacy_consent));
+}
+
+function syncSignupLegalConsent(data = ensureSignupState().data) {
+  const accepted = legalPackageAccepted(data);
+  data.legal_consent = accepted;
+  data.terms_consent = accepted;
+  data.privacy_consent = accepted;
+  return data;
+}
+
 function collectSignupForm(form) {
   const data = formObject(form);
   const current = ensureSignupState().data;
@@ -1572,14 +2912,32 @@ function collectSignupForm(form) {
     "notification_preferences",
     "notification_channels"
   ];
-  const boolFields = ["transactional_email_consent", "sms_consent", "marketing_consent", "allergy_acknowledgement", "privacy_consent", "terms_consent"];
+  const boolFields = ["transactional_email_consent", "sms_consent", "marketing_consent", "allergy_acknowledgement", "privacy_consent", "terms_consent", "legal_consent"];
   for (const [key, value] of Object.entries(data)) {
     if (checkboxFields.includes(key)) current[key] = asArray(value);
     else if (boolFields.includes(key)) current[key] = Array.isArray(value) ? value.at(-1) === "true" : value === "true";
     else current[key] = String(value || "").trim();
   }
+  if (Object.prototype.hasOwnProperty.call(data, "legal_consent")) syncSignupLegalConsent(current);
+  else current.legal_consent = legalPackageAccepted(current);
+  if (current.country && !signupLocationCatalog[current.country]) current.country = "US";
+  if (current.country && fieldsForSignupStep(ensureSignupState().step).includes("country")) {
+    const validRegions = Object.keys(countryConfig(current.country).states || {});
+    if (current.region && !validRegions.includes(current.region)) current.region = "";
+    if (current.region && current.city_select && current.city_select !== otherCityValue && !isListedCity(current.country, current.region, current.city_select)) current.city_select = "";
+    current.city = current.city_select === otherCityValue ? String(current.other_city || "").trim() : String(current.city_select || current.city || "").trim();
+    current.travel_distance_unit = ["miles", "kilometers"].includes(current.travel_distance_unit) ? current.travel_distance_unit : travelDistanceUnitForCountry(current.country);
+    current.travel_distance_value = String(current.travel_distance_value || current.travel_distance_miles || "").trim();
+    current.travel_distance_miles = normalizeDistanceToMiles(current.travel_distance_value, current.travel_distance_unit);
+  }
+  if (current.preferred_neighborhoods) current.preferred_neighborhoods = normalizeSignupNeighborhoods(current.preferred_neighborhoods);
+  if (current.companions) current.companions = asArray(current.companions).map((value) => choiceKey(value) === "single_solo" ? "Single / Solo" : value);
   for (const field of checkboxFields) {
     if (data[field] === undefined && fieldsForSignupStep(ensureSignupState().step).includes(field)) current[field] = [];
+  }
+  if (fieldsForSignupStep(ensureSignupState().step).includes("preferred_neighborhoods")) {
+    current.preferred_neighborhoods = normalizeSignupNeighborhoods(current.preferred_neighborhoods);
+    if (!current.preferred_neighborhoods.length) current.preferred_neighborhoods = [noNeighborhoodPreference];
   }
   if (fieldsForSignupStep(ensureSignupState().step).includes("transportation_methods")) {
     current.transportation_method = asArray(current.transportation_methods)[0] || "";
@@ -1588,6 +2946,9 @@ function collectSignupForm(form) {
     const parts = String(current.full_name).trim().split(/\s+/);
     current.first_name = parts[0] || "";
     current.last_name = parts.slice(1).join(" ") || "";
+  }
+  if (fieldsForSignupStep(ensureSignupState().step).includes("sms_phone_number") && !asArray(current.notification_channels).includes(smsNotificationChannel)) {
+    current.sms_consent = false;
   }
   ensureSignupState().submitError = "";
   return current;
@@ -1611,10 +2972,12 @@ function signupStepErrors(stepIndex, data = ensureSignupState().data) {
     if (data.password && passwordStrength(data.password).score < 5) errors.password = signupValidationMessage("password");
     if (data.password && data.confirm_password && data.password !== data.confirm_password) errors.confirm_password = signupValidationMessage("password_match");
   } else if (stepKey === "location") {
-    ["city", "region", "postal_code", "travel_distance_miles"].forEach(requireText);
-    ["preferred_neighborhoods", "transportation_methods"].forEach(requireArray);
+    ["country", "region", "city_select", "postal_code", "travel_distance_value", "travel_distance_unit"].forEach(requireText);
+    if (data.city_select === otherCityValue) requireText("other_city");
+    ["transportation_methods"].forEach(requireArray);
   } else if (stepKey === "preferences") {
-    ["cuisines", "food_categories", "dietary_needs", "drink_preferences"].forEach(requireArray);
+    ["cuisines"].forEach(requireArray);
+    if (asArray(data.cuisines).some((value) => choiceKey(value) === "other") && !String(data.custom_cuisine || "").trim()) errors.custom_cuisine = signupValidationMessage("required");
   } else if (stepKey === "habits") {
     ["dining_experiences", "companions", "preferred_days", "preferred_time_windows", "selection_priorities", "excluded_categories"].forEach(requireArray);
     ["party_size", "booking_lead_time", "dining_duration", "discovery_preference", "new_restaurant_recommendations", "new_menu_item_recommendations"].forEach(requireText);
@@ -1629,10 +2992,11 @@ function signupStepErrors(stepIndex, data = ensureSignupState().data) {
     requireText("event_recommendations_interest");
     requireText("future_calendar_interest");
     if (asArray(data.notification_channels).includes("SMS") && !data.sms_consent) errors.sms_consent = signupValidationMessage("sms_consent");
+    if (asArray(data.notification_channels).includes("SMS") && !isValidInternationalPhone(data.sms_country_code, data.sms_phone_number || data.phone)) errors.sms_phone_number = signupValidationMessage("phone");
     if (!data.transactional_email_consent) errors.transactional_email_consent = signupValidationMessage("consent");
   } else if (stepKey === "consent") {
-    if (!data.privacy_consent) errors.privacy_consent = signupValidationMessage("consent");
-    if (!data.terms_consent) errors.terms_consent = signupValidationMessage("consent");
+    if (!data.transactional_email_consent) errors.transactional_email_consent = signupValidationMessage("consent");
+    if (!legalPackageAccepted(data)) errors.legal_consent = signupValidationMessage("consent");
     if (asArray(data.dietary_needs).some((item) => /allergy|gluten|dairy|halal|kosher|vegan|vegetarian|low-carb|other/i.test(item)) && !data.allergy_acknowledgement) {
       errors.allergy_acknowledgement = signupValidationMessage("consent");
     }
@@ -1651,8 +3015,8 @@ function validateSignupStep(stepIndex = ensureSignupState().step) {
 function fieldsForSignupStep(stepIndex) {
   const key = signupSteps[stepIndex]?.key;
   if (key === "account") return ["full_name", "email", "password", "confirm_password", "phone"];
-  if (key === "location") return ["city", "region", "postal_code", "preferred_neighborhoods", "travel_distance_miles", "transportation_methods"];
-  if (key === "preferences") return ["cuisines", "food_categories", "dietary_needs", "drink_preferences"];
+  if (key === "location") return ["country", "region", "city_select", "other_city", "city", "postal_code", "preferred_neighborhoods", "travel_distance_value", "travel_distance_unit", "travel_distance_miles", "transportation_methods"];
+  if (key === "preferences") return ["cuisines", "custom_cuisine", "food_categories", "dietary_needs", "drink_preferences"];
   if (key === "habits") {
     return [
       "dining_experiences", "companions", "party_size", "preferred_days", "preferred_time_windows", "booking_lead_time",
@@ -1664,15 +3028,17 @@ function fieldsForSignupStep(stepIndex) {
   if (key === "notifications") {
     return [
       "notification_preferences", "notification_channels", "notification_frequency", "event_recommendations_interest",
-      "future_calendar_interest", "transactional_email_consent", "sms_consent", "marketing_consent"
+      "future_calendar_interest", "transactional_email_consent", "sms_consent", "marketing_consent", "sms_country_code", "sms_phone_number"
     ];
   }
-  if (key === "consent") return ["allergy_acknowledgement", "privacy_consent", "terms_consent"];
+  if (key === "consent") return ["allergy_acknowledgement", "transactional_email_consent", "legal_consent", "privacy_consent", "terms_consent"];
   return [];
 }
 
 function validateAllSignupSteps() {
+  const requiredCreationSteps = new Set(["account", "location", "consent"]);
   for (let index = 0; index < signupSteps.length; index += 1) {
+    if (!requiredCreationSteps.has(signupSteps[index]?.key)) continue;
     if (!validateSignupStep(index)) {
       ensureSignupState().step = index;
       return false;
@@ -1683,11 +3049,13 @@ function validateAllSignupSteps() {
 
 function signupValidationSummary() {
   const signup = ensureSignupState();
+  const requiredCreationSteps = new Set(["account", "location", "consent"]);
   return signupSteps
+    .filter((step) => requiredCreationSteps.has(step.key))
     .map((step, index) => ({
-      index,
+      index: signupSteps.findIndex((candidate) => candidate.key === step.key),
       label: t(step.labelKey, step.fallback),
-      errors: signupStepErrors(index, signup.data)
+      errors: signupStepErrors(signupSteps.findIndex((candidate) => candidate.key === step.key), signup.data)
     }))
     .filter((item) => Object.keys(item.errors).length);
 }
@@ -1741,6 +3109,7 @@ function aiCheckboxGroup(name, options, selected = []) {
 }
 
 function boolValue(value) {
+  if (Array.isArray(value)) return value.some((item) => boolValue(item));
   return value === true || value === "true" || value === "on" || value === 1 || value === "1";
 }
 
@@ -1807,18 +3176,228 @@ function firstOfferForRestaurant(restaurant = {}) {
   return (restaurant.filteredOffers || restaurant.offers || []).filter(offerIsPublicVisible)[0] || null;
 }
 
-function dashboardShell(items, inner) {
+function dashboardShell(items, inner, shellOptions = {}) {
   const options = {
     kicker: uiText("Smart Table SaaS"),
     title: uiText(state.mode === "admin" ? "Super Admin" : "Restaurant Partner"),
     navLabel: uiText("Dashboard sections"),
     items,
-    inner,
+    inner: `${impersonationBanner()}${inner}`,
     activeHash: location.hash,
+    ...shellOptions,
     escapeHtml,
     escapeAttr
   };
   return state.mode === "admin" ? adminDashboardLayout(options) : partnerDashboardLayout(options);
+}
+
+function dashboardShellTabbed(inner, className = "") {
+  return dashboardShell([], inner, {
+    hideSidebar: true,
+    className: ["tabbed-dashboard-app", className].filter(Boolean).join(" ")
+  });
+}
+
+function dashboardRouteStorageKey(area) {
+  if (area === "superadmin") return "smarttable.superadminDashboardLastRoute";
+  if (area === "admin") return "smarttable.adminDashboardLastRoute";
+  return "smarttable.partnerDashboardLastRoute";
+}
+
+function safeStoredDashboardRoute(area, fallback) {
+  try {
+    const stored = localStorage.getItem(dashboardRouteStorageKey(area));
+    const prefix = area === "superadmin" ? "/superadmin" : area === "admin" ? "/admin" : "/partner";
+    if (stored && (stored === prefix || stored.startsWith(`${prefix}/`))) return stored;
+  } catch {
+    // Storage can be unavailable in private browsing; fall back to the role home.
+  }
+  return fallback;
+}
+
+function rememberDashboardRoute(area, route) {
+  const prefix = area === "superadmin" ? "/superadmin" : area === "admin" ? "/admin" : "/partner";
+  if (!route || !(route === prefix || route.startsWith(`${prefix}/`))) return;
+  try {
+    localStorage.setItem(dashboardRouteStorageKey(area), route);
+  } catch {
+    // Non-critical navigation persistence.
+  }
+}
+
+function dashboardTabRoute(area, key) {
+  const base = area === "superadmin" ? "/superadmin" : area === "admin" ? "/admin" : "/partner";
+  const adminSegments = {
+    overview: "",
+    restaurants: "restaurants",
+    partners: "partners",
+    reservations: "reservations",
+    offers: "offers",
+    "food-feed": "food-feed",
+    users: "users",
+    notifications: "notifications",
+    payments: "payments",
+    reports: "reports",
+    reviews: "reviews",
+    settings: "settings",
+    audit: "audit"
+  };
+  const partnerSegments = {
+    overview: "",
+    reservations: "reservations",
+    offers: "offers",
+    profile: "profile",
+    capacity: "capacity",
+    availability: "availability",
+    notifications: "notifications",
+    reviews: "reviews",
+    analytics: "analytics",
+    billing: "billing",
+    settings: "settings"
+  };
+  const segment = (area === "partner" ? partnerSegments : adminSegments)[key] || "";
+  return segment ? `${base}/${segment}` : base;
+}
+
+function activeDashboardTab(area, tabs) {
+  const path = window.location.pathname.replace(/\/+$/, "") || "/";
+  const direct = tabs.find((tab) => dashboardTabRoute(area, tab.key) === path);
+  if (direct) return direct.key;
+  const legacyAdminRoutes = {
+    "/admin/restaurants": "restaurants",
+    "/admin/partners": "partners",
+    "/admin/reservations": "reservations",
+    "/admin/offers": "offers",
+    "/admin/notifications": "notifications",
+    "/admin/reports": "reports",
+    "/admin/audit": "audit",
+    "/admin/content": "settings",
+    "/admin/platform-settings": "settings",
+    "/admin/analytics": "reports",
+    "/admin/users": "partners",
+    "/superadmin/settings": "settings",
+    "/superadmin/analytics": "reports",
+    "/superadmin/users": "partners"
+  };
+  const legacyPartnerRoutes = {
+    "/partner/deals": "offers",
+    "/partner/settings": "profile"
+  };
+  const legacy = area === "partner" ? legacyPartnerRoutes[path] : legacyAdminRoutes[path];
+  if (legacy && tabs.some((tab) => tab.key === legacy)) return legacy;
+  return tabs[0]?.key || "overview";
+}
+
+function dashboardTabsMarkup(area, tabs, activeKey, label) {
+  return `
+    <div class="dashboard-tabs-shell" data-dashboard-tabs-area="${escapeAttr(area)}">
+      <div class="dashboard-tabs-scroll" role="presentation">
+        <div class="dashboard-tabs" role="tablist" aria-label="${escapeAttr(label)}">
+          ${tabs.map((tab) => {
+            const active = tab.key === activeKey;
+            return `
+              <button
+                class="dashboard-tab${active ? " active" : ""}"
+                id="${escapeAttr(tab.tabId)}"
+                type="button"
+                role="tab"
+                aria-label="${escapeAttr(tab.label)}"
+                aria-selected="${active ? "true" : "false"}"
+                aria-controls="${escapeAttr(tab.panelId)}"
+                tabindex="${active ? "0" : "-1"}"
+                data-dashboard-tab="${escapeAttr(tab.key)}"
+                data-dashboard-tab-route="${escapeAttr(dashboardTabRoute(area, tab.key))}"
+              >
+                <span class="dashboard-tab__label">${escapeHtml(tab.label)}</span>
+                ${tab.compactLabel ? `<span class="dashboard-tab__compact" aria-hidden="true">${escapeHtml(tab.compactLabel)}</span>` : ""}
+              </button>
+            `;
+          }).join("")}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function dashboardTabPanelsMarkup(tabs, activeKey) {
+  return tabs.map((tab) => `
+    <section
+      class="dashboard-tab-panel"
+      id="${escapeAttr(tab.panelId)}"
+      role="tabpanel"
+      aria-labelledby="${escapeAttr(tab.tabId)}"
+      data-dashboard-tab-panel="${escapeAttr(tab.key)}"
+      ${tab.key === activeKey ? "" : "hidden"}
+    >
+      ${tab.content || ""}
+    </section>
+  `).join("");
+}
+
+function dashboardTabbedInterface(area, tabs, activeKey, label) {
+  rememberDashboardRoute(area, dashboardTabRoute(area, activeKey));
+  return `
+    ${dashboardTabsMarkup(area, tabs, activeKey, label)}
+    <div class="dashboard-tab-panels">
+      ${dashboardTabPanelsMarkup(tabs, activeKey)}
+    </div>
+  `;
+}
+
+function bindDashboardTabs(renderFn) {
+  const tabs = Array.from(document.querySelectorAll("[data-dashboard-tab-route]"));
+  tabs.forEach((tab) => {
+    tab.addEventListener("click", () => {
+      const route = tab.dataset.dashboardTabRoute || "";
+      if (!route) return;
+      if (window.location.pathname !== route) history.pushState({ dashboardTab: tab.dataset.dashboardTab }, "", route);
+      renderFn();
+    });
+  });
+  document.querySelectorAll("[role='tablist'] .dashboard-tab").forEach((tab) => {
+    tab.addEventListener("keydown", (event) => {
+      if (!["ArrowRight", "ArrowLeft", "Home", "End"].includes(event.key)) return;
+      const group = Array.from(tab.closest("[role='tablist']")?.querySelectorAll(".dashboard-tab") || []);
+      if (!group.length) return;
+      event.preventDefault();
+      const currentIndex = Math.max(0, group.indexOf(tab));
+      let nextIndex = currentIndex;
+      if (event.key === "ArrowRight") nextIndex = (currentIndex + 1) % group.length;
+      if (event.key === "ArrowLeft") nextIndex = (currentIndex - 1 + group.length) % group.length;
+      if (event.key === "Home") nextIndex = 0;
+      if (event.key === "End") nextIndex = group.length - 1;
+      group[nextIndex]?.focus();
+      group[nextIndex]?.click();
+    });
+  });
+}
+
+function currentImpersonation() {
+  return state.session?.profile?.impersonation || null;
+}
+
+function isImpersonating() {
+  return Boolean(currentImpersonation() || state.originalAdminSession);
+}
+
+function impersonationBanner() {
+  if (!isImpersonating()) return "";
+  const profile = state.session?.profile || {};
+  const impersonation = currentImpersonation() || {};
+  const mode = impersonation.mode || "read";
+  return `
+    <section class="warning-box impersonation-banner" role="status" aria-live="polite">
+      <div>
+        <strong>${escapeHtml(t("impersonation_banner_title", "View-as mode active"))}</strong>
+        <p>${escapeHtml(contentTemplate("impersonation_banner_body", "You are viewing {{name}} as {{role}} in {{mode}} mode. Writes are blocked unless write mode was explicitly confirmed.", {
+          name: profile.full_name || profile.email || t("account_label", "account"),
+          role: normalizeRole(profile.role || ""),
+          mode
+        }))}</p>
+      </div>
+      ${state.originalAdminSession ? `<button class="ghost-button" id="returnAdmin" type="button">${escapeHtml(t("partner_return_admin", "Return to Admin"))}</button>` : ""}
+    </section>
+  `;
 }
 
 function loadingSkeleton() {
@@ -1851,6 +3430,20 @@ function textInput(name, label, value = "", type = "text", attrs = "") {
 
 function textArea(name, label, value = "", attrs = "") {
   return `<label>${escapeHtml(uiText(label))}<textarea name="${escapeAttr(name)}" ${attrs}>${escapeHtml(value)}</textarea></label>`;
+}
+
+function campaignRichTextArea(name, label, value = "", attrs = "") {
+  return `
+    <label class="campaign-rich-editor">${escapeHtml(uiText(label))}
+      <div class="campaign-editor-toolbar" aria-label="${escapeAttr(t("campaign_editor_toolbar_label", "Safe formatting controls"))}">
+        <button class="ghost-button icon-button" data-campaign-format="bold" data-campaign-target="${escapeAttr(name)}" type="button" title="${escapeAttr(t("campaign_format_bold", "Bold"))}">B</button>
+        <button class="ghost-button icon-button" data-campaign-format="list" data-campaign-target="${escapeAttr(name)}" type="button" title="${escapeAttr(t("campaign_format_list", "Bullet list"))}">•</button>
+        <button class="ghost-button icon-button" data-campaign-format="link" data-campaign-target="${escapeAttr(name)}" type="button" title="${escapeAttr(t("campaign_format_link", "Link"))}">↗</button>
+      </div>
+      <textarea name="${escapeAttr(name)}" ${attrs}>${escapeHtml(value)}</textarea>
+      <span class="form-note">${escapeHtml(t("campaign_editor_safe_note", "Safe formatting only: plain text, simple lists, and links. HTML is escaped."))}</span>
+    </label>
+  `;
 }
 
 function mediaUploadControl(kind, targetName, label) {
@@ -1914,6 +3507,124 @@ function formObject(form) {
   return data;
 }
 
+function normalizeContentLanguage(value = "") {
+  const raw = String(value || "").trim().toLowerCase();
+  if (raw.startsWith("hu") || raw.includes("hungary") || raw.includes("magyar") || raw.includes("budapest")) return "hu";
+  if (raw.startsWith("es") || raw.includes("spain") || raw.includes("espa") || raw.includes("madrid") || raw.includes("barcelona")) return "es";
+  return "en";
+}
+
+function primaryContentLanguageForRestaurant(restaurant = {}) {
+  const candidates = [
+    restaurant.content_language,
+    restaurant.default_locale,
+    restaurant.market_default_locale,
+    restaurant.primary_locale,
+    restaurant.locale,
+    restaurant.language,
+    restaurant.country_code,
+    restaurant.country,
+    restaurant.market_code,
+    restaurant.market,
+    restaurant.city_name,
+    restaurant.city
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    const lang = normalizeContentLanguage(candidate);
+    if (lang !== "en" || /^(en|us|usa|united states|nyc|new york)/i.test(String(candidate))) return lang;
+  }
+  return "en";
+}
+
+function contentLanguageName(language = "en") {
+  const lang = normalizeContentLanguage(language);
+  if (lang === "hu") return t("content_language_hungarian", "Hungarian");
+  if (lang === "es") return t("content_language_spanish", "Spanish");
+  return t("content_language_english", "English");
+}
+
+function localizedContentField(item = {}, base = "title", lang = state.lang) {
+  const requested = normalizeLanguage(lang);
+  const fields = requested === "hu"
+    ? [`${base}_hu`, `${base}_en`, `${base}_es`, base]
+    : requested === "es"
+      ? [`${base}_es`, `${base}_en`, `${base}_hu`, base]
+      : [`${base}_en`, `${base}_es`, `${base}_hu`, base];
+  for (const field of fields) {
+    const value = item?.[field];
+    if (String(value || "").trim()) return value;
+  }
+  return "";
+}
+
+function primaryOfferContentFields(restaurant = {}) {
+  const language = primaryContentLanguageForRestaurant(restaurant);
+  const languageName = contentLanguageName(language);
+  return `
+    <div class="single-language-content-card">
+      <input type="hidden" name="content_language" value="${escapeAttr(language)}">
+      <p class="form-note">
+        ${escapeHtml(contentTemplate("offer_content_language_note", "This market uses {{language}} as the source language for offer content. Enter it once; SmartTable keeps the guest interface translated with the selected site language.", { language: languageName }))}
+      </p>
+      ${textInput("title_primary", t("offer_primary_title_label", "Offer title"), "", "text", "required")}
+      ${textArea("description_primary", t("offer_primary_description_label", "Offer description"))}
+    </div>
+  `;
+}
+
+function primaryRestaurantContentFields(restaurant = {}) {
+  const language = primaryContentLanguageForRestaurant(restaurant);
+  const languageName = contentLanguageName(language);
+  const description = localizedContentField(restaurant, "description", language) || restaurant.description || "";
+  return `
+    <div class="single-language-content-card">
+      <input type="hidden" name="profile_content_language" value="${escapeAttr(language)}">
+      <p class="form-note">
+        ${escapeHtml(contentTemplate("restaurant_content_language_note", "This market uses {{language}} as the source language for restaurant profile content. Enter it once; SmartTable keeps the guest interface translated with the selected site language.", { language: languageName }))}
+      </p>
+      ${textArea("description_primary", t("restaurant_primary_description_label", "Restaurant description"), description)}
+    </div>
+  `;
+}
+
+function offerPayloadFromForm(form, restaurant = state.partnerProfile || {}) {
+  const data = formObject(form);
+  const language = normalizeContentLanguage(data.content_language || primaryContentLanguageForRestaurant(restaurant));
+  const title = String(data.title_primary || "").trim();
+  const description = String(data.description_primary || "").trim();
+  delete data.content_language;
+  delete data.title_primary;
+  delete data.description_primary;
+  delete data.title_en;
+  delete data.title_es;
+  delete data.title_hu;
+  delete data.description_en;
+  delete data.description_es;
+  delete data.description_hu;
+  data[`title_${language}`] = title;
+  data[`description_${language}`] = description;
+  if (language !== "en") {
+    data.title_en = data.title_en || title;
+    data.description_en = data.description_en || description;
+  }
+  return data;
+}
+
+function profilePayloadFromForm(form, restaurant = state.partnerProfile || {}) {
+  const data = formObject(form);
+  const language = normalizeContentLanguage(data.profile_content_language || primaryContentLanguageForRestaurant(restaurant));
+  const description = String(data.description_primary || "").trim();
+  delete data.profile_content_language;
+  delete data.description_primary;
+  delete data.description_en;
+  delete data.description_es;
+  delete data.description_hu;
+  data[`description_${language}`] = description;
+  data.description = description;
+  if (language !== "en") data.description_en = data.description_en || description;
+  return data;
+}
+
 async function loadPublicContent() {
   const payload = await api(`/public/content?lang=${encodeURIComponent(state.lang)}`);
   state.apiMode = payload.mode || state.apiMode;
@@ -1934,6 +3645,15 @@ async function loadPublicOffers() {
   updateMeta();
 }
 
+async function loadPublicRestaurants() {
+  const includeTestData = new URLSearchParams(window.location.search).get("include_test_data");
+  const testDataQuery = boolValue(includeTestData) ? "&include_test_data=true" : "";
+  const payload = await api(`/public/restaurants?lang=${encodeURIComponent(state.lang)}${testDataQuery}`).catch(() => ({ restaurants: [] }));
+  state.apiMode = payload.mode || state.apiMode;
+  state.publicRestaurants = payload.restaurants || [];
+  updateMeta();
+}
+
 async function loadNewestRestaurants() {
   const payload = await api(`/public/restaurants/newest?lang=${encodeURIComponent(state.lang)}`);
   state.apiMode = payload.mode || state.apiMode;
@@ -1943,6 +3663,7 @@ async function loadNewestRestaurants() {
 async function loadPublicConfig() {
   const payload = await api("/public/config");
   state.config = payload || {};
+  state.apiMode = payload.mode || state.apiMode;
   state.platformMode = normalizePlatformMode(payload?.platform_mode);
   state.aiDemoVisibility = normalizeBooleanSetting(payload?.ai_demo_visibility, false);
   state.showAiModeBadge = normalizeBooleanSetting(payload?.show_ai_mode_badge, true);
@@ -2116,14 +3837,30 @@ function maybeTrackSignupAbandoned(reason = "navigation", keepalive = false) {
   }), { keepalive });
 }
 
-function layoutHero(inner) {
+function homepageHeroActions() {
+  return `
+    <div class="mvp-hero-actions" role="group" aria-label="${escapeAttr(t("homepage_hero_actions_label", "Homepage actions"))}">
+      <button class="guest-primary-action" data-home-find-table type="button">${escapeHtml(t("homepage_hero_primary_cta", "Find a Table"))}</button>
+      <button class="guest-secondary-action" data-home-browse-restaurants type="button">${escapeHtml(t("homepage_hero_secondary_cta", "Browse Restaurants"))}</button>
+    </div>
+  `;
+}
+
+function layoutHero(inner, options = {}) {
   const image = t("banner_image", "/assets/restaurant-hero.png");
+  const homeHero = options.variant === "home";
   const heroCopy = isBasicMode()
-    ? {
-      kicker: t("basic_hero_kicker", "SmartTable"),
-      title: t("basic_hero_title", "Discounted restaurant reservations in New York"),
-      subtitle: t("basic_hero_subtitle", "Browse restaurants, choose a discounted table offer, and send a reservation request directly to the restaurant.")
-    }
+    ? homeHero
+      ? {
+        kicker: t("homepage_hero_kicker", "SMARTTABLE"),
+        title: t("homepage_hero_title", "Book great restaurants for less"),
+        subtitle: t("homepage_hero_subtitle", "Discover discounted restaurant tables during selected times and send your reservation request directly to the restaurant.")
+      }
+      : {
+        kicker: t("basic_hero_kicker", "SmartTable"),
+        title: t("basic_hero_title", "Discounted restaurant reservations in New York"),
+        subtitle: t("basic_hero_subtitle", "Browse restaurants, choose a discounted table offer, and send a reservation request directly to the restaurant.")
+      }
     : {
       kicker: t("hero_kicker", "SmartTable AI"),
       title: t("hero_title", "The AI Revenue Operating System for Restaurants"),
@@ -2134,6 +3871,8 @@ function layoutHero(inner) {
     image,
     copy: heroCopy,
     inner,
+    actions: homeHero ? homepageHeroActions() : "",
+    heroClassName: homeHero ? "mvp-hero--home" : "",
     escapeHtml,
     escapeAttr
   };
@@ -2153,6 +3892,36 @@ function isDisallowedStatus(value) {
   return Boolean(status && ["inactive", "disabled", "deleted", "archived", "paused", "hidden", "draft", "unpublished", "rejected"].includes(status));
 }
 
+function isGeneratedPublicQaContent(item = {}) {
+  const haystack = [
+    item.offer_title,
+    item.title,
+    item.title_en,
+    item.title_es,
+    item.title_hu,
+    item.offer_description,
+    item.offer_description_en,
+    item.offer_description_es,
+    item.offer_description_hu,
+    item.written_review,
+    item.comment,
+    item.review_text,
+    item.short_review,
+    item.moderation_reason,
+    item.description,
+    item.description_en,
+    item.description_es,
+    item.description_hu
+  ].map((value) => String(value || "").trim().toLowerCase()).filter(Boolean).join(" ");
+  return /verified\s+review\s+photo\s+qa/.test(haystack) ||
+    /safe\s+production\s+qa/.test(haystack) ||
+    /smarttable\s+qa/.test(haystack);
+}
+
+function isGeneratedPublicQaOffer(offer = {}) {
+  return isGeneratedPublicQaContent(offer);
+}
+
 function isPastOffer(offer = {}) {
   const calculatedStatus = String(offer.offer_status_calculated || offer.calculated_status || "").trim().toLowerCase();
   const errorCode = String(offer.offer_error_code || offer.code || "").trim().toUpperCase();
@@ -2160,76 +3929,119 @@ function isPastOffer(offer = {}) {
 }
 
 function offerIsPublicVisible(offer = {}) {
+  if (isGeneratedPublicQaOffer(offer)) return false;
   if (isDisallowedStatus(offer.status || offer.offer_status || offer.deal_status)) return false;
   if (isDisallowedStatus(offer.restaurant_status || offer.restaurant_visibility || offer.partner_status)) return false;
   if (offer.is_published === false || offer.published === false || offer.public === false) return false;
   if (isPastOffer(offer)) return false;
-  if (Number(offer.available_tables ?? offer.available_seats ?? 0) < 1) return false;
+  const availableTables = Number(offer.available_tables);
+  const reservedTables = Number(offer.reserved_tables);
+  if (offer.available_tables !== undefined && Number.isFinite(availableTables)) {
+    if (offer.reserved_tables !== undefined && Number.isFinite(reservedTables)) {
+      if (availableTables <= reservedTables) return false;
+    } else if (availableTables < 1) {
+      return false;
+    }
+  } else if (Number(offer.available_seats ?? 0) < 1) {
+    return false;
+  }
   return true;
 }
 
 function groupRestaurants() {
   const grouped = new Map();
-  for (const offer of state.offers.filter(offerIsPublicVisible)) {
-    const restaurantId = offer.restaurant_id;
-    if (!restaurantId) continue;
+  const ensureRestaurant = (restaurantId, values = {}) => {
+    if (!restaurantId) return null;
     if (!grouped.has(restaurantId)) {
       grouped.set(restaurantId, {
         id: restaurantId,
-        name: offer.restaurant_name,
-        email: offer.restaurant_email,
-        district: offer.district,
-        address: offer.address,
-        cuisine: offer.cuisine_type || offer.cuisine,
-        rating: offer.rating || "4.8",
-        description: offer.restaurant_description || offer.description || "",
-        website: offer.website,
-        instagram: offer.instagram,
-        facebook: offer.facebook,
-        tiktok: offer.tiktok,
-        google_maps_url: offer.google_maps_url,
-        google_place_id: offer.google_place_id,
-        logo_url: offer.logo_url,
-        hero_image_url: offer.hero_image_url,
-        cover_image: offer.cover_image,
-        card_image: offer.card_image,
-        icon_image: offer.icon_image,
-        menu_pdf_url: offer.menu_pdf_url,
-        price_range: offer.price_range,
-        dress_code: offer.dress_code,
-        outdoor_seating: offer.outdoor_seating,
-        parking_available: offer.parking_available,
-        kids_friendly: offer.kids_friendly,
-        pet_friendly: offer.pet_friendly,
-        wheelchair_accessible: offer.wheelchair_accessible,
-        payment_methods: offer.payment_methods,
-        chef_name: offer.chef_name,
-        year_opened: offer.year_opened,
-        capacity: offer.capacity,
-        private_room_available: offer.private_room_available,
-        opening_hours: offer.opening_hours,
-        gallery_images: offer.gallery_images,
-        restaurant_type: offer.restaurant_type,
-        latitude: offer.latitude,
-        longitude: offer.longitude,
-        sort_order: offer.sort_order,
-        created_at: offer.restaurant_created_at || offer.created_at,
-        ai_discount_enabled: offer.ai_discount_enabled !== false,
-        min_discount_percent: offer.min_discount_percent ?? 10,
-        max_discount_percent: offer.max_discount_percent ?? 30,
-        target_margin_percent: offer.target_margin_percent ?? 65,
-        average_service_minutes: offer.average_service_minutes ?? 75,
-        food_rating_avg: offer.food_rating_avg,
-        service_rating_avg: offer.service_rating_avg,
-        ambience_rating_avg: offer.ambience_rating_avg,
-        overall_rating_avg: offer.overall_rating_avg,
-        review_count: offer.review_count || 0,
-        favorites_count: offer.favorites_count || 0,
-        image: offer.card_image || offer.hero_image_url || offer.icon_image || offer.offer_image || "/assets/restaurant-hero.png",
+        name: values.name || values.restaurant_name,
+        slug: values.slug || "",
+        email: values.email || values.restaurant_email,
+        district: values.district,
+        city: values.city,
+        country: values.country,
+        address: values.address,
+        cuisine: values.cuisine_type || values.cuisine,
+        rating: values.rating || "4.8",
+        description: values.restaurant_description || values.description || "",
+        website: values.website,
+        instagram: values.instagram,
+        facebook: values.facebook,
+        tiktok: values.tiktok,
+        google_maps_url: values.google_maps_url,
+        google_place_id: values.google_place_id,
+        logo_url: values.logo_url,
+        hero_image_url: values.hero_image_url,
+        cover_image: values.cover_image,
+        card_image: values.card_image,
+        icon_image: values.icon_image,
+        menu_pdf_url: values.menu_pdf_url,
+        price_range: values.price_range,
+        dress_code: values.dress_code,
+        outdoor_seating: values.outdoor_seating,
+        parking_available: values.parking_available,
+        kids_friendly: values.kids_friendly,
+        pet_friendly: values.pet_friendly,
+        wheelchair_accessible: values.wheelchair_accessible,
+        payment_methods: values.payment_methods,
+        chef_name: values.chef_name,
+        year_opened: values.year_opened,
+        capacity: values.capacity,
+        private_room_available: values.private_room_available,
+        opening_hours: values.opening_hours,
+        gallery_images: values.gallery_images,
+        restaurant_type: values.restaurant_type,
+        latitude: values.latitude,
+        longitude: values.longitude,
+        sort_order: values.sort_order,
+        created_at: values.restaurant_created_at || values.created_at,
+        visible_on_guest_site: values.visible_on_guest_site !== false,
+        is_test_restaurant: boolValue(values.is_test_restaurant),
+        test_badge: values.test_badge || "",
+        accepts_reservation_requests: values.accepts_reservation_requests !== false,
+        reservation_provider: values.reservation_provider || "smarttable",
+        booking_interval_minutes: values.booking_interval_minutes,
+        minimum_advance_minutes: values.minimum_advance_minutes,
+        maximum_booking_window_days: values.maximum_booking_window_days,
+        restaurant_min_party_size: values.restaurant_min_party_size,
+        restaurant_max_party_size: values.restaurant_max_party_size,
+        auto_confirmation: boolValue(values.auto_confirmation),
+        partner_approval_required: values.partner_approval_required !== false,
+        ai_discount_enabled: values.ai_discount_enabled !== false,
+        min_discount_percent: values.min_discount_percent ?? 10,
+        max_discount_percent: values.max_discount_percent ?? 30,
+        target_margin_percent: values.target_margin_percent ?? 65,
+        average_service_minutes: values.average_service_minutes ?? 75,
+        food_rating_avg: values.food_rating_avg,
+        service_rating_avg: values.service_rating_avg,
+        ambience_rating_avg: values.ambience_rating_avg,
+        overall_rating_avg: values.overall_rating_avg,
+        review_count: values.review_count || 0,
+        favorites_count: values.favorites_count || 0,
+        image: values.card_image || values.hero_image_url || values.icon_image || values.offer_image || "/assets/restaurant-hero.png",
         offers: []
       });
     }
-    grouped.get(restaurantId).offers.push(offer);
+    return grouped.get(restaurantId);
+  };
+  for (const offer of state.offers.filter(offerIsPublicVisible)) {
+    const restaurantId = offer.restaurant_id;
+    const restaurant = ensureRestaurant(restaurantId, {
+      ...offer,
+      name: offer.restaurant_name,
+      email: offer.restaurant_email
+    });
+    if (restaurant) restaurant.offers.push(offer);
+  }
+  for (const row of state.publicRestaurants || []) {
+    const restaurantId = row.restaurant_id || row.id;
+    ensureRestaurant(restaurantId, {
+      ...row,
+      name: row.restaurant_name || row.name,
+      cuisine: row.cuisine_type || row.cuisine,
+      restaurant_created_at: row.restaurant_created_at || row.created_at
+    });
   }
   return [...grouped.values()].map((restaurant) => ({
     ...restaurant,
@@ -2238,11 +4050,60 @@ function groupRestaurants() {
 }
 
 function highestDiscount(restaurant) {
-  return Math.max(...restaurant.offers.map((offer) => Number(offer.discount_value || offer.discount_percent || 0)), 0);
+  const offers = restaurantVisibleOffers(restaurant);
+  return Math.max(...offers.map(offerDiscountPercent), 0);
 }
 
 function soonestOfferKey(restaurant) {
-  return restaurant.offers.map((offer) => `${offer.offer_date || "9999-12-31"}${offer.start_time || offer.offer_time || "23:59"}`).sort()[0] || "9999-12-31";
+  return restaurantVisibleOffers(restaurant).map((offer) => `${offer.offer_date || "9999-12-31"}${offer.start_time || offer.offer_time || "23:59"}`).sort()[0] || "9999-12-31";
+}
+
+function offerDiscountPercent(offer = {}) {
+  return Number.parseFloat(offer.discount_value ?? offer.discount_percent ?? 0) || 0;
+}
+
+function restaurantVisibleOffers(restaurant = {}, options = {}) {
+  const source = options.useFiltered === false
+    ? restaurant.offers
+    : (restaurant.filteredOffers || restaurant.offers);
+  return (source || []).filter(offerIsPublicVisible);
+}
+
+function sortRestaurantOffers(offers = []) {
+  return [...offers].sort((a, b) => {
+    const aDate = `${a.offer_date || a.reservation_date || "9999-12-31"}${a.start_time || a.offer_time || "23:59"}`;
+    const bDate = `${b.offer_date || b.reservation_date || "9999-12-31"}${b.start_time || b.offer_time || "23:59"}`;
+    return aDate.localeCompare(bDate) || offerDiscountPercent(b) - offerDiscountPercent(a);
+  });
+}
+
+function restaurantOfferAggregate(restaurant = {}, options = {}) {
+  const offers = sortRestaurantOffers(restaurantVisibleOffers(restaurant, options));
+  const discounts = offers.map(offerDiscountPercent).filter((value) => value > 0);
+  return {
+    offers,
+    count: offers.length,
+    minDiscount: discounts.length ? Math.min(...discounts) : 0,
+    maxDiscount: discounts.length ? Math.max(...discounts) : 0,
+    nextOffer: offers[0] || null
+  };
+}
+
+function restaurantDiscountRangeLabel(aggregate = {}) {
+  const min = Math.round(Number(aggregate.minDiscount || 0));
+  const max = Math.round(Number(aggregate.maxDiscount || 0));
+  if (!aggregate.count || !max) return t("restaurant_no_active_offers_label", "No active offers");
+  if (min === max) {
+    return contentTemplate("restaurant_discount_single", "{{discount}}% OFF", { discount: max });
+  }
+  return contentTemplate("restaurant_discount_range", "{{min}}-{{max}}% OFF", { min, max });
+}
+
+function restaurantTileAvailabilityLabel(aggregate = {}) {
+  if (!aggregate.count) return t("restaurant_no_active_offers_label", "No active offers");
+  const countLabel = `${aggregate.count} ${t("offers_count_label", "active offers")}`;
+  if (!aggregate.nextOffer) return countLabel;
+  return `${countLabel} - ${formatDate(aggregate.nextOffer.offer_date || aggregate.nextOffer.reservation_date, aggregate.nextOffer.start_time || aggregate.nextOffer.offer_time)}`;
 }
 
 function filteredRestaurants() {
@@ -2252,8 +4113,18 @@ function filteredRestaurants() {
   const cuisine = filters.cuisine.toLowerCase().trim();
   const minDiscount = Number(filters.discount || 0);
   const partySize = Number(filters.partySize || 0);
+  const hasOfferSpecificFilter = Boolean(minDiscount || filters.date || filters.time || partySize);
   const restaurants = groupRestaurants().filter((restaurant) => {
-    if (queryName && !restaurant.name.toLowerCase().includes(queryName)) return false;
+    const searchableRestaurantText = [
+      restaurant.name,
+      restaurant.cuisine,
+      restaurant.district,
+      restaurant.city,
+      restaurant.address,
+      restaurant.description,
+      restaurant.restaurant_type
+    ].filter(Boolean).join(" ").toLowerCase();
+    if (queryName && !searchableRestaurantText.includes(queryName)) return false;
     if (neighborhood && !String(restaurant.district || restaurant.address || "").toLowerCase().includes(neighborhood)) return false;
     if (cuisine && !String(restaurant.cuisine || "").toLowerCase().includes(cuisine)) return false;
     const matchingOffers = restaurant.offers.filter((offer) => {
@@ -2270,7 +4141,8 @@ function filteredRestaurants() {
       return true;
     });
     restaurant.filteredOffers = matchingOffers;
-    return matchingOffers.length > 0;
+    if (filters.availableOnly || hasOfferSpecificFilter) return matchingOffers.length > 0;
+    return true;
   });
 
   return restaurants.sort((a, b) => {
@@ -2301,39 +4173,6 @@ function optionSelect(name, label, value, options, placeholder) {
   `;
 }
 
-function guestHeroSearchPanel() {
-  const filters = state.filters;
-  const neighborhoods = filterOptionValues("district");
-  const cuisines = filterOptionValues("cuisine");
-  return `
-    <form class="guest-form-card guest-hero-search offers-filters" id="guestHeroSearchForm">
-      <div>
-        <span class="section-kicker">${escapeHtml(t("guest_search_kicker", "Find a table"))}</span>
-        <h2>${escapeHtml(t("guest_search_title", "Search discounted restaurant offers"))}</h2>
-      </div>
-      <div class="guest-field-grid">
-        <label class="guest-field">${escapeHtml(t("filter_restaurant_name_label", "Restaurant name"))}<input name="restaurantName" value="${escapeAttr(filters.restaurantName)}" placeholder="${escapeAttr(t("restaurant_search_placeholder", "Restaurant name"))}"></label>
-        <label class="guest-field">${escapeHtml(t("filter_date_label", "Date"))}<input name="date" type="date" value="${escapeAttr(filters.date)}"></label>
-        <label class="guest-field">${escapeHtml(t("filter_time_label", "Time"))}<input name="time" type="time" value="${escapeAttr(filters.time)}"></label>
-        <label class="guest-field">${escapeHtml(t("filter_party_size_label", "Guests"))}<input name="partySize" type="number" min="1" value="${escapeAttr(filters.partySize)}" placeholder="2"></label>
-        ${optionSelect("neighborhood", t("filter_neighborhood_label", "Neighborhood"), filters.neighborhood, neighborhoods, t("all_neighborhoods_label", "All neighborhoods"))}
-        ${optionSelect("cuisine", t("filter_cuisine_label", "Cuisine"), filters.cuisine, cuisines, t("all_cuisines_label", "All cuisines"))}
-        <label class="guest-select">
-          ${escapeHtml(t("filter_discount_label", "Minimum discount"))}
-          <select name="discount">
-            <option value="">${escapeHtml(t("any_discount_label", "Any discount"))}</option>
-            ${["10", "15", "20", "25", "30", "40", "50"].map((discount) => `<option value="${discount}" ${String(filters.discount) === discount ? "selected" : ""}>${discount}%+</option>`).join("")}
-          </select>
-        </label>
-      </div>
-      <div class="guest-button-row guest-hero-actions">
-        <button class="guest-primary-action" type="submit">${escapeHtml(t("search_offers_button", "Search offers"))}</button>
-        <button class="guest-secondary-action" data-clear-guest-filters type="button">${escapeHtml(t("clear_filters_button", "Clear filters"))}</button>
-      </div>
-    </form>
-  `;
-}
-
 function filterBar() {
   const filters = state.filters;
   return `
@@ -2361,7 +4200,7 @@ function filterBar() {
 }
 
 function offerRows(restaurant) {
-  const offers = restaurant.filteredOffers || restaurant.offers;
+  const offers = restaurantVisibleOffers(restaurant);
   return offers.map((offer) => `
     <article class="nested-offer premium-offer-card">
       <div>
@@ -2378,7 +4217,7 @@ function offerRows(restaurant) {
 }
 
 function restaurantDetailOffers(restaurant) {
-  const offers = (restaurant.filteredOffers || restaurant.offers || []).filter(offerIsPublicVisible);
+  const offers = sortRestaurantOffers(restaurantVisibleOffers(restaurant, { useFiltered: false }));
   return offers.map((offer) => `
     <article class="detail-offer-card guest-card">
       <div class="offer-line">
@@ -2394,7 +4233,37 @@ function restaurantDetailOffers(restaurant) {
       ${offerTermsList(offer)}
       <button class="primary-button" data-open-reserve="${escapeAttr(offer.offer_id)}" data-restaurant="${escapeAttr(restaurant.id)}" type="button">${escapeHtml(t("reserve_button", "Reserve"))}</button>
     </article>
-  `).join("") || `<div class="guest-empty-state">${escapeHtml(t("restaurant_no_active_offers", "This restaurant does not have an active SmartTable offer right now."))}</div>`;
+  `).join("") || `<div class="guest-empty-state">${escapeHtml(t("restaurant_no_active_offers", "No active offers are currently available for this restaurant."))}</div>`;
+}
+
+function restaurantAcceptsStandardReservations(restaurant = {}) {
+  return restaurant && restaurant.accepts_reservation_requests !== false;
+}
+
+function standardReservationButton(restaurant = {}, className = "ghost-button wide") {
+  if (!restaurantAcceptsStandardReservations(restaurant)) return "";
+  const id = restaurant.id || restaurant.restaurant_id;
+  return `<button class="${escapeAttr(className)}" data-open-standard-reserve="${escapeAttr(id)}" data-restaurant="${escapeAttr(id)}" type="button">${escapeHtml(t("standard_reservation_button", "Book a regular table"))}</button>`;
+}
+
+function standardReservationDetailPanel(restaurant = {}) {
+  if (!restaurantAcceptsStandardReservations(restaurant)) return "";
+  const minParty = Number(restaurant.restaurant_min_party_size || restaurant.min_party_size || 1) || 1;
+  const maxParty = Number(restaurant.restaurant_max_party_size || restaurant.max_party_size || 8) || 8;
+  return `
+    <article class="detail-offer-card guest-card standard-reservation-card">
+      <div class="offer-line">
+        <h3>${escapeHtml(t("standard_reservation_title", "Regular table reservation"))}</h3>
+        <span class="guest-badge">${escapeHtml(t("standard_reservation_badge", "No discount"))}</span>
+      </div>
+      <p class="muted">${escapeHtml(t("standard_reservation_body", "Choose a date, time, and party size. The restaurant will confirm your request just like a SmartTable offer reservation."))}</p>
+      <div class="detail-offer-meta">
+        <span>${escapeHtml(contentTemplate("standard_reservation_party_range", "{{min}}-{{max}} guests", { min: minParty, max: maxParty }))}</span>
+        <span>${escapeHtml(t("standard_reservation_partner_confirmed", "Restaurant confirmation required"))}</span>
+      </div>
+      ${standardReservationButton(restaurant, "primary-button")}
+    </article>
+  `;
 }
 
 function readableCustomTerms(value) {
@@ -2444,32 +4313,190 @@ function restaurantRatings(restaurant) {
   `;
 }
 
-function restaurantCard(restaurant) {
-  const firstOffer = firstOfferForRestaurant(restaurant);
-  const rating = restaurant.overall_rating_avg || restaurant.rating;
+function restaurantReviewCacheEntry(restaurantId) {
+  return state.publicReviewCache?.[restaurantId] || { loading: false, loaded: false, reviews: [], summary: null, error: "" };
+}
+
+async function loadPublicRestaurantReviews(restaurantId) {
+  if (!restaurantId) return;
+  const current = restaurantReviewCacheEntry(restaurantId);
+  if (current.loading || current.loaded) return;
+  state.publicReviewCache[restaurantId] = { ...current, loading: true, error: "" };
+  try {
+    const payload = await api(`/public/restaurants/reviews?restaurant_id=${encodeURIComponent(restaurantId)}`);
+    state.publicReviewCache[restaurantId] = {
+      loading: false,
+      loaded: true,
+      reviews: payload.reviews || [],
+      summary: payload.summary || null,
+      error: ""
+    };
+  } catch (error) {
+    state.publicReviewCache[restaurantId] = { loading: false, loaded: true, reviews: [], summary: null, error: error.message };
+  }
+}
+
+function reviewDurationLabel(minutes) {
+  const value = Number(minutes);
+  if (!Number.isFinite(value) || value <= 0) return "";
+  const hours = Math.floor(value / 60);
+  const mins = value % 60;
+  if (!hours) return `${mins} min`;
+  return mins ? `${hours} hr ${mins} min` : `${hours} hr`;
+}
+
+function publicReviewDate(value) {
+  if (!value) return "";
+  try {
+    return new Date(value).toLocaleDateString((supportedLanguages[state.lang] || supportedLanguages.en).locale, {
+      year: "numeric",
+      month: "long",
+      day: "numeric"
+    });
+  } catch {
+    return "";
+  }
+}
+
+function publicReviewPhotoGrid(review) {
+  const photos = Array.isArray(review.photos) ? review.photos.slice(0, 5) : [];
+  if (!photos.length) return "";
   return `
-    <article class="restaurant-card grouped-card guest-card guest-restaurant-card">
-      <div class="restaurant-photo" style="background-image: linear-gradient(180deg, rgba(20, 30, 25, 0), rgba(20, 30, 25, 0.54)), url('${escapeAttr(restaurant.image)}')" aria-hidden="true"></div>
-      <div class="restaurant-body">
-        <div class="restaurant-footer">
+    <div class="review-photo-gallery" aria-label="${escapeAttr(t("guest_photos_label", "Guest photos"))}">
+      ${photos.map((photo, index) => `
+        <button class="review-photo-thumb" data-review-lightbox-review="${escapeAttr(review.id)}" data-review-lightbox-index="${index}" type="button" aria-label="${escapeAttr(t("review_photo_open_label", "Open review photo"))}">
+          <img src="${escapeAttr(photo.url)}" alt="${escapeAttr(`${t("guest_photos_label", "Guest photos")} ${index + 1}`)}" loading="lazy" decoding="async">
+        </button>
+      `).join("")}
+    </div>
+  `;
+}
+
+function publicReviewCard(review) {
+  const written = String(review.written_review || "").trim();
+  const duration = reviewDurationLabel(review.visit_duration_minutes);
+  const response = review.restaurant_response && String(review.restaurant_response.text || "").trim()
+    ? review.restaurant_response
+    : null;
+  return `
+    <article class="public-review-card">
+      <header>
+        <div>
+          <strong>${escapeHtml(review.reviewer_name || t("guest_label", "Guest"))}</strong>
+          <span class="verified-review-badge">${escapeHtml(t("verified_visit_badge", "Verified SmartTable visit"))}</span>
+        </div>
+        <time>${escapeHtml(publicReviewDate(review.submitted_at))}</time>
+      </header>
+      <dl class="review-rating-list">
+        <div><dt>${escapeHtml(t("review_food_label", "Food"))}</dt><dd aria-label="${escapeAttr(`${review.food_rating} / 5`)}">${escapeHtml(starsMarkup(review.food_rating))}</dd></div>
+        <div><dt>${escapeHtml(t("review_service_label", "Service"))}</dt><dd aria-label="${escapeAttr(`${review.service_rating} / 5`)}">${escapeHtml(starsMarkup(review.service_rating))}</dd></div>
+        <div><dt>${escapeHtml(t("review_atmosphere_label", "Atmosphere"))}</dt><dd aria-label="${escapeAttr(`${review.atmosphere_rating} / 5`)}">${escapeHtml(starsMarkup(review.atmosphere_rating))}</dd></div>
+      </dl>
+      ${written ? `<p class="public-review-text">${escapeHtml(written)}</p>` : ""}
+      ${duration ? `<p class="muted">${escapeHtml(t("visit_duration_label", "Visit duration"))}: ${escapeHtml(duration)}</p>` : ""}
+      ${publicReviewPhotoGrid(review)}
+      ${response ? `
+        <div class="restaurant-review-response">
+          <strong>${escapeHtml(t("partner_review_response_public_label", "Restaurant response"))}</strong>
+          <p>${escapeHtml(response.text)}</p>
+        </div>
+      ` : ""}
+    </article>
+  `;
+}
+
+function publicRestaurantReviewsSection(restaurant) {
+  const id = restaurant.id || restaurant.restaurant_id;
+  const entry = restaurantReviewCacheEntry(id);
+  const summary = entry.summary || {
+    overall_rating: restaurant.overall_rating_avg,
+    food_rating: restaurant.food_rating_avg,
+    service_rating: restaurant.service_rating_avg,
+    atmosphere_rating: restaurant.atmosphere_rating_avg || restaurant.ambience_rating_avg,
+    verified_review_count: restaurant.review_count || 0
+  };
+  const publicReviews = (entry.reviews || []).filter((review) => !isGeneratedPublicQaContent(review));
+  const count = entry.loaded ? publicReviews.length : Number(summary.verified_review_count || 0);
+  return `
+    <section class="public-reviews-section">
+      <div class="section-title-row compact">
+        <div><span class="section-kicker">${escapeHtml(t("reviews_title", "Reviews"))}</span><h2>${escapeHtml(t("verified_reviews_title", "Verified reviews"))}</h2></div>
+      </div>
+      <div class="rating-summary verified-review-summary">
+        <div><span>${escapeHtml(t("review_overall_label", "Overall"))}</span><strong>${escapeHtml(summary.overall_rating ? ratingValue(summary.overall_rating) : "—")}</strong></div>
+        <div><span>${escapeHtml(t("review_food_label", "Food"))}</span><strong>${escapeHtml(summary.food_rating ? ratingValue(summary.food_rating) : "—")}</strong></div>
+        <div><span>${escapeHtml(t("review_service_label", "Service"))}</span><strong>${escapeHtml(summary.service_rating ? ratingValue(summary.service_rating) : "—")}</strong></div>
+        <div><span>${escapeHtml(t("review_atmosphere_label", "Atmosphere"))}</span><strong>${escapeHtml(summary.atmosphere_rating ? ratingValue(summary.atmosphere_rating) : "—")}</strong></div>
+        <small>${escapeHtml(count)} ${escapeHtml(t("verified_reviews_count_label", "verified reviews"))}</small>
+      </div>
+      ${entry.loading ? `<div class="guest-empty-state compact">${escapeHtml(t("loading_label", "Loading..."))}</div>` : ""}
+      ${entry.error ? `<div class="guest-empty-state compact">${escapeHtml(t("reviews_load_error", "Reviews could not be loaded right now."))}</div>` : ""}
+      ${!entry.loading && !entry.error && !publicReviews.length ? `<div class="guest-empty-state compact"><strong>${escapeHtml(t("no_reviews_yet", "No reviews yet."))}</strong><br>${escapeHtml(t("no_reviews_verified_prompt", "Be the first verified SmartTable guest to review this restaurant."))}</div>` : ""}
+      ${publicReviews.length ? `<div class="public-review-list">${publicReviews.map(publicReviewCard).join("")}</div>` : ""}
+    </section>
+    ${reviewPhotoLightbox()}
+  `;
+}
+
+function reviewPhotoLightbox() {
+  const lightbox = state.reviewLightbox;
+  if (!lightbox) return "";
+  const entry = restaurantReviewCacheEntry(lightbox.restaurantId);
+  const review = (entry.reviews || []).find((item) => item.id === lightbox.reviewId);
+  const photos = Array.isArray(review?.photos) ? review.photos : [];
+  const index = Math.min(Math.max(Number(lightbox.index) || 0, 0), Math.max(photos.length - 1, 0));
+  const photo = photos[index];
+  if (!photo) return "";
+  return `
+    <div class="review-lightbox" role="dialog" aria-modal="true" aria-label="${escapeAttr(t("guest_photos_label", "Guest photos"))}">
+      <button class="review-lightbox-backdrop" data-review-lightbox-close type="button" aria-label="${escapeAttr(t("close_button", "Close"))}"></button>
+      <div class="review-lightbox-panel">
+        <button class="ghost-button review-lightbox-close" data-review-lightbox-close type="button">${escapeHtml(t("close_button", "Close"))}</button>
+        <img src="${escapeAttr(photo.url)}" alt="${escapeAttr(t("guest_photos_label", "Guest photos"))}">
+        <div class="review-lightbox-controls">
+          <button class="ghost-button" data-review-lightbox-prev type="button" ${index === 0 ? "disabled" : ""}>${escapeHtml(t("previous_button", "Previous"))}</button>
+          <span>${escapeHtml(`${index + 1} / ${photos.length}`)}</span>
+          <button class="ghost-button" data-review-lightbox-next type="button" ${index === photos.length - 1 ? "disabled" : ""}>${escapeHtml(t("next_button", "Next"))}</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function testRestaurantBadge(restaurant = {}) {
+  if (!boolValue(restaurant.is_test_restaurant)) return "";
+  return `<span class="guest-badge test-restaurant-badge">${escapeHtml(t("test_restaurant_badge", "Test restaurant \u2013 no real reservation"))}</span>`;
+}
+
+function restaurantCard(restaurant) {
+  const aggregate = restaurantOfferAggregate(restaurant);
+  const rating = restaurant.overall_rating_avg || restaurant.rating;
+  const location = restaurant.district || restaurant.city || "New York";
+  const discount = restaurantDiscountRangeLabel(aggregate);
+  const detailSlug = restaurantRouteSlug(restaurant);
+  const openLabel = contentTemplate("restaurant_tile_open_label", "View restaurant details: {{restaurant}}", { restaurant: restaurant.name });
+  const isFavorite = favoriteRestaurantIds().has(restaurant.id);
+  const favoriteLabel = isFavorite ? t("remove_favorite_accessible_label", "Remove from favorites") : t("favorite_button", "Add to favorites");
+  return `
+    <article class="restaurant-card grouped-card guest-card guest-restaurant-card compact-restaurant-card" data-restaurant-card data-open-restaurant="${escapeAttr(restaurant.id)}" data-restaurant-slug="${escapeAttr(detailSlug)}" tabindex="0" role="link" aria-label="${escapeAttr(openLabel)}">
+      <div class="restaurant-photo restaurant-tile-photo" aria-hidden="true">
+        <img src="${escapeAttr(restaurant.image)}" alt="" loading="lazy" decoding="async">
+      </div>
+      <div class="restaurant-body restaurant-tile-body">
+        <div class="restaurant-tile-title-row">
           <div>
-            <div class="status-title-row"><h3>${escapeHtml(restaurant.name)}</h3></div>
-            <div class="restaurant-meta">
-              <span>${escapeHtml(restaurant.cuisine || "Restaurant")}</span><span class="dot"></span><span>${escapeHtml(restaurant.district || "New York")}</span><span class="dot"></span><span>${escapeHtml(restaurant.price_range || "$$")}</span>
-              ${rating ? `<span class="dot"></span><span>${escapeHtml(ratingValue(rating))}/5</span>` : ""}
-            </div>
+            <h3>${escapeHtml(restaurant.name)}</h3>
+            ${testRestaurantBadge(restaurant)}
           </div>
-          <strong class="discount-pill">${escapeHtml(`-${highestDiscount(restaurant)}%`)}</strong>
+          <strong class="discount-pill restaurant-discount-range">${escapeHtml(discount)}</strong>
         </div>
-        <p class="muted">${escapeHtml(restaurant.description)}</p>
-        ${firstOffer ? `<div class="guest-chip-grid"><span class="guest-badge success">${escapeHtml(t("available_time_label", "Available"))}: ${escapeHtml(formatDate(firstOffer.offer_date || firstOffer.reservation_date, firstOffer.start_time || firstOffer.offer_time, firstOffer.end_time))}</span></div>` : ""}
-        <div class="card-actions outside-actions">
-          ${firstOffer ? `<button class="primary-button" data-open-reserve="${escapeAttr(firstOffer.offer_id)}" data-restaurant="${escapeAttr(restaurant.id)}" type="button">${escapeHtml(t("reserve_button", "Reserve"))}</button>` : ""}
-          <button class="ghost-button" data-open-restaurant="${escapeAttr(restaurant.id)}" data-restaurant-slug="${escapeAttr(restaurantRouteSlug(restaurant))}" type="button">${escapeHtml(t("restaurant_details_button", "View details"))}</button>
-          <button class="guest-icon-action" data-follow-restaurant="${escapeAttr(restaurant.id)}" type="button" aria-label="${escapeAttr(t("favorite_button", "Add to favorites"))}">♡</button>
+        <div class="restaurant-meta restaurant-tile-meta">
+          <span>${escapeHtml(restaurant.cuisine || "Restaurant")}</span><span class="dot"></span><span>${escapeHtml(location)}</span><span class="dot"></span><span>${escapeHtml(restaurant.price_range || "$$")}</span>
+          ${rating ? `<span class="dot"></span><span>${escapeHtml(ratingValue(rating))} &#9733;</span>` : ""}
         </div>
-        <div class="offer-stack">
-          ${offerRows(restaurant)}
+        <div class="restaurant-tile-footer">
+          <span class="restaurant-tile-availability">${escapeHtml(restaurantTileAvailabilityLabel(aggregate))}</span>
+          <button class="guest-icon-action restaurant-favorite-button ${isFavorite ? "active" : ""}" data-follow-restaurant="${escapeAttr(restaurant.id)}" data-favorite-active="${isFavorite ? "true" : "false"}" type="button" aria-label="${escapeAttr(favoriteLabel)}">${isFavorite ? "&#9829;" : "&#9825;"}</button>
         </div>
       </div>
     </article>
@@ -2504,6 +4531,7 @@ function restaurantDetailModal() {
           <div>
             <span class="section-kicker">${escapeHtml(t("restaurant_detail_kicker", "Restaurant profile"))}</span>
             <h2 id="restaurantDetailTitle">${escapeHtml(name)}</h2>
+            ${testRestaurantBadge(restaurant)}
             <div class="restaurant-meta detail-meta">
               <span>${escapeHtml(restaurant.cuisine || restaurant.cuisine_type || "Restaurant")}</span><span class="dot"></span>
               <span>${escapeHtml(restaurant.district || "New York")}</span><span class="dot"></span>
@@ -2519,13 +4547,14 @@ function restaurantDetailModal() {
             </div>
             <div class="detail-cta-stack">
               ${firstOffer ? `<button class="primary-button wide" data-open-reserve="${escapeAttr(firstOffer.offer_id)}" data-restaurant="${escapeAttr(id)}" type="button">${escapeHtml(t("reserve_button", "Reserve"))}</button>` : ""}
+              ${standardReservationButton({ ...restaurant, id })}
               <button class="ghost-button wide" data-follow-restaurant="${escapeAttr(id)}" type="button">${escapeHtml(t("follow_button", "Follow restaurant"))}</button>
               <button class="ghost-button wide" data-follow-restaurant="${escapeAttr(id)}" data-ai-action="favorite" type="button">${escapeHtml(t("favorite_button", "Add to favorites"))}</button>
             </div>
           </section>
           <section>
             <div class="section-title-row compact"><div><span class="section-kicker">${escapeHtml(t("active_offers_label", "Active offers"))}</span><h2>${escapeHtml(t("restaurant_offers_title", "Available tables"))}</h2></div></div>
-            <div class="detail-offer-grid">${restaurantDetailOffers(restaurant)}</div>
+            <div class="detail-offer-grid">${restaurantDetailOffers(restaurant)}${standardReservationDetailPanel({ ...restaurant, id })}</div>
           </section>
           <section class="detail-grid two">
             <article>
@@ -2557,7 +4586,6 @@ function restaurantDetailModal() {
           <section>
             <div class="section-title-row compact">
               <div><span class="section-kicker">${escapeHtml(t("reviews_title", "Reviews"))}</span><h2>${escapeHtml(t("rating_summary_title", "Rating summary"))}</h2></div>
-              <button class="ghost-button" data-review-restaurant="${escapeAttr(id)}" type="button">${escapeHtml(t("review_button", "Write review"))}</button>
             </div>
             ${restaurantRatings(restaurant)}
           </section>
@@ -2567,16 +4595,95 @@ function restaurantDetailModal() {
   `;
 }
 
+function restaurantDetailPage(restaurant = {}) {
+  const id = restaurant.id || restaurant.restaurant_id;
+  const name = restaurant.name || restaurant.restaurant_name || t("restaurant_label", "Restaurant");
+  const firstOffer = firstOfferForRestaurant(restaurant);
+  const amenities = amenityList(restaurant);
+  const gallery = restaurantGallery(restaurant);
+  const hasProvidedImage = restaurantHasProvidedImage(restaurant);
+  const socials = socialLinks(restaurant);
+  const payments = paymentMethods(restaurant.payment_methods);
+  const location = [restaurant.district, restaurant.city].filter(Boolean).join(", ") || restaurant.address || "New York";
+  return `
+    <section class="restaurant-detail-page" data-restaurant-detail-page="${escapeAttr(id)}">
+      <a class="ghost-button restaurant-detail-back" href="/restaurants">${escapeHtml(t("restaurants_back_link", "Back to restaurants"))}</a>
+      <div class="restaurant-detail-hero restaurant-detail-page-hero" style="background-image: linear-gradient(180deg, rgba(13,20,17,0.08), rgba(13,20,17,0.66)), url('${escapeAttr(restaurantHeroImage(restaurant))}')">
+        <img class="restaurant-detail-logo" src="${escapeAttr(restaurantLogoImage(restaurant))}" alt="${escapeAttr(name)}" loading="lazy" decoding="async">
+        <div>
+          <span class="section-kicker">${escapeHtml(t("restaurant_detail_kicker", "Restaurant profile"))}</span>
+          <h1>${escapeHtml(name)}</h1>
+          ${testRestaurantBadge(restaurant)}
+          <div class="restaurant-meta detail-meta">
+            <span>${escapeHtml(restaurant.cuisine || restaurant.cuisine_type || "Restaurant")}</span><span class="dot"></span>
+            <span>${escapeHtml(location)}</span><span class="dot"></span>
+            <span>${escapeHtml(restaurant.price_range || "$$")}</span>
+            ${(restaurant.overall_rating_avg || restaurant.rating) ? `<span class="dot"></span><span>${escapeHtml(ratingValue(restaurant.overall_rating_avg || restaurant.rating))} &#9733;</span>` : ""}
+          </div>
+        </div>
+      </div>
+      <div class="restaurant-detail-body restaurant-detail-page-body">
+        <section class="detail-top-grid">
+          <div>
+            ${restaurantRatings(restaurant)}
+            <p class="restaurant-detail-description">${escapeHtml(restaurant.description || restaurant.restaurant_description || "")}</p>
+          </div>
+          <div class="detail-cta-stack">
+            ${firstOffer ? `<button class="primary-button wide" data-open-reserve="${escapeAttr(firstOffer.offer_id)}" data-restaurant="${escapeAttr(id)}" type="button">${escapeHtml(t("reserve_button", "Reserve"))}</button>` : ""}
+            ${standardReservationButton({ ...restaurant, id })}
+            <button class="ghost-button wide" data-follow-restaurant="${escapeAttr(id)}" type="button">${escapeHtml(t("favorite_button", "Add to favorites"))}</button>
+          </div>
+        </section>
+        <section>
+          <div class="section-title-row compact"><div><span class="section-kicker">${escapeHtml(t("active_offers_label", "Active offers"))}</span><h2>${escapeHtml(t("restaurant_offers_title", "Available tables"))}</h2></div></div>
+          <div class="detail-offer-grid">${restaurantDetailOffers(restaurant)}${standardReservationDetailPanel({ ...restaurant, id })}</div>
+        </section>
+        <section class="detail-grid two">
+          <article>
+            <span class="section-kicker">${escapeHtml(t("about_title", "About"))}</span>
+            <div class="detail-info-list">
+              ${restaurant.address ? `<span>${escapeHtml(t("address_label", "Address"))}: ${escapeHtml(restaurant.address)}</span>` : ""}
+              ${restaurant.email ? `<span>${escapeHtml(t("guest_email_label", "Email"))}: ${escapeHtml(restaurant.email)}</span>` : ""}
+              ${restaurant.opening_hours ? `<span>${escapeHtml(t("business_hours_label", "Business hours"))}: ${escapeHtml(restaurant.opening_hours)}</span>` : ""}
+              ${restaurant.chef_name ? `<span>${escapeHtml(t("chef_name_label", "Chef"))}: ${escapeHtml(restaurant.chef_name)}</span>` : ""}
+              ${restaurant.year_opened ? `<span>${escapeHtml(t("year_opened_label", "Year opened"))}: ${escapeHtml(restaurant.year_opened)}</span>` : ""}
+              ${restaurant.capacity ? `<span>${escapeHtml(t("capacity_label", "Capacity"))}: ${escapeHtml(restaurant.capacity)}</span>` : ""}
+              ${restaurant.dress_code ? `<span>${escapeHtml(t("dress_code_label", "Dress code"))}: ${escapeHtml(restaurant.dress_code)}</span>` : ""}
+            </div>
+          </article>
+          <article>
+            <span class="section-kicker">${escapeHtml(t("amenities_title", "Amenities"))}</span>
+            <div class="amenity-grid">${amenities.map((item) => `<span class="amenity-chip">${escapeHtml(item)}</span>`).join("") || `<span class="muted">${escapeHtml(t("amenities_empty", "Amenities will appear here soon."))}</span>`}</div>
+            <div class="tag-row">${payments.map((item) => `<span class="tag">${escapeHtml(item)}</span>`).join("")}</div>
+          </article>
+        </section>
+        <section class="detail-link-row">
+          ${restaurant.menu_pdf_url ? `<a class="ghost-button" href="${escapeAttr(restaurant.menu_pdf_url)}" target="_blank" rel="noreferrer">${escapeHtml(t("menu_link_label", "View menu"))}</a>` : ""}
+          ${restaurant.google_maps_url ? `<a class="ghost-button" href="${escapeAttr(restaurant.google_maps_url)}" target="_blank" rel="noreferrer">${escapeHtml(t("directions_link_label", "Map / directions"))}</a>` : ""}
+          ${socials.filter(([label]) => !["Menu", "Google Maps"].includes(label)).map(([label, href]) => `<a class="ghost-button" href="${escapeAttr(href)}" target="_blank" rel="noreferrer">${escapeHtml(label)}</a>`).join("")}
+        </section>
+        <section>
+          <div class="section-title-row compact"><div><span class="section-kicker">${escapeHtml(t("gallery_title", "Gallery"))}</span><h2>${escapeHtml(t("restaurant_gallery_title", "Dining room and dishes"))}</h2></div></div>
+          ${hasProvidedImage ? `<div class="detail-gallery guest-gallery">${gallery.map((image) => `<span style="background-image: url('${escapeAttr(image)}')" aria-hidden="true"></span>`).join("")}</div>` : `<div class="guest-empty-state">${escapeHtml(t("restaurant_no_images", "Restaurant images will appear here after the partner uploads them."))}</div>`}
+        </section>
+        ${publicRestaurantReviewsSection(restaurant)}
+      </div>
+    </section>
+    ${publicFooter()}
+    ${guestModals({ includeRestaurantDetail: false })}
+  `;
+}
+
 function listView(restaurants) {
   const cards = restaurants.map(restaurantCard).join("");
-  return `<section class="restaurant-grid grouped-grid" id="guest-restaurants">${cards || `<div class="empty-state">${escapeHtml(t("offers_empty", "No active offers yet."))}</div>`}</section>`;
+  return `<section class="restaurant-grid grouped-grid compact-restaurant-grid" id="guest-restaurants">${cards || `<div class="empty-state">${escapeHtml(t("offers_empty", "No active offers yet."))}</div>`}</section>`;
 }
 
 function mapView(restaurants) {
   const fallbackCards = restaurants.map((restaurant) => `
-    <button class="map-pin-card" data-open-reserve="${escapeAttr((restaurant.filteredOffers || restaurant.offers)[0]?.offer_id || "")}" data-restaurant="${escapeAttr(restaurant.id)}" type="button">
+    <button class="map-pin-card" data-open-restaurant="${escapeAttr(restaurant.id)}" data-restaurant-slug="${escapeAttr(restaurantRouteSlug(restaurant))}" type="button">
       <strong>${escapeHtml(restaurant.name)}</strong>
-      <span>${escapeHtml(restaurant.district || "New York")} - ${escapeHtml((restaurant.filteredOffers || restaurant.offers).length)} ${escapeHtml(t("offers_count_label", "active offers"))}</span>
+      <span>${escapeHtml(restaurant.district || restaurant.city || "New York")} - ${escapeHtml(restaurantOfferAggregate(restaurant).count)} ${escapeHtml(t("offers_count_label", "active offers"))}</span>
     </button>
   `).join("");
   return `
@@ -2591,7 +4698,10 @@ function normalizeNewestRestaurant(row) {
   return {
     id: row.restaurant_id || row.id,
     name: row.restaurant_name || row.name,
+    slug: row.slug || "",
     district: row.district,
+    city: row.city,
+    country: row.country,
     address: row.address,
     cuisine: row.cuisine_type || row.cuisine,
     description: row.restaurant_description || row.description || "",
@@ -2624,6 +4734,9 @@ function normalizeNewestRestaurant(row) {
     first_offer_id: row.first_offer_id,
     offer_count: row.offer_count || 0,
     highest_discount: row.highest_discount || 0,
+    is_test_restaurant: boolValue(row.is_test_restaurant),
+    test_badge: row.test_badge || "",
+    reservation_provider: row.reservation_provider || "smarttable",
     food_rating_avg: row.food_rating_avg,
     service_rating_avg: row.service_rating_avg,
     ambience_rating_avg: row.ambience_rating_avg,
@@ -2639,6 +4752,7 @@ function newestRestaurantsSection() {
       <span class="newest-image" style="background-image: url('${escapeAttr(restaurant.image)}')" aria-hidden="true"></span>
       <span class="newest-copy">
         <strong>${escapeHtml(restaurant.name)}</strong>
+        ${testRestaurantBadge(restaurant)}
         <small>${escapeHtml(restaurant.district || "New York")} - ${escapeHtml(restaurant.cuisine || "Restaurant")}</small>
         <small>${escapeHtml(restaurant.offer_count)} ${escapeHtml(t("offers_count_label", "active offers"))}</small>
       </span>
@@ -2864,12 +4978,10 @@ function postVisitRewardsPage() {
 }
 
 function aiConsumptionPanel() {
-  const restaurants = publicRestaurantOptions();
   const result = state.aiConsumptionResult;
   const upload = result?.upload || null;
   const loyalty = result?.loyalty || state.loyaltyStatus;
   const context = state.rewardBookingContext;
-  const selectedRestaurantId = context?.restaurant_id || context?.restaurantId || restaurants[0]?.id || "";
   const hasContext = Boolean(context && !context.error);
   return `
     <article class="ai-tool-panel dining-rewards-panel">
@@ -2880,26 +4992,12 @@ function aiConsumptionPanel() {
         <p class="reward-points-cap">${escapeHtml(t("photo_rewards_points_cap", "You can earn up to 160 points for this visit."))}</p>
       </div>
       ${rewardBookingContextCard(context)}
+      ${hasContext ? `
       <form class="mini-form ai-tool-form" id="consumptionForm">
-        ${hasContext ? `
-          <input type="hidden" name="restaurant_id" value="${escapeAttr(selectedRestaurantId)}">
-          <input type="hidden" name="reservation_id" value="${escapeAttr(context.bookingId || context.reservation_id || "")}">
-          <input type="hidden" name="booking_id" value="${escapeAttr(context.bookingId || context.reservation_id || "")}">
-          <input type="hidden" name="guest_id" value="${escapeAttr(context.guestId || "")}">
-          <input type="hidden" name="guest_name" value="${escapeAttr(context.guestName || "")}">
-          <input type="hidden" name="guest_email" value="${escapeAttr(context.guestEmail || "")}">
-        ` : ""}
+        <input type="hidden" name="reservation_id" value="${escapeAttr(context.bookingId || context.reservation_id || "")}">
         <div class="form-grid two">
-          ${hasContext ? `
-            <label>${escapeHtml(t("route_restaurant_label", "Restaurant"))}<input value="${escapeAttr(context.restaurantName || "")}" readonly></label>
-            <label>${escapeHtml(t("booking_id_label", "Booking ID"))}<input value="${escapeAttr(context.bookingId || context.reservation_id || "")}" readonly></label>
-          ` : `
-            <label>${escapeHtml(t("route_restaurant_label", "Restaurant"))}
-              <select name="restaurant_id" required>
-                ${restaurants.map((restaurant) => `<option value="${escapeAttr(restaurant.id)}" ${restaurant.id === selectedRestaurantId ? "selected" : ""}>${escapeHtml(restaurant.name)}</option>`).join("")}
-              </select>
-            </label>
-          `}
+          <label>${escapeHtml(t("route_restaurant_label", "Restaurant"))}<input value="${escapeAttr(context.restaurantName || "")}" readonly></label>
+          <label>${escapeHtml(t("booking_id_label", "Booking ID"))}<input value="${escapeAttr(context.bookingId || context.reservation_id || "")}" readonly></label>
           <label>${escapeHtml(t("photo_type_label", "Food or drink type"))}
             <select name="media_type">
               <option value="food">${escapeHtml(t("photo_type_food", "Food"))}</option>
@@ -2908,8 +5006,7 @@ function aiConsumptionPanel() {
               <option value="menu">${escapeHtml(t("photo_type_menu", "Menu item"))}</option>
             </select>
           </label>
-          <label>${escapeHtml(t("photo_upload_label", "Photo upload"))}<input name="photo" type="file" accept="image/png,image/jpeg,image/webp"></label>
-          <label>${escapeHtml(t("photo_url_label", "Optional image URL"))}<input name="image_url" placeholder="${escapeAttr(t("photo_url_placeholder", "Optional image URL"))}"></label>
+          <label>${escapeHtml(t("photo_upload_label", "Photo upload"))}<input name="photo" type="file" accept="image/png,image/jpeg,image/webp" required></label>
           <label>${escapeHtml(t("review_overall_label", "Overall rating"))}<input name="overall_rating" type="number" min="1" max="5" step="0.5" value="5" required></label>
           <label>${escapeHtml(t("review_food_label", "Food"))}<input name="food_rating" type="number" min="1" max="5" step="1" value="5" required></label>
           <label>${escapeHtml(t("review_service_label", "Service"))}<input name="service_rating" type="number" min="1" max="5" step="1" value="5" required></label>
@@ -2945,6 +5042,7 @@ function aiConsumptionPanel() {
         <p class="form-note consent-submit-copy">${escapeHtml(t("photo_rewards_consent", "By submitting, you allow SmartTable to use your review, uploaded photos, and dining information to improve restaurant recommendations and platform analytics. Public display requires approval."))}</p>
         <button class="primary-button wide" type="submit">${escapeHtml(t("photo_rewards_earn_cta", "Earn points for your visit"))}</button>
       </form>
+      ` : `<div class="empty-state"><p>${escapeHtml(t("photo_rewards_reservation_required", "Open an eligible completed reservation to upload a dining photo."))}</p><a class="primary-button" href="/account/reservations">${escapeHtml(t("view_my_reservations", "View my reservations"))}</a></div>`}
       ${result ? `
         <div class="reward-confirmation-state">
           <strong>${escapeHtml(t("photo_rewards_confirmation_title", "Thank you for your feedback!"))}</strong>
@@ -3176,10 +5274,6 @@ async function initializeMap(restaurants) {
     const center = mapped[0] ? { lat: Number(mapped[0].latitude), lng: Number(mapped[0].longitude) } : { lat: 40.7306, lng: -73.9352 };
     const map = new window.google.maps.Map(canvas, { center, zoom: mapped.length ? 12 : 11 });
     const infoWindow = new window.google.maps.InfoWindow();
-    window.smarttableReserveFromMap = (restaurantId, offerId) => {
-      state.reservationModal = { restaurantId, offerId };
-      renderGuest();
-    };
     mapped.forEach((restaurant) => {
       const offer = (restaurant.filteredOffers || restaurant.offers)[0];
       const marker = new window.google.maps.Marker({
@@ -3193,9 +5287,19 @@ async function initializeMap(restaurants) {
             <strong>${escapeHtml(restaurant.name)}</strong>
             <p>${escapeHtml(restaurant.description || "")}</p>
             <p>${escapeHtml((restaurant.filteredOffers || restaurant.offers).length)} ${escapeHtml(t("offers_count_label", "active offers"))}</p>
-            <button onclick="window.smarttableReserveFromMap('${escapeAttr(restaurant.id)}','${escapeAttr(offer?.offer_id || "")}')">${escapeHtml(t("reserve_button", "Reserve"))}</button>
+            <button data-map-reserve data-restaurant="${escapeAttr(restaurant.id)}" data-offer="${escapeAttr(offer?.offer_id || "")}" type="button">${escapeHtml(t("reserve_button", "Reserve"))}</button>
           </div>
         `);
+        window.google.maps.event.addListenerOnce(infoWindow, "domready", () => {
+          const reserveButton = document.querySelector(".map-info [data-map-reserve]");
+          reserveButton?.addEventListener("click", () => {
+            state.reservationModal = {
+              restaurantId: reserveButton.dataset.restaurant,
+              offerId: reserveButton.dataset.offer
+            };
+            renderGuest();
+          });
+        });
         infoWindow.open({ anchor: marker, map });
       });
     });
@@ -3209,18 +5313,25 @@ function reservationModal() {
   if (!modal) return "";
   const restaurant = groupRestaurants().find((item) => item.id === modal.restaurantId);
   if (!restaurant) return "";
-  const offer = restaurant.offers.find((item) => item.offer_id === modal.offerId) || restaurant.offers[0];
-  return `
-    <div class="modal-backdrop" role="presentation">
-      <section class="modal-card" role="dialog" aria-modal="true" aria-labelledby="reservationTitle">
-        <div class="dialog-head">
-          <div>
-            <span class="section-kicker">${escapeHtml(t("reserve_modal_title", "Reservation request"))}</span>
-            <h2 id="reservationTitle">${escapeHtml(restaurant.name)}</h2>
-          </div>
-          <button class="icon-button" data-close-modal type="button" aria-label="${escapeAttr(t("modal_cancel_label", "Cancel"))}">X</button>
+  const isStandardReservation = modal.reservationType === "standard";
+  const offers = Array.isArray(restaurant.offers) ? restaurant.offers : [];
+  const offer = isStandardReservation ? null : (offers.find((item) => item.offer_id === modal.offerId) || offers[0]);
+  if (!isStandardReservation && !offer) return "";
+  const today = new Date().toISOString().slice(0, 10);
+  const maxParty = Math.max(1, Number(
+    isStandardReservation
+      ? (restaurant.restaurant_max_party_size || restaurant.max_party_size || restaurant.capacity || 8)
+      : (offer.max_party_size || offer.available_seats || 8)
+  ) || 8);
+  const modalKicker = isStandardReservation
+    ? t("standard_reservation_modal_kicker", "Regular reservation")
+    : t("reserve_modal_title", "Reservation request");
+  const modalHelp = isStandardReservation ? `
+        <div class="ai-planning-note">
+          <strong>${escapeHtml(t("standard_reservation_title", "Regular table reservation"))}</strong>
+          <p>${escapeHtml(t("standard_reservation_modal_help", "This is a standard reservation request without a SmartTable discount. The restaurant will confirm availability."))}</p>
         </div>
-        <button class="ghost-button subtle-wide" data-follow-restaurant="${escapeAttr(restaurant.id)}" type="button">${escapeHtml(t("favorite_button", "Add to favorites"))}</button>
+  ` : `
         <div class="ai-planning-note">
           <strong>${escapeHtml(t("ai_service_time_title", "Service time estimate"))}</strong>
           <p>${escapeHtml(contentTemplate("service_time_estimate_body", "{{minutes}} min baseline for {{restaurant_type}}. Party size and timing are refined after submit.", {
@@ -3228,16 +5339,32 @@ function reservationModal() {
             restaurant_type: restaurant.restaurant_type || restaurant.cuisine || t("restaurant_type_fallback", "this restaurant")
           }))}</p>
         </div>
-        <form class="mini-form reservation-form" data-reserve="${escapeAttr(offer.offer_id)}">
+  `;
+  return `
+    <div class="modal-backdrop" role="presentation">
+      <section class="modal-card" role="dialog" aria-modal="true" aria-labelledby="reservationTitle">
+        <div class="dialog-head">
+          <div>
+            <span class="section-kicker">${escapeHtml(modalKicker)}</span>
+            <h2 id="reservationTitle">${escapeHtml(restaurant.name)}</h2>
+          </div>
+          <button class="icon-button" data-close-modal type="button" aria-label="${escapeAttr(t("modal_cancel_label", "Cancel"))}">X</button>
+        </div>
+        <button class="ghost-button subtle-wide" data-follow-restaurant="${escapeAttr(restaurant.id)}" type="button">${escapeHtml(t("favorite_button", "Add to favorites"))}</button>
+        ${modalHelp}
+        <form class="mini-form reservation-form" data-reserve="${escapeAttr(offer?.offer_id || "")}">
+          <input type="hidden" name="reservation_type" value="${escapeAttr(isStandardReservation ? "standard" : "discount_offer")}">
+          <input type="hidden" name="restaurant_id" value="${escapeAttr(restaurant.id)}">
+          ${isStandardReservation ? "" : `
           <label>${escapeHtml(t("modal_offer_label", "Selected offer"))}
             <select name="offer_id" data-modal-offer>
-              ${restaurant.offers.map((item) => `<option value="${escapeAttr(item.offer_id)}" ${item.offer_id === offer.offer_id ? "selected" : ""}>${escapeHtml(item.title || item.offer_title || "Discounted table")} (${escapeHtml(discountLabel(item))})</option>`).join("")}
+              ${offers.map((item) => `<option value="${escapeAttr(item.offer_id)}" ${item.offer_id === offer.offer_id ? "selected" : ""}>${escapeHtml(item.title || item.offer_title || "Discounted table")} (${escapeHtml(discountLabel(item))})</option>`).join("")}
             </select>
-          </label>
+          </label>`}
           <div class="form-grid two">
-            <label>${escapeHtml(t("filter_date_label", "Date"))}<input name="reservation_date" type="date" value="${escapeAttr(offer.reservation_date || offer.offer_date || "")}" required></label>
-            <label>${escapeHtml(t("filter_time_label", "Time"))}<input name="reservation_time" type="time" value="${escapeAttr(offer.start_time || offer.offer_time || "")}" required></label>
-            <label>${escapeHtml(t("party_size_label", "Party size"))}<input name="party_size" type="number" min="1" max="${escapeAttr(offer.max_party_size || offer.available_seats || 8)}" value="2" required></label>
+            <label>${escapeHtml(t("filter_date_label", "Date"))}<input name="reservation_date" type="date" min="${escapeAttr(today)}" value="${escapeAttr(isStandardReservation ? "" : (offer.reservation_date || offer.offer_date || ""))}" required></label>
+            <label>${escapeHtml(t("filter_time_label", "Time"))}<input name="reservation_time" type="time" value="${escapeAttr(isStandardReservation ? "" : (offer.start_time || offer.offer_time || ""))}" required></label>
+            <label>${escapeHtml(t("party_size_label", "Party size"))}<input name="party_size" type="number" min="1" max="${escapeAttr(maxParty)}" value="2" required></label>
             <label>${escapeHtml(t("guest_name_label", "Name"))}<input name="guest_name" required></label>
             <label>${escapeHtml(t("guest_email_label", "Email"))}<input name="guest_email" type="email" required></label>
             <label>${escapeHtml(t("guest_phone_label", "Phone"))}<input name="guest_phone" required></label>
@@ -3255,6 +5382,7 @@ function reservationModal() {
 
 function findPublicRestaurant(restaurantId) {
   return groupRestaurants().find((item) => item.id === restaurantId)
+    || state.publicRestaurants.find((item) => item.restaurant_id === restaurantId || item.id === restaurantId)
     || state.newestRestaurants.find((item) => item.restaurant_id === restaurantId || item.id === restaurantId)
     || state.aiRecommendations.find((item) => item.restaurant_id === restaurantId || item.id === restaurantId)
     || null;
@@ -3303,36 +5431,430 @@ function ratingSelect(name, label) {
   `;
 }
 
-function reviewModal() {
-  const restaurantId = state.reviewModal;
-  if (!restaurantId) return "";
-  const restaurant = findPublicRestaurant(restaurantId);
-  if (!restaurant) return "";
-  const name = restaurant.name || restaurant.restaurant_name;
-  return `
-    <div class="modal-backdrop" role="presentation">
-      <section class="modal-card small-modal" role="dialog" aria-modal="true">
-        <div class="dialog-head">
-          <div>
-            <span class="section-kicker">${escapeHtml(t("review_title", "Review this restaurant"))}</span>
-            <h2>${escapeHtml(name)}</h2>
+function currentQueryParam(name) {
+  return new URLSearchParams(window.location.search).get(name) || "";
+}
+
+function postVisitStatusLine(reservation = {}) {
+  const arrival = reservation.arrival_status || "not_requested";
+  const visit = reservation.visit_status || "scheduled";
+  const labels = {
+    not_requested: t("post_visit_status_not_requested", "Arrival not requested yet"),
+    unknown: t("post_visit_status_not_requested", "Arrival not requested yet"),
+    pending: t("post_visit_status_pending", "Waiting for arrival confirmation"),
+    arrived: t("post_visit_status_arrived", "Arrival confirmed"),
+    on_the_way: t("post_visit_status_on_the_way", "Guest is still on the way"),
+    cannot_attend: t("post_visit_status_cannot_attend", "Guest cannot attend"),
+    not_attending: t("post_visit_status_cannot_attend", "Guest cannot attend"),
+    no_show: t("post_visit_status_no_show", "No-show recorded"),
+    scheduled: t("visit_status_scheduled", "Visit scheduled"),
+    checked_in: t("visit_status_checked_in", "Checked in"),
+    in_progress: t("visit_status_in_progress", "Visit in progress"),
+    completed: t("visit_status_completed", "Visit completed"),
+    cancelled: t("visit_status_cancelled", "Visit cancelled")
+  };
+  return `${labels[arrival] || arrival} - ${labels[visit] || visit}`;
+}
+
+function postVisitActionLabel(action = "") {
+  const labels = {
+    arrived: t("post_visit_action_arrived", "I arrived"),
+    on_the_way: t("post_visit_action_on_the_way", "I'm still on my way"),
+    cannot_attend: t("post_visit_action_cannot_attend", "I can't attend"),
+    finished: t("post_visit_action_finished", "We finished our visit"),
+    still_at_restaurant: t("post_visit_action_still_at_restaurant", "We're still at the restaurant"),
+    did_not_attend: t("post_visit_action_did_not_attend", "We didn't attend"),
+    open_review: t("post_visit_action_open_review", "Rate your visit")
+  };
+  return labels[String(action || "")] || t("post_visit_action_default", "Confirm visit update");
+}
+
+async function loadPostVisitActionContext() {
+  const token = currentQueryParam("token");
+  if (!token) {
+    state.postVisitAction = { ...state.postVisitAction, loading: false, error: t("post_visit_link_missing", "This post-visit link is missing its secure token."), context: null };
+    return;
+  }
+  state.postVisitAction.loading = true;
+  state.postVisitAction.error = "";
+  try {
+    const payload = await api(`/post-visit/action?token=${encodeURIComponent(token)}`);
+    state.postVisitAction.context = payload.context || null;
+    state.postVisitAction.completed = payload.token_status === "used";
+  } catch (error) {
+    state.postVisitAction.error = error.message;
+    state.postVisitAction.context = null;
+  } finally {
+    state.postVisitAction.loading = false;
+  }
+}
+
+async function renderPostVisitActionPage() {
+  state.mode = "guest";
+  await loadPostVisitActionContext();
+  const view = state.postVisitAction;
+  const context = view.context || {};
+  const reservation = context.reservation || {};
+  const action = context.action || "";
+  app.innerHTML = appAreaShell("guest", `
+    <section class="post-visit-page">
+      <article class="panel post-visit-card">
+        <span class="section-kicker">${escapeHtml(t("post_visit_kicker", "SmartTable visit"))}</span>
+        <h1>${escapeHtml(t("post_visit_action_title", "Confirm your visit status"))}</h1>
+        ${view.error ? `<p class="form-error" role="alert">${escapeHtml(view.error)}</p>` : ""}
+        ${view.loading ? `<div class="empty-state">${escapeHtml(t("loading_label", "Loading..."))}</div>` : ""}
+        ${reservation.reservation_id ? `
+          <div class="reservation-context-box">
+            <h2>${escapeHtml(reservation.restaurant_name || t("restaurant_label", "Restaurant"))}</h2>
+            <p>${escapeHtml(formatDate(reservation.reservation_date, reservation.reservation_time))} - ${escapeHtml(reservation.party_size || "")} ${escapeHtml(t("guests_label", "guests"))}</p>
+            <p class="muted">${escapeHtml(t("reservation_reference_label", "Reference"))}: ${escapeHtml(reservation.reference || "")}</p>
+            <p>${escapeHtml(postVisitStatusLine(reservation))}</p>
           </div>
-          <button class="icon-button" data-close-modal type="button" aria-label="${escapeAttr(t("modal_cancel_label", "Cancel"))}">X</button>
+          ${view.completed ? `<div class="success-banner">${escapeHtml(t("post_visit_action_already_used", "This secure action link has already been used."))}</div>` : `
+            <p>${escapeHtml(t("post_visit_action_prompt", "Please confirm this update for your SmartTable reservation."))}</p>
+            <button class="primary-button wide" data-confirm-post-visit-action="${escapeAttr(action)}" type="button" ${view.submitting ? "disabled" : ""}>
+              ${escapeHtml(view.submitting ? t("saving_button", "Saving...") : context.action_label || postVisitActionLabel(action))}
+            </button>
+          `}
+        ` : ""}
+        <div class="button-row">
+          <a class="ghost-button" href="/account/reservations">${escapeHtml(t("email_cta_my_reservations", "View My Reservations"))}</a>
+          <a class="ghost-button" href="/offers">${escapeHtml(t("browse_offers_button", "Browse offers"))}</a>
         </div>
-        <form class="mini-form" data-review-form="${escapeAttr(restaurantId)}">
-          <input name="guest_name" placeholder="${escapeAttr(t("guest_name_label", "Name"))}">
-          <input name="guest_email" type="email" placeholder="${escapeAttr(t("guest_email_label", "Email"))}">
-          <div class="form-grid">
-            ${ratingSelect("food_rating", t("review_food_label", "Food"))}
-            ${ratingSelect("service_rating", t("review_service_label", "Service"))}
-            ${ratingSelect("ambience_rating", t("review_ambience_label", "Ambience"))}
+      </article>
+    </section>
+  `);
+  document.querySelector("[data-confirm-post-visit-action]")?.addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    const token = currentQueryParam("token");
+    try {
+      setButtonPending(button, true);
+      const payload = await api("/post-visit/action", {
+        method: "POST",
+        body: JSON.stringify({ token, action: button.dataset.confirmPostVisitAction })
+      });
+      state.postVisitAction.context = {
+        ...(state.postVisitAction.context || {}),
+        reservation: payload.reservation || state.postVisitAction.context?.reservation
+      };
+      state.postVisitAction.completed = true;
+      await renderPostVisitActionPage();
+      showToast(t("post_visit_action_saved", "Visit status saved."));
+    } catch (error) {
+      setButtonPending(button, false);
+      showToast(error.message);
+    }
+  });
+  finalizeRenderedLanguage();
+}
+
+function starsMarkup(value = 0) {
+  const rating = Number(value) || 0;
+  return [1, 2, 3, 4, 5].map((star) => star <= rating ? "★" : "☆").join("");
+}
+
+function verifiedReviewRatingSelect(name, labelKey, fallback) {
+  const value = state.verifiedReview.form[name] || "";
+  const label = t(labelKey, fallback);
+  return `
+    <fieldset class="star-rating-field">
+      <legend class="sr-only">${escapeHtml(label)}</legend>
+      <span class="star-rating-visible-label">${escapeHtml(label)}</span>
+      <div class="star-rating" role="radiogroup" aria-label="${escapeAttr(label)}">
+        ${[1, 2, 3, 4, 5].map((rating) => `
+          <input class="sr-only" id="${escapeAttr(name)}-${rating}" type="radio" name="${escapeAttr(name)}" value="${rating}" ${String(value) === String(rating) ? "checked" : ""} required>
+          <label for="${escapeAttr(name)}-${rating}" aria-label="${escapeAttr(`${rating} / 5`)}">★</label>
+        `).join("")}
+      </div>
+    </fieldset>
+  `;
+}
+
+function clearVerifiedReviewPhotoPreviews() {
+  (state.verifiedReview.photoPreviews || []).forEach((preview) => {
+    if (preview.url?.startsWith("blob:")) URL.revokeObjectURL(preview.url);
+  });
+  state.verifiedReview.photoPreviews = [];
+}
+
+function setVerifiedReviewPhotoFiles(files = []) {
+  clearVerifiedReviewPhotoPreviews();
+  const accepted = Array.from(files)
+    .filter((file) => ["image/jpeg", "image/png", "image/webp"].includes(file.type) && file.size > 0 && file.size <= 5 * 1024 * 1024)
+    .slice(0, 5);
+  state.verifiedReview.photoFiles = accepted;
+  state.verifiedReview.photoPreviews = accepted.map((file, index) => ({
+    index,
+    name: file.name,
+    size: file.size,
+    type: file.type,
+    url: URL.createObjectURL(file)
+  }));
+}
+
+function verifiedReviewPhotoPreviews() {
+  const previews = state.verifiedReview.photoPreviews || [];
+  if (!previews.length) return "";
+  return `
+    <div class="review-photo-preview-grid">
+      ${previews.map((preview, index) => `
+        <article class="review-photo-preview">
+          <img src="${escapeAttr(preview.url)}" alt="${escapeAttr(preview.name)}">
+          <div>
+            <span>${escapeHtml(preview.name)}</span>
+            <div class="button-row compact">
+              <button class="ghost-button tiny" data-review-photo-move="${index}" data-direction="-1" type="button" ${index === 0 ? "disabled" : ""}>${escapeHtml(t("move_up_label", "Move up"))}</button>
+              <button class="ghost-button tiny" data-review-photo-move="${index}" data-direction="1" type="button" ${index === previews.length - 1 ? "disabled" : ""}>${escapeHtml(t("move_down_label", "Move down"))}</button>
+              <button class="ghost-button tiny danger" data-review-photo-remove="${index}" type="button">${escapeHtml(t("remove_button", "Remove"))}</button>
+            </div>
           </div>
-          <label>${escapeHtml(t("review_comment_label", "Comment"))}<textarea name="comment"></textarea></label>
-          <button class="primary-button wide" type="submit">${escapeHtml(t("review_submit_label", "Submit review"))}</button>
-        </form>
-      </section>
+        </article>
+      `).join("")}
     </div>
   `;
+}
+
+function visitDurationOptions(selected = "") {
+  const options = [
+    ["25", t("visit_duration_under_30", "Under 30 minutes")],
+    ["45", t("visit_duration_30_60", "30-60 minutes")],
+    ["75", t("visit_duration_1_1_5", "1-1.5 hours")],
+    ["105", t("visit_duration_1_5_2", "1.5-2 hours")],
+    ["150", t("visit_duration_2_3", "2-3 hours")],
+    ["210", t("visit_duration_more_3", "More than 3 hours")]
+  ];
+  return options.map(([value, label]) => `<option value="${value}" ${String(selected) === value ? "selected" : ""}>${escapeHtml(label)}</option>`).join("");
+}
+
+async function loadVerifiedReviewContext() {
+  const token = currentQueryParam("token");
+  const reservationId = currentQueryParam("reservation_id");
+  const query = token ? `token=${encodeURIComponent(token)}` : reservationId ? `reservation_id=${encodeURIComponent(reservationId)}` : "";
+  if (!query) {
+    state.verifiedReview = { ...state.verifiedReview, loading: false, error: t("verified_review_missing_context", "This review link is missing reservation context."), context: null };
+    return;
+  }
+  state.verifiedReview.loading = true;
+  state.verifiedReview.error = "";
+  try {
+    const payload = await api(`/guest/reviews/verified?${query}`);
+    state.verifiedReview.context = payload.context || null;
+  } catch (error) {
+    state.verifiedReview.error = error.message;
+    state.verifiedReview.context = null;
+  } finally {
+    state.verifiedReview.loading = false;
+  }
+}
+
+async function uploadVerifiedReviewPhotos(reservationId, files = []) {
+  const reviewToken = currentQueryParam("token");
+  if (!reservationId || (!state.session?.access_token && !reviewToken) || !files.length) return [];
+  const selected = Array.from(files).slice(0, 5);
+  const uploaded = [];
+  for (const file of selected) {
+    const signed = await api("/guest/reviews/photos/sign-upload", {
+      method: "POST",
+      body: JSON.stringify({
+        token: reviewToken,
+        reservation_id: reservationId,
+        filename: file.name,
+        content_type: file.type,
+        file_size: file.size
+      })
+    });
+    if (signed.upload_url) {
+      const response = await fetch(signed.upload_url, {
+        method: "PUT",
+        headers: { "content-type": file.type },
+        body: file
+      });
+      if (!response.ok) throw new Error(t("photo_upload_failed_error", "Photo upload failed."));
+    }
+    uploaded.push({
+      storage_path: signed.storage_path,
+      mime_type: file.type,
+      file_size: file.size
+    });
+  }
+  return uploaded;
+}
+
+async function renderVerifiedReviewPage() {
+  state.mode = "guest";
+  if (!state.verifiedReview.context && !state.verifiedReview.submitted) await loadVerifiedReviewContext();
+  const view = state.verifiedReview;
+  const context = view.context || {};
+  const reservation = context.reservation || {};
+  const eligibility = context.review_eligibility || {};
+  const canSubmit = Boolean(eligibility.eligible && !view.submitted);
+  const durationMinutes = Number(view.form.visit_duration_minutes || reservation.expected_visit_duration_minutes || 0);
+  const writtenLength = String(view.form.written_review || "").length;
+  app.innerHTML = appAreaShell("guest", `
+    <section class="post-visit-page">
+      <article class="panel post-visit-card verified-review-card">
+        <span class="section-kicker">${escapeHtml(t("verified_visit_badge", "Verified SmartTable visit"))}</span>
+        <h1>${escapeHtml(view.submitted ? t("verified_review_thanks_title", "Thank you for your review") : t("verified_review_title", "Rate your visit"))}</h1>
+        ${view.error ? `<p class="form-error" role="alert">${escapeHtml(view.error)}</p>` : ""}
+        ${view.loading ? `<div class="empty-state">${escapeHtml(t("loading_label", "Loading..."))}</div>` : ""}
+        ${reservation.reservation_id ? `
+          <div class="reservation-context-box">
+            <h2>${escapeHtml(reservation.restaurant_name || t("restaurant_label", "Restaurant"))}</h2>
+            <p>${escapeHtml(formatDate(reservation.reservation_date, reservation.reservation_time))}</p>
+            <p>${escapeHtml(t("reservation_reference_label", "Reference"))}: ${escapeHtml(reservation.reference || "")}</p>
+            <p>${escapeHtml(postVisitStatusLine(reservation))}</p>
+          </div>
+        ` : ""}
+        ${view.submitted ? `
+          <div class="success-banner">${escapeHtml(t("verified_review_submitted_message", "Your verified review was submitted for moderation."))}</div>
+          <div class="review-submitted-summary">
+            <p><strong>${escapeHtml(t("review_food_label", "Food"))}</strong> ${escapeHtml(starsMarkup(view.form.food_rating))}</p>
+            <p><strong>${escapeHtml(t("review_service_label", "Service"))}</strong> ${escapeHtml(starsMarkup(view.form.service_rating))}</p>
+            <p><strong>${escapeHtml(t("review_atmosphere_label", "Atmosphere"))}</strong> ${escapeHtml(starsMarkup(view.form.atmosphere_rating))}</p>
+          </div>
+          <div class="button-row">
+            <a class="primary-button" href="/account/reservations">${escapeHtml(t("email_cta_my_reservations", "View My Reservations"))}</a>
+            <a class="ghost-button" href="/offers">${escapeHtml(t("browse_offers_button", "Browse offers"))}</a>
+          </div>
+        ` : canSubmit ? `
+          <form class="mini-form verified-review-form" id="verifiedReviewForm">
+            <div class="form-grid three">
+              ${verifiedReviewRatingSelect("food_rating", "review_food_label", "Food")}
+              ${verifiedReviewRatingSelect("service_rating", "review_service_label", "Service")}
+              ${verifiedReviewRatingSelect("atmosphere_rating", "review_atmosphere_label", "Atmosphere")}
+            </div>
+            <label>${escapeHtml(t("verified_review_written_label", "Written review"))}
+              <textarea name="written_review" maxlength="1500" placeholder="${escapeAttr(t("verified_review_written_placeholder", "Share what future guests should know."))}">${escapeHtml(view.form.written_review || "")}</textarea>
+              <small data-review-character-count>${escapeHtml(`${writtenLength}/1500`)}</small>
+            </label>
+            <div class="form-grid two">
+              <label>${escapeHtml(t("visit_duration_minutes_label", "Visit duration"))}
+                <select name="visit_duration_minutes">
+                  <option value="">${escapeHtml(t("rating_choose_label", "Choose"))}</option>
+                  ${visitDurationOptions(String(view.form.visit_duration_minutes || ""))}
+                </select>
+              </label>
+              ${durationMinutes ? `<label class="check-row"><input name="visit_duration_confirmed" type="checkbox" value="true" ${view.form.visit_duration_confirmed ? "checked" : ""}> ${escapeHtml(t("visit_duration_confirmed_label", "This duration looks correct"))}</label>` : ""}
+            </div>
+            <label>${escapeHtml(t("review_photos_label", "Photos"))}
+              <input name="photos" type="file" accept="image/jpeg,image/png,image/webp" multiple>
+              <small>${escapeHtml(t("review_photos_help", "Optional. Up to 5 JPEG, PNG, or WebP images."))}</small>
+            </label>
+            ${verifiedReviewPhotoPreviews()}
+            ${view.uploadStatus ? `<p class="form-note" role="status">${escapeHtml(view.uploadStatus)}</p>` : ""}
+            <p class="form-note">${escapeHtml(t("verified_review_moderation_notice", "Reviews and photos may be moderated before public display."))}</p>
+            <button class="primary-button wide" data-review-submit type="submit" ${view.submitting ? "disabled" : ""}>${escapeHtml(view.submitting ? t("saving_button", "Saving...") : t("review_submit_label", t("review_submit_button", "Submit review")))}</button>
+          </form>
+        ` : `
+          <div class="empty-state">${escapeHtml(t(`verified_review_ineligible_${eligibility.reason}`, "This reservation is not eligible for a verified review yet."))}</div>
+          <div class="button-row">
+            <a class="ghost-button" href="/account/reservations">${escapeHtml(t("email_cta_my_reservations", "View My Reservations"))}</a>
+          </div>
+        `}
+      </article>
+    </section>
+  `);
+  document.querySelector("#verifiedReviewForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const data = formObject(form);
+    const files = [...(state.verifiedReview.photoFiles || [])];
+    state.verifiedReview.form = {
+      food_rating: data.food_rating,
+      service_rating: data.service_rating,
+      atmosphere_rating: data.atmosphere_rating,
+      written_review: data.written_review,
+      visit_duration_minutes: data.visit_duration_minutes,
+      visit_duration_confirmed: Boolean(data.visit_duration_confirmed)
+    };
+    try {
+      state.verifiedReview.submitting = true;
+      state.verifiedReview.uploadStatus = files.length ? t("review_photos_uploading", "Uploading photos...") : "";
+      await renderVerifiedReviewPage();
+      const photos = await uploadVerifiedReviewPhotos(reservation.reservation_id, files);
+      await api("/guest/reviews/verified", {
+        method: "POST",
+        body: JSON.stringify({
+          token: currentQueryParam("token"),
+          reservation_id: currentQueryParam("reservation_id") || reservation.reservation_id,
+          food_rating: Number(data.food_rating),
+          service_rating: Number(data.service_rating),
+          atmosphere_rating: Number(data.atmosphere_rating),
+          written_review: data.written_review,
+          visit_duration_minutes: Number(data.visit_duration_minutes || 0) || null,
+          visit_duration_confirmed: Boolean(data.visit_duration_confirmed),
+          photos
+        })
+      });
+      state.verifiedReview.submitted = true;
+      state.verifiedReview.submitting = false;
+      state.verifiedReview.uploadStatus = "";
+      clearVerifiedReviewPhotoPreviews();
+      state.verifiedReview.photoFiles = [];
+      showToast(t("verified_review_submitted_message", "Your verified review was submitted for moderation."));
+      await renderVerifiedReviewPage();
+    } catch (error) {
+      state.verifiedReview.submitting = false;
+      state.verifiedReview.uploadStatus = "";
+      state.verifiedReview.error = error.message;
+      await renderVerifiedReviewPage();
+    }
+  });
+  const reviewForm = document.querySelector("#verifiedReviewForm");
+  const submitButton = reviewForm?.querySelector("[data-review-submit]");
+  const updateReviewSubmitState = () => {
+    if (!submitButton || state.verifiedReview.submitting) return;
+    const values = formObject(reviewForm);
+    submitButton.disabled = !values.food_rating || !values.service_rating || !values.atmosphere_rating;
+  };
+  reviewForm?.addEventListener("change", (event) => {
+    const target = event.target;
+    if (target?.name === "photos") {
+      setVerifiedReviewPhotoFiles(target.files || []);
+      renderVerifiedReviewPage();
+      return;
+    }
+    if (target?.name) {
+      const values = formObject(reviewForm);
+      state.verifiedReview.form = {
+        ...state.verifiedReview.form,
+        food_rating: values.food_rating,
+        service_rating: values.service_rating,
+        atmosphere_rating: values.atmosphere_rating,
+        visit_duration_minutes: values.visit_duration_minutes,
+        visit_duration_confirmed: Boolean(values.visit_duration_confirmed)
+      };
+    }
+    updateReviewSubmitState();
+  });
+  reviewForm?.querySelector("[name='written_review']")?.addEventListener("input", (event) => {
+    state.verifiedReview.form.written_review = event.target.value;
+    const counter = reviewForm.querySelector("[data-review-character-count]");
+    if (counter) counter.textContent = `${event.target.value.length}/1500`;
+  });
+  document.querySelectorAll("[data-review-photo-remove]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const index = Number(button.dataset.reviewPhotoRemove);
+      const files = [...(state.verifiedReview.photoFiles || [])];
+      files.splice(index, 1);
+      setVerifiedReviewPhotoFiles(files);
+      renderVerifiedReviewPage();
+    });
+  });
+  document.querySelectorAll("[data-review-photo-move]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const index = Number(button.dataset.reviewPhotoMove);
+      const direction = Number(button.dataset.direction);
+      const files = [...(state.verifiedReview.photoFiles || [])];
+      const targetIndex = index + direction;
+      if (targetIndex < 0 || targetIndex >= files.length) return;
+      [files[index], files[targetIndex]] = [files[targetIndex], files[index]];
+      setVerifiedReviewPhotoFiles(files);
+      renderVerifiedReviewPage();
+    });
+  });
+  updateReviewSubmitState();
+  finalizeRenderedLanguage();
 }
 
 function successModal() {
@@ -3439,8 +5961,9 @@ function aiPreferenceWizard() {
   `;
 }
 
-function guestModals() {
-  return `${restaurantDetailModal()}${reservationModal()}${followModal()}${reviewModal()}${successModal()}${canShowFeature("ai.preferenceSurvey", { allowDemo: true }) ? aiPreferenceWizard() : ""}`;
+function guestModals(options = {}) {
+  const includeRestaurantDetail = options.includeRestaurantDetail !== false;
+  return `${includeRestaurantDetail ? restaurantDetailModal() : ""}${reservationModal()}${followModal()}${successModal()}${canShowFeature("ai.preferenceSurvey", { allowDemo: true }) ? aiPreferenceWizard() : ""}`;
 }
 
 function fieldError(name) {
@@ -3455,6 +5978,68 @@ function signupInput(name, labelKey, fallback, type = "text", attrs = "") {
       ${escapeHtml(t(labelKey, fallback))}
       <input name="${escapeAttr(name)}" type="${escapeAttr(type)}" value="${escapeAttr(data[name] || "")}" ${attrs}>
       ${fieldError(name)}
+    </label>
+  `;
+}
+
+function signupSelect(name, labelKey, fallback, options = [], attrs = "") {
+  const data = ensureSignupState().data;
+  const selected = String(data[name] || "");
+  return `
+    <label class="${fieldError(name) ? "has-error" : ""}">
+      ${escapeHtml(t(labelKey, fallback))}
+      <select name="${escapeAttr(name)}" ${attrs}>
+        ${options.map((option) => `<option value="${escapeAttr(option.value)}" ${String(option.value) === selected ? "selected" : ""}>${escapeHtml(option.label)}</option>`).join("")}
+      </select>
+      ${fieldError(name)}
+    </label>
+  `;
+}
+
+function signupLocationControls() {
+  const data = ensureSignupState().data;
+  const country = data.country || "US";
+  const regions = Object.entries(countryConfig(country).states || {});
+  const region = regions.some(([code]) => code === data.region) ? data.region : "";
+  const cities = cityOptionsFor(country, region);
+  const selectedCity = data.city_select || (isListedCity(country, region, data.city) ? data.city : (data.city ? otherCityValue : ""));
+  data.city_select = selectedCity;
+  const cityOptions = [
+    { value: "", label: t("signup_select_state_first", "Select state first") },
+    ...cities.map((city) => ({ value: city, label: city })),
+    ...(region ? [{ value: otherCityValue, label: t("signup_other_city_option", "Other city") }] : [])
+  ];
+  return `
+    ${signupSelect("country", "signup_country", "Country", Object.entries(signupLocationCatalog).map(([code, config]) => ({
+      value: code,
+      label: t(config.labelKey, config.fallback)
+    })), "required")}
+    ${signupSelect("region", "signup_region", "State or region", [
+      { value: "", label: t("signup_select_placeholder", "Select one") },
+      ...regions.map(([code, config]) => ({ value: code, label: t(config.labelKey, config.fallback) }))
+    ], "required")}
+    ${signupSelect("city_select", "signup_city", "City", cityOptions.map((option) => ({
+      ...option,
+      label: option.value && option.value !== otherCityValue ? option.label : option.label
+    })), `${region ? "" : "disabled"} required`)}
+    ${selectedCity === otherCityValue ? signupInput("other_city", "signup_other_city_label", "Other city", "text", "autocomplete=\"address-level2\" required") : ""}
+  `;
+}
+
+function signupDistanceControls() {
+  const data = ensureSignupState().data;
+  if (!data.travel_distance_unit) data.travel_distance_unit = travelDistanceUnitForCountry(data.country || "US");
+  return `
+    <label class="${fieldError("travel_distance_value") ? "has-error" : ""}">
+      ${escapeHtml(t("signup_travel_distance", "Maximum preferred travel distance"))}
+      <span class="input-with-select">
+        <input name="travel_distance_value" type="number" min="1" step="0.5" value="${escapeAttr(data.travel_distance_value || "")}" required>
+        <select name="travel_distance_unit" aria-label="${escapeAttr(t("signup_travel_distance_unit", "Travel distance unit"))}" required>
+          <option value="miles" ${data.travel_distance_unit === "miles" ? "selected" : ""}>${escapeHtml(t("distance_unit_miles", "Miles"))}</option>
+          <option value="kilometers" ${data.travel_distance_unit === "kilometers" ? "selected" : ""}>${escapeHtml(t("distance_unit_kilometers", "Kilometers"))}</option>
+        </select>
+      </span>
+      ${fieldError("travel_distance_value") || fieldError("travel_distance_unit")}
     </label>
   `;
 }
@@ -3497,12 +6082,12 @@ function updatePasswordStrengthMeter() {
 }
 
 function signupCheckboxGroup(name, options) {
-  const selected = new Set(asArray(ensureSignupState().data[name]).map((item) => String(item).toLowerCase()));
+  const selected = asArray(ensureSignupState().data[name]);
   return `
     <div class="signup-chip-grid ${fieldError(name) ? "has-error" : ""}">
       ${options.map((option) => `
         <label class="ai-chip signup-chip">
-          <input type="checkbox" name="${escapeAttr(name)}" value="${escapeAttr(option)}" ${selected.has(option.toLowerCase()) ? "checked" : ""}>
+          <input type="checkbox" name="${escapeAttr(name)}" value="${escapeAttr(option)}" ${optionValueSelected(selected, option) ? "checked" : ""}>
           <span>${escapeHtml(optionLabel(option))}</span>
         </label>
       `).join("")}
@@ -3528,17 +6113,25 @@ function signupRadioGroup(name, options) {
 
 function signupProgress() {
   const current = ensureSignupState().step;
+  const currentTitle = signupStepTitle(current);
   return `
-    <ol class="signup-progress" aria-label="${escapeAttr(t("signup_progress_label", "Signup progress"))}">
-      ${signupSteps.map((step, index) => `
-        <li class="${index < current ? "done" : index === current ? "active" : ""}">
-          <button data-signup-step="${index}" type="button" ${index > current ? "disabled" : ""}>
-            <span>${index + 1}</span>
-            <b>${escapeHtml(t(step.labelKey, step.fallback))}</b>
-          </button>
-        </li>
-      `).join("")}
-    </ol>
+    <nav class="signup-progress-nav" aria-label="${escapeAttr(t("signup_progress_label", "Signup progress"))}">
+      <p class="signup-progress-summary">${escapeHtml(`${t("signup_step_label", "Step")} ${current + 1} / ${signupSteps.length}: ${currentTitle}`)}</p>
+      <ol class="signup-progress">
+        ${signupSteps.map((step, index) => {
+          const fullTitle = t(step.labelKey, step.fallback);
+          const isCurrent = index === current;
+          return `
+          <li class="${index < current ? "done" : isCurrent ? "active" : ""}">
+            <button data-signup-step="${index}" type="button" aria-label="${escapeAttr(`${t("signup_step_label", "Step")} ${index + 1}: ${fullTitle}`)}" ${isCurrent ? 'aria-current="step"' : ""} ${index > current ? "disabled" : ""}>
+              <span aria-hidden="true">${index + 1}</span>
+              <b>${escapeHtml(signupStepNavLabel(index))}</b>
+            </button>
+          </li>
+        `;
+        }).join("")}
+      </ol>
+    </nav>
   `;
 }
 
@@ -3565,10 +6158,9 @@ function signupStepBody() {
   if (stepKey === "location") {
     return `
       <div class="form-grid two">
-        ${signupInput("city", "signup_city", "City", "text", "autocomplete=\"address-level2\" required")}
-        ${signupInput("region", "signup_region", "State or region", "text", "autocomplete=\"address-level1\" required")}
+        ${signupLocationControls()}
         ${signupInput("postal_code", "signup_postal_code", "ZIP or postal code", "text", "autocomplete=\"postal-code\" required")}
-        ${signupInput("travel_distance_miles", "signup_travel_distance", "Maximum preferred travel distance", "number", "min=\"1\" step=\"0.5\" required")}
+        ${signupDistanceControls()}
       </div>
       <fieldset>
         <legend>${escapeHtml(t("signup_neighborhoods", "Preferred neighborhoods or dining areas"))}</legend>
@@ -3579,12 +6171,15 @@ function signupStepBody() {
         ${signupCheckboxGroup("transportation_methods", signupOptionGroups.transportation)}
       </fieldset>
       <button class="ghost-button" id="useDeviceLocation" type="button">${escapeHtml(t("signup_use_device_location", "Use device location"))}</button>
+      ${signup.locationMessage ? `<p class="${signup.locationStatus === "error" ? "form-error" : "success-state"}" role="status">${escapeHtml(signup.locationMessage)}</p>` : ""}
       <p class="form-note">${escapeHtml(t("signup_location_note", "Exact home address is not required. If location access is declined, city and region are still required."))}</p>
     `;
   }
   if (stepKey === "preferences") {
+    const wantsOtherCuisine = asArray(data.cuisines).some((value) => choiceKey(value) === "other");
     return `
       <fieldset><legend>${escapeHtml(t("signup_cuisines", "Preferred cuisines"))}</legend>${signupCheckboxGroup("cuisines", signupOptionGroups.cuisines)}</fieldset>
+      ${wantsOtherCuisine ? signupInput("custom_cuisine", "signup_custom_cuisine", "Specify other cuisine", "text", "autocomplete=\"off\" required") : ""}
       <fieldset><legend>${escapeHtml(t("signup_food_categories", "Preferred food categories"))}</legend>${signupCheckboxGroup("food_categories", signupOptionGroups.food_categories)}</fieldset>
       <fieldset><legend>${escapeHtml(t("signup_dietary_needs", "Dietary needs"))}</legend>${signupCheckboxGroup("dietary_needs", signupOptionGroups.dietary_needs)}</fieldset>
       ${signupInput("allergy_notes", "signup_allergy_notes", "Optional allergy notes", "text")}
@@ -3622,10 +6217,18 @@ function signupStepBody() {
     `;
   }
   if (stepKey === "notifications") {
+    const smsSelected = asArray(data.notification_channels).includes(smsNotificationChannel);
     return `
       <fieldset><legend>${escapeHtml(t("signup_notification_preferences", "Notification preferences"))}</legend>${signupCheckboxGroup("notification_preferences", signupOptionGroups.notification_preferences)}</fieldset>
       <fieldset><legend>${escapeHtml(t("signup_notification_channels", "Notification channels"))}</legend>${signupCheckboxGroup("notification_channels", signupOptionGroups.notification_channels)}</fieldset>
-      <p class="form-note">${escapeHtml(t("signup_push_unavailable", "Push notifications are not enabled yet, so they are not offered during signup."))}</p>
+      <p class="form-note">${escapeHtml(t("signup_push_unavailable", "Push notifications on this device are not enabled during signup yet. You can manage device notifications later where available."))}</p>
+      ${smsSelected ? `
+        <div class="form-grid two sms-preference-fields">
+          ${signupInput("sms_country_code", "signup_sms_country_code", "SMS country code", "text", "inputmode=\"tel\" autocomplete=\"tel-country-code\" required")}
+          ${signupInput("sms_phone_number", "signup_sms_phone_number", "SMS phone number", "tel", "autocomplete=\"tel-national\" required")}
+        </div>
+        <p class="form-note">${escapeHtml(t("signup_sms_not_sending_note", "SmartTable will store this SMS preference, but SMS messages are sent only if the provider is configured and your consent remains active."))}</p>
+      ` : ""}
       <fieldset><legend>${escapeHtml(t("signup_notification_frequency", "Notification frequency"))}</legend>${signupRadioGroup("notification_frequency", signupOptionGroups.notification_frequency)}</fieldset>
       <fieldset><legend>${escapeHtml(t("signup_events_interest", "Would you like SmartTable to recommend restaurants around concerts, theater, movies, or other events?"))}</legend>${signupRadioGroup("event_recommendations_interest", signupOptionGroups.yes_no)}</fieldset>
       <fieldset><legend>${escapeHtml(t("signup_calendar_future_interest", "Would you consider connecting your calendar in the future?"))}</legend>${signupRadioGroup("future_calendar_interest", signupOptionGroups.yes_no)}</fieldset>
@@ -3643,25 +6246,16 @@ function signupStepBody() {
   return `
     <div class="signup-review-grid">
       ${signupReviewCard(0, "signup_review_personal", "Personal information", data.full_name || `${data.first_name} ${data.last_name}`.trim(), `${data.email} | ${data.phone}`)}
-      ${signupReviewCard(1, "signup_review_location", "Location", `${data.city}, ${data.region}`, `${data.postal_code} | ${selectedOptionSummary(data.preferred_neighborhoods)}`)}
-      ${signupReviewCard(2, "signup_review_food", "Food", selectedOptionSummary(data.cuisines), selectedOptionSummary(data.food_categories))}
-      ${signupReviewCard(2, "signup_review_dietary", "Dietary needs", selectedOptionSummary(data.dietary_needs), data.allergy_notes || t("signup_review_no_allergy_notes", "No allergy notes"))}
-      ${signupReviewCard(2, "signup_review_drinks", "Drinks", selectedOptionSummary(data.drink_preferences))}
-      ${signupReviewCard(3, "signup_review_habits", "Dining habits", selectedOptionSummary(data.dining_experiences), `${selectedOptionSummary(data.preferred_days, 3)} | ${selectedOptionSummary(data.preferred_time_windows, 3)}`)}
-      ${signupReviewCard(3, "signup_review_priorities", "Selection priorities", selectedOptionSummary(data.selection_priorities, 6))}
-      ${signupReviewCard(4, "signup_review_budget", "Budget", optionLabel(data.spending_range), selectedOptionSummary(data.discount_levels))}
-      ${signupReviewCard(4, "signup_review_discounts", "Discount preferences", selectedOptionSummary(data.discount_levels), `${t("signup_no_discount_question_short", "No-discount match")}: ${optionLabel(data.consider_no_discount_match)}`)}
-      ${signupReviewCard(5, "signup_review_notifications", "Notifications", selectedOptionSummary(data.notification_preferences), `${selectedOptionSummary(data.notification_channels)} | ${optionLabel(data.notification_frequency)}`)}
-      ${signupReviewCard(6, "signup_review_legal", "Legal consent", data.terms_consent && data.privacy_consent ? t("signup_review_legal_ready", "Ready to accept") : t("signup_review_legal_pending", "Consent required"))}
-      ${signupReviewCard(5, "signup_review_marketing", "Marketing consent", data.marketing_consent ? t("yes_label", "Yes") : t("no_label", "No"))}
+      ${signupReviewCard(1, "signup_review_location", "Location", `${data.city || data.other_city}, ${regionLabel(data.country, data.region)}`, `${countryLabel(data.country)} | ${data.postal_code} | ${data.travel_distance_value || data.travel_distance_miles} ${data.travel_distance_unit || "miles"} | ${selectedOptionSummary(data.preferred_neighborhoods)}`)}
+      ${signupReviewCard(2, "signup_review_legal", "Legal consent", legalPackageAccepted(data) ? t("signup_review_legal_ready", "Ready to accept") : t("signup_review_legal_pending", "Consent required"))}
     </div>
     <div class="signup-consent-list">
       ${checkboxInput("allergy_acknowledgement", t("signup_allergy_acknowledgement", "I understand that SmartTable preferences do not replace direct allergy confirmation with the restaurant."), data.allergy_acknowledgement)}
       ${fieldError("allergy_acknowledgement")}
-      ${signupConsentCheckbox("terms_consent", `${escapeHtml(t("signup_terms_consent_prefix", "I have read and agree to the SmartTable"))} <a href="/terms" target="_blank" rel="noreferrer">${escapeHtml(t("signup_terms_link", "Terms and Conditions"))}</a>.`, data.terms_consent)}
-      ${fieldError("terms_consent")}
-      ${signupConsentCheckbox("privacy_consent", `${escapeHtml(t("signup_privacy_consent_prefix", "I have read and agree to the SmartTable"))} <a href="/privacy" target="_blank" rel="noreferrer">${escapeHtml(t("signup_privacy_link", "Privacy Policy"))}</a>.`, data.privacy_consent)}
-      ${fieldError("privacy_consent")}
+      ${checkboxInput("transactional_email_consent", t("signup_transactional_email_consent", "I agree to receive reservation confirmations and important account emails."), data.transactional_email_consent)}
+      ${fieldError("transactional_email_consent")}
+      ${signupConsentCheckbox("legal_consent", guestLegalConsentLabelHtml(), legalPackageAccepted(data))}
+      ${fieldError("legal_consent")}
       <p class="form-note">${escapeHtml(t("signup_consent_storage_note", "Terms and Privacy Policy acceptance are stored with version, timestamp, user ID and acceptance language. Marketing consent is stored separately and can be changed later."))}</p>
     </div>
   `;
@@ -3669,12 +6263,22 @@ function signupStepBody() {
 
 function signupSuccessPanel() {
   const showAi = canShowFeature("ai.concierge", { audience: "guest", allowDemo: true });
+  const success = state.signupSuccess || {};
+  const notices = [
+    success.emailVerificationRequired
+      ? `<div class="warning-box" role="status"><strong>${escapeHtml(t("signup_email_verification_required_title", "Check your email to finish sign-in."))}</strong><p>${escapeHtml(t("signup_email_verification_required_body", "We sent a confirmation link to the email address you used during registration. Confirm your email address before signing in."))}</p></div>`
+      : "",
+    success.welcomeEmailWarning
+      ? `<div class="warning-box" role="status"><strong>${escapeHtml(t("signup_welcome_email_warning_title", "Welcome email notice"))}</strong><p>${escapeHtml(t("signup_welcome_email_warning_body", "Your account was created and your verification email was sent. A separate welcome email could not be delivered, but this does not affect your registration."))}</p></div>`
+      : ""
+  ].join("");
   return `
     <section class="panel signup-success-panel" role="status" aria-live="polite">
       <div>
         <span class="section-kicker">${escapeHtml(t("signup_success_kicker", "Account ready"))}</span>
         <h2>${escapeHtml(t("signup_profile_ready_title", "Your SmartTable profile is ready."))}</h2>
         <p class="muted">${escapeHtml(t("signup_profile_ready_message", "We will use your preferences to show more relevant restaurants and offers."))}</p>
+        ${notices}
       </div>
       <div class="button-row">
         <button class="primary-button" data-dismiss-signup-success type="button">${escapeHtml(t("signup_explore_restaurants", "Explore Restaurants"))}</button>
@@ -3685,43 +6289,75 @@ function signupSuccessPanel() {
   `;
 }
 
+function fastSignupErrors(data = ensureSignupState().data) {
+  const errors = {};
+  const requireText = (field) => {
+    if (!String(data[field] || "").trim()) errors[field] = signupValidationMessage("required");
+  };
+  ["full_name", "email", "password", "confirm_password"].forEach(requireText);
+  if (data.email && !isValidEmail(data.email)) errors.email = signupValidationMessage("email");
+  if (data.phone && !isValidPhone(data.phone)) errors.phone = signupValidationMessage("phone");
+  if (data.password && passwordStrength(data.password).score < 5) errors.password = signupValidationMessage("password");
+  if (data.password && data.confirm_password && data.password !== data.confirm_password) errors.confirm_password = signupValidationMessage("password_match");
+  if (!legalPackageAccepted(data)) errors.legal_consent = signupValidationMessage("consent");
+  return errors;
+}
+
 function renderGuestSignup() {
   const signup = ensureSignupState();
+  signup.step = 0;
   if (!signup.analyticsStarted) {
     signup.analyticsStarted = true;
-    trackSignupEvent("signup_started", signupStepAnalyticsMeta(0));
+    trackSignupEvent("signup_started", { step_key: "fast_account" });
   }
-  const finalStep = signup.step === signupSteps.length - 1;
-  const createDisabled = finalStep && !isSignupReadyToCreate();
-  app.innerHTML = `
-    ${layoutHero(`
-      <section class="signup-page">
+  app.innerHTML = guestStandaloneShell(`
+      <section class="signup-page fast-signup-page">
         <div class="signup-header">
           <span class="section-kicker">${escapeHtml(t("signup_kicker", "Guest account"))}</span>
           <h1>${escapeHtml(t("signup_title", "Create your SmartTable account"))}</h1>
-          <p class="muted">${escapeHtml(t("signup_subtitle", "Complete every step so SmartTable can match you with better restaurants and reservation offers."))}</p>
+          <p class="muted">${escapeHtml(t("signup_subtitle_fast", "Create your account now. You can personalize restaurant preferences later."))}</p>
         </div>
-        ${signupProgress()}
-        <form class="signup-card" id="guestSignupForm" novalidate>
+        <form class="signup-card fast-signup-card" id="guestSignupForm" novalidate>
+          <input type="hidden" name="transactional_email_consent" value="true">
           <div class="section-title-row compact">
             <div>
-              <span class="section-kicker">${escapeHtml(t("signup_step_label", "Step"))} ${signup.step + 1} / ${signupSteps.length}</span>
-              <h2>${escapeHtml(signupStepTitle())}</h2>
+              <span class="section-kicker">${escapeHtml(t("signup_fast_kicker", "Fast signup"))}</span>
+              <h2>${escapeHtml(t("signup_fast_title", "Account details"))}</h2>
             </div>
           </div>
-          ${signupStepBody()}
-          ${finalStep ? signupValidationSummaryHtml() : ""}
-          ${signup.submitError ? `<p class="form-error">${escapeHtml(signup.submitError)}</p>` : ""}
-          <div class="button-row signup-actions">
-            ${signup.step > 0 ? `<button class="ghost-button" data-signup-back type="button">${escapeHtml(t("signup_back", "Back"))}</button>` : ""}
-            <button class="primary-button" type="submit" ${createDisabled ? "disabled" : ""}>${escapeHtml(finalStep ? t("signup_create_my_account", "Create My SmartTable Account") : t("signup_continue", "Continue"))}</button>
+          <div class="form-grid two">
+            ${signupInput("full_name", "signup_full_name", "Full name", "text", "autocomplete=\"name\" required")}
+            ${signupInput("email", "signup_email", "Email", "email", "autocomplete=\"email\" required")}
+            ${signupInput("phone", "signup_phone_optional", "Phone number (optional)", "tel", "autocomplete=\"tel\"")}
+            ${signupPasswordInput("password", "signup_password", "Password", "showPassword")}
+            ${signupPasswordInput("confirm_password", "signup_confirm_password", "Confirm password", "showConfirmPassword")}
           </div>
+          ${passwordStrengthMeter()}
+          <p class="form-note">${escapeHtml(t("signup_password_storage_notice", "SmartTable never stores your password in long-term browser storage."))}</p>
+          <div class="signup-consent-list">
+            ${signupConsentCheckbox("legal_consent", guestLegalConsentLabelHtml(), legalPackageAccepted(signup.data))}
+            ${fieldError("legal_consent")}
+            <p class="form-note">${escapeHtml(t("signup_consent_storage_note", "Terms and Privacy Policy acceptance are stored with version, timestamp, user ID and acceptance language. Marketing consent is stored separately and can be changed later."))}</p>
+          </div>
+          ${signup.submitError ? `<p class="form-error" role="alert">${escapeHtml(signup.submitError)}</p>` : ""}
+          <div class="button-row signup-actions">
+            <button class="primary-button" type="submit" ${signup.submitting ? "disabled" : ""}>${escapeHtml(signup.submitting ? t("creating_account_button", "Creating account...") : t("signup_create_account", "Create account"))}</button>
+            <button class="ghost-button" data-guest-login type="button">${escapeHtml(t("signup_sign_in", "Sign in"))}</button>
+          </div>
+          <p class="form-note">${escapeHtml(t("signup_optional_preferences_note", "Cuisine, neighborhood, travel distance, and notification preferences are optional and can be added after account creation."))}</p>
         </form>
       </section>
-    `)}
-  `;
+    `, "guest-signup-shell");
   bindSignupEvents();
   finalizeRenderedLanguage();
+}
+
+function scrollActiveSignupStepIntoView() {
+  const activeStep = document.querySelector(".signup-progress .active");
+  if (!activeStep) return;
+  requestAnimationFrame(() => {
+    activeStep.scrollIntoView({ block: "nearest", inline: "center" });
+  });
 }
 
 function bindSignupEvents() {
@@ -3729,63 +6365,25 @@ function bindSignupEvents() {
   const signup = ensureSignupState();
   form?.addEventListener("input", (event) => {
     collectSignupForm(form);
+    signup.errors = {};
+    signup.submitError = "";
     if (["password", "confirm_password"].includes(event.target?.name)) updatePasswordStrengthMeter();
-    if (signup.step === signupSteps.length - 1) renderGuestSignup();
   });
   form?.addEventListener("change", (event) => {
     collectSignupForm(form);
+    signup.errors = {};
+    signup.submitError = "";
     const targetName = event.target?.name || "";
-    if (signupAnalyticsFields.has(targetName) && ["checkbox", "radio"].includes(event.target?.type)) {
-      trackSignupEvent("preference_selected", signupStepAnalyticsMeta(signup.step, {
-        field_key: targetName,
-        selected_count: asArray(signup.data[targetName]).length || (signup.data[targetName] ? 1 : 0),
-        selected: Boolean(event.target.checked)
-      }));
+    if (targetName === "legal_consent" && event.target.checked) {
+      trackSignupEvent("terms_accepted", { step_key: "fast_account", terms_version: "2026-07-17" });
+      trackSignupEvent("privacy_accepted", { step_key: "fast_account", privacy_policy_version: "2026-07-17" });
     }
-    if (targetName === "terms_consent" && event.target.checked) {
-      trackSignupEvent("terms_accepted", signupStepAnalyticsMeta(signup.step, {
-        terms_version: "2026-07-17"
-      }));
-    }
-    if (targetName === "privacy_consent" && event.target.checked) {
-      trackSignupEvent("privacy_accepted", signupStepAnalyticsMeta(signup.step, {
-        privacy_policy_version: "2026-07-17"
-      }));
-    }
-    if (targetName === "marketing_consent" && event.target.checked) {
-      trackSignupEvent("marketing_consent_given", signupStepAnalyticsMeta(signup.step, {
-        marketing_consent: true
-      }));
-    }
-    if (signup.step === signupSteps.length - 1) renderGuestSignup();
   });
   form?.addEventListener("submit", submitSignupStep);
-  document.querySelector("[data-signup-back]")?.addEventListener("click", () => {
-    collectSignupForm(form);
-    signup.step = Math.max(0, signup.step - 1);
-    signup.errors = {};
-    renderGuestSignup();
-  });
-  document.querySelectorAll("[data-signup-step]").forEach((button) => {
-    button.addEventListener("click", () => {
-      collectSignupForm(form);
-      signup.step = Math.min(Number(button.dataset.signupStep || 0), signup.step);
-      signup.errors = {};
-      renderGuestSignup();
-    });
-  });
   document.querySelectorAll("[data-toggle-password]").forEach((button) => {
     button.addEventListener("click", () => {
       collectSignupForm(form);
       signup[button.dataset.togglePassword] = !signup[button.dataset.togglePassword];
-      renderGuestSignup();
-    });
-  });
-  document.querySelectorAll("[data-edit-signup-step]").forEach((button) => {
-    button.addEventListener("click", () => {
-      collectSignupForm(form);
-      signup.step = Number(button.dataset.editSignupStep || 0);
-      signup.errors = {};
       renderGuestSignup();
     });
   });
@@ -3795,16 +6393,6 @@ function bindSignupEvents() {
     state.mode = "guest";
     renderCurrentMode();
   });
-  document.querySelector("#useDeviceLocation")?.addEventListener("click", () => {
-    if (!navigator.geolocation) {
-      showToast(t("signup_location_unavailable", "Device location is not available in this browser."));
-      return;
-    }
-    navigator.geolocation.getCurrentPosition(
-      () => showToast(t("signup_location_received", "Location permission received. Please still confirm your city and region.")),
-      () => showToast(t("signup_location_declined", "Location access was declined. Please enter your city and region manually."))
-    );
-  });
 }
 
 async function submitSignupStep(event) {
@@ -3812,30 +6400,44 @@ async function submitSignupStep(event) {
   const form = event.currentTarget;
   const signup = ensureSignupState();
   collectSignupForm(form);
-  if (!validateSignupStep(signup.step)) {
-    renderGuestSignup();
-    return;
-  }
-  trackSignupEvent("signup_step_completed", signupStepAnalyticsMeta(signup.step, {
-    completion_state: signup.step === signupSteps.length - 1 ? "ready_to_create" : "step_complete"
-  }));
-  if (signup.step < signupSteps.length - 1) {
-    signup.step += 1;
-    signup.errors = {};
-    renderGuestSignup();
-    return;
-  }
-  if (!validateAllSignupSteps()) {
+  syncSignupLegalConsent(signup.data);
+  signup.errors = fastSignupErrors(signup.data);
+  if (Object.keys(signup.errors).length) {
+    trackSignupEvent("signup_validation_failed", {
+      step_key: "fast_account",
+      field_key: Object.keys(signup.errors).join(",")
+    });
     renderGuestSignup();
     return;
   }
   try {
     signup.submitting = true;
+    signup.submitError = "";
+    trackSignupEvent("signup_submitted", { step_key: "fast_account" });
     renderGuestSignup();
     const payload = await api("/auth/signup-guest", {
       method: "POST",
       body: JSON.stringify({
-        ...signup.data,
+        full_name: signup.data.full_name,
+        email: signup.data.email,
+        phone: signup.data.phone || "",
+        password: signup.data.password,
+        confirm_password: signup.data.confirm_password,
+        transactional_email_consent: true,
+        privacy_consent: Boolean(signup.data.privacy_consent),
+        terms_consent: Boolean(signup.data.terms_consent),
+        marketing_consent: false,
+        sms_consent: false,
+        notification_channels: ["Email"],
+        notification_preferences: ["Reservation status updates"],
+        preferred_neighborhoods: [noNeighborhoodPreference],
+        travel_distance_unit: travelDistanceUnitForCountry("US"),
+        account_creation_phase: true,
+        onboarding_progress: {
+          account_created: true,
+          optional_preferences_completed: false,
+          completed_steps: ["account"]
+        },
         profile_key: state.aiProfileKey,
         preferred_language: state.lang
       })
@@ -3847,32 +6449,181 @@ async function submitSignupStep(event) {
     }
     state.aiPreferences = payload.preferences || null;
     signup.analyticsCompleted = true;
-    trackSignupEvent("signup_completed", signupStepAnalyticsMeta(signupSteps.length - 1, {
-      completion_state: "completed",
-      completed_steps_count: signupSteps.length,
-      preference_question_count: 28,
-      marketing_consent: Boolean(signup.data.marketing_consent)
-    }));
+    trackSignupEvent("signup_succeeded", { step_key: "fast_account" });
+    trackSignupEvent("signup_completed", { step_key: "fast_account", preference_question_count: 0 });
+    if (payload.auth_confirmation_email?.requested || payload.email_verification_required) {
+      trackSignupEvent("confirmation_email_sent", { step_key: "fast_account" });
+    }
+    const welcomeEmail = payload.welcome_email || {};
+    const welcomeEmailWarning = Boolean(welcomeEmail.attempted && welcomeEmail.accepted === false && welcomeEmail.verifiedRejection);
     state.signupSuccess = {
       profile: payload.profile || null,
       preferences: payload.preferences || null,
-      emailVerificationRequired: !payload.access_token && Boolean(payload.message)
+      emailVerificationRequired: Boolean(payload.email_verification_required || (!payload.access_token && payload.message)),
+      welcomeEmailWarning,
+      welcomeEmail,
+      authConfirmationEmail: payload.auth_confirmation_email || {},
+      emailDelivery: payload.email_delivery || {}
+    };
+    state.signupCheckEmail = {
+      ...state.signupCheckEmail,
+      email: signup.data.email,
+      sent: Boolean(payload.email_verification_required || !payload.access_token),
+      error: "",
+      submitting: false
     };
     state.signup = null;
-    history.pushState(null, "", "/");
     state.mode = "guest";
+    if (payload.access_token) {
+      state.guestAccountWelcomeDismissed = false;
+      savePendingSignupEmail("");
+      history.pushState(null, "", "/account?welcome=1");
+    } else {
+      savePendingSignupEmail(signup.data.email);
+      history.pushState(null, "", "/signup/check-email");
+    }
     await renderCurrentMode();
-    showToast(t("signup_success", "Your SmartTable account was created."));
+    showToast(welcomeEmailWarning
+      ? t("signup_success_welcome_email_issue", "Your account was created and your verification email was sent. A separate welcome email could not be delivered, but this does not affect your registration.")
+      : t("signup_success", "Your SmartTable account was created."));
   } catch (error) {
     signup.submitting = false;
-    signup.submitError = /exists|registered|duplicate/i.test(error.message)
-      ? t("signup_duplicate_email_error", "An account with this email already exists. Please sign in.")
+    signup.submitError = error.payload?.code === "ACCOUNT_ALREADY_EXISTS" || /exists|registered|duplicate/i.test(error.message)
+      ? t("signup_duplicate_email_error", "An account already exists with this email address. Sign in or reset your password.")
       : error.message;
     renderGuestSignup();
   }
 }
 
+function signupCheckEmailCooldownSeconds() {
+  const until = Number(state.signupCheckEmail?.cooldownUntil || 0);
+  return Math.max(0, Math.ceil((until - Date.now()) / 1000));
+}
+
+function renderSignupCheckEmail() {
+  const model = state.signupCheckEmail || {};
+  const email = model.email || readPendingSignupEmail();
+  if (email && !model.email) state.signupCheckEmail.email = email;
+  const cooldown = signupCheckEmailCooldownSeconds();
+  app.innerHTML = guestStandaloneShell(`
+    <section class="signup-page fast-signup-page">
+      <article class="signup-card check-email-card" aria-live="polite">
+        <span class="section-kicker">${escapeHtml(t("signup_check_email_kicker", "Email confirmation"))}</span>
+        <h1>${escapeHtml(t("signup_check_email_title", "Check your email"))}</h1>
+        <p class="muted">${escapeHtml(contentTemplate("signup_check_email_body", "We sent a confirmation link to {{email}}. Open the link to activate your SmartTable account.", { email }))}</p>
+        ${email ? `<p class="signup-email-pill">${escapeHtml(email)}</p>` : `<p class="form-note warning">${escapeHtml(t("signup_check_email_missing", "Enter your email again if you need a new confirmation link."))}</p>`}
+        <form id="signupResendConfirmationForm" class="stacked-form" novalidate>
+          <label>${escapeHtml(t("signup_email", "Email"))}<input name="email" type="email" value="${escapeAttr(email)}" autocomplete="email" required></label>
+          ${model.error ? `<p class="form-error" role="alert">${escapeHtml(model.error)}</p>` : ""}
+          ${model.sent ? `<p class="success-state">${escapeHtml(t("auth_callback_resend_neutral_success", "If a SmartTable account exists and still needs verification, a new confirmation email will be sent."))}</p>` : ""}
+          ${cooldown > 0 ? `<p class="form-hint" role="timer">${escapeHtml(authCallbackCooldownLabel(cooldown))}</p>` : ""}
+          <div class="button-row">
+            <button class="primary-button" type="submit" ${model.submitting || cooldown > 0 ? "disabled" : ""}>${escapeHtml(model.submitting ? t("sending_button", "Sending...") : t("auth_callback_resend_button", "Send a new confirmation email"))}</button>
+            <button class="ghost-button" data-change-signup-email type="button">${escapeHtml(t("signup_change_email_button", "Change email"))}</button>
+          </div>
+        </form>
+      </article>
+    </section>
+  `, "guest-signup-shell");
+  finalizeRenderedLanguage();
+  if (cooldown > 0) {
+    window.setTimeout(() => {
+      if (currentGuestAccountRoute() === "signup-check-email") renderSignupCheckEmail();
+    }, 1000);
+  }
+  document.querySelector("[data-change-signup-email]")?.addEventListener("click", () => {
+    savePendingSignupEmail("");
+    state.signup = {
+      ...ensureSignupState(),
+      data: { ...defaultSignupData(), email }
+    };
+    history.pushState(null, "", "/signup");
+    renderCurrentMode();
+  });
+  document.querySelector("#signupResendConfirmationForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const data = formObject(event.currentTarget);
+    state.signupCheckEmail.email = data.email || "";
+    savePendingSignupEmail(state.signupCheckEmail.email);
+    state.signupCheckEmail.error = "";
+    state.signupCheckEmail.sent = false;
+    if (!isValidEmail(state.signupCheckEmail.email)) {
+      state.signupCheckEmail.error = t("signup_error_email", "Enter a valid email address.");
+      renderSignupCheckEmail();
+      return;
+    }
+    try {
+      state.signupCheckEmail.submitting = true;
+      renderSignupCheckEmail();
+      const payload = await api("/auth/resend-verification", {
+        method: "POST",
+        body: JSON.stringify({ email: state.signupCheckEmail.email })
+      });
+      state.signupCheckEmail.submitting = false;
+      state.signupCheckEmail.sent = true;
+      state.signupCheckEmail.cooldownUntil = Date.now() + (Number(payload.cooldown_seconds || 60) * 1000);
+      trackSignupEvent("confirmation_email_resent", { step_key: "check_email" });
+      renderSignupCheckEmail();
+    } catch (error) {
+      state.signupCheckEmail.submitting = false;
+      state.signupCheckEmail.error = error.payload?.code === "VERIFICATION_RESEND_RATE_LIMITED"
+        ? t("auth_callback_resend_rate_limited", "Please wait before requesting another confirmation email.")
+        : t("auth_callback_resend_failed", "We could not process the request. Please try again.");
+      renderSignupCheckEmail();
+    }
+  });
+}
+
+function renderSignupWelcome() {
+  state.mode = "guest";
+  app.innerHTML = guestStandaloneShell(`
+    <section class="signup-page fast-signup-page signup-welcome-page" aria-live="polite">
+      <article class="signup-card signup-welcome-success-card">
+        <span class="section-kicker">${escapeHtml(t("auth_callback_kicker", "Email confirmation"))}</span>
+        <h1>${escapeHtml(t("signup_welcome_confirmed_title", "Email confirmed"))}</h1>
+        <p class="muted">${escapeHtml(t("signup_welcome_confirmed_body", "Your SmartTable account is ready."))}</p>
+        <div class="button-row signup-actions">
+          <button class="primary-button" data-signup-welcome-browse type="button">${escapeHtml(t("signup_welcome_browse_offers", "Browse offers"))}</button>
+          <button class="ghost-button" data-signup-welcome-personalize type="button">${escapeHtml(t("signup_welcome_personalize", "Personalize my profile"))}</button>
+        </div>
+      </article>
+    </section>
+  `, "guest-signup-shell");
+  finalizeRenderedLanguage();
+  updateSessionButton();
+  document.querySelector("[data-signup-welcome-browse]")?.addEventListener("click", async () => {
+    state.guestAccountWelcomeDismissed = true;
+    trackSignupEvent("profile_setup_skipped", { step_key: "signup_welcome" });
+    history.pushState(null, "", "/offers");
+    await renderCurrentMode();
+  });
+  document.querySelector("[data-signup-welcome-personalize]")?.addEventListener("click", async () => {
+    state.guestAccountWelcomeDismissed = true;
+    trackSignupEvent("profile_setup_started", { step_key: "signup_welcome" });
+    if (!isGuestSession()) {
+      state.postLoginRedirect = "/account/preferences";
+      history.pushState(null, "", "/login");
+      await renderCurrentMode();
+      return;
+    }
+    state.guestAccountTab = "preferences";
+    history.pushState(null, "", "/account/preferences");
+    await renderCurrentMode();
+  });
+}
+
 function bindGuestEvents(restaurants) {
+  document.querySelector("[data-home-find-table]")?.addEventListener("click", (event) => {
+    event.stopPropagation();
+    const reduceMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
+    openHeaderSearch();
+    document.querySelector(".topbar")?.scrollIntoView({ behavior: reduceMotion ? "auto" : "smooth", block: "start" });
+  });
+  document.querySelector("[data-home-browse-restaurants]")?.addEventListener("click", async () => {
+    history.pushState(null, "", "/restaurants");
+    state.mode = "guest";
+    await renderCurrentMode();
+  });
   document.querySelectorAll("[data-ai-concierge-entry]").forEach((button) => {
     button.addEventListener("click", () => {
       location.hash = "#ai-concierge";
@@ -3885,7 +6636,6 @@ function bindGuestEvents(restaurants) {
       state.aiWizardOpen = true;
       state.reservationModal = null;
       state.followModal = null;
-      state.reviewModal = null;
       trackAiEvent("preference_wizard_opened");
       renderGuest();
     });
@@ -3896,7 +6646,6 @@ function bindGuestEvents(restaurants) {
       state.aiWizardOpen = true;
       state.reservationModal = null;
       state.followModal = null;
-      state.reviewModal = null;
       trackAiEvent("preference_wizard_opened");
       renderGuest();
     });
@@ -3939,7 +6688,7 @@ function bindGuestEvents(restaurants) {
         time: "",
         partySize: "",
         restaurantName: "",
-        availableOnly: true,
+        availableOnly: false,
         sort: "recommended"
       };
       renderGuest();
@@ -3952,7 +6701,8 @@ function bindGuestEvents(restaurants) {
     });
   });
   document.querySelectorAll("[data-open-reserve]").forEach((button) => {
-    button.addEventListener("click", () => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
       prepareGuestModalOpen(button);
       trackAiEvent(button.dataset.aiAction === "reserve" ? "ai_recommendation_reserve_clicked" : "reserve_clicked", {
         restaurant_id: button.dataset.restaurant,
@@ -3961,24 +6711,58 @@ function bindGuestEvents(restaurants) {
       state.reservationModal = { restaurantId: button.dataset.restaurant, offerId: button.dataset.openReserve };
       state.restaurantDetail = null;
       state.followModal = null;
-      state.reviewModal = null;
       state.reservationSuccess = null;
       state.aiWizardOpen = false;
       renderGuest();
     });
   });
-  document.querySelectorAll("[data-open-restaurant]").forEach((button) => {
-    button.addEventListener("click", () => {
+  document.querySelectorAll("[data-open-standard-reserve]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
       prepareGuestModalOpen(button);
-      state.restaurantDetail = button.dataset.openRestaurant;
-      state.reservationModal = null;
+      trackAiEvent("standard_reservation_clicked", {
+        restaurant_id: button.dataset.restaurant || button.dataset.openStandardReserve
+      });
+      state.reservationModal = {
+        restaurantId: button.dataset.restaurant || button.dataset.openStandardReserve,
+        offerId: "",
+        reservationType: "standard"
+      };
+      state.restaurantDetail = null;
       state.followModal = null;
-      state.reviewModal = null;
       state.reservationSuccess = null;
       state.aiWizardOpen = false;
-      trackAiEvent("restaurant_detail_opened", { restaurant_id: button.dataset.openRestaurant });
-      if (button.dataset.restaurantSlug) history.pushState(null, "", `/restaurants/${button.dataset.restaurantSlug}`);
       renderGuest();
+    });
+  });
+  const openRestaurantFromTrigger = (trigger) => {
+    prepareGuestModalOpen(trigger);
+    state.restaurantDetail = trigger.dataset.openRestaurant;
+    state.reservationModal = null;
+    state.followModal = null;
+    state.reservationSuccess = null;
+    state.aiWizardOpen = false;
+    trackAiEvent("restaurant_detail_opened", { restaurant_id: trigger.dataset.openRestaurant });
+    if (trigger.dataset.restaurantSlug) history.pushState(null, "", `/restaurants/${trigger.dataset.restaurantSlug}`);
+    renderGuest(currentPublicGuestRoute());
+  };
+  document.querySelectorAll("[data-open-restaurant]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      const nestedInteractive = event.target.closest("button, a, input, select, textarea, label");
+      if (nestedInteractive && nestedInteractive !== button) return;
+      openRestaurantFromTrigger(button);
+    });
+    if (button.getAttribute("role") === "link") {
+      button.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        openRestaurantFromTrigger(button);
+      });
+    }
+  });
+  document.querySelectorAll(".compact-restaurant-card [data-follow-restaurant]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
     });
   });
   document.querySelectorAll("[data-newest-restaurant]").forEach((button) => {
@@ -3989,33 +6773,51 @@ function bindGuestEvents(restaurants) {
       state.restaurantDetail = restaurantId;
       state.reservationModal = null;
       state.followModal = null;
-      state.reviewModal = null;
       state.reservationSuccess = null;
       if (button.dataset.restaurantSlug) history.pushState(null, "", `/restaurants/${button.dataset.restaurantSlug}`);
       renderGuest();
     });
   });
   document.querySelectorAll("[data-follow-restaurant]").forEach((button) => {
-    button.addEventListener("click", () => {
+    button.addEventListener("click", async (event) => {
+      event.stopPropagation();
+      const restaurantId = button.dataset.followRestaurant;
+      if (isGuestSession()) {
+        const guest = currentGuest();
+        const profile = state.session?.profile || {};
+        const favoriteActive = button.dataset.favoriteActive === "true" || favoriteRestaurantIds().has(restaurantId);
+        setButtonPending(button, true);
+        try {
+          if (favoriteActive) {
+            await api(`/guest/favorites?restaurant_id=${encodeURIComponent(restaurantId)}`, { method: "DELETE" });
+            showToast(t("favorite_removed_toast", "Favorite removed."));
+          } else {
+            await api("/public/follow", {
+              method: "POST",
+              body: JSON.stringify({
+                restaurant_id: restaurantId,
+                guest_email: guest.email || profile.email,
+                guest_name: guest.full_name || profile.full_name || profile.email,
+                profile_key: state.aiProfileKey,
+                notification_enabled: true
+              })
+            });
+            showToast(t("favorite_added_toast", "Restaurant added to favorites."));
+          }
+          await loadGuestFavoritesForPublic();
+          renderGuest(currentPublicGuestRoute());
+        } catch (error) {
+          setButtonPending(button, false);
+          showToast(error.message);
+        }
+        return;
+      }
       prepareGuestModalOpen(button);
       trackAiEvent(button.dataset.aiAction === "follow" ? "ai_recommendation_follow_clicked" : "follow_clicked", {
-        restaurant_id: button.dataset.followRestaurant
+        restaurant_id: restaurantId
       });
-      state.followModal = button.dataset.followRestaurant;
+      state.followModal = restaurantId;
       state.restaurantDetail = null;
-      state.reviewModal = null;
-      state.reservationSuccess = null;
-      state.aiWizardOpen = false;
-      renderGuest();
-    });
-  });
-  document.querySelectorAll("[data-review-restaurant]").forEach((button) => {
-    button.addEventListener("click", () => {
-      prepareGuestModalOpen(button);
-      trackAiEvent("review_clicked", { restaurant_id: button.dataset.reviewRestaurant });
-      state.reviewModal = button.dataset.reviewRestaurant;
-      state.restaurantDetail = null;
-      state.followModal = null;
       state.reservationSuccess = null;
       state.aiWizardOpen = false;
       renderGuest();
@@ -4034,6 +6836,33 @@ function bindGuestEvents(restaurants) {
       state.reservationSuccess = null;
       renderGuest();
     });
+  });
+  document.querySelectorAll("[data-review-lightbox-review]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const restaurantId = document.querySelector("[data-restaurant-detail-page]")?.dataset.restaurantDetailPage || "";
+      state.reviewLightbox = {
+        restaurantId,
+        reviewId: button.dataset.reviewLightboxReview,
+        index: Number(button.dataset.reviewLightboxIndex) || 0
+      };
+      renderGuest(currentPublicGuestRoute());
+    });
+  });
+  document.querySelectorAll("[data-review-lightbox-close]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.reviewLightbox = null;
+      renderGuest(currentPublicGuestRoute());
+    });
+  });
+  document.querySelector("[data-review-lightbox-prev]")?.addEventListener("click", () => {
+    if (!state.reviewLightbox) return;
+    state.reviewLightbox.index = Math.max(0, Number(state.reviewLightbox.index || 0) - 1);
+    renderGuest(currentPublicGuestRoute());
+  });
+  document.querySelector("[data-review-lightbox-next]")?.addEventListener("click", () => {
+    if (!state.reviewLightbox) return;
+    state.reviewLightbox.index = Number(state.reviewLightbox.index || 0) + 1;
+    renderGuest(currentPublicGuestRoute());
   });
   document.querySelector("[data-dismiss-signup-success]")?.addEventListener("click", () => {
     state.signupSuccess = null;
@@ -4068,14 +6897,447 @@ function bindGuestEvents(restaurants) {
   document.querySelectorAll("[data-follow-form]").forEach((form) => {
     form.addEventListener("submit", submitFollow);
   });
-  document.querySelectorAll("[data-review-form]").forEach((form) => {
-    form.addEventListener("submit", submitReview);
-  });
   initializeMap(restaurants);
+}
+
+function foodFeedRadiusKm() {
+  return Math.round(Number(state.foodFeed.radiusMiles || 10) * 1.609344 * 10) / 10;
+}
+
+function stopFoodFeedPlayback() {
+  foodFeedObserver?.disconnect();
+  foodFeedObserver = null;
+  document.querySelectorAll("[data-food-feed-video]").forEach((video) => video.pause());
+}
+
+function prepareFoodFeedCycle(videos = [], cycle = 1, existingVideos = []) {
+  const prepared = [...videos];
+  const previousVideoId = existingVideos.at(-1)?.id;
+  if (previousVideoId && prepared.length > 1 && prepared[0]?.id === previousVideoId) {
+    const nextIndex = prepared.findIndex((video) => video?.id !== previousVideoId);
+    if (nextIndex > 0) prepared.push(...prepared.splice(0, nextIndex));
+  }
+  return prepared.map((video, index) => ({
+    ...video,
+    feed_instance_id: `${video.id || "food"}-${cycle}-${index}`
+  }));
+}
+
+function foodFeedPreviewRequest() {
+  const pageQuery = new URLSearchParams(window.location.search);
+  const includeTestData = boolValue(pageQuery.get("include_test_data"));
+  const restaurantId = cleanString(pageQuery.get("preview_restaurant_id")).toLowerCase();
+  const validRestaurantId = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(restaurantId);
+  return {
+    enabled: includeTestData && validRestaurantId,
+    includeTestData,
+    restaurantId,
+    requestKey: includeTestData || restaurantId ? `preview:${restaurantId || "invalid"}:${includeTestData}` : "public"
+  };
+}
+
+async function loadFoodFeed(options = {}) {
+  if (state.foodFeed.loading) return [];
+  const append = options.append === true;
+  state.foodFeed.loading = true;
+  state.foodFeed.error = "";
+  try {
+    const query = new URLSearchParams({ limit: "40" });
+    const preview = foodFeedPreviewRequest();
+    if (preview.includeTestData || preview.restaurantId) {
+      query.set("include_test_data", preview.includeTestData ? "true" : "false");
+      if (preview.restaurantId) query.set("preview_restaurant_id", preview.restaurantId);
+    }
+    if (!preview.enabled && state.foodFeed.location) {
+      query.set("lat", String(state.foodFeed.location.latitude));
+      query.set("lng", String(state.foodFeed.location.longitude));
+      query.set("radius_km", String(foodFeedRadiusKm()));
+    }
+    const nextCycle = append ? state.foodFeed.cycle + 1 : 1;
+    if (options.force || append) query.set("fresh", `${Date.now()}-${nextCycle}`);
+    const payload = await api(`/public/food-feed?${query.toString()}`, options.force || append ? { cache: "no-store" } : {});
+    const incoming = Array.isArray(payload.videos) ? payload.videos : [];
+    const cycleVideos = prepareFoodFeedCycle(incoming, nextCycle, append ? state.foodFeed.videos : []);
+    state.foodFeed.videos = append ? [...state.foodFeed.videos, ...cycleVideos] : cycleVideos;
+    state.foodFeed.cycle = cycleVideos.length ? nextCycle : state.foodFeed.cycle;
+    state.foodFeed.requestKey = preview.requestKey;
+    state.foodFeed.loaded = true;
+    return cycleVideos;
+  } catch (error) {
+    state.foodFeed.error = error?.message || t("food_feed_load_error", "What to Eat could not be loaded.");
+    state.foodFeed.requestKey = foodFeedPreviewRequest().requestKey;
+    state.foodFeed.loaded = true;
+    return [];
+  } finally {
+    state.foodFeed.loading = false;
+  }
+}
+
+function foodFeedDistanceLabel(video = {}) {
+  const rawDistance = video.distance_km;
+  if (rawDistance === null || rawDistance === undefined || rawDistance === "") return "";
+  const km = Number(rawDistance);
+  if (!Number.isFinite(km)) return "";
+  const miles = km * 0.621371;
+  return `${miles < 10 ? miles.toFixed(1) : Math.round(miles)} ${t("distance_miles_short", "mi")}`;
+}
+
+function foodFeedFavoriteIds() {
+  return new Set((state.guestFoodFeedFavorites || []).map((favorite) => favorite.food_feed_video_id));
+}
+
+async function loadGuestFoodFeedFavorites() {
+  const ownerId = currentSession()?.profile?.id || "";
+  if (!isGuestSession()) {
+    state.guestFoodFeedFavorites = [];
+    state.foodFeed.favoritesLoaded = false;
+    state.foodFeed.favoriteOwnerId = "";
+    return [];
+  }
+  const payload = await api("/guest/food-feed-favorites").catch(() => ({ favorites: [] }));
+  state.guestFoodFeedFavorites = payload.favorites || [];
+  state.foodFeed.favoritesLoaded = true;
+  state.foodFeed.favoriteOwnerId = ownerId;
+  return state.guestFoodFeedFavorites;
+}
+
+function updateFoodFeedFavoriteButtons(videoId) {
+  const saved = foodFeedFavoriteIds().has(videoId);
+  document.querySelectorAll(`[data-food-feed-favorite="${CSS.escape(videoId)}"]`).forEach((button) => {
+    const accessibleLabel = t(saved ? "food_feed_remove_favorite" : "food_feed_add_favorite", saved ? "Remove saved dish" : "Save dish");
+    button.classList.toggle("active", saved);
+    button.setAttribute("aria-pressed", saved ? "true" : "false");
+    button.setAttribute("aria-label", accessibleLabel);
+    button.replaceChildren();
+    const icon = document.createElement("span");
+    icon.className = "food-feed-favorite-icon";
+    icon.setAttribute("aria-hidden", "true");
+    icon.textContent = saved ? "\u2605" : "\u2606";
+    button.append(icon);
+  });
+}
+
+function showFoodFeedFavoriteAuthPrompt(videoId) {
+  document.querySelector("[data-food-feed-auth-prompt]")?.remove();
+  const backdrop = document.createElement("div");
+  backdrop.className = "food-feed-auth-backdrop";
+  backdrop.dataset.foodFeedAuthPrompt = "true";
+  backdrop.innerHTML = `
+    <section class="food-feed-auth-dialog" role="dialog" aria-modal="true" aria-labelledby="food-feed-auth-title">
+      <button class="food-feed-auth-close" type="button" data-food-feed-auth-close aria-label="${escapeAttr(t("close_button", "Close"))}">&#10005;</button>
+      <span class="section-kicker">${escapeHtml(t("food_feed_saved_dishes_title", "Saved dishes"))}</span>
+      <h2 id="food-feed-auth-title">${escapeHtml(t("food_feed_favorite_login_title", "Save this dish"))}</h2>
+      <p>${escapeHtml(t("food_feed_favorite_login_body", "Sign in or create a free guest account to keep this dish in your favorites."))}</p>
+      <div class="food-feed-auth-actions">
+        <button class="primary-button" type="button" data-food-feed-auth-login>${escapeHtml(t("food_feed_favorite_login_button", "Sign in"))}</button>
+        <button class="ghost-button" type="button" data-food-feed-auth-signup>${escapeHtml(t("food_feed_favorite_signup_button", "Create account"))}</button>
+      </div>
+    </section>
+  `;
+  document.body.appendChild(backdrop);
+  const close = () => backdrop.remove();
+  backdrop.addEventListener("click", (event) => {
+    if (event.target === backdrop || event.target.closest("[data-food-feed-auth-close]")) close();
+  });
+  backdrop.querySelector("[data-food-feed-auth-login]")?.addEventListener("click", async () => {
+    state.postLoginRedirect = `/food-feed?favorite=${encodeURIComponent(videoId)}`;
+    close();
+    stopFoodFeedPlayback();
+    history.pushState(null, "", "/login");
+    await renderCurrentMode();
+  });
+  backdrop.querySelector("[data-food-feed-auth-signup]")?.addEventListener("click", async () => {
+    state.postLoginRedirect = `/food-feed?favorite=${encodeURIComponent(videoId)}`;
+    close();
+    stopFoodFeedPlayback();
+    history.pushState(null, "", "/signup");
+    await renderCurrentMode();
+  });
+  backdrop.querySelector("[data-food-feed-auth-close]")?.focus();
+}
+
+async function savePendingFoodFeedFavorite() {
+  const videoId = new URLSearchParams(window.location.search).get("favorite") || "";
+  if (!videoId || !isGuestSession()) return false;
+  try {
+    await api("/guest/food-feed-favorites", {
+      method: "POST",
+      body: JSON.stringify({ food_feed_video_id: videoId })
+    });
+    await loadGuestFoodFeedFavorites();
+    history.replaceState(null, "", "/food-feed");
+    showToast(t("food_feed_favorite_saved", "Dish saved to favorites."));
+  } catch (error) {
+    history.replaceState(null, "", "/food-feed");
+    showToast(t("food_feed_favorite_error", "This dish could not be saved."));
+  }
+  return true;
+}
+
+function foodFeedCard(video, index) {
+  const restaurant = video.restaurant || {};
+  const slug = restaurantRouteSlug(restaurant);
+  const isTestPreview = video.preview_mode === true || video.is_test_data === true || restaurant.preview_only === true;
+  const distance = isTestPreview ? "" : foodFeedDistanceLabel(video);
+  const discount = isTestPreview ? 0 : Number(video.offer?.discount_percentage || 0);
+  const location = [restaurant.neighborhood, restaurant.city].filter(Boolean).join(" · ");
+  const mediaUrl = video.media_url || video.video_url || "";
+  const isImage = video.media_type === "image" || String(video.mime_type || "").startsWith("image/");
+  const instanceId = video.feed_instance_id || `${video.id || "food"}-1-${index}`;
+  const isFavorite = foodFeedFavoriteIds().has(video.id);
+  return `
+    <article class="food-feed-card" data-food-feed-card="${escapeAttr(instanceId)}" data-food-feed-video-id="${escapeAttr(video.id)}" aria-label="${escapeAttr(`${video.title || "Food media"} — ${restaurant.name || "Restaurant"}`)}">
+      ${isImage ? `
+        <img class="food-feed-video" src="${escapeAttr(mediaUrl)}" loading="${index < 2 ? "eager" : "lazy"}" alt="${escapeAttr(video.title || t("food_feed_image_label", "Food photo"))}">
+      ` : `
+        <video
+          class="food-feed-video"
+          data-food-feed-video
+          src="${escapeAttr(mediaUrl)}"
+          ${restaurant.cover_image_url ? `poster="${escapeAttr(restaurant.cover_image_url)}"` : ""}
+          type="${escapeAttr(video.mime_type || "video/mp4")}"
+          muted
+          loop
+          playsinline
+          preload="${index < 2 ? "auto" : "metadata"}"
+          aria-label="${escapeAttr(video.title || t("food_feed_video_label", "Food video"))}"
+        ></video>
+      `}
+      ${isTestPreview ? "" : `
+        <button class="food-feed-favorite ${isFavorite ? "active" : ""}" type="button" data-food-feed-favorite="${escapeAttr(video.id)}" aria-pressed="${isFavorite ? "true" : "false"}" aria-label="${escapeAttr(t(isFavorite ? "food_feed_remove_favorite" : "food_feed_add_favorite", isFavorite ? "Remove saved dish" : "Save dish"))}">
+          <span class="food-feed-favorite-icon" aria-hidden="true">${isFavorite ? "&#9733;" : "&#9734;"}</span>
+        </button>
+      `}
+      <div class="food-feed-overlay">
+        <div class="food-feed-copy">
+          <h2>${escapeHtml(video.title || restaurant.name || t("restaurant_label", "Restaurant"))}</h2>
+          ${isTestPreview
+            ? `<strong class="food-feed-preview-restaurant">${escapeHtml(restaurant.name || t("restaurant_label", "Restaurant"))}</strong>`
+            : `<button class="food-feed-restaurant-link" type="button" data-food-feed-open="${escapeAttr(slug)}">${escapeHtml(restaurant.name || t("restaurant_label", "Restaurant"))}</button>`}
+          ${video.caption ? `<p>${escapeHtml(video.caption)}</p>` : ""}
+          <div class="food-feed-meta">
+            ${restaurant.cuisine ? `<span>${escapeHtml(restaurant.cuisine)}</span>` : ""}
+            ${location ? `<span>${escapeHtml(location)}</span>` : ""}
+            ${distance ? `<span>${escapeHtml(distance)}</span>` : ""}
+            ${discount > 0 ? `<strong>${escapeHtml(`${discount}% ${t("discount_off_short", "OFF")}`)}</strong>` : ""}
+          </div>
+        </div>
+        <div class="food-feed-actions">
+          ${isTestPreview ? `
+            <div class="food-feed-preview-note" data-food-feed-preview-note role="note">
+              <strong>${escapeHtml(t("food_feed_test_preview_badge", "Test preview"))}</strong>
+              <span>${escapeHtml(t("food_feed_test_preview_note", "Bookings and favorites are disabled."))}</span>
+            </div>
+          ` : `<button class="primary-button" type="button" data-food-feed-book="${escapeAttr(slug)}">${escapeHtml(t("food_feed_book_table", "Book a table"))}</button>`}
+        </div>
+      </div>
+    </article>
+  `;
+}
+
+function foodFeedPage() {
+  const videos = state.foodFeed.videos || [];
+  const hasLocation = Boolean(state.foodFeed.location);
+  const isTestPreview = foodFeedPreviewRequest().enabled || videos.some((video) => video?.preview_mode === true);
+  return `
+    <section class="food-feed-page" aria-labelledby="food-feed-page-title">
+      <h1 class="visually-hidden" id="food-feed-page-title">${escapeHtml(t("food_feed_title", "What do you feel like eating?"))}</h1>
+      <div class="food-feed-toolbar">
+        <button class="food-feed-toolbar-button food-feed-close" type="button" data-food-feed-close aria-label="${escapeAttr(t("food_feed_close", "Close What to Eat"))}" title="${escapeAttr(t("food_feed_close", "Close What to Eat"))}">&#10005;</button>
+        <strong class="food-feed-toolbar-title">${escapeHtml(isTestPreview ? t("food_feed_test_preview_title", "What to Eat test preview") : t("nav_food_feed", "What to Eat"))}</strong>
+        ${isTestPreview ? `
+          <span class="food-feed-preview-badge">${escapeHtml(t("food_feed_test_preview_badge", "Test preview"))}</span>
+        ` : `<div class="food-feed-location-controls">
+          <button class="food-feed-toolbar-button food-feed-location-button" type="button" data-food-feed-location aria-label="${escapeAttr(hasLocation ? t("food_feed_location_on", "Location enabled") : t("food_feed_use_location", "Use my location"))}">
+            <span aria-hidden="true">&#9678;</span>
+            <span class="food-feed-toolbar-label">${escapeHtml(hasLocation ? t("food_feed_near_me", "Near me") : t("food_feed_location", "Location"))}</span>
+          </button>
+          <label class="food-feed-radius-control">
+            <span class="visually-hidden">${escapeHtml(t("food_feed_distance", "Distance"))}</span>
+            <select data-food-feed-radius ${hasLocation ? "" : "disabled"}>
+              ${[3, 5, 10, 25, 50].map((miles) => `<option value="${miles}" ${Number(state.foodFeed.radiusMiles) === miles ? "selected" : ""}>${miles} ${escapeHtml(t("distance_miles_short", "mi"))}</option>`).join("")}
+            </select>
+          </label>
+          <button class="food-feed-toolbar-button" type="button" data-food-feed-refresh aria-label="${escapeAttr(t("refresh_button", "Refresh"))}" title="${escapeAttr(t("refresh_button", "Refresh"))}">&#8635;</button>
+        </div>`}
+      </div>
+      ${!isTestPreview && state.foodFeed.locationStatus === "denied" ? `<p class="food-feed-notice warning">${escapeHtml(t("food_feed_location_denied", "Location was not shared. You can still browse all available videos."))}</p>` : ""}
+      ${state.foodFeed.error ? `<p class="food-feed-notice error">${escapeHtml(state.foodFeed.error)}</p>` : ""}
+      <div class="food-feed-stream" data-food-feed-stream aria-label="${escapeAttr(t("food_feed_stream_label", "Food video feed"))}">
+        ${state.foodFeed.loading && !videos.length ? `<div class="food-feed-empty"><div class="loading-skeleton"></div><p>${escapeHtml(t("loading_text", "Loading…"))}</p></div>` : videos.map(foodFeedCard).join("") || `
+          <div class="food-feed-empty">
+            <h2>${escapeHtml(t("food_feed_empty_title", "No food videos yet"))}</h2>
+            <p>${escapeHtml(t("food_feed_empty_body", "Restaurant videos will appear here after they are reviewed and published."))}</p>
+            <a class="primary-button" href="/restaurants">${escapeHtml(t("nav_restaurants", "Restaurants"))}</a>
+          </div>
+        `}
+      </div>
+    </section>
+  `;
+}
+
+function initializeFoodFeedPlayback() {
+  stopFoodFeedPlayback();
+  const videos = [...document.querySelectorAll("[data-food-feed-video]")];
+  if (!videos.length || window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
+  foodFeedObserver = new IntersectionObserver((entries) => {
+    entries.forEach((entry) => {
+      const video = entry.target;
+      if (entry.isIntersecting && entry.intersectionRatio >= 0.7) {
+        videos.forEach((other) => {
+          if (other !== video) other.pause();
+        });
+        video.play().catch(() => null);
+      } else {
+        video.pause();
+      }
+    });
+  }, { threshold: [0.25, 0.7, 0.95] });
+  videos.forEach((video) => foodFeedObserver.observe(video));
+}
+
+function bindFoodFeedCardEvents() {
+  document.querySelectorAll("[data-food-feed-open]:not([data-food-feed-bound]), [data-food-feed-book]:not([data-food-feed-bound])").forEach((button) => {
+    button.dataset.foodFeedBound = "true";
+    button.addEventListener("click", async () => {
+      stopFoodFeedPlayback();
+      const slug = button.dataset.foodFeedOpen || button.dataset.foodFeedBook;
+      history.pushState(null, "", `/restaurants/${encodeURIComponent(slug)}`);
+      await renderCurrentMode();
+    });
+  });
+  document.querySelectorAll("[data-food-feed-favorite]:not([data-food-feed-bound])").forEach((button) => {
+    button.dataset.foodFeedBound = "true";
+    button.addEventListener("click", async () => {
+      const videoId = button.dataset.foodFeedFavorite;
+      if (!isGuestSession()) {
+        showFoodFeedFavoriteAuthPrompt(videoId);
+        return;
+      }
+      const saved = foodFeedFavoriteIds().has(videoId);
+      try {
+        button.disabled = true;
+        await api(`/guest/food-feed-favorites?food_feed_video_id=${encodeURIComponent(videoId)}`, {
+          method: saved ? "DELETE" : "POST",
+          body: saved ? undefined : JSON.stringify({ food_feed_video_id: videoId })
+        });
+        await loadGuestFoodFeedFavorites();
+        updateFoodFeedFavoriteButtons(videoId);
+        showToast(t(saved ? "food_feed_favorite_removed" : "food_feed_favorite_saved", saved ? "Dish removed from favorites." : "Dish saved to favorites."));
+      } catch (error) {
+        showToast(t("food_feed_favorite_error", "This dish could not be saved."));
+      } finally {
+        button.disabled = false;
+      }
+    });
+  });
+}
+
+async function appendNextFoodFeedCycle() {
+  if (foodFeedPreviewRequest().enabled) return;
+  const stream = document.querySelector("[data-food-feed-stream]");
+  if (!stream || state.foodFeed.loading || !state.foodFeed.videos.length) return;
+  const previousCount = state.foodFeed.videos.length;
+  const appended = await loadFoodFeed({ append: true });
+  if (!appended.length || !document.body.contains(stream)) return;
+  stream.insertAdjacentHTML("beforeend", appended.map((video, index) => foodFeedCard(video, previousCount + index)).join(""));
+  bindFoodFeedCardEvents();
+  initializeFoodFeedPlayback();
+}
+
+function bindInfiniteFoodFeedScroll() {
+  const stream = document.querySelector("[data-food-feed-stream]");
+  if (!stream) return;
+  let scheduled = false;
+  stream.addEventListener("scroll", () => {
+    if (scheduled) return;
+    scheduled = true;
+    window.requestAnimationFrame(() => {
+      scheduled = false;
+      const remaining = stream.scrollHeight - stream.scrollTop - stream.clientHeight;
+      if (remaining <= stream.clientHeight * 1.5) appendNextFoodFeedCycle();
+    });
+  }, { passive: true });
+}
+
+function bindFoodFeedEvents() {
+  initializeFoodFeedPlayback();
+  bindFoodFeedCardEvents();
+  bindInfiniteFoodFeedScroll();
+  document.querySelector("[data-food-feed-close]")?.addEventListener("click", async () => {
+    stopFoodFeedPlayback();
+    history.pushState(null, "", "/");
+    await renderCurrentMode();
+  });
+  document.querySelector("[data-food-feed-location]")?.addEventListener("click", () => {
+    if (!navigator.geolocation) {
+      state.foodFeed.locationStatus = "denied";
+      renderGuest(currentPublicGuestRoute());
+      return;
+    }
+    state.foodFeed.locationStatus = "requesting";
+    navigator.geolocation.getCurrentPosition(async (position) => {
+      state.foodFeed.location = {
+        latitude: position.coords.latitude,
+        longitude: position.coords.longitude
+      };
+      state.foodFeed.locationStatus = "granted";
+      state.foodFeed.loaded = false;
+      await loadFoodFeed({ force: true });
+      renderGuest(currentPublicGuestRoute());
+    }, () => {
+      state.foodFeed.locationStatus = "denied";
+      renderGuest(currentPublicGuestRoute());
+    }, { enableHighAccuracy: false, timeout: 10_000, maximumAge: 300_000 });
+  });
+  document.querySelector("[data-food-feed-radius]")?.addEventListener("change", async (event) => {
+    state.foodFeed.radiusMiles = Number(event.target.value) || 10;
+    state.foodFeed.loaded = false;
+    await loadFoodFeed({ force: true });
+    renderGuest(currentPublicGuestRoute());
+  });
+  document.querySelector("[data-food-feed-refresh]")?.addEventListener("click", async (event) => {
+    setButtonPending(event.currentTarget, true);
+    await loadFoodFeed({ force: true });
+    renderGuest(currentPublicGuestRoute());
+  });
 }
 
 function renderGuest(publicRoute = currentPublicGuestRoute()) {
   updateMeta();
+  if (publicRoute?.kind === "food-feed") {
+    const requestKey = foodFeedPreviewRequest().requestKey;
+    if (!state.foodFeed.loading && state.foodFeed.requestKey !== requestKey) {
+      state.foodFeed.videos = [];
+      state.foodFeed.loaded = false;
+      state.foodFeed.error = "";
+      state.foodFeed.cycle = 0;
+    }
+    app.innerHTML = foodFeedPage();
+    bindFoodFeedEvents();
+    finalizeRenderedLanguage();
+    const favoriteOwnerId = currentSession()?.profile?.id || "";
+    if (isGuestSession() && (!state.foodFeed.favoritesLoaded || state.foodFeed.favoriteOwnerId !== favoriteOwnerId)) {
+      loadGuestFoodFeedFavorites().then(async () => {
+        await savePendingFoodFeedFavorite();
+        if (currentPublicGuestRoute()?.kind === "food-feed") renderGuest(currentPublicGuestRoute());
+      });
+    } else if (isGuestSession() && new URLSearchParams(window.location.search).has("favorite")) {
+      savePendingFoodFeedFavorite().then(() => {
+        if (currentPublicGuestRoute()?.kind === "food-feed") renderGuest(currentPublicGuestRoute());
+      });
+    } else if (!isGuestSession() && state.guestFoodFeedFavorites.length) {
+      state.guestFoodFeedFavorites = [];
+      state.foodFeed.favoritesLoaded = false;
+      state.foodFeed.favoriteOwnerId = "";
+    }
+    if (!state.foodFeed.loaded && !state.foodFeed.loading) {
+      loadFoodFeed().then(() => {
+        if (currentPublicGuestRoute()?.kind === "food-feed") renderGuest(currentPublicGuestRoute());
+      });
+    }
+    return;
+  }
   const restaurants = filteredRestaurants();
   const offerCount = restaurants.reduce((sum, restaurant) => sum + (restaurant.filteredOffers || restaurant.offers).length, 0);
   if (rewardsBookingIdFromUrl()) {
@@ -4089,7 +7351,7 @@ function renderGuest(publicRoute = currentPublicGuestRoute()) {
       `)}
       ${aiModeBanner("guest")}
       ${postVisitRewardsPage()}
-      <footer class="site-footer">${escapeHtml(t("footer_text", "Smarttable.com serves New York restaurants and guests."))}</footer>
+      ${publicFooter()}
       ${guestModals()}
     `;
     bindGuestEvents(restaurants);
@@ -4097,8 +7359,30 @@ function renderGuest(publicRoute = currentPublicGuestRoute()) {
     finalizeRenderedLanguage();
     return;
   }
+  if (publicRoute?.kind === "restaurant-detail") {
+    const restaurant = findPublicRestaurantBySlug(publicRoute.slug) || findPublicRestaurant(state.restaurantDetail);
+    if (!restaurant) {
+      renderNotFoundRoute();
+      return;
+    }
+    state.restaurantDetail = restaurant.id || restaurant.restaurant_id;
+    app.innerHTML = restaurantDetailPage(restaurant);
+    bindGuestEvents([restaurant]);
+    syncGuestModalState();
+    finalizeRenderedLanguage();
+    window.scrollTo({ top: 0, left: 0, behavior: "auto" });
+    const restaurantId = restaurant.id || restaurant.restaurant_id;
+    const reviewEntry = restaurantReviewCacheEntry(restaurantId);
+    if (!reviewEntry.loaded && !reviewEntry.loading) {
+      loadPublicRestaurantReviews(restaurantId).then(() => {
+        const route = currentPublicGuestRoute();
+        if (route?.kind === "restaurant-detail" && String(state.restaurantDetail || "") === String(restaurantId || "")) renderGuest(route);
+      });
+    }
+    return;
+  }
   app.innerHTML = `
-    ${layoutHero(guestHeroSearchPanel())}
+    ${layoutHero("", { variant: "home" })}
     ${aiModeBanner("guest")}
     ${state.signupSuccess ? signupSuccessPanel() : ""}
     ${guestAiConciergeHomepageEntry()}
@@ -4135,7 +7419,7 @@ function renderGuest(publicRoute = currentPublicGuestRoute()) {
         <p>${escapeHtml(t("guests_body", "Find deals and receive email updates."))}</p>
       </article>
     </section>
-    <footer class="site-footer">${escapeHtml(t("footer_text", "Smarttable.com serves New York restaurants and guests."))}</footer>
+    ${publicFooter()}
     ${guestModals()}
   `;
   bindGuestEvents(restaurants);
@@ -4149,7 +7433,12 @@ async function submitReservation(event) {
   if (state.reservationSubmitting) return;
   const form = event.currentTarget;
   const data = formObject(form);
-  data.offer_id = data.offer_id || form.dataset.reserve;
+  if (form.dataset.reserve) {
+    data.offer_id = data.offer_id || form.dataset.reserve;
+  } else {
+    delete data.offer_id;
+  }
+  data.reservation_type = data.reservation_type || (data.offer_id ? "discount_offer" : "standard");
   data.party_size = Number(data.party_size);
   data.profile_key = state.aiProfileKey;
   data.lang = state.lang;
@@ -4166,6 +7455,8 @@ async function submitReservation(event) {
     });
     trackAiEvent("reservation_form_submitted", {
       offer_id: data.offer_id,
+      restaurant_id: data.restaurant_id,
+      reservation_type: data.reservation_type,
       reservation_id: payload.reservation?.reservation_id,
       party_size: data.party_size,
       reservation_date: data.reservation_date,
@@ -4201,7 +7492,16 @@ function reservationErrorMessage(error) {
     OFFER_NOT_FOUND: "reservation_error_offer_not_found",
     INVALID_OFFER_TIME: "reservation_error_invalid_offer_time",
     OFFER_DATE_MISMATCH: "reservation_error_offer_date_mismatch",
-    OFFER_UNAVAILABLE: "reservation_error_offer_unavailable"
+    OFFER_UNAVAILABLE: "reservation_error_offer_unavailable",
+    STANDARD_RESERVATION_REQUIRED_FIELDS: "reservation_error_standard_required",
+    STANDARD_RESERVATION_UNAVAILABLE: "reservation_error_standard_unavailable",
+    STANDARD_RESERVATION_SOLD_OUT: "reservation_error_standard_sold_out",
+    STANDARD_RESERVATION_PARTY_SIZE_INVALID: "reservation_error_standard_party_size",
+    STANDARD_RESERVATION_WINDOW_EXCEEDED: "reservation_error_standard_window",
+    STANDARD_RESERVATION_SCHEMA_MISSING: "reservation_error_standard_schema",
+    INVALID_RESERVATION_DATE: "reservation_error_invalid_date",
+    INVALID_RESERVATION_TIME: "reservation_error_invalid_time",
+    DUPLICATE_RESERVATION: "reservation_error_duplicate"
   };
   if (keys[code]) return t(keys[code], error?.message || "This offer is not available.");
   return error?.message || t("reservation_error_generic", "Reservation could not be submitted. Please try again.");
@@ -4226,33 +7526,6 @@ async function submitFollow(event) {
     if (canShowFeature("ai.concierge", { allowDemo: true })) await loadAiRecommendations();
     renderGuest();
     showToast(t("follow_success", "You are following this restaurant."));
-  } catch (error) {
-    showToast(error.message);
-  }
-}
-
-async function submitReview(event) {
-  event.preventDefault();
-  const form = event.currentTarget;
-  const data = formObject(form);
-  try {
-    await api("/public/reviews", {
-      method: "POST",
-      body: JSON.stringify({
-        restaurant_id: form.dataset.reviewForm,
-        guest_name: data.guest_name,
-        guest_email: data.guest_email,
-        food_rating: Number(data.food_rating),
-        service_rating: Number(data.service_rating),
-        ambience_rating: Number(data.ambience_rating),
-        profile_key: state.aiProfileKey,
-        comment: data.comment
-      })
-    });
-    state.reviewModal = null;
-    if (canShowFeature("ai.concierge", { allowDemo: true })) await loadAiRecommendations();
-    renderGuest();
-    showToast(t("review_success", "Thanks. Your review is waiting for admin approval."));
   } catch (error) {
     showToast(error.message);
   }
@@ -4381,13 +7654,20 @@ async function submitRoutePlan(event) {
 
 async function resolveConsumptionImage(form, data) {
   const file = form.elements.photo?.files?.[0];
-  if (!file) return data.image_url;
+  if (!file) throw new Error(t("photo_required_error", "Choose a photo to upload."));
+  if (!["image/jpeg", "image/png", "image/webp"].includes(file.type)) {
+    throw new Error(t("photo_type_error", "Use a JPEG, PNG, or WebP image."));
+  }
+  if (file.size > 5 * 1024 * 1024) {
+    throw new Error(t("photo_size_error", "The photo must be 5 MB or smaller."));
+  }
   const signed = await api("/ai/consumption/sign-upload", {
     method: "POST",
     body: JSON.stringify({
-      profile_key: state.aiProfileKey,
+      reservation_id: data.reservation_id,
       filename: file.name,
-      content_type: file.type
+      content_type: file.type,
+      file_size: file.size
     })
   });
   if (signed.upload_url) {
@@ -4398,7 +7678,9 @@ async function resolveConsumptionImage(form, data) {
     });
     if (!response.ok) throw new Error(t("photo_upload_failed_error", "Photo upload failed."));
   }
-  return signed.public_url;
+  const storagePath = signed.storage_path || signed.path;
+  if (!storagePath) throw new Error(t("photo_upload_failed_error", "Photo upload failed."));
+  return { storagePath, uploadedFileName: file.name };
 }
 
 async function submitConsumptionUpload(event) {
@@ -4406,20 +7688,13 @@ async function submitConsumptionUpload(event) {
   const form = event.currentTarget;
   const data = formObject(form);
   try {
-    const imageUrl = await resolveConsumptionImage(form, data);
-    const file = form.elements.photo?.files?.[0];
+    const uploaded = await resolveConsumptionImage(form, data);
     const payload = await api("/ai/consumption-uploads", {
       method: "POST",
       body: JSON.stringify({
-        profile_key: state.aiProfileKey,
-        restaurant_id: data.restaurant_id,
-        reservation_id: data.reservation_id || data.booking_id || "",
-        booking_id: data.booking_id || data.reservation_id || "",
-        guest_id: data.guest_id,
-        guest_name: data.guest_name,
-        guest_email: data.guest_email,
-        image_url: imageUrl,
-        uploaded_file_name: file?.name || "",
+        reservation_id: data.reservation_id,
+        storage_path: uploaded.storagePath,
+        uploaded_file_name: uploaded.uploadedFileName,
         media_type: data.media_type,
         description: data.description,
         rating: Number(data.overall_rating || data.rating || 0),
@@ -4450,7 +7725,17 @@ async function submitConsumptionUpload(event) {
 }
 
 function guestAuthShell(inner) {
-  return layoutHero(`<section class="account-auth-page">${inner}</section>`);
+  return `
+    ${layoutHero(`<section class="account-auth-page">${inner}</section>`)}
+    ${publicFooter()}
+  `;
+}
+
+function guestStandaloneShell(inner, className = "") {
+  return `
+    <section class="guest-standalone-page ${escapeAttr(className)}">${inner}</section>
+    ${publicFooter()}
+  `;
 }
 
 function renderPasswordField(name, label, value = "", stateKey = "showPassword", autocomplete = "current-password") {
@@ -4476,9 +7761,47 @@ function resetPasswordStrengthMeter(password = "") {
   `;
 }
 
+function loginDiagnosticsPanel() {
+  if (!canRenderLoginDiagnostics()) return "";
+  const health = state.runtimeHealth || {};
+  const auth = state.authDiagnostics || {};
+  const apiStatus = state.runtimeHealthError
+    ? `error: ${state.runtimeHealthError}`
+    : health.status || "loading";
+  const build = health.build_id || health.version || health.commit || "not reported";
+  const rows = [
+    ["APP_ENV", health.environment || "unknown"],
+    ["Runtime mode", health.runtime_mode || health.environment || "unknown"],
+    ["Supabase project ref", health.supabase_project_ref || "not reported"],
+    ["Supabase hostname", health.supabase_url_hostname || "not reported"],
+    ["Build/version", build],
+    ["Current hostname", window.location.hostname || "unknown"],
+    ["API health status", `${apiStatus}${health.database_reachable === false ? " / database unreachable" : ""}`],
+    ["Auth request status", auth.requestStatus || "not attempted"],
+    ["Session present", auth.sessionPresent ? "yes" : "no"],
+    ["Resolved role", auth.resolvedRole || "not resolved"],
+    ["Selected redirect route", auth.selectedRedirectRoute || "not selected"],
+    ["Error code", auth.errorCode || "none"]
+  ];
+  return `
+    <aside class="login-diagnostics-panel" data-login-diagnostics role="status" aria-label="SmartTable login diagnostics">
+      <strong>Login diagnostics</strong>
+      <dl>
+        ${rows.map(([label, value]) => `
+          <div>
+            <dt>${escapeHtml(label)}</dt>
+            <dd>${escapeHtml(String(value || "unknown"))}</dd>
+          </div>
+        `).join("")}
+      </dl>
+    </aside>
+  `;
+}
+
 function renderGuestLogin() {
-  if (isGuestSession()) {
-    history.replaceState(null, "", "/account");
+  const existingSession = currentSession();
+  if (existingSession) {
+    history.replaceState(null, "", defaultDashboardRouteForRole(existingSession.profile?.role));
     renderCurrentMode();
     return;
   }
@@ -4497,7 +7820,8 @@ function renderGuestLogin() {
         <button class="link-button" data-forgot-password type="button">${escapeHtml(t("forgot_password_link", "Forgot password?"))}</button>
         <button class="link-button" data-guest-signup type="button">${escapeHtml(t("signup_create_account", "Create account"))}</button>
       </div>
-      ${state.apiMode === "demo" ? `<p class="form-note">${escapeHtml(t("guest_demo_credentials_note", "Demo guest: guest@smarttable.com / guest123"))}</p>` : ""}
+      ${loginDiagnosticsPanel()}
+      ${canShowDemoCredentials() ? `<p class="form-note">${escapeHtml(t("guest_demo_credentials_note", "Local test accounts require protected test credentials."))}</p>` : ""}
     </form>
   `);
   finalizeRenderedLanguage();
@@ -4535,6 +7859,13 @@ function bindGuestLoginEvents() {
     }
     try {
       state.guestLogin.submitting = true;
+      updateAuthDiagnostics({
+        requestStatus: "sending",
+        sessionPresent: Boolean(currentSession()),
+        resolvedRole: normalizeRole(currentSession()?.profile?.role || ""),
+        selectedRedirectRoute: "",
+        errorCode: ""
+      });
       renderGuestLogin();
       const payload = await api("/auth/login", {
         method: "POST",
@@ -4545,20 +7876,74 @@ function bindGuestLoginEvents() {
         })
       });
       payload.profile.role = normalizeRole(payload.profile.role);
-      if (payload.profile.role !== "guest") throw new Error(t("guest_login_role_error", "Please use the correct dashboard login for this account."));
-      saveSession(payload, { remember: Boolean(data.remember_me) });
-      trackGuestAccountEvent("login_success", { remember_me: Boolean(data.remember_me), auth_provider: payload.mode || state.apiMode });
-      await applyProfileLanguagePreference(payload);
+      if (payload.profile.role === "guest") {
+        trackGuestAccountEvent("login_success", { remember_me: Boolean(data.remember_me), auth_provider: payload.mode || state.apiMode });
+      }
       state.guestLogin = { showPassword: false, submitting: false, error: "", rememberMe: Boolean(data.remember_me) };
-      state.mode = "guest";
-      history.pushState(null, "", state.postLoginRedirect || "/account");
-      state.postLoginRedirect = "";
-      await renderCurrentMode();
-      showToast(t("logged_in_toast", "Logged in."));
+      await completeAuthenticatedLogin(payload, { remember: Boolean(data.remember_me), redirectFallback: defaultDashboardRouteForRole(payload.profile.role) });
     } catch (error) {
-      trackGuestAccountEvent("login_failed", { error_category: /too many/i.test(error.message) ? "rate_limited" : "invalid_credentials" });
+      const errorCode = error.payload?.code || "";
+      trackGuestAccountEvent("login_failed", {
+        error_category: errorCode === "EMAIL_NOT_CONFIRMED"
+          ? "email_not_confirmed"
+          : errorCode === "ACCOUNT_SETUP_INCOMPLETE"
+          ? "account_setup_incomplete"
+          : /too many/i.test(error.message) ? "rate_limited" : "invalid_credentials"
+      });
+      if (errorCode === "ACCOUNT_SETUP_INCOMPLETE" && error.payload?.onboarding_required && error.payload?.access_token && error.payload?.profile) {
+        const profile = {
+          ...error.payload.profile,
+          role: normalizeRole(error.payload.profile.role)
+        };
+        saveSession({
+          mode: error.payload.mode || state.apiMode,
+          access_token: error.payload.access_token,
+          refresh_token: error.payload.refresh_token,
+          expires_in: error.payload.expires_in,
+          profile
+        }, { remember: Boolean(data.remember_me) });
+        const nameParts = String(profile.full_name || "").trim().split(/\s+/).filter(Boolean);
+        state.signup = {
+          step: 0,
+          data: {
+            ...defaultSignupData(),
+            full_name: profile.full_name || "",
+            first_name: nameParts[0] || "",
+            last_name: nameParts.slice(1).join(" "),
+            email: profile.email || data.email || ""
+          },
+          errors: {},
+          submitError: t("login_account_setup_incomplete_redirect", "Your account is signed in, but onboarding is incomplete. Finish these steps to activate your SmartTable profile."),
+          showPassword: false,
+          showConfirmPassword: false,
+          locating: false,
+          submitting: false,
+          analyticsStarted: false,
+          analyticsCompleted: false,
+          analyticsAbandoned: false
+        };
+        state.guestLogin = { showPassword: false, submitting: false, error: "", rememberMe: Boolean(data.remember_me) };
+        state.mode = "guest";
+        history.pushState(null, "", "/signup");
+        await renderCurrentMode();
+        showToast(t("login_account_setup_incomplete_toast", "Finish onboarding to activate your account."));
+        return;
+      }
       state.guestLogin.submitting = false;
-      state.guestLogin.error = /too many/i.test(error.message)
+      updateAuthDiagnostics({
+        requestStatus: error.status ? `HTTP ${error.status}` : "error",
+        sessionPresent: Boolean(currentSession()),
+        resolvedRole: normalizeRole(currentSession()?.profile?.role || ""),
+        selectedRedirectRoute: "",
+        errorCode: errorCode || "AUTH_LOGIN_FAILED"
+      });
+      state.guestLogin.error = errorCode === "EMAIL_NOT_CONFIRMED"
+        ? t("login_email_not_confirmed_error", "Please verify your email before signing in. Check your inbox for the SmartTable verification link.")
+        : errorCode === "ACCOUNT_SETUP_INCOMPLETE"
+        ? t("login_account_setup_incomplete_error", "Your account was created, but setup is incomplete. Please contact SmartTable support.")
+        : errorCode === "AUTH_SERVICE_UNAVAILABLE"
+        ? t("login_service_unavailable_error", "Sign in is temporarily unavailable. Please try again.")
+        : /too many/i.test(error.message)
         ? t("login_rate_limited_error", "Too many login attempts. Please wait before trying again.")
         : t("login_generic_error", "Invalid email or password.");
       renderGuestLogin();
@@ -4730,19 +8115,206 @@ async function renderVerifyEmail() {
   });
 }
 
+function authCallbackErrorMessage(code = "", description = "") {
+  const value = String(code || "").toLowerCase();
+  const details = String(description || "").toLowerCase();
+  if (/already.*confirm|confirm.*already|already.*used|used/.test(details) || /already/.test(value)) {
+    return t("auth_callback_already_confirmed_message", "Your email address is already confirmed. You can sign in.");
+  }
+  if (value === "otp_expired" || /expired/.test(details)) {
+    return t("auth_callback_expired_message", "This confirmation link has expired. Request a new confirmation email.");
+  }
+  if (/invalid/.test(value) || /invalid/.test(details)) {
+    return t("auth_callback_invalid_message", "This confirmation link is invalid or has already been used.");
+  }
+  if (value === "access_denied") {
+    return t("auth_callback_access_denied_message", "Email confirmation was denied. Please request a new confirmation email.");
+  }
+  if (value === "missing_code" || value === "auth_callback_missing_token") {
+    return t("auth_callback_missing_message", "This confirmation link is missing required information.");
+  }
+  return t("auth_callback_unknown_error", "Email confirmation could not be completed. Please request a new confirmation email.");
+}
+
+function authCodeVerifier() {
+  return sessionStorage.getItem("smarttable.auth.code_verifier")
+    || localStorage.getItem("smarttable.auth.code_verifier")
+    || sessionStorage.getItem("supabase.auth.code_verifier")
+    || localStorage.getItem("supabase.auth.code_verifier")
+    || "";
+}
+
+async function exchangeAuthCallback(params) {
+  const body = {
+    code: params.get("code") || "",
+    code_verifier: authCodeVerifier(),
+    access_token: params.get("access_token") || "",
+    refresh_token: params.get("refresh_token") || "",
+    expires_in: params.get("expires_in") || "",
+    token_hash: params.get("token_hash") || "",
+    token: params.get("token") || "",
+    type: params.get("type") || ""
+  };
+  return await api("/auth/callback", {
+    method: "POST",
+    body: JSON.stringify(body)
+  });
+}
+
+async function renderAuthCallback() {
+  state.mode = "guest";
+  const params = authCallbackParams();
+  const callbackKey = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+  const callback = state.guestAuthCallback;
+
+  if (callback.processedKey !== callbackKey) {
+    callback.processedKey = callbackKey;
+    callback.status = "loading";
+    callback.message = "";
+    callback.errorCode = "";
+    callback.resendSent = false;
+    callback.resendError = "";
+    const errorCode = params.get("error_code") || params.get("error") || "";
+    if (errorCode) {
+      callback.status = "error";
+      callback.errorCode = errorCode;
+      callback.message = authCallbackErrorMessage(errorCode, params.get("error_description") || "");
+    } else if (params.get("access_token") || params.get("code") || params.get("token_hash") || params.get("token")) {
+      try {
+        const payload = await exchangeAuthCallback(params);
+        if (payload.access_token && payload.profile) {
+          payload.profile.role = normalizeRole(payload.profile.role);
+          saveSession(payload, { remember: true });
+          await applyProfileLanguagePreference(payload);
+          state.guestAccountWelcomeDismissed = false;
+          savePendingSignupEmail("");
+          trackSignupEvent("email_confirmed", { step_key: "auth_callback" });
+          window.history.replaceState(null, "", "/signup/welcome");
+          renderSignupWelcome();
+          return;
+        }
+        callback.status = "success";
+        callback.message = t("auth_callback_success_message", "Your email address has been confirmed. You can now log in.");
+        window.history.replaceState(null, "", "/auth/callback?status=confirmed");
+      } catch (error) {
+        callback.status = "error";
+        callback.errorCode = error.payload?.code || "AUTH_CALLBACK_FAILED";
+        callback.message = error.payload?.code === "PKCE_CODE_VERIFIER_MISSING"
+          ? t("auth_callback_pkce_missing_message", "This confirmation link could not be completed in this browser. Please request a new confirmation email.")
+          : authCallbackErrorMessage(error.payload?.code || "", error.message);
+      }
+    } else if (params.get("status") === "confirmed") {
+      callback.status = "success";
+      callback.message = t("auth_callback_success_message", "Your email address has been confirmed. You can now log in.");
+    } else {
+      callback.status = "error";
+      callback.errorCode = "missing_code";
+      callback.message = authCallbackErrorMessage("missing_code", "");
+    }
+  }
+
+  const isSuccess = callback.status === "success";
+  const isLoading = callback.status === "loading";
+  const cooldownSeconds = authCallbackCooldownSeconds();
+  const resendDisabled = Boolean(callback.resendSubmitting || cooldownSeconds > 0);
+  const cooldownNotice = cooldownSeconds > 0
+    ? `<p class="form-hint" role="timer" aria-live="polite">${escapeHtml(authCallbackCooldownLabel(cooldownSeconds))}</p>`
+    : "";
+  scheduleAuthCallbackCooldownRefresh(cooldownSeconds);
+  app.innerHTML = guestAuthShell(`
+    <section class="login-card account-card" aria-live="polite">
+      <span class="section-kicker">${escapeHtml(t("auth_callback_kicker", "Email confirmation"))}</span>
+      <h1>${escapeHtml(isSuccess ? t("auth_callback_success_title", "Email confirmed") : t("auth_callback_error_title", "Confirmation link problem"))}</h1>
+      <p class="${isSuccess ? "success-state" : "form-error"}">${escapeHtml(isLoading ? t("loading_label", "Loading...") : callback.message)}</p>
+      ${!isSuccess && !isLoading ? `
+        <form id="resendConfirmationForm" class="stacked-form" novalidate>
+          <label>${escapeHtml(t("signup_email", "Email"))}<input name="email" type="email" autocomplete="email" value="${escapeAttr(callback.email)}" required></label>
+          ${callback.resendError ? `<p class="form-error" role="alert">${escapeHtml(callback.resendError)}</p>` : ""}
+          ${callback.resendSent ? `<p class="success-state">${escapeHtml(t("auth_callback_resend_neutral_success", "If a SmartTable account exists and still needs verification, a new confirmation email will be sent."))}</p>` : ""}
+          ${cooldownNotice}
+          <button class="primary-button wide" type="submit" ${resendDisabled ? "disabled" : ""}>${escapeHtml(callback.resendSubmitting ? t("sending_button", "Sending...") : t("auth_callback_resend_button", "Send a new confirmation email"))}</button>
+        </form>
+      ` : ""}
+      <div class="button-row">
+        <button class="secondary-button" data-auth-callback-login type="button">${escapeHtml(t("guest_sign_in_button", "Sign In"))}</button>
+        ${!isSuccess && !isLoading ? `<button class="ghost-button" data-auth-callback-signup type="button">${escapeHtml(t("auth_callback_return_signup_button", "Return to signup"))}</button>` : ""}
+        ${isGuestSession() ? `<button class="ghost-button" data-auth-callback-account type="button">${escapeHtml(t("account_menu_my_account", "My Account"))}</button>` : ""}
+      </div>
+    </section>
+  `);
+  finalizeRenderedLanguage();
+  document.querySelector("[data-auth-callback-login]")?.addEventListener("click", () => {
+    history.pushState(null, "", "/login");
+    renderCurrentMode();
+  });
+  document.querySelector("[data-auth-callback-signup]")?.addEventListener("click", () => {
+    history.pushState(null, "", "/signup");
+    renderCurrentMode();
+  });
+  document.querySelector("[data-auth-callback-account]")?.addEventListener("click", () => {
+    history.pushState(null, "", "/account");
+    renderCurrentMode();
+  });
+  document.querySelector("#resendConfirmationForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (authCallbackCooldownSeconds() > 0) {
+      callback.resendError = "";
+      callback.resendSent = true;
+      await renderAuthCallback();
+      return;
+    }
+    const data = formObject(event.currentTarget);
+    callback.email = data.email || "";
+    callback.resendError = "";
+    callback.resendSent = false;
+    if (!isValidEmail(callback.email)) {
+      callback.resendError = t("signup_error_email", "Enter a valid email address.");
+      await renderAuthCallback();
+      return;
+    }
+    try {
+      callback.resendSubmitting = true;
+      await renderAuthCallback();
+      const payload = await api("/auth/resend-verification", {
+        method: "POST",
+        body: JSON.stringify({ email: callback.email })
+      });
+      callback.resendSubmitting = false;
+      callback.resendSent = true;
+      setAuthCallbackCooldown(Number(payload.cooldown_seconds || 60));
+      await renderAuthCallback();
+    } catch (error) {
+      callback.resendSubmitting = false;
+      const retryAfter = Number(error.payload?.retry_after || 0);
+      if (retryAfter > 0) setAuthCallbackCooldown(retryAfter);
+      callback.resendError = error.payload?.code === "VERIFICATION_RESEND_RATE_LIMITED"
+        ? t("auth_callback_resend_rate_limited", "Please wait before requesting another confirmation email.")
+        : t("auth_callback_resend_failed", "We could not process the request. Please try again.");
+      await renderAuthCallback();
+    }
+  });
+}
+
 async function loadGuestAccountData() {
-  const [account, reservations, favorites, notifications, privacy, offers] = await Promise.all([
+  const [account, reservations, favorites, foodFeedFavorites, notifications, userNotifications, communications, privacy, offers] = await Promise.all([
     api("/guest/account"),
     api("/guest/reservations").catch(() => ({ reservations: [] })),
     api("/guest/favorites").catch(() => ({ favorites: [] })),
+    api("/guest/food-feed-favorites").catch(() => ({ favorites: [] })),
     api("/guest/notifications").catch(() => ({ notifications: [] })),
+    api("/notifications").catch(() => ({ notifications: [] })),
+    api("/guest/communications").catch(() => null),
     api("/guest/privacy").catch(() => null),
     api(`/public/offers?lang=${encodeURIComponent(state.lang)}`).catch(() => ({ offers: [] }))
   ]);
   state.guestAccount = account;
   state.guestReservations = reservations.reservations || [];
   state.guestFavorites = favorites.favorites || [];
-  state.guestNotifications = notifications.notifications || [];
+  state.guestFoodFeedFavorites = foodFeedFavorites.favorites || [];
+  state.foodFeed.favoritesLoaded = true;
+  state.foodFeed.favoriteOwnerId = currentSession()?.profile?.id || "";
+  state.guestNotifications = [...(userNotifications.notifications || []), ...(notifications.notifications || [])];
+  state.guestCommunications = communications;
   state.guestPrivacy = privacy;
   if (offers.offers) {
     state.offers = offers.offers;
@@ -4766,13 +8338,11 @@ function currentGuestPreferences() {
 function guestAccountTabs() {
   return [
     ["overview", "account_tab_overview", "Overview"],
-    ["reservations", "account_tab_reservations", "My Reservations"],
+    ["reservations", "account_tab_reservations", "Reservations"],
     ["favorites", "account_tab_favorites", "Favorites"],
-    ["profile", "account_tab_profile", "Profile"],
-    ["preferences", "account_tab_preferences", "My Preferences"],
+    ["preferences", "account_tab_preferences", "Preferences"],
     ["notifications", "account_tab_notifications", "Notifications"],
-    ["reviews", "account_tab_reviews", "Reviews"],
-    ["security", "account_tab_security", "Security"]
+    ["account", "account_tab_account_privacy", "Account & Privacy"]
   ];
 }
 
@@ -4801,13 +8371,12 @@ function renderGuestAccount() {
     overview: accountOverviewPanel(guest, profile, overview),
     reservations: accountReservationsPanel(),
     favorites: accountFavoritesPanel(),
-    profile: accountProfilePanel(),
     preferences: accountPreferencesPanel(),
     notifications: accountNotificationsPanel(),
-    reviews: accountReviewsPanel(),
-    security: accountSecurityPanel()
+    account: accountAndPrivacyPanel()
   };
   app.innerHTML = `
+    ${impersonationBanner()}
     <section class="account-dashboard">
       <div class="section-title-row">
         <div>
@@ -4825,6 +8394,37 @@ function renderGuestAccount() {
   bindGuestAccountEvents();
 }
 
+function shouldShowAccountWelcome() {
+  const params = new URLSearchParams(window.location.search || "");
+  return params.get("welcome") === "1" && !state.guestAccountWelcomeDismissed;
+}
+
+function accountWelcomePanel() {
+  if (!shouldShowAccountWelcome()) return "";
+  return `
+    <article class="panel account-welcome-card" aria-live="polite">
+      <span class="section-kicker">${escapeHtml(t("signup_success_kicker", "Account ready"))}</span>
+      <h2>${escapeHtml(t("signup_welcome_title", "Welcome to SmartTable"))}</h2>
+      <p class="muted">${escapeHtml(t("signup_welcome_body", "Your account is ready. You can start browsing discounted restaurant offers now or personalize your experience."))}</p>
+      <div class="button-row">
+        <button class="primary-button" data-welcome-browse-offers type="button">${escapeHtml(t("signup_welcome_browse_offers", "Browse offers"))}</button>
+        <button class="ghost-button" data-welcome-personalize type="button">${escapeHtml(t("signup_welcome_personalize", "Personalize my profile"))}</button>
+        <button class="ghost-button" data-welcome-later type="button">${escapeHtml(t("signup_welcome_later", "Do this later"))}</button>
+      </div>
+    </article>
+  `;
+}
+
+function profileCompletionFromClient(guest = currentGuest(), profile = currentGuestPreferenceProfile()) {
+  const prefs = profile?.preferences || {};
+  const location = prefs.location || {};
+  const basicComplete = Boolean((guest.full_name || state.session?.profile?.full_name) && (guest.email || state.session?.profile?.email));
+  const locationComplete = Boolean(location.city || guest.city || asArray(prefs.preferred_neighborhoods).length || guest.region || location.region || location.max_travel_distance_miles);
+  const foodComplete = Boolean(asArray(prefs.cuisines).length || asArray(prefs.dietary_needs).length || asArray(prefs.companions).length || prefs.custom_cuisine || prefs.allergy_notes);
+  const notificationComplete = Boolean(asArray(prefs.notification_channels).length || asArray(prefs.notification_preferences).length || prefs.notification_frequency || prefs.consents?.sms || prefs.consents?.marketing);
+  return [basicComplete, locationComplete, foodComplete, notificationComplete].reduce((total, item) => total + (item ? 25 : 0), 0);
+}
+
 function accountOverviewPanel(guest, profile, overview) {
   const aiAction = canShowFeature("ai.concierge", { audience: "guest", allowDemo: true })
     ? `<button class="ghost-button" data-start-ai-concierge type="button">${escapeHtml(t("start_ai_concierge_button", "Start AI Concierge"))}</button>`
@@ -4835,7 +8435,11 @@ function accountOverviewPanel(guest, profile, overview) {
   const freshOffers = canShowFeature("basic.discountOffers", { audience: "guest" })
     ? (state.offers || []).filter(offerIsPublicVisible).slice(0, 3)
     : [];
+  const completion = Number.isFinite(Number(overview.profile_completion))
+    ? Number(overview.profile_completion)
+    : profileCompletionFromClient(guest, profile);
   return `
+    ${accountWelcomePanel()}
     <section class="account-grid">
       <article class="panel account-main-card">
         <span class="section-kicker">${escapeHtml(t("account_tab_overview", "Overview"))}</span>
@@ -4845,11 +8449,11 @@ function accountOverviewPanel(guest, profile, overview) {
           ${statusBadge(supportedLanguages[guest.selected_language || state.lang]?.label || supportedLanguages[state.lang].label)}
         </div>
         <p class="muted">${escapeHtml([guest.city, guest.region].filter(Boolean).join(", ") || t("account_city_missing", "City not set"))}</p>
-        <div class="progress-label"><span>${escapeHtml(t("profile_completion_label", "Profile completion"))}</span><strong>${escapeHtml(formatNumber(overview.profile_completion || 0))}%</strong></div>
-        <div class="progress-bar"><span style="width:${Math.max(0, Math.min(100, Number(overview.profile_completion || 0)))}%"></span></div>
+        <div class="progress-label"><span>${escapeHtml(t("profile_completion_label", "Profile completion"))}</span><strong>${escapeHtml(formatNumber(completion))}%</strong></div>
+        <div class="progress-bar"><span style="width:${Math.max(0, Math.min(100, Number(completion)))}%"></span></div>
         <div class="button-row">
           <button class="ghost-button" data-account-tab-jump="reservations" type="button">${escapeHtml(t("account_quick_view_reservations", "View Reservations"))}</button>
-          <button class="ghost-button" data-account-tab-jump="preferences" type="button">${escapeHtml(t("account_quick_edit_preferences", "Edit Preferences"))}</button>
+          <button class="ghost-button" data-account-tab-jump="preferences" type="button">${escapeHtml(t("account_complete_profile_button", "Complete profile"))}</button>
           <button class="ghost-button" data-account-tab-jump="favorites" type="button">${escapeHtml(t("account_quick_manage_favorites", "Manage Favorites"))}</button>
           ${aiAction}
         </div>
@@ -5003,7 +8607,10 @@ function canGuestCancelInUi(row) {
 }
 
 function isFeedbackEligible(row) {
-  return !isBasicMode() && canShowFeature("ai.concierge", { audience: "guest" }) && normalizeReservationStatusValue(row.status) === "completed" && !row.feedback_submitted;
+  const status = normalizeReservationStatusValue(row.status);
+  const visitStatus = String(row.visit_status || "").toLowerCase();
+  const reviewSubmitted = Boolean(row.review_submitted_at || row.verified_review_submitted || row.feedback_submitted);
+  return ["completed"].includes(status) && ["completed", ""].includes(visitStatus || "completed") && Boolean(row.verified_visit || row.review_eligible_at || row.visit_completed_at || row.completed_at) && !reviewSubmitted;
 }
 
 function reservationHistoryCard(row) {
@@ -5026,6 +8633,10 @@ function reservationHistoryCard(row) {
         ${statCard(t("reservation_requested_label", "Request date"), row.created_at ? formatDate(row.created_at.slice(0, 10), "") : "-")}
         ${statCard(t("reservation_reference_label", "Reference"), row.reference || "-")}
       </div>
+      <div class="reservation-contact-block post-visit-status-block">
+        <p><strong>${escapeHtml(t("post_visit_status_label", "Visit status"))}:</strong> ${escapeHtml(postVisitStatusLine(row))}</p>
+        ${row.verified_visit ? `<p><span class="status success">${escapeHtml(t("verified_visit_badge", "Verified SmartTable visit"))}</span></p>` : ""}
+      </div>
       <div class="reservation-contact-block">
         <p><strong>${escapeHtml(t("address_label", "Address"))}:</strong> ${escapeHtml(row.restaurant_address || t("not_available_label", "Not available"))}</p>
         <p><strong>${escapeHtml(t("phone_label", "Phone"))}:</strong> ${escapeHtml(row.restaurant_phone || t("not_available_label", "Not available"))}</p>
@@ -5033,6 +8644,10 @@ function reservationHistoryCard(row) {
       </div>
       <div class="button-row">
         ${canGuestCancelInUi(row) ? `<button class="ghost-button danger" data-cancel-reservation="${escapeAttr(row.reservation_id)}" type="button">${escapeHtml(t("cancel_reservation_button", "Cancel reservation"))}</button>` : ""}
+        ${status === "accepted" ? `<button class="ghost-button" data-guest-visit-action="arrived" data-guest-visit-reservation="${escapeAttr(row.reservation_id)}" type="button">${escapeHtml(t("post_visit_action_arrived", "I arrived"))}</button>` : ""}
+        ${status === "accepted" ? `<button class="ghost-button" data-guest-visit-action="on_the_way" data-guest-visit-reservation="${escapeAttr(row.reservation_id)}" type="button">${escapeHtml(t("post_visit_action_on_the_way", "I'm still on my way"))}</button>` : ""}
+        ${status === "accepted" ? `<button class="ghost-button warning" data-guest-visit-action="cannot_attend" data-guest-visit-reservation="${escapeAttr(row.reservation_id)}" type="button">${escapeHtml(t("post_visit_action_cannot_attend", "I can't attend"))}</button>` : ""}
+        ${(row.verified_visit && normalizeReservationStatusValue(row.status) !== "completed") || String(row.visit_status || "") === "checked_in" ? `<button class="ghost-button success" data-guest-visit-action="finished" data-guest-visit-reservation="${escapeAttr(row.reservation_id)}" type="button">${escapeHtml(t("post_visit_action_finished", "We finished our visit"))}</button>` : ""}
         ${isFeedbackEligible(row) ? `<button class="ghost-button" data-feedback-reservation="${escapeAttr(row.reservation_id)}" type="button">${escapeHtml(t("rate_visit_button", "Rate visit"))}</button>` : ""}
       </div>
     </article>
@@ -5061,7 +8676,51 @@ function favoriteRestaurantIds() {
   return new Set(state.guestFavorites.map((favorite) => favorite.restaurant_id));
 }
 
+async function loadGuestFavoritesForPublic() {
+  if (!isGuestSession()) {
+    state.guestFavorites = [];
+    return;
+  }
+  const payload = await api("/guest/favorites").catch(() => ({ favorites: [] }));
+  state.guestFavorites = payload.favorites || [];
+}
+
+function savedFoodFeedDishesPanel() {
+  const favorites = state.guestFoodFeedFavorites || [];
+  return `
+    <section class="panel">
+      <h2>${escapeHtml(t("food_feed_saved_dishes_title", "Saved dishes"))}</h2>
+      ${favorites.length ? `
+        <div class="saved-dishes-grid">
+          ${favorites.map((favorite) => {
+            const video = favorite.video || {};
+            const restaurant = video.restaurant || {};
+            const slug = restaurantRouteSlug(restaurant);
+            const isImage = video.media_type === "image" || String(video.mime_type || "").startsWith("image/");
+            return `
+              <article class="saved-dish-card">
+                ${isImage
+                  ? `<img src="${escapeAttr(video.media_url || "/assets/restaurant-hero.png")}" alt="${escapeAttr(video.title || t("food_feed_image_label", "Food photo"))}" loading="lazy" decoding="async">`
+                  : `<video src="${escapeAttr(video.media_url || "")}" muted playsinline preload="metadata" aria-label="${escapeAttr(video.title || t("food_feed_video_label", "Food video"))}"></video>`}
+                <div class="saved-dish-copy">
+                  <strong>${escapeHtml(video.title || t("food_feed_saved_dish", "Saved dish"))}</strong>
+                  <p>${escapeHtml(restaurant.name || t("restaurant_label", "Restaurant"))}</p>
+                  <div class="button-row">
+                    ${slug ? `<button class="ghost-button" type="button" data-food-favorite-restaurant="${escapeAttr(slug)}">${escapeHtml(t("food_feed_saved_dish_open", "View restaurant"))}</button>` : ""}
+                    <button class="ghost-button danger" type="button" data-remove-food-favorite="${escapeAttr(video.id || favorite.food_feed_video_id)}">${escapeHtml(t("remove_favorite_button", "Remove"))}</button>
+                  </div>
+                </div>
+              </article>
+            `;
+          }).join("")}
+        </div>
+      ` : `<div class="empty-state">${escapeHtml(t("food_feed_saved_dishes_empty", "No saved dishes yet. Tap the star in What to Eat to save one."))}</div>`}
+    </section>
+  `;
+}
+
 function accountFavoritesPanel() {
+  const savedDishes = savedFoodFeedDishesPanel();
   const favoriteIds = favoriteRestaurantIds();
   const availableRestaurants = [...new Map((state.restaurants || []).map((restaurant) => [restaurant.id, restaurant])).values()]
     .filter((restaurant) => restaurant?.id && !favoriteIds.has(restaurant.id));
@@ -5079,9 +8738,10 @@ function accountFavoritesPanel() {
     </article>
   ` : "";
   if (!state.guestFavorites.length) {
-    return `<section class="panel"><h2>${escapeHtml(t("account_tab_favorites", "Favorites"))}</h2><div class="empty-state">${escapeHtml(t("account_no_favorites", "No favorite restaurants yet."))}</div></section>${addable}`;
+    return `${savedDishes}<section class="panel"><h2>${escapeHtml(t("account_favorites_title", "Favorite restaurants"))}</h2><div class="empty-state">${escapeHtml(t("account_no_favorites", "No favorite restaurants yet."))}</div></section>${addable}`;
   }
   return `
+    ${savedDishes}
     <section class="panel">
       <h2>${escapeHtml(t("account_favorites_title", "Favorite restaurants"))}</h2>
       <div class="favorites-grid">
@@ -5122,7 +8782,7 @@ function accountChoiceGrid(name, options = [], selected = [], type = "checkbox")
   return `<div class="signup-chip-grid ${state.guestPreferenceErrors[name] ? "has-error" : ""}">
     ${options.map((option) => `
       <label class="signup-chip">
-        <input type="${type}" name="${escapeAttr(name)}" value="${escapeAttr(option)}" ${values.includes(option) ? "checked" : ""}>
+        <input type="${type}" name="${escapeAttr(name)}" value="${escapeAttr(option)}" ${optionValueSelected(values, option) ? "checked" : ""}>
         <span>${escapeHtml(optionLabel(option))}</span>
       </label>
     `).join("")}
@@ -5140,39 +8800,12 @@ function accountRadioGroup(name, labelKey, fallback, options, selected) {
 
 function validateAccountPreferenceData(data) {
   const errors = {};
-  const showAiPreferenceFields = canShowFeature("ai.concierge", { audience: "guest" });
-  const requiredArrays = [
-    ["cuisines", "signup_cuisines", "Preferred cuisines"],
-    ["food_categories", "signup_food_categories", "Preferred food categories"],
-    ["drink_preferences", "signup_drink_preferences", "Drink preferences"],
-    ["dietary_needs", "signup_dietary_needs", "Dietary needs"],
-    ["dining_experiences", "signup_dining_experiences", "Dining experience preferences"],
-    ["companions", "signup_companions", "Typical dining companions"],
-    ["preferred_days", "signup_preferred_days", "Preferred dining days"],
-    ["preferred_time_windows", "signup_preferred_times", "Preferred dining times"],
-    ["discount_levels", "signup_discount_levels", "Preferred discount levels"],
-    ["selection_priorities", "signup_selection_priorities", "Restaurant-selection priorities"],
-    ["excluded_categories", "signup_excluded_categories", "Excluded cuisines or restaurant categories"]
-  ];
-  const requiredText = [
-    ["party_size", "signup_party_size", "Typical party size"],
-    ["booking_lead_time", "signup_booking_lead_time", "Preferred booking lead time"],
-    ["dining_duration", "signup_dining_duration", "Preferred dining duration"],
-    ["spending_range", "signup_spending_range", "Preferred spending per person"],
-    ["consider_no_discount_match", "signup_no_discount_question_short", "No-discount match"],
-    ["discovery_preference", "signup_discovery_preference", "Discovery preference"],
-    ["new_restaurant_recommendations", "signup_new_restaurants_question", "New restaurant recommendations"],
-    ["new_menu_item_recommendations", "signup_new_menu_items_question", "New menu item recommendations"],
-    ...(showAiPreferenceFields ? [
-      ["event_recommendations_interest", "signup_events_interest", "Event-related recommendations"],
-      ["future_calendar_interest", "signup_calendar_future_interest", "Future calendar interest"]
-    ] : [])
-  ];
-  for (const [field, key, fallback] of requiredArrays) {
-    if (!asArray(data[field]).length) errors[field] = `${t(key, fallback)}: ${signupValidationMessage("select_one")}`;
+  if (asArray(data.cuisines).some((value) => choiceKey(value) === "other") && !String(data.custom_cuisine || "").trim()) {
+    errors.custom_cuisine = `${t("signup_custom_cuisine", "Specify other cuisine")}: ${signupValidationMessage("required")}`;
   }
-  for (const [field, key, fallback] of requiredText) {
-    if (!String(data[field] || "").trim()) errors[field] = `${t(key, fallback)}: ${signupValidationMessage("required")}`;
+  const channels = new Set(["Email", ...asArray(data.notification_channels)]);
+  if (channels.has(smsNotificationChannel) && (!data.sms_consent || !isValidInternationalPhone(data.sms_country_code, data.sms_phone_number || data.phone))) {
+    errors.sms_phone_number = t("signup_error_sms_phone", "Enter a valid SMS number and separate SMS consent.");
   }
   return errors;
 }
@@ -5184,47 +8817,78 @@ function minimumInterestingDiscountLabel(levels = []) {
 
 function accountPreferencesPanel() {
   const prefs = currentGuestPreferences();
-  const minDiscount = minimumInterestingDiscountLabel(prefs.discount_levels);
-  const showAiPreferenceFields = canShowFeature("ai.concierge", { audience: "guest" });
+  const guest = currentGuest();
+  const location = prefs.location || {};
+  const country = location.country_code || location.country || guest.country_code || guest.country || "US";
+  const region = location.region || location.state_region || guest.region || guest.state_region || "";
+  const city = location.city || guest.city || "";
+  const noNeighborhood = asArray(prefs.preferred_neighborhoods || guest.preferred_dining_areas).some((item) => choiceKey(item) === choiceKey(noNeighborhoodPreference));
+  const selectedChannels = new Set(asArray(prefs.notification_channels || ["Email"]));
+  selectedChannels.add("Email");
+  const smsSelected = selectedChannels.has(smsNotificationChannel);
+  const locationRegionOptions = Object.entries(countryConfig(country).states || {});
+  const companionOptions = ["Solo", "Couple", "Family", "Friends", "Business", "Other"];
   return `
     <form class="panel account-form" id="guestPreferencesForm">
       <div class="section-title-row compact">
-        <div><span class="section-kicker">${escapeHtml(t("account_tab_preferences", "My Preferences"))}</span><h2>${escapeHtml(t("account_preferences_title", "Dining preferences"))}</h2></div>
+        <div><span class="section-kicker">${escapeHtml(t("account_tab_preferences", "Preferences"))}</span><h2>${escapeHtml(t("account_preferences_title", "Optional profile setup"))}</h2></div>
         <button class="primary-button" type="submit">${escapeHtml(t("save_preferences_button", "Save preferences"))}</button>
       </div>
-      <p class="form-note">${escapeHtml(t("account_preferences_update_anytime", "You can update your preferences at any time."))}</p>
-      ${accountCheckboxGroup("cuisines", "signup_cuisines", "Preferred cuisines", signupOptionGroups.cuisines, prefs.cuisines)}
-      ${accountCheckboxGroup("food_categories", "signup_food_categories", "Preferred food categories", signupOptionGroups.food_categories, prefs.food_categories)}
-      ${accountCheckboxGroup("drink_preferences", "signup_drink_preferences", "Drink preferences", signupOptionGroups.drink_preferences, prefs.drink_preferences)}
-      ${accountCheckboxGroup("dietary_needs", "signup_dietary_needs", "Dietary needs", signupOptionGroups.dietary_needs, prefs.dietary_needs)}
-      ${textArea("allergy_notes", t("signup_allergy_notes", "Optional allergy notes"), prefs.allergy_notes || "")}
-      ${accountCheckboxGroup("dining_experiences", "signup_dining_experiences", "Dining experience preferences", signupOptionGroups.dining_experiences, prefs.dining_experiences)}
-      ${accountCheckboxGroup("companions", "signup_companions", "Typical dining companions", signupOptionGroups.companions, prefs.companions)}
-      ${accountRadioGroup("party_size", "signup_party_size", "Typical party size", signupOptionGroups.party_size, prefs.party_size)}
-      ${accountCheckboxGroup("preferred_days", "signup_preferred_days", "Preferred dining days", signupOptionGroups.preferred_days, prefs.preferred_days)}
-      ${accountCheckboxGroup("preferred_time_windows", "signup_preferred_times", "Preferred dining times", signupOptionGroups.preferred_time_windows, prefs.preferred_time_windows)}
-      ${accountRadioGroup("booking_lead_time", "signup_booking_lead_time", "Preferred booking lead time", signupOptionGroups.booking_lead_time, prefs.booking_lead_time)}
-      ${accountRadioGroup("dining_duration", "signup_dining_duration", "Preferred dining duration", signupOptionGroups.dining_duration, prefs.dining_duration)}
-      ${accountRadioGroup("spending_range", "signup_spending_range", "Preferred spending per person", signupOptionGroups.spending_ranges, prefs.spending_range)}
-      ${accountCheckboxGroup("discount_levels", "signup_discount_levels", "Preferred discount levels", signupOptionGroups.discount_levels, prefs.discount_levels)}
-      <p class="form-note"><strong>${escapeHtml(t("minimum_interesting_discount_label", "Minimum interesting discount"))}:</strong> <span id="minimumInterestingDiscountPreview">${escapeHtml(minDiscount)}</span></p>
-      ${accountRadioGroup("consider_no_discount_match", "signup_no_discount_question", "Would you consider a restaurant without a discount if it strongly matches your preferences?", signupOptionGroups.yes_no_sometimes, prefs.consider_no_discount_match)}
-      ${accountRadioGroup("discovery_preference", "signup_discovery_preference", "Discovery preference", signupOptionGroups.discovery_preference, prefs.discovery_preference)}
-      <fieldset>
-        <legend>${escapeHtml(t("signup_selection_priorities", "Restaurant-selection priorities"))}</legend>
-        <p class="form-note">${escapeHtml(t("signup_selection_priorities_note_unlimited", "Choose every priority that matters to you."))}</p>
-        ${accountChoiceGrid("selection_priorities", signupOptionGroups.selection_priorities, prefs.selection_priorities, "checkbox")}
-      </fieldset>
-      ${accountCheckboxGroup("excluded_categories", "signup_excluded_categories", "Excluded cuisines or restaurant categories", signupOptionGroups.excluded_categories, prefs.excluded_categories)}
-      ${accountRadioGroup("new_restaurant_recommendations", "signup_new_restaurants_question", "Would you like recommendations for newly opened restaurants?", signupOptionGroups.yes_no, prefs.new_restaurant_recommendations)}
-      ${accountRadioGroup("new_menu_item_recommendations", "signup_new_menu_items_question", "Would you like recommendations when a restaurant adds a new menu item?", signupOptionGroups.yes_no, prefs.new_menu_item_recommendations)}
-      ${showAiPreferenceFields ? `
-        ${accountRadioGroup("event_recommendations_interest", "signup_events_interest", "Would you like SmartTable to recommend restaurants around concerts, theater, movies, or other events?", signupOptionGroups.yes_no, prefs.event_recommendations_interest)}
-        ${accountRadioGroup("future_calendar_interest", "signup_calendar_future_interest", "Would you consider connecting your calendar in the future?", signupOptionGroups.yes_no, prefs.future_calendar_interest)}
-      ` : `
-        <input type="hidden" name="event_recommendations_interest" value="${escapeAttr(prefs.event_recommendations_interest || "No")}">
-        <input type="hidden" name="future_calendar_interest" value="${escapeAttr(prefs.future_calendar_interest || "No")}">
-      `}
+      <p class="form-note">${escapeHtml(t("account_preferences_update_anytime", "You can update your preferences at any time. These settings are optional and do not block booking."))}</p>
+      <section class="preference-section">
+        <h3>${escapeHtml(t("profile_setup_location_title", "Location"))}</h3>
+        <div class="form-grid two">
+          <label>${escapeHtml(t("signup_country", "Country"))}
+            <select name="country">
+              ${Object.keys(signupLocationCatalog).map((code) => `<option value="${escapeAttr(code)}" ${country === code ? "selected" : ""}>${escapeHtml(countryLabel(code))}</option>`).join("")}
+            </select>
+          </label>
+          <label>${escapeHtml(t("signup_region", "State or region"))}
+            <input name="region" list="accountRegionOptions" value="${escapeAttr(region)}" autocomplete="address-level1">
+            <datalist id="accountRegionOptions">
+              ${locationRegionOptions.map(([code, config]) => `<option value="${escapeAttr(code)}">${escapeHtml(t(config.labelKey, config.fallback))}</option>`).join("")}
+            </datalist>
+          </label>
+          <label>${escapeHtml(t("signup_city", "City"))}<input name="city" value="${escapeAttr(city)}" autocomplete="address-level2"></label>
+          <label>${escapeHtml(t("signup_neighborhoods", "Neighborhood"))}<input name="preferred_neighborhoods" value="${escapeAttr(noNeighborhood ? "" : csvValue(prefs.preferred_neighborhoods || guest.preferred_dining_areas))}" autocomplete="off"></label>
+          <label class="check-row"><input name="no_neighborhood_preference" type="checkbox" value="true" ${noNeighborhood ? "checked" : ""}> ${escapeHtml(t("profile_no_neighborhood_preference", "No neighborhood preference"))}</label>
+          <span></span>
+          ${textInput("max_travel_distance_value", t("signup_travel_distance", "Maximum travel distance"), location.travel_distance_value || guest.max_travel_distance_value || "", "number", "min=\"0\" step=\"0.5\"")}
+          <label>${escapeHtml(t("signup_travel_distance_unit", "Distance unit"))}
+            <select name="travel_distance_unit">
+              <option value="miles" ${(location.travel_distance_unit || guest.travel_distance_unit || "miles") === "miles" ? "selected" : ""}>${escapeHtml(t("distance_unit_miles", "miles"))}</option>
+              <option value="kilometers" ${(location.travel_distance_unit || guest.travel_distance_unit) === "kilometers" ? "selected" : ""}>${escapeHtml(t("distance_unit_kilometers", "kilometers"))}</option>
+            </select>
+          </label>
+        </div>
+        <button class="ghost-button" data-account-use-location type="button">${escapeHtml(t("signup_use_device_location", "Use my current location"))}</button>
+        <p class="form-note">${escapeHtml(t("profile_location_permission_note", "SmartTable requests browser location only after you click this button."))}</p>
+      </section>
+      <section class="preference-section">
+        <h3>${escapeHtml(t("profile_setup_food_title", "Food and dining preferences"))}</h3>
+        ${accountCheckboxGroup("cuisines", "signup_cuisines", "Preferred cuisines", signupOptionGroups.cuisines, prefs.cuisines)}
+        ${textInput("custom_cuisine", t("signup_custom_cuisine", "Other cuisine"), prefs.custom_cuisine || "", "text")}
+        ${accountCheckboxGroup("dietary_needs", "signup_dietary_needs", "Dietary preferences", signupOptionGroups.dietary_needs, prefs.dietary_needs)}
+        ${textArea("allergy_notes", t("signup_allergy_notes", "Allergies"), prefs.allergy_notes || "")}
+        ${accountRadioGroup("companions", "signup_companions", "Typical dining companion", companionOptions, asArray(prefs.companions)[0] || "")}
+      </section>
+      <section class="preference-section">
+        <h3>${escapeHtml(t("profile_setup_notifications_title", "Notifications"))}</h3>
+        <div class="channel-grid">
+          <label class="check-row"><input name="notification_channels" type="checkbox" value="Email" ${selectedChannels.has("Email") ? "checked" : ""}> ${escapeHtml(t("email_channel_label", "Email notifications"))}</label>
+          <label class="check-row"><input name="notification_channels" type="checkbox" value="${escapeAttr(smsNotificationChannel)}" ${smsSelected ? "checked" : ""}> ${escapeHtml(t("sms_channel_label", "SMS notifications"))}</label>
+          <label class="check-row"><input name="notification_channels" type="checkbox" value="Push" ${selectedChannels.has("Push") || selectedChannels.has("Browser or push notifications") ? "checked" : ""}> ${escapeHtml(t("push_channel_label", "Browser or push notifications"))}</label>
+        </div>
+        <input type="hidden" name="notification_preferences" value="Reservation status updates">
+        <div class="form-grid two sms-preference-fields">
+          ${textInput("sms_country_code", t("signup_sms_country_code", "SMS country code"), prefs.sms_country_code || "+1", "text", "inputmode=\"tel\" autocomplete=\"tel-country-code\"")}
+          ${textInput("sms_phone_number", t("signup_sms_phone_number", "SMS phone number"), prefs.sms_phone_number || guest.phone || "", "tel", "autocomplete=\"tel-national\"")}
+        </div>
+        ${state.guestPreferenceErrors.sms_phone_number ? `<small class="field-error">${escapeHtml(state.guestPreferenceErrors.sms_phone_number)}</small>` : ""}
+        <label class="check-row"><input name="sms_consent" type="checkbox" value="true" ${prefs.consents?.sms ? "checked" : ""}> ${escapeHtml(t("signup_sms_consent", "I separately agree to receive SMS messages if I selected SMS."))}</label>
+        <p class="form-note">${escapeHtml(t("push_sms_distinction_note", "SMS text messages and browser or push notifications are separate notification channels."))}</p>
+        ${accountRadioGroup("notification_frequency", "signup_notification_frequency", "Notification frequency", signupOptionGroups.notification_frequency, prefs.notification_frequency)}
+      </section>
       <p class="form-note warning">${escapeHtml(t("account_preferences_privacy_note", "Dietary and allergy preferences are private and are not shared with restaurant partners as individual guest profiles."))}</p>
     </form>
   `;
@@ -5232,9 +8896,13 @@ function accountPreferencesPanel() {
 
 function accountNotificationSettingsForm() {
   const prefs = currentGuestPreferences();
+  const commPrefs = state.guestCommunications?.preferences || {};
   const selected = new Set(asArray(prefs.notification_preferences));
   selected.add("Reservation status updates");
-  const marketingEnabled = Boolean(prefs.consents?.marketing);
+  const selectedChannels = new Set(asArray(prefs.notification_channels || ["Email"]));
+  const marketingEnabled = commPrefs.marketing_email_enabled ?? Boolean(prefs.consents?.marketing);
+  const smsEnabled = Boolean(commPrefs.transactional_sms_enabled || selectedChannels.has(smsNotificationChannel));
+  const inAppEnabled = commPrefs.in_app_enabled !== false;
   const optionalPreferences = signupOptionGroups.notification_preferences.filter((option) => option !== "Reservation status updates");
   return `
     <form class="account-settings-card" id="guestNotificationSettingsForm">
@@ -5265,13 +8933,20 @@ function accountNotificationSettingsForm() {
         <legend>${escapeHtml(t("notification_channels_label", "Channels"))}</legend>
         <div class="channel-grid">
           <label class="check-row"><input name="notification_channels" type="checkbox" value="Email" checked> ${escapeHtml(t("email_channel_label", "Email"))}</label>
-          <span class="disabled-channel">${escapeHtml(t("push_not_available_label", "Push notifications are not implemented yet."))}</span>
-          <span class="disabled-channel">${escapeHtml(t("sms_not_available_label", "SMS is not implemented and requires separate consent."))}</span>
+          <label class="check-row"><input name="notification_channels" type="checkbox" value="${escapeAttr(smsNotificationChannel)}" ${smsEnabled ? "checked" : ""}> ${escapeHtml(t("sms_channel_label", "SMS"))}</label>
         </div>
       </fieldset>
+      <div class="form-grid two sms-preference-fields">
+        ${textInput("sms_country_code", t("signup_sms_country_code", "SMS country code"), prefs.sms_country_code || "+1", "text", "inputmode=\"tel\" autocomplete=\"tel-country-code\"")}
+        ${textInput("sms_phone_number", t("signup_sms_phone_number", "SMS phone number"), prefs.sms_phone_number || "", "tel", "autocomplete=\"tel-national\"")}
+      </div>
+      <label class="check-row"><input name="sms_consent" type="checkbox" value="true" ${smsEnabled || prefs.consents?.sms ? "checked" : ""}> ${escapeHtml(t("signup_sms_consent", "I separately agree to receive SMS messages if I selected SMS."))}</label>
+      <p class="form-note">${escapeHtml(t("signup_sms_not_sending_note", "SmartTable will store this SMS preference, but SMS messages are sent only if the provider is configured and your consent remains active."))}</p>
       ${accountRadioGroup("notification_frequency", "signup_notification_frequency", "Notification frequency", signupOptionGroups.notification_frequency, prefs.notification_frequency || "Only important reservation messages")}
-      <label class="check-row"><input name="marketing_consent" type="checkbox" value="true" ${marketingEnabled ? "checked" : ""}> ${escapeHtml(t("notification_marketing_consent_label", "I would like to receive SmartTable offers, restaurant recommendations, and marketing messages."))}</label>
-      <p class="form-note">${escapeHtml(t("marketing_not_default_note", "Marketing and SMS are not enabled by default. You can withdraw marketing consent at any time."))}</p>
+      <label class="check-row"><input name="marketing_email_enabled" type="checkbox" value="true" ${marketingEnabled ? "checked" : ""}> ${escapeHtml(t("notification_marketing_consent_label", "I would like to receive SmartTable offers, restaurant recommendations, and marketing messages."))}</label>
+      <label class="check-row"><input name="in_app_enabled" type="checkbox" value="true" ${inAppEnabled ? "checked" : ""}> ${escapeHtml(t("notification_in_app_enabled_label", "Show in-app notifications in my SmartTable account."))}</label>
+      <label>${escapeHtml(t("communication_timezone_label", "Notification timezone"))}<input name="timezone" type="text" value="${escapeAttr(commPrefs.timezone || "America/New_York")}" autocomplete="off"></label>
+      <p class="form-note">${escapeHtml(t("marketing_email_not_default_note", "Marketing email is not enabled by default. You can withdraw marketing consent at any time."))}</p>
     </form>
   `;
 }
@@ -5285,20 +8960,32 @@ function accountNotificationsPanel() {
       </div>
       ${accountNotificationSettingsForm()}
       ${state.guestNotifications.length ? `<div class="notification-center-list">
-        ${state.guestNotifications.map((notification) => `
-          <article class="notification-card ${notification.read_at ? "read" : "unread"}">
-            <div>
-              <span class="section-kicker">${escapeHtml(notification.type || t("notification_label", "Notification"))}</span>
-              <h3>${escapeHtml(notification.title || t("notification_label", "Notification"))}</h3>
-              <p class="muted">${escapeHtml(notification.message || "")}</p>
-            </div>
-            <div class="button-row">
-              ${!notification.read_at ? `<button class="ghost-button" data-mark-notification="${escapeAttr(notification.id)}" type="button">${escapeHtml(t("mark_read_button", "Mark as read"))}</button>` : ""}
-              ${notification.url ? `<button class="ghost-button" data-open-notification-url="${escapeAttr(notification.url)}" type="button">${escapeHtml(t("open_notification_button", "Open"))}</button>` : ""}
-            </div>
-          </article>
-        `).join("")}
+        ${state.guestNotifications.map((notification) => {
+          const notificationUrl = safeInternalNavigationUrl(notification.url || notification.action_url);
+          return `
+            <article class="notification-card ${notification.read_at ? "read" : "unread"}">
+              <div>
+                <span class="section-kicker">${escapeHtml(notification.category || notification.type || t("notification_label", "Notification"))}</span>
+                <h3>${escapeHtml(notification.title || t("notification_label", "Notification"))}</h3>
+                <p class="muted">${escapeHtml(notification.message || notification.body || "")}</p>
+              </div>
+              <div class="button-row">
+                ${!notification.read_at ? `<button class="ghost-button" data-mark-notification="${escapeAttr(notification.id)}" type="button">${escapeHtml(t("mark_read_button", "Mark as read"))}</button>` : ""}
+                ${notificationUrl ? `<button class="ghost-button" data-open-notification-url="${escapeAttr(notificationUrl)}" type="button">${escapeHtml(t("open_notification_button", "Open"))}</button>` : ""}
+              </div>
+            </article>
+          `;
+        }).join("")}
       </div>` : `<div class="empty-state">${escapeHtml(t("account_no_notifications", "No notifications yet."))}</div>`}
+    </section>
+  `;
+}
+
+function accountAndPrivacyPanel() {
+  return `
+    <section class="account-stack">
+      ${accountProfilePanel()}
+      ${accountSecurityPanel()}
     </section>
   `;
 }
@@ -5308,7 +8995,7 @@ function accountProfilePanel() {
   return `
     <form class="panel account-form" id="guestProfileForm">
       <div class="section-title-row compact">
-        <div><span class="section-kicker">${escapeHtml(t("account_tab_profile", "Profile"))}</span><h2>${escapeHtml(t("account_profile_title", "Profile details"))}</h2></div>
+        <div><span class="section-kicker">${escapeHtml(t("account_tab_account_privacy", "Account & Privacy"))}</span><h2>${escapeHtml(t("account_profile_title", "Profile details"))}</h2></div>
         <button class="primary-button" type="submit">${escapeHtml(t("save_profile_button", "Save profile"))}</button>
       </div>
       <p class="form-note">${escapeHtml(t("email_change_security_note", "Email changes require a secure re-verification flow and are not edited here."))}</p>
@@ -5316,14 +9003,15 @@ function accountProfilePanel() {
         ${textInput("first_name", t("signup_first_name", "First name"), guest.first_name || "", "text", "required")}
         ${textInput("last_name", t("signup_last_name", "Last name"), guest.last_name || "", "text", "required")}
         ${textInput("email", t("signup_email", "Email"), guest.email || state.session?.profile?.email || "", "email", "readonly")}
-        ${textInput("phone", t("signup_phone", "Phone number"), guest.phone || "", "tel", "required")}
-        ${textInput("city", t("signup_city", "City"), guest.city || "", "text", "required")}
-        ${textInput("region", t("signup_region", "State or region"), guest.region || "", "text", "required")}
-        ${textInput("postal_code", t("signup_postal_code", "ZIP or postal code"), guest.postal_code || "", "text", "required")}
-        ${textInput("max_travel_distance_miles", t("signup_travel_distance", "Maximum preferred travel distance"), guest.max_travel_distance_miles || "", "number", "min=\"1\" step=\"0.5\" required")}
-        ${textInput("preferred_dining_areas", t("signup_neighborhoods", "Preferred neighborhoods or dining areas"), csvValue(guest.preferred_dining_areas), "text", "required")}
+        ${textInput("phone", t("signup_phone_optional", "Phone number (optional)"), guest.phone || "", "tel", "autocomplete=\"tel\"")}
+        ${textInput("city", t("signup_city", "City"), guest.city || "", "text")}
+        ${textInput("region", t("signup_region", "State or region"), guest.region || "", "text")}
+        ${textInput("postal_code", t("signup_postal_code", "ZIP or postal code"), guest.postal_code || "", "text")}
+        ${textInput("max_travel_distance_miles", t("signup_travel_distance", "Maximum preferred travel distance"), guest.max_travel_distance_miles || "", "number", "min=\"0\" step=\"0.5\"")}
+        ${textInput("preferred_dining_areas", t("signup_neighborhoods", "Preferred neighborhoods or dining areas"), csvValue(guest.preferred_dining_areas), "text")}
         <label>${escapeHtml(t("signup_transportation", "Preferred transportation method"))}
-          <select name="transportation_method" required>
+          <select name="transportation_method">
+            <option value="">${escapeHtml(t("signup_select_placeholder", "Select one"))}</option>
             ${signupOptionGroups.transportation.map((option) => `<option value="${escapeAttr(option)}" ${guest.transportation_method === option ? "selected" : ""}>${escapeHtml(optionLabel(option))}</option>`).join("")}
           </select>
         </label>
@@ -5340,8 +9028,8 @@ function accountProfilePanel() {
 function formatDateTime(value) {
   if (!value) return t("not_available_label", "Not available");
   const language = supportedLanguages[state.lang] || supportedLanguages.en;
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return t("not_available_label", "Not available");
+  const date = parseDisplayDate(value);
+  if (!date) return t("not_available_label", "Not available");
   return new Intl.DateTimeFormat(language.locale, { dateStyle: "medium", timeStyle: "short" }).format(date);
 }
 
@@ -5358,6 +9046,58 @@ function consentStatusCard(label, accepted, version, acceptedAt) {
         <div><dt>${escapeHtml(t("accepted_at_label", "Accepted at"))}</dt><dd>${escapeHtml(formatDateTime(acceptedAt))}</dd></div>
       </dl>
     </article>
+  `;
+}
+
+function legalDocumentStatusCard(doc = {}) {
+  const mandatory = Boolean(doc.mandatory);
+  const withdrawable = Boolean(doc.withdrawable);
+  const accepted = doc.status === "accepted" || doc.accepted === true;
+  const activeLabel = accepted
+    ? t("consent_status_accepted", "Accepted")
+    : doc.status === "withdrawn"
+      ? t("consent_status_withdrawn", "Withdrawn")
+      : t("consent_status_missing", "Not accepted");
+  const action = withdrawable ? `
+    <button class="ghost-button" data-toggle-legal-consent="${escapeAttr(doc.document_type)}" data-accepted="${accepted ? "false" : "true"}" type="button">
+      ${escapeHtml(accepted ? t("withdraw_consent_button", "Withdraw") : t("enable_consent_button", "Enable"))}
+    </button>
+  ` : "";
+  const acceptedUrl = doc.accepted_url || doc.current_url || "";
+  return `
+    <article class="consent-status-card legal-document-card ${mandatory ? "mandatory" : "optional"}">
+      <div>
+        <strong>${escapeHtml(doc.title || uiText(doc.document_type))}</strong>
+        <p class="muted">${escapeHtml(mandatory ? t("mandatory_legal_document_label", "Required for an active account") : t("optional_legal_document_label", "Optional and independently withdrawable where applicable"))}</p>
+      </div>
+      ${statusBadge(activeLabel)}
+      <dl>
+        <div><dt>${escapeHtml(t("accepted_version_label", "Accepted version"))}</dt><dd>${escapeHtml(doc.accepted_version || "-")}</dd></div>
+        <div><dt>${escapeHtml(t("current_version_label", "Current version"))}</dt><dd>${escapeHtml(doc.current_version || "-")}</dd></div>
+        <div><dt>${escapeHtml(t("accepted_at_label", "Accepted at"))}</dt><dd>${escapeHtml(formatDateTime(doc.accepted_at))}</dd></div>
+        <div><dt>${escapeHtml(t("withdrawn_at_label", "Withdrawn at"))}</dt><dd>${escapeHtml(formatDateTime(doc.withdrawn_at))}</dd></div>
+      </dl>
+      ${doc.requires_reacceptance ? `<p class="form-note warning">${escapeHtml(t("legal_reacceptance_required_note", "A newer mandatory version is effective and must be accepted before protected platform use."))}</p>` : ""}
+      <div class="button-row">
+        ${acceptedUrl ? `<a class="ghost-button" href="${escapeAttr(acceptedUrl)}" target="_blank" rel="noreferrer">${escapeHtml(t("view_accepted_version_button", "View accepted version"))}</a>` : ""}
+        ${doc.current_url && doc.current_url !== acceptedUrl ? `<a class="ghost-button" href="${escapeAttr(doc.current_url)}" target="_blank" rel="noreferrer">${escapeHtml(t("view_current_version_button", "View current version"))}</a>` : ""}
+        ${action}
+      </div>
+    </article>
+  `;
+}
+
+function legalConsentHistoryList(history = []) {
+  if (!history.length) return `<div class="empty-state">${escapeHtml(t("legal_history_empty", "Legal consent history will appear here after you accept or withdraw consent."))}</div>`;
+  return `
+    <div class="compact-list legal-history-list">
+      ${history.slice(0, 12).map((item) => `
+        <div>
+          <strong>${escapeHtml(item.document_name || uiText(item.document_type))}</strong>
+          <span>${escapeHtml(t("version_label", "Version"))} ${escapeHtml(item.document_version || "-")} - ${escapeHtml(uiText(item.status))} - ${escapeHtml(formatDateTime(item.accepted_at || item.withdrawn_at || item.created_at))}</span>
+        </div>
+      `).join("")}
+    </div>
   `;
 }
 
@@ -5379,7 +9119,9 @@ function privacyRequestList(requests = []) {
   return `<div class="compact-list privacy-request-list">${requests.slice(0, 5).map((request) => `
     <div>
       <strong>${escapeHtml(uiText(request.request_type || "request"))}</strong>
-      <span>${escapeHtml(uiText(request.status || "received"))} - ${escapeHtml(formatDateTime(request.created_at))}</span>
+      <span>${escapeHtml(uiText(request.status || "received"))} - ${escapeHtml(formatDateTime(request.requested_at || request.created_at))}</span>
+      ${request.download_url ? `<a class="ghost-button small-button" href="${escapeAttr(request.download_url)}" target="_blank" rel="noreferrer">${escapeHtml(t("download_data_export_button", "Download export"))}</a>` : ""}
+      ${request.expires_at ? `<small>${escapeHtml(t("export_expires_at_label", "Expires"))}: ${escapeHtml(formatDateTime(request.expires_at))}</small>` : ""}
     </div>
   `).join("")}</div>`;
 }
@@ -5414,11 +9156,35 @@ function accountReviewsPanel() {
   `;
 }
 
+function signOutAllSessionsModal() {
+  if (!state.guestSecurity.signOutAllConfirmOpen) return "";
+  return `
+    <div class="modal-backdrop account-confirm-backdrop" role="presentation">
+      <section class="modal-card small-modal confirmation-card" role="dialog" aria-modal="true" aria-labelledby="signOutAllSessionsTitle">
+        <div class="modal-header">
+          <div>
+            <span class="section-kicker">${escapeHtml(t("session_security_title", "Sessions"))}</span>
+            <h2 id="signOutAllSessionsTitle">${escapeHtml(t("signout_all_confirm_title", "End all active sessions?"))}</h2>
+          </div>
+        </div>
+        <p>${escapeHtml(t("signout_all_confirm_body", "This signs you out of your SmartTable account on every phone, computer, and browser. You will need to sign in again afterward."))}</p>
+        ${state.guestSecurity.signOutAllError ? `<p class="form-error" role="alert">${escapeHtml(state.guestSecurity.signOutAllError)}</p>` : ""}
+        <div class="button-row">
+          <button class="ghost-button" data-cancel-signout-all type="button" ${state.guestSecurity.signOutAllSubmitting ? "disabled" : ""}>${escapeHtml(t("modal_cancel_label", "Cancel"))}</button>
+          <button class="primary-button danger" data-confirm-signout-all type="button" ${state.guestSecurity.signOutAllSubmitting ? "disabled" : ""}>${escapeHtml(state.guestSecurity.signOutAllSubmitting ? t("signout_all_loading", "Ending sessions...") : t("signout_all_confirm_button", "End all sessions"))}</button>
+        </div>
+      </section>
+    </div>
+  `;
+}
+
 function accountSecurityPanel() {
   const prefs = currentGuestPreferences();
   const privacy = state.guestPrivacy || {};
   const consent = privacy.consent || {};
-  const marketing = Boolean(consent.marketing_consent ?? prefs.consents?.marketing);
+  const legal = privacy.legal || {};
+  const legalDocuments = legal.documents || [];
+  const fallbackMarketing = Boolean(consent.marketing_consent ?? prefs.consents?.marketing);
   return `
     <section class="panel privacy-security-panel">
       <div class="section-title-row compact">
@@ -5427,34 +9193,38 @@ function accountSecurityPanel() {
           <h2>${escapeHtml(t("account_security_title", "Security, privacy and consent"))}</h2>
         </div>
       </div>
-      <div class="consent-status-grid">
-        ${consentStatusCard(t("terms_status_title", "Terms and Conditions"), consent.terms_accepted, consent.terms_version, consent.terms_accepted_at)}
-        ${consentStatusCard(t("privacy_status_title", "Privacy Policy"), consent.privacy_accepted, consent.privacy_policy_version, consent.privacy_accepted_at)}
-        <article class="consent-status-card">
-          <div>
-            <strong>${escapeHtml(t("marketing_consent_title", "Marketing consent"))}</strong>
-            <p class="muted">${escapeHtml(t("marketing_consent_body", "Optional restaurant offers and SmartTable updates. Reservation messages remain separate."))}</p>
-          </div>
-          ${statusBadge(marketing ? t("enabled_label", "Enabled") : t("disabled_label", "Disabled"))}
-          <dl>
-            <div><dt>${escapeHtml(t("accepted_at_label", "Accepted at"))}</dt><dd>${escapeHtml(formatDateTime(consent.marketing_consent_at))}</dd></div>
-            <div><dt>${escapeHtml(t("revoked_at_label", "Revoked at"))}</dt><dd>${escapeHtml(formatDateTime(consent.marketing_revoked_at))}</dd></div>
-          </dl>
-          <button class="ghost-button" data-toggle-marketing-consent="${marketing ? "false" : "true"}" type="button">${escapeHtml(marketing ? t("withdraw_marketing_button", "Withdraw") : t("enable_marketing_button", "Enable"))}</button>
-        </article>
-      </div>
-      <div class="button-row">
-        <a class="ghost-button" href="/terms" target="_blank" rel="noreferrer">${escapeHtml(t("view_terms_button", "View Terms and Conditions"))}</a>
-        <a class="ghost-button" href="/privacy" target="_blank" rel="noreferrer">${escapeHtml(t("view_privacy_button", "View Privacy Policy"))}</a>
-      </div>
+      ${legalDocuments.length ? `
+        <div class="consent-status-grid legal-document-grid">
+          ${legalDocuments.map(legalDocumentStatusCard).join("")}
+        </div>
+      ` : `
+        <div class="consent-status-grid">
+          ${consentStatusCard(t("terms_status_title", "Terms and Conditions"), consent.terms_accepted, consent.terms_version, consent.terms_accepted_at)}
+          ${consentStatusCard(t("privacy_status_title", "Privacy Policy"), consent.privacy_accepted, consent.privacy_policy_version, consent.privacy_accepted_at)}
+          <article class="consent-status-card">
+            <div>
+              <strong>${escapeHtml(t("marketing_consent_title", "Marketing consent"))}</strong>
+              <p class="muted">${escapeHtml(t("marketing_consent_body", "Optional restaurant offers and SmartTable updates. Reservation messages remain separate."))}</p>
+            </div>
+            ${statusBadge(fallbackMarketing ? t("enabled_label", "Enabled") : t("disabled_label", "Disabled"))}
+            <button class="ghost-button" data-toggle-legal-consent="marketing_consent" data-accepted="${fallbackMarketing ? "false" : "true"}" type="button">${escapeHtml(fallbackMarketing ? t("withdraw_marketing_button", "Withdraw") : t("enable_marketing_button", "Enable"))}</button>
+          </article>
+        </div>
+      `}
       <p class="form-note warning">${escapeHtml(t("legal_consent_closure_note", "Required legal consent cannot be unchecked while the account remains active. Account closure is handled through the deletion flow below."))}</p>
+      <article class="account-settings-card">
+        <div class="section-title-row compact">
+          <div><h3>${escapeHtml(t("legal_consent_history_title", "Legal consent history"))}</h3><p class="muted">${escapeHtml(t("legal_consent_history_body", "SmartTable stores each accepted or withdrawn legal version as an audit event. Published legal versions are not edited in place."))}</p></div>
+        </div>
+        ${legalConsentHistoryList(legal.history || [])}
+      </article>
       <article class="account-settings-card">
         <div class="section-title-row compact">
           <div><h3>${escapeHtml(t("personal_data_export_title", "Personal data export"))}</h3><p class="muted">${escapeHtml(t("personal_data_export_body", "Request a copy of your SmartTable profile, preferences, favorites, reservations, reviews, notification settings, and consent records."))}</p></div>
           <button class="ghost-button" data-request-data-export type="button" ${state.guestSecurity.exportSubmitting ? "disabled" : ""}>${escapeHtml(t("request_data_export_button", "Request data export"))}</button>
         </div>
-        <p class="form-note">${escapeHtml(t("data_export_not_download_note", "A request workflow is available. SmartTable will not claim the export is complete unless a real downloadable file is generated."))}</p>
-        ${privacyRequestList((privacy.requests || []).filter((request) => request.request_type === "export"))}
+        <p class="form-note">${escapeHtml(t("data_export_download_note", "SmartTable generates a real JSON export package and sends an expiring download link when the package is ready."))}</p>
+        ${privacyRequestList((privacy.export_requests || []).concat((privacy.requests || []).filter((request) => request.request_type === "export")))}
       </article>
       <form class="account-settings-card" id="guestPasswordChangeForm">
         <div class="section-title-row compact">
@@ -5470,11 +9240,21 @@ function accountSecurityPanel() {
       </form>
       <article class="account-settings-card">
         <div class="section-title-row compact">
-          <div><h3>${escapeHtml(t("session_security_title", "Sessions"))}</h3><p class="muted">${escapeHtml(t("session_security_body", "Sign out of this browser or request sign out of all active sessions if supported by the authentication provider."))}</p></div>
+          <div><h3>${escapeHtml(t("session_security_title", "Sessions"))}</h3><p class="muted">${escapeHtml(t("session_security_body", "Choose whether to leave only this browser or every active SmartTable session."))}</p></div>
           <div class="button-row">
-            <button class="ghost-button" data-signout-current type="button">${escapeHtml(t("signout_current_session_button", "Sign out current session"))}</button>
-            <button class="ghost-button" data-signout-all-sessions type="button">${escapeHtml(t("signout_all_sessions_button", "Sign out all sessions"))}</button>
+            <button class="ghost-button" data-signout-current type="button" ${state.guestSecurity.signOutCurrentSubmitting ? "disabled" : ""}>${escapeHtml(state.guestSecurity.signOutCurrentSubmitting ? t("signout_current_loading", "Signing out...") : t("signout_current_session_button", "Sign out from this session"))}</button>
+            <button class="ghost-button danger" data-signout-all-sessions type="button" ${state.guestSecurity.signOutAllSubmitting ? "disabled" : ""}>${escapeHtml(t("signout_all_sessions_button", "End all sessions"))}</button>
           </div>
+        </div>
+        <div class="consent-status-grid">
+          <article class="consent-status-card">
+            <strong>${escapeHtml(t("signout_current_session_button", "Sign out from this session"))}</strong>
+            <p class="muted">${escapeHtml(t("signout_current_session_explainer", "Logs you out only from this browser."))}</p>
+          </article>
+          <article class="consent-status-card">
+            <strong>${escapeHtml(t("signout_all_sessions_button", "End all sessions"))}</strong>
+            <p class="muted">${escapeHtml(t("signout_all_sessions_explainer", "Logs you out from every device and browser where your SmartTable account is currently signed in."))}</p>
+          </article>
         </div>
         <p class="form-note">${escapeHtml(t("email_verification_status_label", "Email verification status"))}: ${escapeHtml(state.guestAccount?.overview?.email_verified ? t("email_verified_label", "Email verified") : t("email_not_verified_label", "Email not verified"))}</p>
       </article>
@@ -5494,21 +9274,64 @@ function accountSecurityPanel() {
       </form>
       ${privacyRequestList((privacy.requests || []).filter((request) => request.request_type === "deletion"))}
       <p class="form-note">${escapeHtml(t("account_privacy_note", "Restaurants only see aggregated or operational reservation information required to serve your booking. Private preference profiles are not exposed to partners."))}</p>
+      ${signOutAllSessionsModal()}
     </section>
   `;
 }
 
 function bindGuestAccountEvents() {
+  document.querySelector("#returnAdmin")?.addEventListener("click", returnToSuperAdmin);
   document.querySelector("[data-explore-restaurants]")?.addEventListener("click", async () => {
     history.pushState(null, "", "/");
     state.mode = "guest";
     await renderCurrentMode();
   });
+  document.querySelector("[data-welcome-browse-offers]")?.addEventListener("click", async () => {
+    state.guestAccountWelcomeDismissed = true;
+    trackSignupEvent("profile_setup_skipped", { source: "welcome_browse_offers" });
+    history.pushState(null, "", "/offers");
+    state.mode = "guest";
+    await renderCurrentMode();
+  });
+  document.querySelector("[data-welcome-personalize]")?.addEventListener("click", () => {
+    state.guestAccountWelcomeDismissed = true;
+    state.guestAccountTab = "preferences";
+    trackSignupEvent("profile_setup_started", { source: "welcome_card" });
+    history.pushState(null, "", "/account/preferences");
+    renderGuestAccount();
+  });
+  document.querySelector("[data-welcome-later]")?.addEventListener("click", () => {
+    state.guestAccountWelcomeDismissed = true;
+    trackSignupEvent("profile_setup_skipped", { source: "welcome_card" });
+    history.replaceState(null, "", "/account");
+    renderGuestAccount();
+  });
   document.querySelectorAll("[data-account-tab], [data-account-tab-jump]").forEach((button) => {
     button.addEventListener("click", () => {
       state.guestAccountTab = button.dataset.accountTab || button.dataset.accountTabJump;
+      if (state.guestAccountTab === "preferences") trackSignupEvent("profile_setup_started", { source: "account_tab" });
       history.pushState(null, "", routeForGuestAccountTab(state.guestAccountTab));
       renderGuestAccount();
+    });
+  });
+  document.querySelectorAll("[data-remove-food-favorite]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      try {
+        setButtonPending(button, true);
+        await api(`/guest/food-feed-favorites?food_feed_video_id=${encodeURIComponent(button.dataset.removeFoodFavorite)}`, { method: "DELETE" });
+        await loadGuestFoodFeedFavorites();
+        renderGuestAccount();
+        showToast(t("food_feed_favorite_removed", "Dish removed from favorites."));
+      } catch (error) {
+        setButtonPending(button, false);
+        showToast(t("food_feed_favorite_error", "This dish could not be updated."));
+      }
+    });
+  });
+  document.querySelectorAll("[data-food-favorite-restaurant]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      history.pushState(null, "", `/restaurants/${encodeURIComponent(button.dataset.foodFavoriteRestaurant)}`);
+      await renderCurrentMode();
     });
   });
   document.querySelectorAll("[data-reservation-filter]").forEach((button) => {
@@ -5533,9 +9356,30 @@ function bindGuestAccountEvents() {
       }
     });
   });
+  document.querySelectorAll("[data-guest-visit-action]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const action = button.dataset.guestVisitAction;
+      const reservationId = button.dataset.guestVisitReservation;
+      if (action === "cannot_attend" && !confirm(t("post_visit_cannot_attend_confirm", "Confirm that you cannot attend this reservation?"))) return;
+      if (action === "finished" && !confirm(t("post_visit_finished_confirm", "Confirm that your visit is finished?"))) return;
+      try {
+        setButtonPending(button, true);
+        await api("/guest/reservations", {
+          method: "PATCH",
+          body: JSON.stringify({ id: reservationId, action })
+        });
+        await loadGuestAccountData();
+        renderGuestAccount();
+        showToast(t("post_visit_action_saved", "Visit status saved."));
+      } catch (error) {
+        setButtonPending(button, false);
+        showToast(error.message);
+      }
+    });
+  });
   document.querySelectorAll("[data-feedback-reservation]").forEach((button) => {
     button.addEventListener("click", () => {
-      window.location.href = `/guest/rewards/photo-upload?bookingId=${encodeURIComponent(button.dataset.feedbackReservation)}`;
+      window.location.href = `/review/verified?reservation_id=${encodeURIComponent(button.dataset.feedbackReservation)}`;
     });
   });
   document.querySelector("[data-start-ai-concierge]")?.addEventListener("click", openGuestAiExperience);
@@ -5557,11 +9401,18 @@ function bindGuestAccountEvents() {
   document.querySelector("#guestPreferencesForm")?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const data = formObject(event.currentTarget);
+    if (data.no_neighborhood_preference) data.preferred_neighborhoods = [noNeighborhoodPreference];
+    else data.preferred_neighborhoods = splitCommaList(data.preferred_neighborhoods);
+    data.notification_channels = [...new Set(["Email", ...asArray(data.notification_channels)])];
+    data.notification_preferences = [...new Set(["Reservation status updates", ...asArray(data.notification_preferences)])];
+    if (asArray(data.notification_channels).includes("Push")) {
+      data.notification_channels = data.notification_channels.map((item) => item === "Push" ? "Browser or push notifications" : item);
+    }
     const errors = validateAccountPreferenceData(data);
     if (Object.keys(errors).length) {
       state.guestPreferenceErrors = errors;
       renderGuestAccount();
-      showToast(t("account_preferences_required_error", "Complete all required preferences before saving."));
+      showToast(t("account_preferences_validation_error", "Review the highlighted preference fields."));
       return;
     }
     try {
@@ -5573,6 +9424,7 @@ function bindGuestAccountEvents() {
       await loadGuestAccountData();
       renderGuestAccount();
       trackGuestAccountEvent("preferences_updated", { status: "saved" });
+      trackSignupEvent("profile_setup_completed", { source: "account_preferences" });
       showToast(t("preferences_saved_toast", "Preferences saved."));
     } catch (error) {
       showToast(error.message);
@@ -5585,25 +9437,77 @@ function bindGuestAccountEvents() {
       if (preview) preview.textContent = minimumInterestingDiscountLabel(selected);
     }
   });
+  document.querySelector("[data-account-use-location]")?.addEventListener("click", () => {
+    const form = document.querySelector("#guestPreferencesForm");
+    if (!navigator.geolocation) {
+      showToast(t("signup_location_unavailable", "Device location is not available in this browser."));
+      return;
+    }
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        const suggestion = signupLocationSuggestion(position?.coords?.latitude, position?.coords?.longitude);
+        if (suggestion && form) {
+          const country = form.querySelector('[name="country"]');
+          const region = form.querySelector('[name="region"]');
+          const city = form.querySelector('[name="city"]');
+          if (country) country.value = suggestion.country || country.value;
+          if (region) region.value = suggestion.region || region.value;
+          if (city) city.value = suggestion.city || city.value;
+          showToast(t("signup_location_suggested", "Location permission received. We suggested a nearby city; please review it before continuing."));
+        } else {
+          showToast(t("signup_location_received", "Location permission received. Please still confirm your city and region."));
+        }
+      },
+      (error) => {
+        showToast(error?.code === 1
+          ? t("signup_location_declined", "Location access was declined. Please enter your city and region manually.")
+          : error?.code === 3
+            ? t("signup_location_timeout", "Location lookup timed out. Please select your location manually.")
+            : t("signup_location_unavailable", "Device location is not available in this browser."));
+      },
+      { enableHighAccuracy: false, timeout: 8000, maximumAge: 300000 }
+    );
+  });
   document.querySelector("#guestNotificationSettingsForm")?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const data = formObject(event.currentTarget);
     const preferences = new Set(["Reservation status updates", ...asArray(data.notification_preferences)]);
+    const channels = new Set(["Email", ...asArray(data.notification_channels)]);
+    const smsSelected = channels.has(smsNotificationChannel);
     const wantsMarketingMessages = preferences.has("SmartTable news and marketing");
-    const marketingConsent = Boolean(data.marketing_consent);
+    const marketingConsent = Boolean(data.marketing_email_enabled);
     if (wantsMarketingMessages && !marketingConsent) {
       showToast(t("marketing_consent_required_for_messages", "Enable marketing consent to receive marketing messages."));
       return;
     }
+    if (smsSelected && (!data.sms_consent || !isValidInternationalPhone(data.sms_country_code, data.sms_phone_number))) {
+      showToast(t("signup_error_sms_phone", "Enter a valid SMS number and separate SMS consent."));
+      return;
+    }
     try {
-      const previousMarketingConsent = Boolean(currentGuestPreferences().consents?.marketing);
+      const previousMarketingConsent = Boolean(state.guestCommunications?.preferences?.marketing_email_enabled ?? currentGuestPreferences().consents?.marketing);
       await api("/guest/preferences", {
         method: "PATCH",
         body: JSON.stringify({
           notification_preferences: [...preferences],
-          notification_channels: ["Email"],
+          notification_channels: [...channels],
           notification_frequency: data.notification_frequency,
+          sms_country_code: data.sms_country_code,
+          sms_phone_number: data.sms_phone_number,
+          sms_consent: Boolean(data.sms_consent && smsSelected),
           marketing_consent: marketingConsent
+        })
+      });
+      await api("/guest/communications", {
+        method: "PATCH",
+        body: JSON.stringify({
+          marketing_email_enabled: marketingConsent,
+          transactional_sms_enabled: Boolean(data.sms_consent && smsSelected),
+          marketing_sms_enabled: false,
+          in_app_enabled: Boolean(data.in_app_enabled),
+          preferred_language: state.lang,
+          timezone: data.timezone || "America/New_York",
+          source: "account_notifications"
         })
       });
       await loadGuestAccountData();
@@ -5705,7 +9609,10 @@ function bindGuestAccountEvents() {
   });
   document.querySelector("[data-mark-notifications-read]")?.addEventListener("click", async () => {
     try {
-      await api("/guest/notifications", { method: "PATCH", body: JSON.stringify({ read_all: true }) });
+      await Promise.all([
+        api("/notifications", { method: "PATCH", body: JSON.stringify({ read_all: true }) }).catch(() => null),
+        api("/guest/notifications", { method: "PATCH", body: JSON.stringify({ read_all: true }) }).catch(() => null)
+      ]);
       await loadGuestAccountData();
       renderGuestAccount();
       showToast(t("notifications_marked_read_toast", "Notifications marked as read."));
@@ -5716,10 +9623,16 @@ function bindGuestAccountEvents() {
   document.querySelectorAll("[data-mark-notification]").forEach((button) => {
     button.addEventListener("click", async () => {
       try {
-        await api("/guest/notifications", {
-          method: "PATCH",
-          body: JSON.stringify({ id: button.dataset.markNotification })
-        });
+        await Promise.all([
+          api("/notifications", {
+            method: "PATCH",
+            body: JSON.stringify({ id: button.dataset.markNotification })
+          }).catch(() => null),
+          api("/guest/notifications", {
+            method: "PATCH",
+            body: JSON.stringify({ id: button.dataset.markNotification })
+          }).catch(() => null)
+        ]);
         await loadGuestAccountData();
         renderGuestAccount();
         trackGuestAccountEvent("notification_opened", { action: "mark_read" });
@@ -5731,7 +9644,12 @@ function bindGuestAccountEvents() {
   document.querySelectorAll("[data-open-notification-url]").forEach((button) => {
     button.addEventListener("click", () => {
       trackGuestAccountEvent("notification_opened", { action: "open_related" }, { keepalive: true });
-      window.location.href = button.dataset.openNotificationUrl;
+      const targetUrl = safeInternalNavigationUrl(button.dataset.openNotificationUrl);
+      if (!targetUrl) {
+        showToast(t("invalid_notification_link", "This notification link is no longer available."));
+        return;
+      }
+      window.location.href = targetUrl;
     });
   });
   document.querySelectorAll("[data-toggle-account-password]").forEach((button) => {
@@ -5755,19 +9673,43 @@ function bindGuestAccountEvents() {
       showToast(error.message);
     }
   });
+  document.querySelectorAll("[data-toggle-legal-consent]").forEach((button) => {
+    button.addEventListener("click", async (event) => {
+      const target = event.currentTarget;
+      try {
+        await api("/guest/privacy", {
+          method: "POST",
+          body: JSON.stringify({
+            action: "set_optional_consent",
+            document_type: target.dataset.toggleLegalConsent,
+            accepted: target.dataset.accepted === "true"
+          })
+        });
+        await loadGuestAccountData();
+        renderGuestAccount();
+        trackGuestAccountEvent("marketing_consent_changed", {
+          document_type: target.dataset.toggleLegalConsent,
+          status: target.dataset.accepted === "true" ? "accepted" : "withdrawn"
+        });
+        showToast(t("legal_consent_saved_toast", "Consent preference updated."));
+      } catch (error) {
+        showToast(error.message);
+      }
+    });
+  });
   document.querySelector("[data-request-data-export]")?.addEventListener("click", async () => {
     try {
       state.guestSecurity.exportSubmitting = true;
       renderGuestAccount();
-      await api("/guest/privacy", {
+      const result = await api("/guest/privacy", {
         method: "POST",
         body: JSON.stringify({ action: "export", message: t("data_export_default_message", "Guest requested a personal data export from account settings.") })
       });
       await loadGuestAccountData();
       state.guestSecurity.exportSubmitting = false;
       renderGuestAccount();
-      trackGuestAccountEvent("data_export_requested", { request_type: "export", status: "received" });
-      showToast(t("data_export_request_received_toast", "Data export request received."));
+      trackGuestAccountEvent("data_export_requested", { request_type: "export", status: result.export?.status || "received" });
+      showToast(result.export?.download_url ? t("data_export_ready_toast", "Data export ready. A secure download link is available.") : t("data_export_request_received_toast", "Data export request received."));
     } catch (error) {
       state.guestSecurity.exportSubmitting = false;
       renderGuestAccount();
@@ -5807,17 +9749,58 @@ function bindGuestAccountEvents() {
       showToast(error.message);
     }
   });
-  document.querySelector("[data-signout-current]")?.addEventListener("click", signOut);
-  document.querySelector("[data-signout-all-sessions]")?.addEventListener("click", async () => {
+  document.querySelector("[data-signout-current]")?.addEventListener("click", async () => {
     try {
+      state.guestSecurity.signOutCurrentSubmitting = true;
+      renderGuestAccount();
+      await signOut({
+        redirectTo: "/login",
+        scope: "current",
+        toast: t("logged_out_toast", "Logged out.")
+      });
+    } catch (error) {
+      state.guestSecurity.signOutCurrentSubmitting = false;
+      renderGuestAccount();
+      showToast(error.message);
+    }
+  });
+  document.querySelector("[data-signout-all-sessions]")?.addEventListener("click", () => {
+    state.guestSecurity.signOutAllConfirmOpen = true;
+    state.guestSecurity.signOutAllError = "";
+    renderGuestAccount();
+  });
+  document.querySelector("[data-cancel-signout-all]")?.addEventListener("click", () => {
+    if (state.guestSecurity.signOutAllSubmitting) return;
+    state.guestSecurity.signOutAllConfirmOpen = false;
+    state.guestSecurity.signOutAllError = "";
+    renderGuestAccount();
+  });
+  document.querySelector(".account-confirm-backdrop")?.addEventListener("click", (event) => {
+    if (state.guestSecurity.signOutAllSubmitting || event.target !== event.currentTarget) return;
+    state.guestSecurity.signOutAllConfirmOpen = false;
+    state.guestSecurity.signOutAllError = "";
+    renderGuestAccount();
+  });
+  document.querySelector("[data-confirm-signout-all]")?.addEventListener("click", async () => {
+    try {
+      state.guestSecurity.signOutAllSubmitting = true;
+      state.guestSecurity.signOutAllError = "";
+      renderGuestAccount();
       await api("/auth/security", {
         method: "POST",
         body: JSON.stringify({ action: "sign_out_all" })
       });
-      await signOut();
-      showToast(t("signed_out_all_toast", "Signed out of active sessions."));
+      await signOut({
+        redirectTo: "/login",
+        scope: "all",
+        skipServer: true,
+        toast: t("signed_out_all_toast", "Signed out of active sessions.")
+      });
     } catch (error) {
-      showToast(error.message);
+      state.guestSecurity.signOutAllSubmitting = false;
+      state.guestSecurity.signOutAllError = error.message || t("signout_all_failed", "Could not end all sessions. Please try again.");
+      renderGuestAccount();
+      showToast(state.guestSecurity.signOutAllError);
     }
   });
   document.querySelector("#guestDeletionForm")?.addEventListener("submit", async (event) => {
@@ -5858,9 +9841,8 @@ function renderLogin(role) {
     return;
   }
   const isAdmin = role === "admin";
-  const demoMode = state.apiMode === "demo";
-  const demoEmail = demoMode ? (isAdmin ? "admin@smarttable.com" : "owner@hudsonhearth.com") : "";
-  const demoPassword = demoMode ? (isAdmin ? "admin123" : "restaurant123") : "";
+  const demoMode = canShowDemoCredentials();
+  const demoEmail = "";
   const title = isAdmin
     ? t("admin_login_title", "Super Admin login")
     : t("partner_login_title", "Restaurant Partner login");
@@ -5873,7 +9855,7 @@ function renderLogin(role) {
         <label class="password-field">
           ${escapeHtml(t("signup_password", "Password"))}
           <span>
-            <input name="password" type="password" value="${escapeAttr(demoPassword)}" autocomplete="current-password" required>
+            <input name="password" type="password" value="" autocomplete="current-password" required>
             <button class="ghost-button" data-toggle-dashboard-password type="button">${escapeHtml(t("show_password_button", "Show"))}</button>
           </span>
         </label>
@@ -5881,7 +9863,8 @@ function renderLogin(role) {
         <div class="auth-link-row">
           <button class="link-button" data-dashboard-forgot-password type="button">${escapeHtml(t("forgot_password_link", "Forgot password?"))}</button>
         </div>
-        ${state.apiMode === "demo" ? `<p class="form-note">${escapeHtml(t("demo_credentials_prefilled", "Demo credentials are prefilled until Supabase is connected."))}</p>` : ""}
+        ${loginDiagnosticsPanel()}
+        ${demoMode ? `<p class="form-note">${escapeHtml(t("demo_credentials_prefilled", "Local test accounts require protected test credentials."))}</p>` : ""}
       </form>
     `)}
   `;
@@ -5905,47 +9888,133 @@ function renderLogin(role) {
     if (submitButton?.disabled) return;
     try {
       setButtonPending(submitButton, true, t("login_signing_in", "Signing in..."));
+      updateAuthDiagnostics({
+        requestStatus: "sending",
+        sessionPresent: Boolean(currentSession()),
+        resolvedRole: normalizeRole(currentSession()?.profile?.role || ""),
+        selectedRedirectRoute: "",
+        errorCode: ""
+      });
       const payload = await api("/auth/login", {
         method: "POST",
         body: JSON.stringify(formObject(event.currentTarget))
       });
       payload.profile.role = normalizeRole(payload.profile.role);
-      if (role === "partner" && payload.profile.role !== "partner") throw new Error(t("partner_login_role_error", "Please use the correct login for this account."));
-      if (role === "admin" && !isAdminRole(payload.profile.role)) throw new Error(t("admin_login_role_error", "Please use the correct login for this account."));
-      saveSession(payload);
-      await applyProfileLanguagePreference(payload);
-      state.mode = isAdminRole(payload.profile.role) ? "admin" : payload.profile.role === "partner" ? "partner" : "guest";
-      const defaultRedirect = state.mode === "admin" ? "/admin" : state.mode === "partner" ? "/partner" : "/account";
-      history.pushState(null, "", state.postLoginRedirect || defaultRedirect);
-      state.postLoginRedirect = "";
-      await renderCurrentMode();
-      showToast(t("logged_in_toast", "Logged in."));
+      await completeAuthenticatedLogin(payload, {
+        redirectFallback: defaultDashboardRouteForRole(payload.profile.role)
+      });
     } catch (error) {
       setButtonPending(submitButton, false);
+      updateAuthDiagnostics({
+        requestStatus: error.status ? `HTTP ${error.status}` : "error",
+        sessionPresent: Boolean(currentSession()),
+        resolvedRole: normalizeRole(currentSession()?.profile?.role || ""),
+        selectedRedirectRoute: "",
+        errorCode: error.payload?.code || error.payload?.error_code || "AUTH_LOGIN_FAILED"
+      });
       showToast(error.message);
     }
   });
 }
 
-async function loadAdminData() {
+function renderPartnerInvitation() {
+  const params = new URLSearchParams(window.location.search);
+  const token = params.get("token") || "";
+  app.innerHTML = `
+    <section class="login-card">
+      <span class="section-kicker">${escapeHtml(t("partner_invite_kicker", "Restaurant partner invitation"))}</span>
+      <h1>${escapeHtml(t("partner_invite_title", "Create your partner password"))}</h1>
+      <p class="muted">${escapeHtml(t("partner_invite_body", "Use the secure invitation link from SmartTable to finish setting up your restaurant partner access."))}</p>
+      ${!token ? `<p class="form-error" role="alert">${escapeHtml(t("partner_invite_missing_token", "This invitation link is missing its token."))}</p>` : ""}
+      <form class="auth-form" id="partnerInviteForm">
+        <input type="hidden" name="token" value="${escapeAttr(token)}">
+        ${renderPasswordField("password", t("signup_password", "Password"), "", "showPassword", "new-password")}
+        ${renderPasswordField("confirm_password", t("signup_confirm_password", "Confirm password"), "", "showConfirmPassword", "new-password")}
+        <div id="resetPasswordStrength">${resetPasswordStrengthMeter("")}</div>
+        <div class="signup-consent-list">
+          ${signupConsentCheckbox("partner_terms_consent", partnerLegalConsentLabelHtml(), false)}
+        </div>
+        <button class="primary-button wide" type="submit" ${!token ? "disabled" : ""}>${escapeHtml(t("partner_invite_accept_button", "Create password"))}</button>
+      </form>
+      <button class="link-button" type="button" data-partner-login>${escapeHtml(t("partner_invite_login_link", "Back to partner login"))}</button>
+    </section>
+  `;
+  document.querySelector("[data-partner-login]")?.addEventListener("click", async () => {
+    history.pushState(null, "", "/partner");
+    state.mode = "partner";
+    await renderCurrentMode();
+  });
+  const form = document.querySelector("#partnerInviteForm");
+  form?.addEventListener("input", () => {
+    const meter = document.querySelector("#resetPasswordStrength");
+    if (meter) meter.innerHTML = resetPasswordStrengthMeter(form.elements.password?.value || "");
+  });
+  document.querySelectorAll("[data-toggle-auth-password]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const key = button.dataset.toggleAuthPassword;
+      state[key] = !state[key];
+      renderPartnerInvitation();
+    });
+  });
+  form?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const data = formObject(form);
+    if (passwordStrength(data.password).score < 5) {
+      showToast(t("signup_error_password", "Use at least 8 characters with uppercase, lowercase, number, and symbol."));
+      return;
+    }
+    if (data.password !== data.confirm_password) {
+      showToast(t("signup_error_password_match", "Passwords must match."));
+      return;
+    }
+    if (!boolValue(data.partner_terms_consent)) {
+      showToast(t("partner_invite_terms_required", "Accept the Partner Terms and Privacy Policy to create partner access."));
+      return;
+    }
+    try {
+      await api("/auth/partner-invitation", {
+        method: "POST",
+        body: JSON.stringify(data)
+      });
+      showToast(t("partner_invite_success", "Partner access is ready. You can now sign in."));
+      history.pushState(null, "", "/partner");
+      state.mode = "partner";
+      await renderCurrentMode();
+    } catch (error) {
+      showToast(error.message || t("partner_invite_failed", "This invitation could not be accepted."));
+    }
+  });
+}
+
+async function loadAdminData(options = {}) {
   const adminAiEnabled = canShowFeature("ai.adminAIControls", { allowDemo: true });
-  const [stats, restaurants, reservations, contentRows, partners, offers, reviews, photoSubmissions, notifications, trends, integrations, featureFlags, errors, billing, checklists, privacy] = await Promise.all([
+  const basicMode = isBasicMode();
+  const analyticsFilters = {
+    ...state.adminAnalyticsFilters,
+    scope: isSuperAdmin() ? "superadmin" : "admin"
+  };
+  const [stats, restaurants, reservations, contentRows, partners, offers, reviews, foodFeed, photoSubmissions, notifications, systemMessages, trends, integrations, featureFlags, errors, billing, analytics, checklists, privacy, legal, reservationAlerts] = await Promise.all([
     api("/admin/stats"),
-    api("/admin/restaurants"),
+    fetchAdminRestaurantList(options),
     api(`/admin/reservations${queryStringFromFilters(state.adminReservationFilters)}`),
     api("/admin/content"),
     api("/admin/partners"),
     api("/admin/offers"),
-    api("/admin/reviews"),
-    api("/admin/photo-reward-submissions"),
+    api(`/admin/reviews${queryStringFromFilters(state.adminReviewFilters)}`),
+    api("/admin/food-feed").catch(() => ({ videos: [] })),
+    basicMode ? Promise.resolve({ submissions: [] }) : api("/admin/photo-reward-submissions"),
     api("/admin/notifications"),
+    basicMode ? Promise.resolve({ campaigns: [], sms_provider: { configured: false } }) : api("/admin/system-messages").catch(() => ({ campaigns: [], sms_provider: { configured: false } })),
     adminAiEnabled ? api("/ai/trends").catch(() => ({ trends: null })) : Promise.resolve({ trends: null }),
     adminAiEnabled ? api("/admin/integrations").catch(() => ({ providers: [], connections: [], sync_runs: [], errors: [] })) : Promise.resolve({ providers: [], connections: [], sync_runs: [], errors: [] }),
     adminAiEnabled ? api("/admin/feature-flags").catch(() => ({ flags: [] })) : Promise.resolve({ flags: [] }),
     adminAiEnabled ? api("/admin/errors").catch(() => ({ app_errors: [], integration_errors: [], failed_emails: [], failed_ai_actions: [], admin_alerts: [] })) : Promise.resolve({ app_errors: [], integration_errors: [], failed_emails: [], failed_ai_actions: [], admin_alerts: [] }),
-    adminAiEnabled ? api("/admin/billing").catch(() => ({ plans: [], subscriptions: [], invoices: [], payment_events: [] })) : Promise.resolve({ plans: [], subscriptions: [], invoices: [], payment_events: [] }),
+    api("/admin/billing").catch(() => ({ plans: [], subscriptions: [], invoices: [], payment_events: [], billing_events: [] })),
+    api(`/admin/analytics${queryStringFromFilters(analyticsFilters)}`).catch(() => ({ analytics: null })),
     adminAiEnabled ? api("/system/checklists").catch(() => ({ checklists: null })) : Promise.resolve({ checklists: null }),
-    api("/privacy/requests").catch(() => ({ requests: [] }))
+    api("/privacy/requests").catch(() => ({ requests: [] })),
+    api("/admin/legal-documents").catch(() => ({ documents: [], counts: {} })),
+    api("/admin/reservation-alerts").catch(() => ({ preferences: [], devices: [], alerts: [], deliveries: [], restaurants_without_push_device: [], offline_devices_over_24h: [] }))
   ]);
   state.stats = stats.stats;
   state.restaurants = restaurants.restaurants || [];
@@ -5954,16 +10023,40 @@ async function loadAdminData() {
   state.partners = partners.partners || [];
   state.adminOffers = offers.offers || [];
   state.adminReviews = reviews.reviews || [];
+  state.adminFoodFeedVideos = foodFeed.videos || [];
+  state.adminReviewPagination = reviews.pagination || { page: 1, page_size: state.adminReviewFilters.page_size || 25, total: state.adminReviews.length, total_pages: 1 };
   state.adminPhotoSubmissions = photoSubmissions.submissions || [];
   state.notifications = notifications.notifications || [];
   state.unreadNotifications = notifications.unread_count || 0;
+  state.adminSystemMessages = systemMessages || null;
   state.platformTrends = trends.trends || null;
   state.adminIntegrations = integrations || null;
   state.adminFeatureFlags = featureFlags.flags || [];
   state.adminErrors = errors || null;
   state.adminBilling = billing || null;
+  state.adminAnalytics = analytics.analytics || null;
   state.systemChecklists = checklists.checklists || null;
   state.privacyRequests = privacy.requests || [];
+  state.adminLegalDocuments = legal.documents || [];
+  state.adminLegalCounts = legal.counts || {};
+  state.adminReservationAlerts = reservationAlerts || null;
+}
+
+async function fetchAdminRestaurantList(options = {}) {
+  const freshRestaurantList = Boolean(options.forceFreshRestaurants);
+  const restaurantListPath = freshRestaurantList
+    ? `/admin/restaurants?fresh=${encodeURIComponent(Date.now())}`
+    : "/admin/restaurants";
+  const fetchOptions = freshRestaurantList
+    ? { cache: "no-store", headers: { "cache-control": "no-store" } }
+    : {};
+  return await api(restaurantListPath, fetchOptions);
+}
+
+async function replaceAdminRestaurantListFromServer(options = {}) {
+  const restaurants = await fetchAdminRestaurantList(options);
+  state.restaurants = restaurants.restaurants || [];
+  return state.restaurants;
 }
 
 function contentEditor() {
@@ -6045,6 +10138,63 @@ function contentEditModal() {
         </form>
       </section>
     </div>
+  `;
+}
+
+function legalDocumentsAdminPanel() {
+  const docs = state.adminLegalDocuments || [];
+  const typeOptions = [
+    ["terms_of_service", t("legal_doc_terms", "Terms of Service")],
+    ["privacy_policy", t("legal_doc_privacy", "Privacy Policy")],
+    ["cookie_policy", t("legal_doc_cookie", "Cookie Policy")],
+    ["guest_platform_rules", t("legal_doc_guest_rules", "Guest Platform Rules")],
+    ["marketing_consent", t("legal_doc_marketing", "Marketing Consent")],
+    ["location_personalization_consent", t("legal_doc_personalization", "Location and Personalization Consent")]
+  ];
+  return `
+    <article class="panel wide-panel" id="admin-legal-documents">
+      <div class="section-title-row compact">
+        <div><span class="section-kicker">${escapeHtml(t("legal_documents_admin_kicker", "Legal"))}</span><h2>${escapeHtml(t("legal_documents_admin_title", "Legal document versions"))}</h2></div>
+      </div>
+      <p class="form-note">${escapeHtml(t("legal_documents_admin_note", "Create new legal versions instead of editing already published accepted versions in place."))}</p>
+      <form class="mini-form admin-form legal-document-form" id="legalDocumentForm">
+        <select name="document_type" required>
+          ${typeOptions.map(([value, label]) => `<option value="${escapeAttr(value)}">${escapeHtml(label)}</option>`).join("")}
+        </select>
+        <select name="language" required>
+          ${Object.entries(supportedLanguages).map(([lang, config]) => `<option value="${escapeAttr(lang)}">${escapeHtml(config.label)}</option>`).join("")}
+        </select>
+        <input name="version" placeholder="${escapeAttr(t("version_label", "Version"))}" required>
+        <input name="title" placeholder="${escapeAttr(t("title_label", "Title"))}" required>
+        <input name="content_url" placeholder="${escapeAttr(t("content_url_label", "Content URL"))}">
+        <input name="effective_at" type="datetime-local" aria-label="${escapeAttr(t("effective_at_label", "Effective at"))}">
+        <textarea name="content" placeholder="${escapeAttr(t("legal_document_content_placeholder", "Optional document content or summary"))}"></textarea>
+        <label class="checkbox-row"><input name="publish_current" type="checkbox"> ${escapeHtml(t("publish_as_current_label", "Publish and mark current"))}</label>
+        <button class="primary-button" type="submit">${escapeHtml(t("create_legal_version_button", "Create legal version"))}</button>
+      </form>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>${escapeHtml(t("document_label", "Document"))}</th><th>${escapeHtml(t("version_label", "Version"))}</th><th>${escapeHtml(t("status_label", "Status"))}</th><th>${escapeHtml(t("acceptance_count_label", "Acceptance count"))}</th><th></th></tr></thead>
+          <tbody>
+            ${docs.map((doc) => `
+              <tr>
+                <td><strong>${escapeHtml(doc.title || uiText(doc.document_type))}</strong><br><span class="muted">${escapeHtml(doc.document_type)} - ${escapeHtml(doc.language || "en")}</span></td>
+                <td>${escapeHtml(doc.version || "-")}<br><span class="muted">${escapeHtml(formatDateTime(doc.effective_at || doc.published_at))}</span></td>
+                <td>${statusBadge(doc.is_current ? t("current_label", "Current") : doc.status || "draft")}<br><span class="muted">${escapeHtml(doc.immutable ? t("immutable_label", "Immutable when published") : t("draft_editable_label", "Draft can be replaced"))}</span></td>
+                <td>${escapeHtml(doc.acceptance_count || 0)}</td>
+                <td>
+                  <div class="button-row">
+                    ${doc.status !== "published" ? `<button class="ghost-button" data-publish-legal-document="${escapeAttr(doc.id)}" type="button">${escapeHtml(t("publish_button", "Publish"))}</button>` : ""}
+                    ${doc.status === "published" && !doc.is_current ? `<button class="ghost-button" data-current-legal-document="${escapeAttr(doc.id)}" type="button">${escapeHtml(t("mark_current_button", "Mark current"))}</button>` : ""}
+                    ${doc.content_url ? `<a class="ghost-button" href="${escapeAttr(doc.content_url)}" target="_blank" rel="noreferrer">${escapeHtml(t("view_button", "View"))}</a>` : ""}
+                  </div>
+                </td>
+              </tr>
+            `).join("") || `<tr><td colspan="5">${escapeHtml(t("legal_documents_empty", "No legal documents found."))}</td></tr>`}
+          </tbody>
+        </table>
+      </div>
+    </article>
   `;
 }
 
@@ -6453,45 +10603,226 @@ function aiExperiencePreviewPanel() {
   `;
 }
 
+function billingPlanDisplayName(plan = {}) {
+  return plan[`display_name_${state.lang}`] || plan.display_name_en || plan.name || plan.internal_name || plan.key || t("billing_no_plan", "No active plan");
+}
+
+function billingSafeDate(value) {
+  return value ? formatDateTime(value) : t("not_available", "Not available");
+}
+
+function billingMaskedRef(value = "") {
+  const text = String(value || "");
+  if (!text) return t("not_available", "Not available");
+  if (text.length <= 12) return text;
+  return `${text.slice(0, 8)}...${text.slice(-4)}`;
+}
+
+function billingAccountForRestaurant(restaurantId, accounts = []) {
+  return accounts.find((account) => account.restaurant_id === restaurantId) || {};
+}
+
+function billingLatestInvoice(subscription = {}, invoices = []) {
+  return invoices.find((invoice) => {
+    if (subscription.last_invoice_id && invoice.stripe_invoice_id === subscription.last_invoice_id) return true;
+    if (subscription.stripe_subscription_id && invoice.stripe_subscription_id === subscription.stripe_subscription_id) return true;
+    return false;
+  }) || {};
+}
+
+function billingLatestOverride(restaurantId, overrides = []) {
+  return overrides.find((override) => override.restaurant_id === restaurantId && override.override_status === "active") || {};
+}
+
+function billingAuditRows(restaurantId, auditEvents = []) {
+  return auditEvents.filter((event) => event.restaurant_id === restaurantId).slice(0, 3);
+}
+
+function billingFeatureList(features = {}) {
+  const labels = {
+    core_restaurant_profile: t("billing_feature_core_profile", "Core restaurant profile"),
+    offers: t("billing_feature_offers", "Offers"),
+    reservations: t("billing_feature_reservations", "Reservations"),
+    standard_email_notifications: t("billing_feature_standard_email", "Standard email notifications"),
+    basic_analytics: t("billing_feature_basic_analytics", "Basic analytics"),
+    advanced_analytics: t("billing_feature_advanced_analytics", "Advanced analytics"),
+    campaign_placeholders: t("billing_feature_campaign_placeholders", "Campaign placeholders"),
+    priority_support_placeholder: t("billing_feature_priority_support", "Priority support placeholder"),
+    multi_location_placeholder: t("billing_feature_multi_location", "Multi-location placeholder"),
+    custom_limits_placeholder: t("billing_feature_custom_limits", "Custom limits placeholder"),
+    dedicated_support_placeholder: t("billing_feature_dedicated_support", "Dedicated support placeholder")
+  };
+  return Object.entries(labels)
+    .filter(([key]) => Boolean(features[key]))
+    .map(([, label]) => `<span class="guest-badge">${escapeHtml(label)}</span>`)
+    .join("") || `<span class="muted">${escapeHtml(t("billing_no_active_entitlements", "No active partner entitlements"))}</span>`;
+}
+
+function billingSubscriptionMatchesFilter(subscription = {}, account = {}, override = {}) {
+  const filter = state.adminBillingFilter || "all";
+  const status = String(subscription.subscription_status || subscription.status || "no_subscription");
+  if (filter === "all") return true;
+  if (filter === "no_subscription") return !subscription.id && !subscription.stripe_subscription_id;
+  if (filter === "complimentary_test") return subscription.internal_plan === "complimentary_test";
+  if (filter === "override_active") return Boolean(subscription.billing_access_override || override.id);
+  if (filter === "grace_active") return Boolean(subscription.payment_grace_period_end || subscription.grace_period_ends_at);
+  if (filter === "payment_failed") return ["failed", "requires_payment_method", "requires_action"].includes(String(subscription.last_payment_status || account.last_payment_status || "").toLowerCase()) || status === "past_due";
+  return status === filter;
+}
+
 function billingFoundationPanel() {
   const billing = state.adminBilling || {};
   const plans = billing.plans || [];
   const subscriptions = billing.subscriptions || [];
   const invoices = billing.invoices || [];
+  const billingEvents = billing.billing_events || billing.payment_events || [];
+  const accounts = billing.billing_accounts || [];
+  const overrides = billing.billing_access_overrides || [];
+  const auditEvents = billing.billing_audit_events || [];
+  const videoOrders = billing.video_service_orders || [];
+  const stripe = billing.stripe || {};
+  const isSuperAdmin = normalizeRole(state.session?.profile?.role) === "super_admin";
+  const filters = [
+    ["all", t("all_filter_option", "All")],
+    ["active", t("billing_filter_active", "Active")],
+    ["trialing", t("billing_filter_trialing", "Trialing")],
+    ["past_due", t("billing_filter_past_due", "Past due")],
+    ["unpaid", t("billing_filter_unpaid", "Unpaid")],
+    ["canceled", t("billing_filter_canceled", "Canceled")],
+    ["incomplete", t("billing_filter_incomplete", "Incomplete")],
+    ["no_subscription", t("billing_filter_no_subscription", "No subscription")],
+    ["complimentary_test", t("billing_filter_complimentary_test", "Complimentary test")],
+    ["override_active", t("billing_filter_override_active", "Override active")],
+    ["grace_active", t("billing_filter_grace_active", "Grace period active")],
+    ["payment_failed", t("billing_filter_payment_failed", "Payment failed")]
+  ];
+  const rows = subscriptions.filter((subscription) => billingSubscriptionMatchesFilter(
+    subscription,
+    billingAccountForRestaurant(subscription.restaurant_id, accounts),
+    billingLatestOverride(subscription.restaurant_id, overrides)
+  ));
   return `
     <article class="panel wide-panel" id="admin-billing">
       <div class="section-title-row compact">
-        <div><div class="status-title-row"><span class="section-kicker">Billing</span>${featureBadge("billing_foundation", "beta")}</div><h2>Stripe-ready subscription foundation</h2></div>
+        <div><div class="status-title-row"><span class="section-kicker">${escapeHtml(t("admin_billing_kicker", "Billing"))}</span>${featureBadge("stripe_partner_subscriptions", "beta")}</div><h2>${escapeHtml(t("admin_billing_title", "Stripe partner subscriptions"))}</h2></div>
+        ${statusBadge(stripe.configured ? "configured" : "requires_configuration", stripe.configured ? t("stripe_configured_label", "Stripe configured") : t("stripe_keys_required_label", "Stripe keys required"))}
       </div>
-      <p class="form-note">This is the subscription foundation only. Stripe checkout, customer portal, and webhooks still require live Stripe keys and webhook configuration.</p>
+      <p class="form-note">${escapeHtml(t("admin_billing_no_connect_note", "Partner subscription fees are collected by the SmartTable Stripe account. This module does not use Stripe Connect, payouts, POS, order, inventory, or revenue integrations."))}</p>
+      <form class="mini-form admin-form" id="billingPlanForm">
+        <input name="internal_name" placeholder="${escapeAttr(t("billing_internal_plan_name", "Internal plan name"))}" required>
+        <input name="display_name_en" placeholder="${escapeAttr(t("billing_display_name_en", "Display name EN"))}" required>
+        <input name="display_name_es" placeholder="${escapeAttr(t("billing_display_name_es", "Display name ES"))}" required>
+        <input name="display_name_hu" placeholder="${escapeAttr(t("billing_display_name_hu", "Display name HU"))}" required>
+        <input name="monthly_price_cents" type="number" min="0" step="1" placeholder="${escapeAttr(t("billing_monthly_price_cents", "Monthly price cents"))}">
+        <input name="stripe_monthly_price_id" placeholder="${escapeAttr(t("billing_stripe_monthly_price_id", "Stripe monthly price ID"))}">
+        <input name="email_monthly_limit" type="number" min="0" step="1" placeholder="${escapeAttr(t("billing_email_monthly_limit", "Email monthly limit"))}">
+        <input name="sms_monthly_limit" type="number" min="0" step="1" placeholder="${escapeAttr(t("billing_sms_monthly_limit", "SMS monthly limit"))}">
+        <label class="check"><input name="is_active" type="checkbox" value="true"> ${escapeHtml(t("billing_active_for_partners", "Active for partners"))}</label>
+        <button class="primary-button" type="submit">${escapeHtml(t("billing_save_plan_button", "Save billing plan"))}</button>
+      </form>
       <section class="marketplace-insight-grid">
         ${plans.map((plan) => `
           <section class="marketplace-insight-card">
-            <span>${escapeHtml(plan.name || plan.key)}</span>
-            <strong>${formatMoney(plan.monthly_price || 0)} / mo</strong>
-            <small>${formatMoney(plan.per_booking_fee || 0)} per booking</small>
+            <span>${escapeHtml(billingPlanDisplayName(plan))}</span>
+            <strong>${escapeHtml(t("billing_fixed_monthly_plan", "Fixed monthly plan"))}</strong>
+            <small>${escapeHtml(plan.stripe_monthly_configured ? t("billing_stripe_monthly_price_linked", "Monthly Stripe Price ID linked") : t("billing_stripe_monthly_price_required", "Monthly Stripe Price ID required"))}</small>
+            <div class="guest-chip-grid">${billingFeatureList(plan.entitlements?.features || plan.features || {})}</div>
           </section>
-        `).join("") || '<div class="empty-state">No billing plans configured.</div>'}
+        `).join("") || `<div class="empty-state">${escapeHtml(t("billing_no_plans_configured", "No billing plans configured."))}</div>`}
+      </section>
+      <div class="form-grid three">
+        <label>${escapeHtml(t("billing_filter_label", "Billing filter"))}
+          <select id="adminBillingFilter">
+            ${filters.map(([value, label]) => `<option value="${escapeAttr(value)}" ${state.adminBillingFilter === value ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}
+          </select>
+        </label>
+      </div>
+      <section>
+        <h3>${escapeHtml(t("admin_subscriptions_title", "Subscriptions"))}</h3>
+        ${rows.length ? rows.slice(0, 20).map((subscription) => {
+          const account = billingAccountForRestaurant(subscription.restaurant_id, accounts);
+          const latestInvoice = billingLatestInvoice(subscription, invoices);
+          const override = billingLatestOverride(subscription.restaurant_id, overrides);
+          const audits = billingAuditRows(subscription.restaurant_id, auditEvents);
+          const restaurantName = subscription.restaurants?.name || subscription.restaurant_name || subscription.restaurant_id || t("restaurant_label", "Restaurant");
+          const status = subscription.subscription_status || subscription.status || "no_subscription";
+          const plan = plans.find((item) => item.id === subscription.plan_id || item.internal_name === subscription.internal_plan) || {};
+          return `
+            <article class="log-row billing-admin-row">
+              <div>
+                <strong>${escapeHtml(restaurantName)}</strong>
+                <div class="guest-chip-grid">
+                  ${statusBadge(status, t(`billing_status_${status}`, status))}
+                  ${statusBadge(subscription.internal_plan || "no_subscription", billingPlanDisplayName(plan) || subscription.internal_plan || t("billing_no_plan", "No active plan"))}
+                  ${override.id || subscription.billing_access_override ? statusBadge("override", t("billing_override_active", "Override active")) : ""}
+                  ${subscription.payment_grace_period_end || subscription.grace_period_ends_at ? statusBadge("grace", t("billing_grace_period_active", "Grace active")) : ""}
+                </div>
+                <dl class="account-detail-list compact">
+                  <div><dt>${escapeHtml(t("billing_trial_status", "Trial"))}</dt><dd>${escapeHtml(subscription.trial_end ? billingSafeDate(subscription.trial_end) : t("not_available", "Not available"))}</dd></div>
+                  <div><dt>${escapeHtml(t("billing_payment_status", "Payment status"))}</dt><dd>${escapeHtml(subscription.last_payment_status || latestInvoice.payment_status || latestInvoice.status || t("not_available", "Not available"))}</dd></div>
+                  <div><dt>${escapeHtml(t("billing_current_period", "Current period"))}</dt><dd>${escapeHtml([subscription.current_period_start, subscription.current_period_end].filter(Boolean).map(billingSafeDate).join(" - ") || t("not_available", "Not available"))}</dd></div>
+                  <div><dt>${escapeHtml(t("billing_grace_period", "Grace period"))}</dt><dd>${escapeHtml(billingSafeDate(subscription.payment_grace_period_end || subscription.grace_period_ends_at))}</dd></div>
+                  <div><dt>${escapeHtml(t("billing_last_invoice", "Last invoice"))}</dt><dd>${escapeHtml(subscription.last_invoice_number || latestInvoice.invoice_number || latestInvoice.status || t("not_available", "Not available"))}</dd></div>
+                  <div><dt>${escapeHtml(t("billing_cancel_at_period_end", "Cancel at period end"))}</dt><dd>${escapeHtml(subscription.cancel_at_period_end ? t("yes_label", "Yes") : t("no_label", "No"))}</dd></div>
+                  <div><dt>${escapeHtml(t("billing_email_label", "Billing email"))}</dt><dd>${escapeHtml(account.billing_email || t("not_available", "Not available"))}</dd></div>
+                </dl>
+                <details class="diagnostic-details">
+                  <summary>${escapeHtml(t("billing_diagnostics_summary", "Restricted diagnostics"))}</summary>
+                  <p class="muted">${escapeHtml(t("billing_stripe_refs_note", "Stripe references are shown only in this admin diagnostic view."))}</p>
+                  <dl class="account-detail-list compact">
+                    <div><dt>Customer</dt><dd>${escapeHtml(billingMaskedRef(subscription.stripe_customer_id || account.stripe_customer_id))}</dd></div>
+                    <div><dt>Subscription</dt><dd>${escapeHtml(billingMaskedRef(subscription.stripe_subscription_id))}</dd></div>
+                    <div><dt>Price</dt><dd>${escapeHtml(billingMaskedRef(subscription.stripe_price_id))}</dd></div>
+                    <div><dt>Environment</dt><dd>${escapeHtml(subscription.billing_environment || "test")}</dd></div>
+                  </dl>
+                </details>
+                ${audits.length ? `<div class="audit-mini-list">${audits.map((event) => `<small>${escapeHtml(event.action || event.event_type)} - ${escapeHtml(event.result || event.processing_status || "success")} - ${escapeHtml(formatDateTime(event.created_at))}</small>`).join("")}</div>` : ""}
+              </div>
+              <div class="button-row">
+                <button class="ghost-button" data-admin-billing-action="extend_trial" data-restaurant-id="${escapeAttr(subscription.restaurant_id)}" type="button">${escapeHtml(t("billing_extend_trial_button", "Extend trial"))}</button>
+                <button class="ghost-button" data-admin-billing-action="grant_billing_override" data-restaurant-id="${escapeAttr(subscription.restaurant_id)}" type="button">${escapeHtml(t("billing_grant_override_button", "Grant override"))}</button>
+                <button class="ghost-button" data-admin-billing-action="remove_billing_override" data-restaurant-id="${escapeAttr(subscription.restaurant_id)}" type="button" ${override.id || subscription.billing_access_override ? "" : "disabled"}>${escapeHtml(t("billing_remove_override_button", "Remove override"))}</button>
+                <button class="ghost-button" data-admin-billing-action="resend_billing_email" data-restaurant-id="${escapeAttr(subscription.restaurant_id)}" data-event-type="subscription_changed" type="button">${escapeHtml(t("billing_resend_email_button", "Resend billing email"))}</button>
+                ${isSuperAdmin ? `
+                  <button class="ghost-button" data-admin-billing-action="correct_billing_plan" data-restaurant-id="${escapeAttr(subscription.restaurant_id)}" data-internal-plan="${escapeAttr(subscription.internal_plan || "basic")}" data-status="${escapeAttr(status)}" type="button">${escapeHtml(t("billing_correct_plan_button", "Correct plan"))}</button>
+                  <button class="ghost-button" data-admin-billing-action="set_enterprise_contract_state" data-restaurant-id="${escapeAttr(subscription.restaurant_id)}" type="button">${escapeHtml(t("billing_enterprise_contract_button", "Enterprise state"))}</button>
+                  <button class="ghost-button" data-admin-billing-action="reconcile_billing" data-restaurant-id="${escapeAttr(subscription.restaurant_id)}" type="button">${escapeHtml(t("billing_reconcile_button", "Reconcile"))}</button>
+                ` : ""}
+              </div>
+            </article>
+          `;
+        }).join("") : `<div class="empty-state">${escapeHtml(t("billing_no_subscriptions", "No subscriptions yet."))}</div>`}
       </section>
       <section class="dashboard-grid two-col compact-operational-grid">
         <div>
-          <h3>Subscriptions</h3>
-          ${subscriptions.length ? subscriptions.slice(0, 6).map((subscription) => `
-            <article class="log-row">
-              <strong>${escapeHtml(subscription.restaurants?.name || subscription.restaurant_name || subscription.restaurant_id || "Restaurant")}</strong>
-              <span>${escapeHtml(subscription.status)} - ${escapeHtml(subscription.stripe_subscription_id || "Stripe ID required")}</span>
-            </article>
-          `).join("") : '<div class="empty-state">No subscriptions yet.</div>'}
-        </div>
-        <div>
-          <h3>Invoices</h3>
-          ${invoices.length ? invoices.slice(0, 6).map((invoice) => `
+          <h3>${escapeHtml(t("billing_invoice_history", "Invoices"))}</h3>
+          ${invoices.length ? invoices.slice(0, 8).map((invoice) => `
             <article class="log-row">
               <strong>${formatMoney(invoice.amount_due || 0)} - ${escapeHtml(invoice.status || "draft")}</strong>
-              <span>${escapeHtml(invoice.stripe_invoice_id || invoice.hosted_invoice_url || "Stripe invoice required")}</span>
+              <span>${escapeHtml(invoice.invoice_number || billingMaskedRef(invoice.stripe_invoice_id) || t("billing_stripe_invoice_required", "Stripe invoice required"))}</span>
             </article>
-          `).join("") : '<div class="empty-state">No invoices yet.</div>'}
+          `).join("") : `<div class="empty-state">${escapeHtml(t("billing_no_invoices_short", "No invoices yet."))}</div>`}
         </div>
+        <div>
+          <h3>${escapeHtml(t("billing_stripe_event_log", "Stripe event log"))}</h3>
+          ${billingEvents.length ? billingEvents.slice(0, 8).map((event) => `
+            <article class="log-row">
+              <strong>${escapeHtml(event.event_type || event.provider || "stripe")}</strong>
+              <span>${escapeHtml(event.processing_status || event.status || "received")} - ${escapeHtml(billingMaskedRef(event.stripe_event_id || event.id || ""))}</span>
+            </article>
+          `).join("") : `<div class="empty-state">${escapeHtml(t("billing_no_stripe_events", "No Stripe events processed yet."))}</div>`}
+        </div>
+      </section>
+      <section>
+        <h3>${escapeHtml(t("billing_video_orders_admin_title", "Video production orders"))}</h3>
+        ${videoOrders.length ? `
+          <div class="table-wrap partner-table-wrap">
+            <table class="partner-data-table">
+              <thead><tr><th>${escapeHtml(t("restaurant_label", "Restaurant"))}</th><th>${escapeHtml(t("package_label", "Package"))}</th><th>${escapeHtml(t("amount_label", "Amount"))}</th><th>${escapeHtml(t("status_label", "Status"))}</th><th>${escapeHtml(t("date_label", "Date"))}</th></tr></thead>
+              <tbody>${videoOrders.slice(0, 25).map((order) => `<tr><td>${escapeHtml(order.restaurants?.name || order.restaurant_name || order.restaurant_id || "")}</td><td>${escapeHtml(order.package_key || "")}</td><td>${escapeHtml(billingUsd(Number(order.amount_cents || 0) / 100))}</td><td>${statusBadge(order.order_status || "processing")}</td><td>${escapeHtml(billingSafeDate(order.created_at))}</td></tr>`).join("")}</tbody>
+            </table>
+          </div>
+        ` : `<div class="empty-state">${escapeHtml(t("billing_no_video_orders", "No video production orders yet."))}</div>`}
       </section>
     </article>
   `;
@@ -6629,51 +10960,620 @@ function partnerIntegrationPanel() {
   `;
 }
 
+function adminSystemMessagesPanel() {
+  const data = state.adminSystemMessages || { campaigns: [], sms_provider: { configured: false } };
+  const campaigns = data.campaigns || [];
+  return `
+    <article class="panel" id="admin-system-messages">
+      <div class="section-title-row compact">
+        <div>
+          <span class="section-kicker">${escapeHtml(t("admin_broadcast_kicker", "Communications"))}</span>
+          <h2>${escapeHtml(t("admin_broadcast_title", "Super Admin Communications Center"))}</h2>
+          <p class="muted">${escapeHtml(t("admin_broadcast_body", "Create in-app, email, or SMS system messages with audience counts and audit-safe delivery summaries."))}</p>
+        </div>
+        ${statusBadge(data.sms_provider?.configured ? "configured" : "not-configured", data.sms_provider?.configured ? t("sms_provider_configured", "SMS configured") : t("sms_provider_not_configured", "SMS not configured"))}
+      </div>
+      <form class="mini-form campaign-form" id="adminSystemMessageForm">
+        ${textInput("name", t("campaign_name_label", "Campaign name"), "", "text", "required")}
+        <div class="form-grid three">
+          <label>${escapeHtml(t("admin_broadcast_category", "Category"))}
+            <select name="category">
+              ${["service_announcement", "planned_maintenance", "outage", "security_alert", "legal_update", "product_update", "marketing_announcement", "partner_announcement", "emergency_notice"].map((item) => `<option value="${escapeAttr(item)}">${escapeHtml(item.replace(/_/g, " "))}</option>`).join("")}
+            </select>
+          </label>
+          <label>${escapeHtml(t("admin_broadcast_audience", "Audience"))}
+            <select name="audience_role">
+              <option value="all">${escapeHtml(t("admin_audience_all", "All users"))}</option>
+              <option value="guests">${escapeHtml(t("admin_audience_guests", "All guests"))}</option>
+              <option value="partners">${escapeHtml(t("admin_audience_partners", "All restaurant partners"))}</option>
+              <option value="active_partners">${escapeHtml(t("admin_audience_active_partners", "Active partners"))}</option>
+              <option value="trialing_partners">${escapeHtml(t("admin_audience_trialing_partners", "Trialing partners"))}</option>
+              <option value="past_due_partners">${escapeHtml(t("admin_audience_past_due_partners", "Past-due partners"))}</option>
+              <option value="canceled_partners">${escapeHtml(t("admin_audience_canceled_partners", "Canceled partners"))}</option>
+              <option value="admins">${escapeHtml(t("admin_audience_admins", "Admins"))}</option>
+            </select>
+          </label>
+          <label>${escapeHtml(t("language_label", "Language"))}
+            <select name="audience_language">
+              <option value="">${escapeHtml(t("all_languages_label", "All languages"))}</option>
+              <option value="en">English</option>
+              <option value="es">Español</option>
+              <option value="hu">Magyar</option>
+            </select>
+          </label>
+        </div>
+        <fieldset>
+          <legend>${escapeHtml(t("admin_broadcast_channels", "Channels"))}</legend>
+          <div class="channel-grid">
+            <label class="check-row"><input name="channels" type="checkbox" value="in_app" checked> ${escapeHtml(t("in_app_channel_label", "In-app"))}</label>
+            <label class="check-row"><input name="channels" type="checkbox" value="email"> ${escapeHtml(t("email_channel_label", "Email"))}</label>
+            <label class="check-row"><input name="channels" type="checkbox" value="sms"> ${escapeHtml(t("sms_channel_label", "SMS"))}</label>
+          </div>
+        </fieldset>
+        <div class="form-grid three">
+          ${textInput("title_en", t("campaign_title_en", "Title English"), "", "text", "required")}
+          ${textInput("title_es", t("campaign_title_es", "Title Spanish"))}
+          ${textInput("title_hu", t("campaign_title_hu", "Title Hungarian"))}
+        </div>
+        <div class="form-grid three">
+          ${textArea("body_en", t("campaign_body_en", "Body English"), "", "rows=\"5\" required")}
+          ${textArea("body_es", t("campaign_body_es", "Body Spanish"), "", "rows=\"5\"")}
+          ${textArea("body_hu", t("campaign_body_hu", "Body Hungarian"), "", "rows=\"5\"")}
+        </div>
+        <div class="form-grid three">
+          ${textInput("scheduled_at", t("campaign_scheduled_label", "Scheduled time"), "", "datetime-local")}
+          ${textInput("audience_city", t("city_filter_label", "City filter"), "", "text")}
+          ${textInput("manual_user_ids", t("manual_user_ids_label", "Manual user IDs"), "", "text", "placeholder=\"comma-separated UUIDs\"")}
+          ${textInput("test_recipient", t("campaign_test_recipient_label", "Explicit test recipient"), "", "text", "placeholder=\"user ID, email, or +12125550123\"")}
+        </div>
+        <div class="button-row">
+          <button class="ghost-button" data-admin-system-message-action="save_draft" type="button">${escapeHtml(t("campaign_save_draft", "Save draft"))}</button>
+          <button class="ghost-button" data-admin-system-message-action="estimate_audience" type="button">${escapeHtml(t("campaign_estimate_audience", "Estimate audience"))}</button>
+          <button class="ghost-button" data-admin-system-message-action="test_send" type="button">${escapeHtml(t("campaign_test_send_button", "Send test"))}</button>
+          <button class="ghost-button" data-admin-system-message-action="schedule" type="button">${escapeHtml(t("campaign_schedule", "Schedule"))}</button>
+          <button class="primary-button" data-admin-system-message-action="send_now" type="button">${escapeHtml(t("campaign_send_now", "Queue send now"))}</button>
+        </div>
+      </form>
+      ${campaigns.length ? `
+        <div class="table-wrap partner-table-wrap">
+          <table class="partner-data-table">
+            <thead><tr><th>${escapeHtml(t("campaign_name_label", "Campaign"))}</th><th>${escapeHtml(t("admin_broadcast_channels", "Channels"))}</th><th>${escapeHtml(t("status_label", "Status"))}</th><th>${escapeHtml(t("campaign_recipients_label", "Recipients"))}</th><th>${escapeHtml(t("actions_label", "Actions"))}</th></tr></thead>
+            <tbody>
+              ${campaigns.map((campaign) => `
+                <tr>
+                  <td><strong>${escapeHtml(campaign.name || "")}</strong><br><small>${escapeHtml(campaign.category || "")}</small></td>
+                  <td>${escapeHtml((campaign.channels || []).join(", "))}</td>
+                  <td>${campaignStatusBadge(campaign.status)}</td>
+                  <td>${escapeHtml(formatNumber(campaign.recipient_count || 0))}</td>
+                  <td data-label="${escapeAttr(guestLabel)}">
+                    <div class="button-row compact">
+                      ${["draft", "scheduled", "queued", "sending"].includes(String(campaign.status || "")) ? `<button class="ghost-button danger" data-admin-system-message-row-action="cancel" data-admin-system-message-id="${escapeAttr(campaign.id)}" type="button">${escapeHtml(t("campaign_cancel_button", "Cancel"))}</button>` : ""}
+                      <button class="ghost-button" data-admin-system-message-row-action="duplicate" data-admin-system-message-id="${escapeAttr(campaign.id)}" type="button">${escapeHtml(t("campaign_clone_button", "Clone"))}</button>
+                    </div>
+                  </td>
+                </tr>
+              `).join("")}
+            </tbody>
+          </table>
+        </div>
+      ` : `<div class="empty-state">${escapeHtml(t("admin_broadcast_empty", "No system messages yet."))}</div>`}
+    </article>
+  `;
+}
+
+function adminSystemMessagePayload(form, action) {
+  const data = formObject(form);
+  return {
+    ...data,
+    action,
+    channels: asArray(data.channels),
+    manual_user_ids: asArray(data.manual_user_ids)
+  };
+}
+
+async function runAdminSystemMessageAction(button) {
+  const form = document.querySelector("#adminSystemMessageForm");
+  if (!form) return;
+  const action = button.dataset.adminSystemMessageAction;
+  if (action === "send_now" && !confirm(t("admin_broadcast_send_confirm", "Send this system message to the selected audience?"))) return;
+  if (action === "test_send" && !confirm(t("admin_broadcast_test_confirm", "Send this diagnostic test message to the explicit recipient only?"))) return;
+  setButtonPending(button, true, action === "estimate_audience" ? t("campaign_estimating", "Estimating...") : t("saving_button", "Saving..."));
+  try {
+    const response = await api("/admin/system-messages", {
+      method: "POST",
+      body: JSON.stringify(adminSystemMessagePayload(form, action))
+    });
+    if (action === "estimate_audience") {
+      showToast(contentTemplate("admin_broadcast_audience_toast", "{{count}} recipients across selected channels.", { count: response.recipient_count || 0 }));
+    } else if (action === "test_send") {
+      showToast(contentTemplate("admin_broadcast_test_toast", "Diagnostic test processed: {{sent}} sent, {{failed}} failed.", {
+        sent: response.sent_count || 0,
+        failed: response.failed_count || 0
+      }));
+    } else {
+      showToast(t("admin_broadcast_saved_toast", "System message updated."));
+    }
+    await loadAdminData();
+    renderAdmin();
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    setButtonPending(button, false);
+  }
+}
+
+async function runAdminSystemMessageRowAction(button) {
+  const action = button.dataset.adminSystemMessageRowAction;
+  const id = button.dataset.adminSystemMessageId;
+  if (!action || !id) return;
+  if (action === "cancel" && !confirm(t("campaign_cancel_confirm", "Cancel this campaign?"))) return;
+  setButtonPending(button, true);
+  try {
+    await api("/admin/system-messages", {
+      method: "POST",
+      body: JSON.stringify({ action, id })
+    });
+    await loadAdminData();
+    renderAdmin();
+    showToast(t("admin_broadcast_saved_toast", "System message updated."));
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    setButtonPending(button, false);
+  }
+}
+
+async function runAdminBillingAction(button) {
+  if (!button || button.disabled) return;
+  const action = button.dataset.adminBillingAction;
+  const restaurantId = button.dataset.restaurantId || "";
+  const sensitiveActions = new Set([
+    "extend_trial",
+    "grant_billing_override",
+    "remove_billing_override",
+    "correct_billing_plan",
+    "set_enterprise_contract_state",
+    "reconcile_billing"
+  ]);
+  const payload = {
+    action,
+    restaurant_id: restaurantId,
+    event_type: button.dataset.eventType || "",
+    internal_plan: button.dataset.internalPlan || "",
+    subscription_status: button.dataset.status || ""
+  };
+  if (action === "extend_trial") payload.days = 30;
+  if (action === "grant_billing_override") payload.days = 14;
+  if (sensitiveActions.has(action)) {
+    const reason = window.prompt(t("billing_action_reason_prompt", "Enter the required reason for this billing action."));
+    if (!reason) return;
+    payload.reason = reason;
+  }
+  if (action === "correct_billing_plan") {
+    const plan = window.prompt(t("billing_correct_plan_prompt", "Enter internal plan: trial, basic, professional, enterprise, complimentary_test, or no_subscription."), payload.internal_plan || "basic");
+    if (!plan) return;
+    payload.internal_plan = plan;
+    const status = window.prompt(t("billing_correct_status_prompt", "Enter subscription status."), payload.subscription_status || "active");
+    if (!status) return;
+    payload.subscription_status = status;
+  }
+  try {
+    setButtonPending(button, true, t("billing_processing", "Processing..."));
+    const response = await api("/admin/billing", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    });
+    await loadAdminData();
+    renderAdmin();
+    showToast(response.message || t("billing_action_saved", "Billing action saved."));
+  } catch (error) {
+    setButtonPending(button, false);
+    showToast(error.message);
+  }
+}
+
+function adminReservationAlertsPanel() {
+  const data = state.adminReservationAlerts || {};
+  const preferences = data.preferences || [];
+  const devices = data.devices || [];
+  const alerts = data.alerts || [];
+  const deliveries = data.deliveries || [];
+  const noPush = data.restaurants_without_push_device || [];
+  const offline = data.offline_devices_over_24h || [];
+  const sms = data.sms || {};
+  const voice = data.voice || {};
+  const voiceEnabled = preferences.filter((item) => item.voice_call_enabled).length;
+  const failedDeliveries = deliveries.filter((item) => item.status === "failed").length;
+  return `
+    <article class="panel wide-panel" id="admin-reservation-alerts">
+      <div class="section-title-row compact">
+        <div>
+          <span class="section-kicker">${escapeHtml(t("admin_reservation_alerts_kicker", "Reservation alerts"))}</span>
+          <h2>${escapeHtml(t("admin_reservation_alerts_title", "Partner alert delivery"))}</h2>
+          <p class="muted">${escapeHtml(t("admin_reservation_alerts_body", "Review restaurant notification settings, push devices, SMS and voice readiness, and alert delivery attempts."))}</p>
+        </div>
+        <div class="button-row compact-actions">
+          ${statusBadge(data.push?.enabled ? "configured" : "disabled", data.push?.enabled ? t("reservation_alert_push_configured", "Web push is configured") : t("reservation_alert_push_not_configured", "Web push is waiting for VAPID configuration"))}
+          ${statusBadge(sms.configured ? "configured" : "disabled", sms.configured ? t("reservation_alert_sms_configured", "SMS fallback is configured server-side.") : t("reservation_alert_sms_not_configured", "SMS fallback is not configured."))}
+          ${statusBadge(voice.configured ? "configured" : "disabled", voice.configured ? t("reservation_alert_voice_configured", "Voice escalation is configured server-side.") : t("reservation_alert_voice_not_configured", "Voice escalation is not configured."))}
+        </div>
+      </div>
+      <form class="mini-form admin-form" id="adminReservationAlertForm">
+        <div class="form-grid">
+          <label>${escapeHtml(t("restaurant_label", "Restaurant"))}
+            <select name="restaurant_id" required>
+              <option value="">${escapeHtml(t("choose_restaurant_option", "Choose restaurant"))}</option>
+              ${(state.restaurants || []).map((restaurant) => `<option value="${escapeAttr(restaurant.id)}">${escapeHtml(restaurant.name)}</option>`).join("")}
+            </select>
+          </label>
+          ${textInput("primary_sms_number", t("reservation_alert_primary_sms", "Primary SMS number"), "", "tel")}
+          ${textInput("escalation_sms_number", t("reservation_alert_escalation_sms", "Escalation SMS number"), "", "tel")}
+          ${textInput("sms_fallback_delay_seconds", t("reservation_alert_sms_delay", "SMS fallback delay seconds"), 60, "number", "min=\"30\" step=\"30\"")}
+          ${textInput("sms_escalation_delay_seconds", t("reservation_alert_escalation_delay", "Escalation delay seconds"), 300, "number", "min=\"60\" step=\"60\"")}
+          ${textInput("voice_call_number", t("reservation_alert_voice_number", "Voice call number"), "", "tel")}
+          ${textInput("voice_call_delay_seconds", t("reservation_alert_voice_delay", "Voice call delay seconds"), 480, "number", "min=\"60\" max=\"86400\" step=\"60\"")}
+          <label>${escapeHtml(t("reservation_alert_language_label", "Notification language"))}
+            <select name="notification_language">
+              ${["en", "es", "hu"].map((lang) => `<option value="${escapeAttr(lang)}">${escapeHtml(LANGUAGE_SHORT_LABELS[lang] || lang)}</option>`).join("")}
+            </select>
+          </label>
+        </div>
+        <div class="channel-grid">
+          ${checkboxInput("dashboard_popup_enabled", t("reservation_alert_dashboard_toggle", "Dashboard popup"), true)}
+          ${checkboxInput("sound_enabled", t("reservation_alert_sound_toggle", "Audible alert"), true)}
+          ${checkboxInput("push_enabled", t("reservation_alert_push_toggle", "Web push notification"), true)}
+          ${checkboxInput("email_enabled", t("reservation_alert_email_toggle", "Transactional email"), true)}
+          ${checkboxInput("sms_fallback_enabled", t("reservation_alert_sms_toggle", "SMS fallback"), false)}
+          ${checkboxInput("voice_call_enabled", t("reservation_alert_voice_toggle", "Voice call escalation"), false)}
+        </div>
+        <div class="button-row">
+          <button class="primary-button" data-admin-alert-action="save_preferences" type="submit">${escapeHtml(t("save_button", "Save"))}</button>
+          <button class="ghost-button" data-admin-alert-action="send_test_alert" type="button">${escapeHtml(t("reservation_alert_send_test", "Send Test Alert"))}</button>
+        </div>
+      </form>
+      <section class="stats-grid compact-grid">
+        ${statCard(t("admin_alert_prefs_count", "Configured restaurants"), preferences.length)}
+        ${statCard(t("admin_alert_devices_count", "Registered devices"), devices.length)}
+        ${statCard(t("admin_alert_no_push_count", "Restaurants without push device"), noPush.length)}
+        ${statCard(t("admin_alert_offline_count", "Offline over 24h"), offline.length)}
+        ${statCard(t("admin_alert_voice_enabled_count", "Restaurants with voice escalation"), voiceEnabled)}
+        ${statCard(t("admin_alert_failed_delivery_count", "Failed delivery attempts"), failedDeliveries)}
+      </section>
+      <div class="dashboard-grid two-col">
+        <div>
+          <h3>${escapeHtml(t("admin_alert_device_health", "Device health"))}</h3>
+          <div class="device-list">
+            ${devices.slice(0, 12).map((device) => `
+              <article class="device-card">
+                <div>
+                  <strong>${escapeHtml(device.device_name || t("reservation_alert_device_fallback", "Restaurant device"))}</strong>
+                  <p class="muted">${escapeHtml(device.restaurant_id || "")} - ${escapeHtml(device.status || "active")} - ${escapeHtml(device.permission_status || "unknown")}</p>
+                  <small>${escapeHtml(t("reservation_alert_last_active", "Last active"))}: ${escapeHtml(formatDateTime(device.last_active_at))}</small>
+                </div>
+              </article>
+            `).join("") || `<div class="empty-state">${escapeHtml(t("reservation_alert_no_devices", "No restaurant devices are registered yet."))}</div>`}
+          </div>
+        </div>
+        <div>
+          <h3>${escapeHtml(t("admin_alert_restaurants_without_push", "Restaurants with no active push device"))}</h3>
+          <div class="simple-list">
+            ${noPush.slice(0, 12).map((restaurant) => `<span>${escapeHtml(restaurant.name || restaurant.id)}</span>`).join("") || `<div class="empty-state">${escapeHtml(t("admin_alert_all_have_push", "No matching restaurants."))}</div>`}
+          </div>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="partner-data-table">
+          <thead><tr><th>${escapeHtml(t("reservation_reference_label", "Reference"))}</th><th>${escapeHtml(t("restaurant_label", "Restaurant"))}</th><th>${escapeHtml(t("status_label", "Status"))}</th><th>${escapeHtml(t("created_at_label", "Created"))}</th></tr></thead>
+          <tbody>
+            ${alerts.slice(0, 20).map((alert) => {
+              const payload = alertPayload(alert);
+              return `<tr><td>${escapeHtml(payload.reference || alert.id || "")}</td><td>${escapeHtml(payload.restaurant_name || alert.restaurant_id || "")}</td><td>${statusBadge(alert.status || "queued")}</td><td>${escapeHtml(formatDateTime(alert.created_at))}</td></tr>`;
+            }).join("") || `<tr><td colspan="4">${escapeHtml(t("reservation_alert_no_recent_alerts", "No recent reservation alerts."))}</td></tr>`}
+          </tbody>
+        </table>
+      </div>
+      <div class="table-wrap">
+        <table class="partner-data-table">
+          <thead><tr><th>${escapeHtml(t("channel_label", "Channel"))}</th><th>${escapeHtml(t("status_label", "Status"))}</th><th>${escapeHtml(t("provider_label", "Provider"))}</th><th>${escapeHtml(t("error_code_label", "Error code"))}</th><th>${escapeHtml(t("created_at_label", "Created"))}</th></tr></thead>
+          <tbody>
+            ${deliveries.slice(0, 20).map((delivery) => `<tr><td>${escapeHtml(delivery.channel || "")}</td><td>${statusBadge(delivery.status || "queued")}</td><td>${escapeHtml(delivery.provider || "")}</td><td>${escapeHtml(delivery.error_code || "")}</td><td>${escapeHtml(formatDateTime(delivery.created_at))}</td></tr>`).join("") || `<tr><td colspan="5">${escapeHtml(t("reservation_alert_no_deliveries", "No delivery attempts yet."))}</td></tr>`}
+          </tbody>
+        </table>
+      </div>
+    </article>
+  `;
+}
+
+function syncAdminReservationAlertForm(form = document.querySelector("#adminReservationAlertForm")) {
+  if (!form) return;
+  const restaurantId = form.elements.restaurant_id?.value || "";
+  const preference = (state.adminReservationAlerts?.preferences || []).find((item) => item.restaurant_id === restaurantId);
+  const defaults = {
+    dashboard_popup_enabled: true,
+    sound_enabled: true,
+    push_enabled: true,
+    email_enabled: true,
+    sms_fallback_enabled: false,
+    voice_call_enabled: false,
+    sms_fallback_delay_seconds: 60,
+    sms_escalation_delay_seconds: 300,
+    voice_call_delay_seconds: 480,
+    notification_language: "en"
+  };
+  const values = { ...defaults, ...(preference || {}) };
+  for (const name of [
+    "dashboard_popup_enabled",
+    "sound_enabled",
+    "push_enabled",
+    "email_enabled",
+    "sms_fallback_enabled",
+    "voice_call_enabled"
+  ]) {
+    if (form.elements[name]) form.elements[name].checked = Boolean(values[name]);
+  }
+  for (const name of [
+    "sms_fallback_delay_seconds",
+    "sms_escalation_delay_seconds",
+    "voice_call_delay_seconds",
+    "notification_language"
+  ]) {
+    if (form.elements[name]) form.elements[name].value = values[name] ?? defaults[name];
+  }
+  for (const name of ["primary_sms_number", "escalation_sms_number", "voice_call_number"]) {
+    const input = form.elements[name];
+    if (!input) continue;
+    input.value = "";
+    input.placeholder = preference?.[`${name}_configured`] ? preference[name] || t("reservation_alert_number_saved", "Saved number") : "";
+  }
+}
+
+async function submitAdminReservationAlertForm(event) {
+  event.preventDefault();
+  const button = event.submitter || event.currentTarget.querySelector('[type="submit"]');
+  try {
+    setButtonPending(button, true);
+    await api("/admin/reservation-alerts", {
+      method: "PATCH",
+      body: JSON.stringify(formObject(event.currentTarget))
+    });
+    await loadAdminData();
+    renderAdmin();
+    showToast(t("reservation_alert_settings_saved", "Reservation notification settings saved."));
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    setButtonPending(button, false);
+  }
+}
+
+async function runAdminReservationAlertAction(button) {
+  const action = button.dataset.adminAlertAction;
+  const form = document.querySelector("#adminReservationAlertForm");
+  if (!action || !form || action === "save_preferences") return;
+  try {
+    setButtonPending(button, true);
+    const data = formObject(form);
+    data.action = action;
+    await api("/admin/reservation-alerts", {
+      method: "POST",
+      body: JSON.stringify(data)
+    });
+    await loadAdminData();
+    renderAdmin();
+    showToast(t("reservation_alert_test_sent", "Test reservation alert sent."));
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    setButtonPending(button, false);
+  }
+}
+
 function renderAdmin() {
   if (!state.session || !isAdminRole(state.session.profile.role)) return renderLogin("admin");
   const stats = state.stats || {};
-  const adminNavItems = [
-    { id: "admin-stats", label: t("admin_nav_statistics", "Statistics") },
-    { id: "admin-platform-settings", label: t("admin_nav_settings", "Settings") },
-    { id: "admin-content", label: t("admin_nav_content", "Site content") },
-    { id: "admin-restaurants", label: t("admin_nav_restaurants", "Restaurants") },
-    { id: "admin-partners", label: t("admin_nav_partners", "Partners") },
-    { id: "admin-offers", label: t("admin_nav_offers", "Offers") },
-    { id: "admin-reviews", label: t("admin_nav_reviews", "Reviews") },
-    { id: "admin-photo-submissions", label: t("admin_nav_photo_rewards", "Photo rewards") },
-    { id: "admin-notifications", label: t("admin_nav_notifications", "Notifications") },
-    { id: "admin-reservations", label: t("admin_nav_reservations", "Reservations") }
-  ];
-  if (canShowFeature("ai.adminAIControls", { allowDemo: true })) {
-    adminNavItems.splice(2, 0,
-      { id: "admin-ai-controls", label: t("ai_controls_kicker", "AI controls") },
-      { id: "admin-ai-preview", label: t("admin_nav_ai_preview", "AI preview") },
-      { id: "admin-ai-trends", label: t("admin_nav_ai_trends", "AI trends") },
-      { id: "admin-integrations", label: t("admin_nav_integrations", "Integrations") },
-      { id: "admin-feature-flags", label: t("admin_nav_feature_flags", "Feature flags") },
-      { id: "admin-billing", label: t("admin_nav_billing", "Billing") },
-      { id: "admin-monitoring", label: t("admin_nav_monitoring", "Monitoring") },
-      { id: "admin-readiness", label: t("admin_nav_readiness", "Readiness") },
-      { id: "admin-marketplace-insights", label: t("admin_nav_marketplace_insights", "Marketplace insights") },
-      { id: "admin-consumer-intelligence", label: t("admin_nav_consumer_intelligence", "Consumer intelligence") }
-    );
-  }
   const aiAdminPanels = canShowFeature("ai.adminAIControls", { allowDemo: true }) ? `
     ${aiAdminControlsPanel()}
     ${aiExperiencePreviewPanel()}
     ${platformTrendPanel()}
     ${integrationHubPanel()}
     ${featureFlagsPanel()}
-    ${billingFoundationPanel()}
     ${monitoringPanel()}
     ${readinessChecklistPanel()}
     ${marketplaceInsightsPanel()}
     ${consumerIntelligencePanel()}
   ` : "";
-  app.innerHTML = dashboardShell(adminNavItems, `
-    <section class="dashboard-head">
+  let futureAdminPanels = `
+      ${billingFoundationPanel()}
+    `;
+  let futureAdminGridPanels = "";
+  if (!isBasicMode()) {
+    futureAdminGridPanels = `
+      <article class="panel" id="admin-photo-submissions">
+        <div class="section-title-row compact">
+          <div><span class="section-kicker">Rewards moderation</span><h2>${escapeHtml(t("admin_photo_submissions_title", "Guest Photo & Review Submissions"))}</h2></div>
+        </div>
+        ${photoSubmissionAdminTable()}
+      </article>
+      ${adminSystemMessagesPanel()}
+    `;
+  }
+  const adminArea = normalizeRole(state.session.profile.role) === "super_admin" ? "superadmin" : "admin";
+  const partnerAccountsPanel = `
+    <article class="panel" id="admin-partners">
+      <div class="section-title-row compact">
+        <div><span class="section-kicker">${escapeHtml(t("admin_nav_partners", "Partners"))}</span><h2>${escapeHtml(t("partner_accounts_title", "Restaurant accounts"))}</h2></div>
+      </div>
+      <form class="mini-form admin-form" id="partnerForm">
+        <input name="full_name" placeholder="${escapeAttr(t("partner_owner_name_placeholder", "Owner name"))}" required>
+        <input name="email" type="email" placeholder="${escapeAttr(t("partner_owner_email_placeholder", "Owner email"))}" required>
+        <select name="restaurant_id" required>
+          <option value="">${escapeHtml(t("choose_restaurant_option", "Choose restaurant"))}</option>
+          ${state.restaurants.map((restaurant) => `<option value="${escapeAttr(restaurant.id)}">${escapeHtml(restaurant.name)}</option>`).join("")}
+        </select>
+        <select name="restaurant_role">
+          <option value="owner">${escapeHtml(t("restaurant_role_owner", "Owner"))}</option>
+          <option value="manager">${escapeHtml(t("restaurant_role_manager", "Manager"))}</option>
+          <option value="reservation_staff">${escapeHtml(t("restaurant_role_reservation_staff", "Reservation staff"))}</option>
+          <option value="marketing_staff">${escapeHtml(t("restaurant_role_marketing_staff", "Marketing staff"))}</option>
+          <option value="read_only">${escapeHtml(t("restaurant_role_read_only", "Read only"))}</option>
+        </select>
+        <p class="form-note">${escapeHtml(t("partner_invitation_password_note", "SmartTable sends a secure invitation. Partners create their own password; temporary plaintext passwords are never emailed."))}</p>
+        <button class="primary-button" type="submit">${escapeHtml(t("send_partner_invitation_button", "Send partner invitation"))}</button>
+      </form>
+      ${partnerTable()}
+    </article>
+  `;
+  const offersPanel = `
+    <article class="panel" id="admin-offers">
+      <div class="section-title-row compact">
+        <div><span class="section-kicker">${escapeHtml(t("admin_nav_offers", "Offers"))}</span><h2>${escapeHtml(t("all_discounted_tables_title", "All discounted tables"))}</h2></div>
+      </div>
+      ${offerAdminTable()}
+    </article>
+  `;
+  const reviewsPanel = `
+    <article class="panel" id="admin-reviews">
+      <div class="section-title-row compact">
+        <div>
+          <span class="section-kicker">${escapeHtml(t("admin_nav_reviews", "Reviews"))}</span>
+          <h2>${escapeHtml(t("moderate_reviews_title", "Moderate restaurant reviews"))}</h2>
+          <p class="muted">${escapeHtml(t("moderate_reviews_body", "Approve or reject verified guest reviews and publish or remove uploaded review photos."))}</p>
+        </div>
+      </div>
+      ${reviewModerationFilterForm()}
+      ${reviewAdminTable()}
+    </article>
+  `;
+  const notificationsPanel = `
+    <article class="panel" id="admin-notifications">
+      <div class="section-title-row compact">
+        <div><span class="section-kicker">${escapeHtml(t("notifications_title", "Notifications"))}</span><h2>${escapeHtml(t("partner_activity_title", "Partner activity"))}</h2></div>
+        <button class="ghost-button" id="markAllNotifications" type="button">${escapeHtml(t("notifications_mark_read", "Mark as read"))}</button>
+      </div>
+      ${notificationList(true)}
+    </article>
+    ${adminReservationAlertsPanel()}
+    ${futureAdminGridPanels}
+  `;
+  const reservationsPanel = `
+    <article class="panel" id="admin-reservations">
+      <div class="section-title-row compact">
+        <div><span class="section-kicker">${escapeHtml(t("admin_nav_reservations", "Reservations"))}</span><h2>${escapeHtml(t("track_reservations_title", "Track reservations"))}</h2></div>
+      </div>
+      ${reservationFilterForm("admin", state.adminReservationFilters)}
+      ${reservationTable(state.reservations, true, "admin")}
+    </article>
+  `;
+  const auditPanel = `
+    <article class="panel wide-panel" id="admin-audit-log">
+      <div class="section-title-row compact">
+        <div><span class="section-kicker">${escapeHtml(t("admin_tab_audit", "Audit Log"))}</span><h2>${escapeHtml(t("admin_audit_log_title", "Restaurant lifecycle and admin audit history"))}</h2></div>
+      </div>
+      <p class="form-note">${escapeHtml(t("admin_audit_log_intro", "Open a restaurant from the Restaurants tab and choose View Audit History to load immutable lifecycle events here."))}</p>
+      ${restaurantAuditHistoryPanel()}
+    </article>
+  `;
+  const adminTabs = [
+    {
+      key: "overview",
+      label: t("dashboard_tab_overview", "Overview"),
+      compactLabel: t("dashboard_tab_overview_compact", "Overview"),
+      content: `
+        ${platformModeQuickPanel()}
+        <section class="stats-grid" id="admin-stats">
+          ${kpiStatCard("admin_kpi_total_restaurants", "Total restaurants", stats.restaurants_total, "admin_kpi_total_restaurants_desc", "Restaurants in the management database", { key: "restaurants_total" })}
+          ${kpiStatCard("admin_kpi_pending_approvals", "Pending approvals", stats.restaurants_pending, "admin_kpi_pending_approvals_desc", "Restaurants awaiting review or approval", { key: "restaurants_pending" })}
+          ${kpiStatCard("admin_kpi_partner_accounts", "Partner accounts", stats.partners_total, "admin_kpi_partner_accounts_desc", "Users with restaurant partner access", { key: "partners_total" })}
+          ${kpiStatCard("admin_kpi_active_offers", "Active offers", stats.offers_active, "admin_kpi_active_offers_desc", "Offers currently marked active", { key: "offers_active" })}
+          ${kpiStatCard("admin_kpi_total_reservations", "Total reservations", stats.reservations_total, "admin_kpi_total_reservations_desc", "All reservation requests recorded by SmartTable", { key: "reservations_total" })}
+          ${kpiStatCard("admin_kpi_profile_views", "Profile views", stats.views_total, "admin_kpi_profile_views_desc", "Public restaurant profile views where available", { key: "views_total" })}
+          ${kpiStatCard("admin_kpi_favorites", "Favorites", stats.favorites_total, "admin_kpi_favorites_desc", "Active restaurant followers and favorites", { key: "favorites_total" })}
+          ${kpiStatCard("admin_kpi_favorites_week", "New favorites this week", stats.favorites_this_week, "admin_kpi_favorites_week_desc", "Favorites created during the last 7 days", { key: "favorites_this_week" })}
+          ${kpiStatCard("admin_kpi_favorites_month", "New favorites this month", stats.favorites_this_month, "admin_kpi_favorites_month_desc", "Favorites created during the current month", { key: "favorites_this_month" })}
+        </section>
+      `
+    },
+    {
+      key: "restaurants",
+      label: t("dashboard_tab_restaurants", "Restaurants"),
+      compactLabel: t("dashboard_tab_restaurants_compact", "Restaurants"),
+      content: `<section class="dashboard-grid one-col">${restaurantAdminPanel(false)}</section>`
+    },
+    {
+      key: "partners",
+      label: t("dashboard_tab_partners", "Partners"),
+      compactLabel: t("dashboard_tab_partners_compact", "Partners"),
+      content: `<section class="dashboard-grid one-col">${partnerAccountsPanel}</section>`
+    },
+    {
+      key: "reservations",
+      label: t("dashboard_tab_reservations", "Reservations"),
+      compactLabel: t("dashboard_tab_reservations_compact", "Reservations"),
+      content: `<section class="dashboard-grid one-col">${reservationsPanel}</section>`
+    },
+    {
+      key: "offers",
+      label: t("dashboard_tab_offers", "Offers"),
+      compactLabel: t("dashboard_tab_offers_compact", "Offers"),
+      content: `<section class="dashboard-grid one-col">${offersPanel}</section>`
+    },
+    {
+      key: "food-feed",
+      label: t("admin_food_feed_tab", "What to Eat"),
+      compactLabel: t("admin_food_feed_tab", "What to Eat"),
+      content: `<section class="dashboard-grid one-col">${adminFoodFeedPanel()}</section>`
+    },
+    {
+      key: "reviews",
+      label: t("dashboard_tab_reviews", t("admin_nav_reviews", "Reviews")),
+      compactLabel: t("dashboard_tab_reviews_compact", t("admin_nav_reviews", "Reviews")),
+      content: `<section class="dashboard-grid one-col">${reviewsPanel}</section>`
+    },
+    {
+      key: "notifications",
+      label: t("dashboard_tab_notifications", "Notifications"),
+      compactLabel: t("dashboard_tab_notifications_compact", "Notifications"),
+      content: `<section class="dashboard-grid two-col">${notificationsPanel}</section>`
+    },
+    ...(futureAdminPanels ? [{
+      key: "payments",
+      label: t("dashboard_tab_payments", "Payments"),
+      compactLabel: t("dashboard_tab_payments_compact", "Payments"),
+      content: `<section class="dashboard-grid one-col">${futureAdminPanels}</section>`
+    }] : []),
+    {
+      key: "reports",
+      label: t("dashboard_tab_reports", t("admin_nav_analytics", "Reports")),
+      compactLabel: t("dashboard_tab_reports_compact", "Reports"),
+      content: adminAnalyticsPanel()
+    },
+    {
+      key: "settings",
+      label: t("dashboard_tab_settings", "Settings"),
+      compactLabel: t("dashboard_tab_settings_compact", "Settings"),
+      content: `
+        ${platformModePanel()}
+        ${aiAdminPanels}
+        ${contentEditorV2()}
+        ${legalDocumentsAdminPanel()}
+      `
+    },
+    {
+      key: "audit",
+      label: t("dashboard_tab_audit", "Audit Log"),
+      compactLabel: t("dashboard_tab_audit_compact", "Audit"),
+      content: auditPanel
+    }
+  ].map((tab) => ({
+    ...tab,
+    tabId: `${adminArea}-tab-${tab.key}`,
+    panelId: `${adminArea}-tab-panel-${tab.key}`
+  }));
+  const activeAdminTab = activeDashboardTab(adminArea, adminTabs);
+  app.innerHTML = dashboardShellTabbed(`
+    <section class="dashboard-head compact-dashboard-head">
       <div>
-        <span class="section-kicker">${escapeHtml(t("admin_dashboard_kicker", "Super Admin dashboard"))}</span>
+        <span class="section-kicker">${escapeHtml(adminArea === "superadmin" ? t("superadmin_dashboard_kicker", "Super Admin dashboard") : t("admin_dashboard_kicker", "Admin dashboard"))}</span>
         <h1>${escapeHtml(t("admin_dashboard_title", "Smart Table operations"))}</h1>
       </div>
       <div class="admin-head-actions">
@@ -6686,115 +11586,9 @@ function renderAdmin() {
         <button class="primary-button" id="refreshAdmin" type="button">${escapeHtml(t("refresh_button", "Refresh"))}</button>
       </div>
     </section>
-    ${platformModeQuickPanel()}
-    <section class="stats-grid" id="admin-stats">
-      ${statCard("Restaurants", stats.restaurants_total)}
-      ${statCard("Pending approvals", stats.restaurants_pending)}
-      ${statCard("Partners", stats.partners_total)}
-      ${statCard("Active offers", stats.offers_active)}
-      ${statCard("Reservations", stats.reservations_total)}
-      ${statCard("Views", stats.views_total)}
-      ${statCard("Favorites", stats.favorites_total)}
-      ${statCard("New favorites this week", stats.favorites_this_week)}
-      ${statCard("New favorites this month", stats.favorites_this_month)}
-    </section>
-    ${platformModePanel()}
-    ${aiAdminPanels}
-    ${contentEditorV2()}
-    <section class="dashboard-grid two-col">
-      <article class="panel" id="admin-restaurants">
-        <div class="section-title-row compact">
-          <div><span class="section-kicker">${escapeHtml(t("admin_nav_restaurants", "Restaurants"))}</span><h2>${escapeHtml(t("admin_restaurants_title", "Manage restaurants"))}</h2></div>
-        </div>
-        <form class="mini-form admin-form" id="restaurantForm">
-          <input name="name" placeholder="Restaurant name" required>
-          <input name="email" type="email" placeholder="Restaurant email" required>
-          <input name="phone" placeholder="Phone">
-          <input name="address" placeholder="Address" required>
-          <input name="district" placeholder="Neighborhood" value="New York">
-          <input name="cuisine_type" placeholder="Cuisine" required>
-          <input name="sort_order" type="number" min="0" placeholder="Sort order">
-          <input name="latitude" type="number" step="0.000001" placeholder="Latitude">
-          <input name="longitude" type="number" step="0.000001" placeholder="Longitude">
-          <input name="google_place_id" placeholder="Google Place ID">
-          <input name="website" placeholder="Website">
-          <input name="instagram" placeholder="Instagram">
-          <input name="facebook" placeholder="Facebook">
-          <input name="tiktok" placeholder="TikTok">
-          <input name="google_maps_url" placeholder="Google Maps">
-          <input name="card_image" placeholder="Card image URL">
-          <textarea name="description_en" placeholder="Description in English"></textarea>
-          <textarea name="description_es" placeholder="Description in Spanish"></textarea>
-          <textarea name="description_hu" placeholder="Description in Hungarian"></textarea>
-          <select name="billing_plan">
-            <option value="free">Free</option>
-            <option value="monthly">Monthly</option>
-            <option value="per_booking">Per booking</option>
-          </select>
-          <input name="monthly_fee" type="number" min="0" step="0.01" placeholder="Monthly fee">
-          <input name="fee_per_booking" type="number" min="0" step="0.01" placeholder="Fee per booking">
-          ${canShowFeature("ai.adminAIControls", { allowDemo: true }) ? `<select name="ai_discount_enabled">
-            <option value="true">AI discount enabled</option>
-            <option value="false">AI discount disabled</option>
-          </select>
-          <input name="min_discount_percent" type="number" min="0" max="90" placeholder="Minimum AI discount %">
-          <input name="max_discount_percent" type="number" min="0" max="90" placeholder="Maximum AI discount %">
-          <input name="target_margin_percent" type="number" min="0" max="100" step="0.1" placeholder="Target margin %">
-          <input name="average_service_minutes" type="number" min="15" placeholder="Average service minutes">` : ""}
-          <button class="primary-button" type="submit">Add restaurant</button>
-        </form>
-        ${restaurantTable()}
-      </article>
-      <article class="panel" id="admin-partners">
-        <div class="section-title-row compact">
-          <div><span class="section-kicker">Partners</span><h2>Restaurant accounts</h2></div>
-        </div>
-        <form class="mini-form admin-form" id="partnerForm">
-          <input name="full_name" placeholder="Owner name" required>
-          <input name="email" type="email" placeholder="Owner email" required>
-          <input name="password" type="password" placeholder="Temporary password" required>
-          <select name="restaurant_id" required>
-            <option value="">Choose restaurant</option>
-            ${state.restaurants.map((restaurant) => `<option value="${escapeAttr(restaurant.id)}">${escapeHtml(restaurant.name)}</option>`).join("")}
-          </select>
-          <button class="primary-button" type="submit">Create partner login</button>
-        </form>
-        ${partnerTable()}
-      </article>
-      <article class="panel" id="admin-offers">
-        <div class="section-title-row compact">
-          <div><span class="section-kicker">Offers</span><h2>All discounted tables</h2></div>
-        </div>
-        ${offerAdminTable()}
-      </article>
-      <article class="panel" id="admin-reviews">
-        <div class="section-title-row compact">
-          <div><span class="section-kicker">Reviews</span><h2>Moderate restaurant reviews</h2></div>
-        </div>
-        ${reviewAdminTable()}
-      </article>
-      <article class="panel" id="admin-photo-submissions">
-        <div class="section-title-row compact">
-          <div><span class="section-kicker">Rewards moderation</span><h2>${escapeHtml(t("admin_photo_submissions_title", "Guest Photo & Review Submissions"))}</h2></div>
-        </div>
-        ${photoSubmissionAdminTable()}
-      </article>
-      <article class="panel" id="admin-notifications">
-        <div class="section-title-row compact">
-          <div><span class="section-kicker">${escapeHtml(t("notifications_title", "Notifications"))}</span><h2>Partner activity</h2></div>
-          <button class="ghost-button" id="markAllNotifications" type="button">${escapeHtml(t("notifications_mark_read", "Mark as read"))}</button>
-        </div>
-        ${notificationList(true)}
-      </article>
-      <article class="panel" id="admin-reservations">
-        <div class="section-title-row compact">
-          <div><span class="section-kicker">Reservations</span><h2>Track reservations</h2></div>
-        </div>
-        ${reservationFilterForm("admin", state.adminReservationFilters)}
-        ${reservationTable(state.reservations, true)}
-      </article>
-    </section>
+    ${dashboardTabbedInterface(adminArea, adminTabs, activeAdminTab, t("admin_dashboard_tabs_label", "Admin dashboard sections"))}
   `);
+  bindDashboardTabs(renderAdmin);
   document.querySelector("#refreshAdmin").addEventListener("click", async () => {
     await loadAdminData();
     renderAdmin();
@@ -6806,6 +11600,12 @@ function renderAdmin() {
   document.querySelector("#markAllNotifications")?.addEventListener("click", () => markNotificationRead(null, true));
   document.querySelectorAll("[data-mark-notification]").forEach((button) => {
     button.addEventListener("click", () => markNotificationRead(button.dataset.markNotification));
+  });
+  document.querySelectorAll("[data-admin-system-message-action]").forEach((button) => {
+    button.addEventListener("click", () => runAdminSystemMessageAction(button));
+  });
+  document.querySelectorAll("[data-admin-system-message-row-action]").forEach((button) => {
+    button.addEventListener("click", () => runAdminSystemMessageRowAction(button));
   });
   document.querySelectorAll("[data-admin-integration-action]").forEach((button) => {
     button.addEventListener("click", () => runIntegrationAction("/admin/integrations", button.dataset.adminIntegrationProvider, button.dataset.adminIntegrationAction, loadAdminData, renderAdmin));
@@ -6853,10 +11653,64 @@ function renderAdmin() {
   document.querySelectorAll("[data-review-status]").forEach((button) => {
     button.addEventListener("click", () => updateReviewStatus(button.dataset.reviewId, button.dataset.reviewStatus));
   });
+  document.querySelectorAll("[data-review-photo-status]").forEach((button) => {
+    button.addEventListener("click", () => updateReviewPhotoStatus(button.dataset.reviewPhotoId, button.dataset.reviewPhotoStatus));
+  });
+  document.querySelectorAll("[data-review-response-status]").forEach((button) => {
+    button.addEventListener("click", () => updateReviewResponseStatus(button.dataset.reviewId, button.dataset.reviewResponseStatus));
+  });
+  document.querySelectorAll("[data-admin-food-feed-status]").forEach((button) => {
+    button.addEventListener("click", () => updateAdminFoodFeedStatus(button));
+  });
+  document.querySelector("#adminFoodFeedForm")?.addEventListener("submit", submitAdminFoodFeed);
+  document.querySelector("#adminReviewFilters")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    applyAdminReviewFilters(event.currentTarget);
+  });
+  document.querySelector("#adminReviewFilters")?.addEventListener("change", (event) => {
+    applyAdminReviewFilters(event.currentTarget, event.target.name);
+  });
+  document.querySelector('#adminReviewFilters [name="search"]')?.addEventListener("input", (event) => {
+    applyAdminReviewFilters(event.currentTarget.form, "search");
+    const search = document.querySelector('#adminReviewFilters [name="search"]');
+    search?.focus();
+    search?.setSelectionRange(event.target.value.length, event.target.value.length);
+  });
+  document.querySelector("[data-clear-admin-review-filters]")?.addEventListener("click", () => clearAdminReviewFilters());
+  document.querySelectorAll("[data-admin-review-page]").forEach((button) => {
+    button.addEventListener("click", () => setAdminReviewPage(button.dataset.adminReviewPage));
+  });
   document.querySelectorAll("[data-photo-submission-status]").forEach((button) => {
     button.addEventListener("click", () => updatePhotoSubmissionStatus(button.dataset.photoSubmissionId, button.dataset.photoSubmissionStatus));
   });
   document.querySelector("#restaurantForm").addEventListener("submit", submitRestaurant);
+  document.querySelector("[data-focus-restaurant-form]")?.addEventListener("click", () => {
+    document.querySelector('#restaurantForm [name="name"]')?.focus();
+  });
+  document.querySelector("#adminRestaurantFilters")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    applyAdminRestaurantFilters(event.currentTarget);
+  });
+  document.querySelector("#adminRestaurantFilters")?.addEventListener("change", (event) => {
+    applyAdminRestaurantFilters(event.currentTarget, event.target.name);
+  });
+  document.querySelector('#adminRestaurantFilters [name="search"]')?.addEventListener("input", (event) => {
+    applyAdminRestaurantFilters(event.currentTarget.form, "search");
+    const search = document.querySelector('#adminRestaurantFilters [name="search"]');
+    search?.focus();
+    search?.setSelectionRange(event.target.value.length, event.target.value.length);
+  });
+  document.querySelector("[data-clear-restaurant-filters]")?.addEventListener("click", () => {
+    state.adminRestaurantFilters = { search: "", status: "all", city: "all", country: "all", district: "all", testData: "all", sort: "updated_desc" };
+    state.adminRestaurantPage = 1;
+    renderAdmin();
+  });
+  document.querySelectorAll("[data-restaurant-page]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.adminRestaurantPage += button.dataset.restaurantPage === "next" ? 1 : -1;
+      renderAdmin();
+    });
+  });
   document.querySelector("#partnerForm").addEventListener("submit", submitPartner);
   document.querySelector("#contentSearch")?.addEventListener("input", (event) => {
     const value = event.target.value;
@@ -6879,6 +11733,83 @@ function renderAdmin() {
     });
   });
   document.querySelector("#contentEditForm")?.addEventListener("submit", saveContentModal);
+  document.querySelector("#legalDocumentForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    try {
+      const data = formObject(event.currentTarget);
+      await api("/admin/legal-documents", {
+        method: "POST",
+        body: JSON.stringify(data)
+      });
+      await loadAdminData();
+      renderAdmin();
+      showToast(t("legal_document_saved_toast", "Legal document version saved."));
+    } catch (error) {
+      showToast(error.message);
+    }
+  });
+  document.querySelector("#billingPlanForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const submitButton = event.currentTarget.querySelector('[type="submit"]');
+    try {
+      setButtonPending(submitButton, true);
+      const data = formObject(event.currentTarget);
+      data.action = "save_plan";
+      await api("/admin/billing", {
+        method: "POST",
+        body: JSON.stringify(data)
+      });
+      await loadAdminData();
+      renderAdmin();
+      showToast(t("billing_plan_saved_toast", "Billing plan saved."));
+    } catch (error) {
+      setButtonPending(submitButton, false);
+      showToast(error.message);
+    }
+  });
+  document.querySelector("#adminBillingFilter")?.addEventListener("change", (event) => {
+    state.adminBillingFilter = event.target.value || "all";
+    renderAdmin();
+  });
+  document.querySelectorAll("[data-admin-billing-action]").forEach((button) => {
+    button.addEventListener("click", () => runAdminBillingAction(button));
+  });
+  const adminReservationAlertForm = document.querySelector("#adminReservationAlertForm");
+  adminReservationAlertForm?.addEventListener("submit", submitAdminReservationAlertForm);
+  adminReservationAlertForm?.elements.restaurant_id?.addEventListener("change", () => syncAdminReservationAlertForm(adminReservationAlertForm));
+  document.querySelectorAll("[data-admin-alert-action]").forEach((button) => {
+    button.addEventListener("click", () => runAdminReservationAlertAction(button));
+  });
+  document.querySelectorAll("[data-publish-legal-document]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      try {
+        await api("/admin/legal-documents", {
+          method: "PATCH",
+          body: JSON.stringify({ id: button.dataset.publishLegalDocument, action: "publish", is_current: true })
+        });
+        await loadAdminData();
+        renderAdmin();
+        showToast(t("legal_document_published_toast", "Legal document published."));
+      } catch (error) {
+        showToast(error.message);
+      }
+    });
+  });
+  document.querySelectorAll("[data-current-legal-document]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      try {
+        await api("/admin/legal-documents", {
+          method: "PATCH",
+          body: JSON.stringify({ id: button.dataset.currentLegalDocument, action: "mark_current" })
+        });
+        await loadAdminData();
+        renderAdmin();
+        showToast(t("legal_document_current_toast", "Legal document marked current."));
+      } catch (error) {
+        showToast(error.message);
+      }
+    });
+  });
   document.querySelectorAll("[data-approve]").forEach((button) => {
     button.addEventListener("click", () => approveRestaurant(button.dataset.approve, button));
   });
@@ -6887,6 +11818,39 @@ function renderAdmin() {
   });
   document.querySelectorAll("[data-disable-restaurant]").forEach((button) => {
     button.addEventListener("click", () => updateRestaurantStatus(button.dataset.disableRestaurant, "suspended", button));
+  });
+  document.querySelectorAll("[data-restaurant-status-action]").forEach((button) => {
+    button.addEventListener("click", () => updateRestaurantStatus(button.dataset.restaurantStatusAction, button.dataset.nextStatus, button));
+  });
+  document.querySelectorAll("[data-view-restaurant]").forEach((button) => {
+    button.addEventListener("click", () => viewRestaurantInAdmin(button.dataset.viewRestaurant));
+  });
+  document.querySelector("[data-close-restaurant-detail]")?.addEventListener("click", () => {
+    state.adminRestaurantDetailId = "";
+    state.adminRestaurantDetail = null;
+    state.adminRestaurantDetailTab = "overview";
+    renderAdmin();
+  });
+  document.querySelectorAll("[data-restaurant-detail-tab]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.adminRestaurantDetailTab = button.dataset.restaurantDetailTab || "overview";
+      renderAdmin();
+    });
+  });
+  document.querySelector("#restaurantCapacityForm")?.addEventListener("submit", saveRestaurantCapacityConfig);
+  document.querySelectorAll("[data-restaurant-access-action]").forEach((button) => {
+    button.addEventListener("click", () => updateRestaurantAccess(button));
+  });
+  document.querySelectorAll("[data-invite-restaurant], [data-manage-restaurant-access]").forEach((button) => {
+    button.addEventListener("click", () => focusPartnerAccessForRestaurant(button.dataset.inviteRestaurant || button.dataset.manageRestaurantAccess));
+  });
+  document.querySelectorAll("[data-restaurant-audit]").forEach((button) => {
+    button.addEventListener("click", () => loadRestaurantAuditHistory(button.dataset.restaurantAudit, button));
+  });
+  document.querySelector("[data-close-restaurant-audit]")?.addEventListener("click", () => {
+    state.adminAuditRestaurantId = "";
+    state.adminAuditLogs = [];
+    renderAdmin();
   });
   document.querySelectorAll("[data-save-admin-offer]").forEach((button) => {
     button.addEventListener("click", () => saveOfferRow("/admin/offers", button.dataset.saveAdminOffer, loadAdminData, renderAdmin, button));
@@ -6897,67 +11861,643 @@ function renderAdmin() {
   document.querySelectorAll("[data-view-as-partner]").forEach((button) => {
     button.addEventListener("click", () => viewAsPartner(button.dataset.viewAsPartner));
   });
+  document.querySelectorAll("[data-view-as-guest]").forEach((button) => {
+    button.addEventListener("click", () => viewAsGuest(button.dataset.viewAsGuest));
+  });
+  document.querySelectorAll("[data-resend-partner-invitation]").forEach((button) => {
+    button.addEventListener("click", () => updatePartnerInvitation(button.dataset.resendPartnerInvitation, "resend_invitation", button));
+  });
+  document.querySelectorAll("[data-revoke-partner-invitation]").forEach((button) => {
+    button.addEventListener("click", () => updatePartnerInvitation(button.dataset.revokePartnerInvitation, "revoke_invitation", button));
+  });
   bindReservationStatusButtons("/admin/reservations", loadAdminData, renderAdmin);
   bindReservationFilterForms();
+  bindAnalyticsControls();
   finalizeRenderedLanguage();
 }
 
+function adminRestaurantLifecycleStatus(restaurant = {}) {
+  const lifecycle = String(restaurant.lifecycle_status || restaurant.onboarding_status || "").toLowerCase();
+  if (["draft", "pending_review", "active", "suspended", "archived"].includes(lifecycle)) return lifecycle;
+  if (restaurant.status === "approved") return "active";
+  if (restaurant.status === "suspended") return "suspended";
+  return "draft";
+}
+
+function restaurantLifecycleLabel(status) {
+  const labels = {
+    draft: t("restaurant_status_draft", "Draft"),
+    pending_review: t("restaurant_status_pending_review", "Pending review"),
+    active: t("restaurant_status_active", "Active"),
+    suspended: t("restaurant_status_suspended", "Suspended"),
+    archived: t("restaurant_status_archived", "Archived")
+  };
+  return labels[status] || status;
+}
+
+function restaurantLifecycleBadge(restaurant = {}) {
+  const status = adminRestaurantLifecycleStatus(restaurant);
+  return statusBadge(status, restaurantLifecycleLabel(status));
+}
+
+function uniqueRestaurantFilterOptions(field) {
+  return [...new Set((state.restaurants || []).map((restaurant) => String(restaurant[field] || "").trim()).filter(Boolean))]
+    .sort((a, b) => a.localeCompare(b));
+}
+
+function filterSelect(name, label, value, options) {
+  const normalizedOptions = options.map((option) => typeof option === "object" ? option : { value: option, label: option });
+  return `
+    <label>${escapeHtml(label)}
+      <select name="${escapeAttr(name)}">
+        <option value="all">${escapeHtml(t("all_filter_option", "All"))}</option>
+        ${normalizedOptions.map((option) => `<option value="${escapeAttr(option.value)}" ${value === option.value ? "selected" : ""}>${escapeHtml(option.label)}</option>`).join("")}
+      </select>
+    </label>
+  `;
+}
+
+function filteredAdminRestaurants() {
+  const filters = state.adminRestaurantFilters;
+  const search = String(filters.search || "").toLowerCase().trim();
+  const matchesValue = (actual, expected) => expected === "all" || String(actual || "") === expected;
+  const rows = (state.restaurants || []).filter((restaurant) => {
+    const lifecycle = adminRestaurantLifecycleStatus(restaurant);
+    const haystack = [
+      restaurant.name,
+      restaurant.legal_name,
+      restaurant.email,
+      restaurant.contact_email,
+      restaurant.city,
+      restaurant.country,
+      restaurant.district,
+      restaurant.address,
+      restaurant.cuisine_type,
+      restaurant.cuisine
+    ].join(" ").toLowerCase();
+    if (search && !haystack.includes(search)) return false;
+    if (!matchesValue(lifecycle, filters.status)) return false;
+    if (!matchesValue(restaurant.city, filters.city)) return false;
+    if (!matchesValue(restaurant.country, filters.country)) return false;
+    if (!matchesValue(restaurant.district, filters.district)) return false;
+    if (filters.testData === "test" && !restaurant.is_test_data && !restaurant.is_test_restaurant) return false;
+    if (filters.testData === "production" && (restaurant.is_test_data || restaurant.is_test_restaurant)) return false;
+    return true;
+  });
+  const sort = filters.sort || "updated_desc";
+  const highlightId = String(state.adminRestaurantHighlightId || "");
+  return rows.sort((a, b) => {
+    if (highlightId) {
+      const aHighlighted = String(a.id || "") === highlightId;
+      const bHighlighted = String(b.id || "") === highlightId;
+      if (aHighlighted !== bHighlighted) return aHighlighted ? -1 : 1;
+    }
+    if (sort === "name_asc") return String(a.name || "").localeCompare(String(b.name || ""));
+    if (sort === "created_desc") return String(b.created_at || "").localeCompare(String(a.created_at || ""));
+    if (sort === "status_asc") return adminRestaurantLifecycleStatus(a).localeCompare(adminRestaurantLifecycleStatus(b)) || String(a.name || "").localeCompare(String(b.name || ""));
+    return String(b.updated_at || b.created_at || "").localeCompare(String(a.updated_at || a.created_at || ""));
+  });
+}
+
+function restaurantWizardField(name, label, value = "", attrs = "") {
+  return `<label>${escapeHtml(label)}<input name="${escapeAttr(name)}" value="${escapeAttr(value)}" ${attrs}></label>`;
+}
+
+function restaurantWizardTextarea(name, label, value = "", attrs = "") {
+  return `<label>${escapeHtml(label)}<textarea name="${escapeAttr(name)}" ${attrs}>${escapeHtml(value)}</textarea></label>`;
+}
+
+function restaurantOnboardingWizard() {
+  return `
+    <form class="mini-form admin-form restaurant-onboarding-wizard" id="restaurantForm">
+      <fieldset>
+        <legend>${escapeHtml(t("restaurant_onboarding_step_basic", "Step 1 - Basic information"))}</legend>
+        ${restaurantWizardField("name", t("restaurant_name_label", "Restaurant name"), "", "required autocomplete=\"organization\"")}
+        ${restaurantWizardField("legal_name", t("restaurant_legal_name_label", "Legal business name"))}
+        ${restaurantWizardField("slug", t("restaurant_slug_label", "Public slug"), "", "placeholder=\"auto-generated-if-empty\"")}
+        ${restaurantWizardTextarea("short_description", t("restaurant_short_description_label", "Short description"))}
+        ${restaurantWizardTextarea("full_description", t("restaurant_full_description_label", "Full description"))}
+        ${restaurantWizardField("contact_name", t("restaurant_contact_name_label", "Contact name"))}
+        ${restaurantWizardField("email", t("restaurant_primary_email_label", "Primary email"), "", "type=\"email\" required")}
+        ${restaurantWizardField("reservation_email", t("restaurant_reservation_email_label", "Reservation email"), "", "type=\"email\"")}
+        ${restaurantWizardField("phone", t("phone_label", "Phone"))}
+        ${restaurantWizardField("website", t("website_label", "Website"), "", "type=\"url\"")}
+        ${restaurantWizardField("country", t("country_label", "Country"), "US", "required")}
+        ${restaurantWizardField("state_region", t("state_region_label", "State / region"))}
+        ${restaurantWizardField("city", t("city_label", "City"), "New York", "required")}
+        ${restaurantWizardField("district", t("filter_neighborhood_label", "Neighborhood"), "New York")}
+        ${restaurantWizardField("postal_code", t("postal_code_label", "Postal code"))}
+        ${restaurantWizardField("address", t("street_address_label", "Street address"), "", "required")}
+        ${restaurantWizardField("latitude", t("latitude_label", "Latitude"), "", "type=\"number\" step=\"0.000001\"")}
+        ${restaurantWizardField("longitude", t("longitude_label", "Longitude"), "", "type=\"number\" step=\"0.000001\"")}
+        ${restaurantWizardField("primary_timezone", t("timezone_label", "Timezone"), "America/New_York", "required")}
+        ${restaurantWizardField("currency_code", t("currency_label", "Currency"), "USD", "required")}
+        ${restaurantWizardField("default_language", t("default_language_label", "Default language"), "en")}
+        ${restaurantWizardField("supported_languages", t("supported_languages_label", "Supported languages"), "en,es,hu")}
+        ${restaurantWizardField("cuisine_type", t("filter_cuisine_label", "Cuisine"), "", "required")}
+        ${restaurantWizardField("price_level", t("price_level_label", "Price level"), "$$")}
+      </fieldset>
+      <fieldset>
+        <legend>${escapeHtml(t("restaurant_onboarding_step_operations", "Step 2 - Profile and operations"))}</legend>
+        ${restaurantWizardField("logo_url", t("restaurant_logo_label", "Logo URL"), "", "type=\"url\"")}
+        ${restaurantWizardField("cover_image", t("restaurant_cover_image_label", "Cover image URL"), "/assets/restaurant-hero.png")}
+        ${restaurantWizardTextarea("gallery_images", t("restaurant_gallery_images_label", "Gallery image URLs"))}
+        ${restaurantWizardField("cuisine_categories", t("restaurant_cuisine_categories_label", "Cuisine categories"))}
+        ${restaurantWizardField("dining_style", t("restaurant_dining_style_label", "Dining style"))}
+        ${restaurantWizardField("dress_code", t("restaurant_dress_code_label", "Dress code"))}
+        ${restaurantWizardTextarea("accessibility_info", t("restaurant_accessibility_info_label", "Accessibility information"))}
+        ${restaurantWizardTextarea("parking_info", t("restaurant_parking_info_label", "Parking information"))}
+        ${restaurantWizardTextarea("public_contact_info", t("restaurant_public_contact_label", "Public contact information"))}
+        ${restaurantWizardField("instagram", "Instagram", "", "type=\"url\"")}
+        ${restaurantWizardField("facebook", "Facebook", "", "type=\"url\"")}
+        ${restaurantWizardField("tiktok", "TikTok", "", "type=\"url\"")}
+        ${restaurantWizardField("google_maps_url", "Google Maps", "", "type=\"url\"")}
+        <label class="check"><input name="visible_on_guest_site" type="checkbox" value="true"> ${escapeHtml(t("restaurant_visible_label", "Visible on guest site"))}</label>
+        <label class="check"><input name="is_featured" type="checkbox" value="true"> ${escapeHtml(t("restaurant_featured_label", "Featured restaurant"))}</label>
+        <label class="check"><input name="is_new_restaurant" type="checkbox" value="true"> ${escapeHtml(t("restaurant_new_label", "New restaurant label"))}</label>
+        <label class="check"><input name="is_test_data" type="checkbox" value="true"> ${escapeHtml(t("restaurant_test_data_label", "Test data"))}</label>
+        ${restaurantWizardField("seo_title", t("seo_title_label", "SEO title"))}
+        ${restaurantWizardTextarea("seo_description", t("seo_description_label", "SEO description"))}
+      </fieldset>
+      <fieldset>
+        <legend>${escapeHtml(t("restaurant_onboarding_step_hours", "Step 3 - Hours and availability"))}</legend>
+        ${restaurantWizardTextarea("service_periods", t("restaurant_service_periods_label", "Structured service periods JSON"), '[{"day":"mon","period":"dinner","opens":"17:00","closes":"22:00"}]')}
+        ${restaurantWizardTextarea("holiday_exceptions", t("restaurant_holiday_exceptions_label", "Holiday exceptions JSON"), "[]")}
+        ${restaurantWizardTextarea("temporary_closures", t("restaurant_temporary_closures_label", "Temporary closures JSON"), "[]")}
+        ${restaurantWizardField("reservation_interval_minutes", t("restaurant_interval_label", "Reservation interval minutes"), "30", "type=\"number\" min=\"5\" step=\"5\"")}
+        ${restaurantWizardField("booking_horizon_days", t("restaurant_booking_horizon_label", "Maximum booking horizon days"), "30", "type=\"number\" min=\"1\"")}
+        ${restaurantWizardField("minimum_booking_notice_minutes", t("restaurant_min_notice_label", "Minimum booking notice minutes"), "30", "type=\"number\" min=\"0\"")}
+        ${restaurantWizardField("default_table_duration_minutes", t("restaurant_default_duration_label", "Default table duration minutes"), "90", "type=\"number\" min=\"15\"")}
+        ${restaurantWizardField("grace_period_minutes", t("restaurant_grace_period_label", "Grace period minutes"), "15", "type=\"number\" min=\"0\"")}
+        ${restaurantWizardField("last_seating_time", t("restaurant_last_seating_label", "Last seating time"), "", "type=\"time\"")}
+      </fieldset>
+      <fieldset>
+        <legend>${escapeHtml(t("restaurant_onboarding_step_reservations", "Step 4 - Reservation configuration"))}</legend>
+        <label>${escapeHtml(t("restaurant_acceptance_mode_label", "Reservation acceptance mode"))}
+          <select name="reservation_acceptance_mode">
+            <option value="manual">${escapeHtml(t("restaurant_acceptance_manual", "Manual approval"))}</option>
+            <option value="automatic">${escapeHtml(t("restaurant_acceptance_automatic", "Automatic"))}</option>
+          </select>
+        </label>
+        ${restaurantWizardField("min_party_size", t("restaurant_min_party_size_label", "Minimum party size"), "1", "type=\"number\" min=\"1\"")}
+        ${restaurantWizardField("max_party_size", t("restaurant_max_party_size_label", "Maximum party size"), "8", "type=\"number\" min=\"1\"")}
+        ${restaurantWizardField("available_party_sizes", t("restaurant_party_options_label", "Available party-size options"), "1,2,3,4,5,6,7,8")}
+        ${restaurantWizardField("capacity", t("restaurant_capacity_label", "Guest capacity"), "", "type=\"number\" min=\"0\"")}
+        ${restaurantWizardField("table_capacity", t("restaurant_table_capacity_label", "Table availability"), "", "type=\"number\" min=\"0\"")}
+        ${restaurantWizardField("min_discount_percent", t("restaurant_min_discount_label", "Minimum discount %"), "", "type=\"number\" min=\"0\" max=\"90\"")}
+        ${restaurantWizardField("max_discount_percent", t("restaurant_max_discount_label", "Maximum discount %"), "", "type=\"number\" min=\"0\" max=\"90\"")}
+        <label class="check"><input name="accepts_reservation_requests" type="checkbox" value="true" checked> ${escapeHtml(t("restaurant_accepts_reservation_requests", "Accept reservation requests"))}</label>
+        <label class="check"><input name="same_day_reservations_enabled" type="checkbox" value="true" checked> ${escapeHtml(t("restaurant_same_day_label", "Same-day reservations"))}</label>
+        <label class="check"><input name="waitlist_enabled" type="checkbox" value="true"> ${escapeHtml(t("restaurant_waitlist_label", "Waitlist enabled"))}</label>
+        <label class="check"><input name="special_requests_enabled" type="checkbox" value="true" checked> ${escapeHtml(t("restaurant_special_requests_label", "Special requests"))}</label>
+        <label class="check"><input name="accessibility_requests_enabled" type="checkbox" value="true" checked> ${escapeHtml(t("restaurant_accessibility_requests_label", "Accessibility requests"))}</label>
+        <label class="check"><input name="high_chair_requests_enabled" type="checkbox" value="true" checked> ${escapeHtml(t("restaurant_high_chair_label", "Child / high-chair request"))}</label>
+        <label class="check"><input name="occasion_field_enabled" type="checkbox" value="true" checked> ${escapeHtml(t("restaurant_occasion_label", "Occasion field"))}</label>
+        ${restaurantWizardTextarea("cancellation_policy", t("restaurant_cancellation_policy_label", "Cancellation policy text"))}
+        ${restaurantWizardTextarea("no_show_policy", t("restaurant_no_show_policy_label", "No-show policy text"))}
+        ${restaurantWizardTextarea("confirmation_message", t("restaurant_confirmation_message_label", "Confirmation message"))}
+        ${restaurantWizardTextarea("arrival_instructions", t("restaurant_arrival_instructions_label", "Arrival instructions"))}
+      </fieldset>
+      <fieldset>
+        <legend>${escapeHtml(t("restaurant_onboarding_step_capacity", "Step 5 - Tables and capacity"))}</legend>
+        ${restaurantWizardTextarea("dining_areas", t("restaurant_dining_areas_label", "Dining areas JSON"), '[{"name":"Main dining room","code":"main","capacity":40,"status":"active"}]')}
+        ${restaurantWizardTextarea("tables", t("restaurant_tables_label", "Tables JSON"), '[{"table_identifier":"T1","min_capacity":2,"max_capacity":4,"seating_type":"indoor","is_accessible":true,"status":"active"}]')}
+        ${restaurantWizardTextarea("capacity_overrides", t("restaurant_capacity_overrides_label", "Service-period capacity overrides JSON"), "[]")}
+        <p class="form-note">${escapeHtml(t("restaurant_table_allocation_note", "BASIC stores table and capacity configuration for operations. It does not claim automatic table optimization or exact table assignment."))}</p>
+      </fieldset>
+      <fieldset>
+        <legend>${escapeHtml(t("restaurant_onboarding_step_partner", "Step 6 - Partner access"))}</legend>
+        <label>${escapeHtml(t("restaurant_partner_access_mode_label", "Partner access setup"))}
+          <select name="partner_access_mode">
+            <option value="none_later">${escapeHtml(t("restaurant_partner_access_none", "Create without a partner and invite one later"))}</option>
+            <option value="invite_new">${escapeHtml(t("restaurant_partner_access_invite_new", "Invite a new partner"))}</option>
+            <option value="assign_existing">${escapeHtml(t("restaurant_partner_access_assign_existing", "Assign an existing partner"))}</option>
+          </select>
+        </label>
+        ${restaurantWizardField("partner_full_name", t("restaurant_partner_contact_name_placeholder", "Partner contact name"))}
+        ${restaurantWizardField("partner_email", t("restaurant_partner_email_placeholder", "Partner email"), "", "type=\"email\"")}
+        <label>${escapeHtml(t("restaurant_role_label", "Restaurant-level role"))}
+          <select name="restaurant_role">
+            <option value="owner">${escapeHtml(t("restaurant_role_owner", "Owner"))}</option>
+            <option value="manager">${escapeHtml(t("restaurant_role_manager", "Manager"))}</option>
+            <option value="reservation_staff">${escapeHtml(t("restaurant_role_reservation_staff", "Reservation staff"))}</option>
+            <option value="marketing_staff">${escapeHtml(t("restaurant_role_marketing_staff", "Marketing staff"))}</option>
+            <option value="read_only">${escapeHtml(t("restaurant_role_read_only", "Read only"))}</option>
+          </select>
+        </label>
+        <p class="form-note">${escapeHtml(t("restaurant_partner_access_note", "Partner access uses secure invitations. New partners create their own password; temporary plaintext passwords are never sent."))}</p>
+      </fieldset>
+      <fieldset>
+        <legend>${escapeHtml(t("restaurant_onboarding_step_review", "Step 7 - Review and activation"))}</legend>
+        <label>${escapeHtml(t("restaurant_status_label", "Restaurant status"))}
+          <select name="status">
+            <option value="draft">${escapeHtml(t("restaurant_status_draft", "Draft"))}</option>
+            <option value="pending_review">${escapeHtml(t("restaurant_status_pending_review", "Pending review"))}</option>
+            <option value="active">${escapeHtml(t("restaurant_status_active", "Active"))}</option>
+            <option value="suspended">${escapeHtml(t("restaurant_status_suspended", "Suspended"))}</option>
+            <option value="archived">${escapeHtml(t("restaurant_status_archived", "Archived"))}</option>
+          </select>
+        </label>
+        ${restaurantWizardTextarea("status_reason", t("restaurant_status_reason_label", "Status change reason"))}
+        <label class="check"><input name="activate_confirmed" type="checkbox" value="true"> ${escapeHtml(t("restaurant_activation_confirm_label", "I confirm this restaurant passed the activation review."))}</label>
+        <ul class="restaurant-review-list">
+          <li>${escapeHtml(t("restaurant_review_required_fields", "Required fields complete"))}</li>
+          <li>${escapeHtml(t("restaurant_review_public_profile", "Public profile reviewed"))}</li>
+          <li>${escapeHtml(t("restaurant_review_hours", "Opening hours and service periods reviewed"))}</li>
+          <li>${escapeHtml(t("restaurant_review_reservation_settings", "Reservation settings reviewed"))}</li>
+          <li>${escapeHtml(t("restaurant_review_capacity", "Tables and capacity reviewed"))}</li>
+          <li>${escapeHtml(t("restaurant_review_partner_access", "Partner access status reviewed"))}</li>
+          <li>${escapeHtml(t("restaurant_review_duplicate_warnings", "Duplicate warnings resolved or overridden with an audit reason"))}</li>
+        </ul>
+        <p class="form-note">${escapeHtml(t("restaurant_default_draft_note", "New restaurants default to Draft and stay off the public site until Admin or Super Admin activates them."))}</p>
+      </fieldset>
+      <button class="primary-button" type="submit">${escapeHtml(t("add_restaurant_button", "Add Restaurant"))}</button>
+    </form>
+  `;
+}
+
+function restaurantAdminFilters() {
+  const filters = state.adminRestaurantFilters;
+  return `
+    <form class="admin-restaurant-filters" id="adminRestaurantFilters">
+      <label>${escapeHtml(t("search_label", "Search"))}<input name="search" value="${escapeAttr(filters.search)}" placeholder="${escapeAttr(t("restaurant_search_admin_placeholder", "Name, city, email, cuisine"))}"></label>
+      ${filterSelect("status", t("status_filter_label", "Status"), filters.status, ["draft", "pending_review", "active", "suspended", "archived"].map((status) => ({ value: status, label: restaurantLifecycleLabel(status) })))}
+      ${filterSelect("country", t("country_label", "Country"), filters.country, uniqueRestaurantFilterOptions("country"))}
+      ${filterSelect("city", t("city_label", "City"), filters.city, uniqueRestaurantFilterOptions("city"))}
+      ${filterSelect("district", t("filter_neighborhood_label", "Neighborhood"), filters.district, uniqueRestaurantFilterOptions("district"))}
+      <label>${escapeHtml(t("restaurant_test_filter_label", "Data type"))}
+        <select name="testData">
+          <option value="all">${escapeHtml(t("all_filter_option", "All"))}</option>
+          <option value="production" ${filters.testData === "production" ? "selected" : ""}>${escapeHtml(t("restaurant_filter_production", "Production"))}</option>
+          <option value="test" ${filters.testData === "test" ? "selected" : ""}>${escapeHtml(t("restaurant_filter_test", "Test"))}</option>
+        </select>
+      </label>
+      <label>${escapeHtml(t("sort_label", "Sort"))}
+        <select name="sort">
+          <option value="updated_desc" ${filters.sort === "updated_desc" ? "selected" : ""}>${escapeHtml(t("sort_updated_desc", "Last updated"))}</option>
+          <option value="created_desc" ${filters.sort === "created_desc" ? "selected" : ""}>${escapeHtml(t("sort_created_desc", "Newest"))}</option>
+          <option value="name_asc" ${filters.sort === "name_asc" ? "selected" : ""}>${escapeHtml(t("sort_name_asc", "Name A-Z"))}</option>
+          <option value="status_asc" ${filters.sort === "status_asc" ? "selected" : ""}>${escapeHtml(t("sort_status_asc", "Status"))}</option>
+        </select>
+      </label>
+      <button class="ghost-button" type="button" data-clear-restaurant-filters>${escapeHtml(t("clear_filters_button", "Clear"))}</button>
+    </form>
+  `;
+}
+
+function restaurantAuditHistoryPanel() {
+  if (!state.adminAuditRestaurantId) return "";
+  const restaurant = state.restaurants.find((item) => item.id === state.adminAuditRestaurantId);
+  const logs = state.adminAuditLogs || [];
+  return `
+    <div class="admin-audit-panel" id="admin-restaurant-audit">
+      <div class="section-title-row compact">
+        <div>
+          <span class="section-kicker">${escapeHtml(t("restaurant_audit_history_label", "Audit history"))}</span>
+          <h3>${escapeHtml(restaurant?.name || state.adminAuditRestaurantId)}</h3>
+        </div>
+        <button class="ghost-button" type="button" data-close-restaurant-audit>${escapeHtml(t("close_button", "Close"))}</button>
+      </div>
+      ${logs.length ? `
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>${escapeHtml(t("audit_action_label", "Action"))}</th><th>${escapeHtml(t("audit_actor_label", "Actor"))}</th><th>${escapeHtml(t("audit_result_label", "Result"))}</th><th>${escapeHtml(t("updated_at_label", "Updated"))}</th></tr></thead>
+            <tbody>
+              ${logs.map((log) => `
+                <tr>
+                  <td>${escapeHtml(log.action || log.metadata?.action || "")}</td>
+                  <td>${escapeHtml(log.actor_role || "")}<br><span class="muted">${escapeHtml(log.actor_user_id || "")}</span></td>
+                  <td>${statusBadge(log.success === false ? "failed" : "success", log.success === false ? t("failed_label", "Failed") : t("success_label", "Success"))}</td>
+                  <td>${escapeHtml(formatDate(log.created_at || log.timestamp || ""))}</td>
+                </tr>
+              `).join("")}
+            </tbody>
+          </table>
+        </div>
+      ` : `<div class="empty-state">${escapeHtml(t("restaurant_audit_empty", "No audit events loaded for this restaurant yet."))}</div>`}
+    </div>
+  `;
+}
+
+function jsonForTextarea(value, fallback = []) {
+  try {
+    return JSON.stringify(value && value.length !== undefined ? value : fallback, null, 2);
+  } catch {
+    return JSON.stringify(fallback, null, 2);
+  }
+}
+
+function restaurantReadinessPanel(readiness = {}) {
+  const checks = [...(readiness.checks || []), ...(readiness.warnings || [])];
+  if (!checks.length) return `<div class="empty-state">${escapeHtml(t("restaurant_readiness_empty", "Readiness checks are not available."))}</div>`;
+  return `
+    <ul class="restaurant-readiness-list">
+      ${checks.map((item) => `<li class="${item.pass ? "pass" : "warn"}"><span>${item.pass ? "PASS" : "CHECK"}</span>${escapeHtml(item.label || item.key)}</li>`).join("")}
+    </ul>
+  `;
+}
+
+function restaurantDetailTabButton(tab, label) {
+  const active = state.adminRestaurantDetailTab === tab;
+  return `<button class="ghost-button ${active ? "active" : ""}" type="button" data-restaurant-detail-tab="${escapeAttr(tab)}">${escapeHtml(label)}</button>`;
+}
+
+function restaurantDetailOverview(detail) {
+  const restaurant = detail.restaurant || {};
+  return `
+    <div class="restaurant-detail-grid">
+      <div>
+        <h4>${escapeHtml(t("restaurant_detail_overview_title", "Overview"))}</h4>
+        <p>${restaurantLifecycleBadge(restaurant)} ${restaurant.is_test_data || restaurant.is_test_restaurant ? statusBadge("test", t("test_data_badge", "TEST DATA")) : ""}</p>
+        <p>${escapeHtml(t("restaurant_profile_completeness_label", "Profile completeness"))}: ${escapeHtml(restaurant.profile_completeness_percent || 0)}%</p>
+        <p>${escapeHtml(t("active_partners_label", "Active partner users"))}: ${escapeHtml(restaurant.assigned_partner_count || 0)}</p>
+        <p>${escapeHtml(t("pending_invitations_label", "Pending invitations"))}: ${escapeHtml(restaurant.pending_invitation_count || 0)}</p>
+        <p>${escapeHtml(t("active_offer_count_label", "{{count}} active offers").replace("{{count}}", restaurant.active_offer_count || 0))}</p>
+        <p>${escapeHtml(t("upcoming_reservation_count_label", "{{count}} upcoming reservations").replace("{{count}}", restaurant.upcoming_reservation_count || 0))}</p>
+        <p>${escapeHtml(t("created_at_label", "Created"))}: ${escapeHtml(formatDate(restaurant.created_at))}</p>
+        <p>${escapeHtml(t("updated_at_label", "Updated"))}: ${escapeHtml(formatDate(restaurant.updated_at))}</p>
+      </div>
+      <div>
+        <h4>${escapeHtml(t("restaurant_activation_readiness_title", "Activation readiness"))}</h4>
+        ${restaurantReadinessPanel(detail.readiness)}
+      </div>
+    </div>
+  `;
+}
+
+function restaurantDetailProfile(detail) {
+  const restaurant = detail.restaurant || {};
+  return `
+    <div class="restaurant-detail-grid">
+      <p><strong>${escapeHtml(t("restaurant_slug_label", "Public slug"))}</strong><br>${escapeHtml(restaurant.slug || t("not_available_label", "Not available"))}</p>
+      <p><strong>${escapeHtml(t("filter_cuisine_label", "Cuisine"))}</strong><br>${escapeHtml(restaurant.cuisine_type || restaurant.cuisine || "")}</p>
+      <p><strong>${escapeHtml(t("price_level_label", "Price level"))}</strong><br>${escapeHtml(restaurant.price_level || restaurant.price_range || "")}</p>
+      <p><strong>${escapeHtml(t("restaurant_visible_label", "Visible on guest site"))}</strong><br>${escapeHtml(String(restaurant.visible_on_guest_site === true))}</p>
+      <p><strong>${escapeHtml(t("seo_title_label", "SEO title"))}</strong><br>${escapeHtml(restaurant.seo_title || "")}</p>
+      <p><strong>${escapeHtml(t("seo_description_label", "SEO description"))}</strong><br>${escapeHtml(restaurant.seo_description || "")}</p>
+    </div>
+  `;
+}
+
+function restaurantDetailHours(detail) {
+  const restaurant = detail.restaurant || {};
+  return `
+    <div class="restaurant-detail-grid">
+      <p><strong>${escapeHtml(t("timezone_label", "Timezone"))}</strong><br>${escapeHtml(restaurant.primary_timezone || restaurant.timezone || "")}</p>
+      <p><strong>${escapeHtml(t("restaurant_interval_label", "Reservation interval minutes"))}</strong><br>${escapeHtml(restaurant.reservation_interval_minutes || "")}</p>
+      <p><strong>${escapeHtml(t("restaurant_booking_horizon_label", "Maximum booking horizon days"))}</strong><br>${escapeHtml(restaurant.booking_horizon_days || "")}</p>
+      <pre class="admin-json-preview">${escapeHtml(jsonForTextarea(restaurant.service_periods || []))}</pre>
+    </div>
+  `;
+}
+
+function restaurantDetailReservationSettings(detail) {
+  const restaurant = detail.restaurant || {};
+  return `
+    <div class="restaurant-detail-grid">
+      <p><strong>${escapeHtml(t("restaurant_acceptance_mode_label", "Reservation acceptance mode"))}</strong><br>${escapeHtml(restaurant.reservation_acceptance_mode || "manual")}</p>
+      <p><strong>${escapeHtml(t("restaurant_min_party_size_label", "Minimum party size"))}</strong><br>${escapeHtml(restaurant.min_party_size || 1)}</p>
+      <p><strong>${escapeHtml(t("restaurant_max_party_size_label", "Maximum party size"))}</strong><br>${escapeHtml(restaurant.max_party_size || 8)}</p>
+      <p><strong>${escapeHtml(t("restaurant_accepts_reservation_requests", "Accept reservation requests"))}</strong><br>${escapeHtml(String(restaurant.accepts_reservation_requests !== false))}</p>
+      <p><strong>${escapeHtml(t("restaurant_cancellation_policy_label", "Cancellation policy text"))}</strong><br>${escapeHtml(restaurant.cancellation_policy || "")}</p>
+      <p><strong>${escapeHtml(t("restaurant_arrival_instructions_label", "Arrival instructions"))}</strong><br>${escapeHtml(restaurant.arrival_instructions || "")}</p>
+    </div>
+  `;
+}
+
+function restaurantCapacityDetailPanel(detail) {
+  const capacity = detail.capacity || {};
+  return `
+    <div class="restaurant-detail-grid">
+      <p><strong>${escapeHtml(t("restaurant_table_config_status_label", "Table configuration"))}</strong><br>${statusBadge(capacity.table_configuration_status || "not_configured")}</p>
+      <p><strong>${escapeHtml(t("restaurant_total_capacity_label", "Restaurant total capacity"))}</strong><br>${escapeHtml(capacity.restaurant_total_capacity || 0)}</p>
+      <p><strong>${escapeHtml(t("restaurant_active_tables_label", "Active tables"))}</strong><br>${escapeHtml(capacity.active_table_count || 0)}</p>
+      <p><strong>${escapeHtml(t("restaurant_active_areas_label", "Active dining areas"))}</strong><br>${escapeHtml(capacity.active_dining_area_count || 0)}</p>
+    </div>
+    <p class="form-note">${escapeHtml(t("restaurant_table_allocation_note", "BASIC stores table and capacity configuration for operations. It does not claim automatic table optimization or exact table assignment."))}</p>
+    <form class="mini-form admin-form capacity-editor" id="restaurantCapacityForm">
+      <input type="hidden" name="restaurant_id" value="${escapeAttr(detail.restaurant?.id || "")}">
+      ${restaurantWizardTextarea("dining_areas", t("restaurant_dining_areas_label", "Dining areas JSON"), jsonForTextarea(detail.dining_areas || []))}
+      ${restaurantWizardTextarea("tables", t("restaurant_tables_label", "Tables JSON"), jsonForTextarea(detail.tables || []))}
+      ${restaurantWizardTextarea("capacity_overrides", t("restaurant_capacity_overrides_label", "Service-period capacity overrides JSON"), jsonForTextarea(detail.capacity_overrides || []))}
+      <button class="primary-button" type="submit">${escapeHtml(t("save_capacity_button", "Save capacity configuration"))}</button>
+    </form>
+  `;
+}
+
+function restaurantPartnerAccessDetailPanel(detail) {
+  const access = detail.partner_access || [];
+  const invitations = detail.invitations || [];
+  return `
+    ${access.length ? `
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>${escapeHtml(t("partner_label", "Partner"))}</th><th>${escapeHtml(t("restaurant_role_label", "Restaurant-level role"))}</th><th>${escapeHtml(t("status_label", "Status"))}</th><th>${escapeHtml(t("actions_label", "Actions"))}</th></tr></thead>
+          <tbody>
+            ${access.map((row) => `
+              <tr>
+                <td>${escapeHtml(row.full_name || row.email || row.user_id || "")}<br><span class="muted">${escapeHtml(row.email || row.user_id || "")}</span></td>
+                <td>
+                  <select data-restaurant-access-role="${escapeAttr(row.id)}" aria-label="${escapeAttr(t("restaurant_role_label", "Restaurant-level role"))}">
+                    ${["owner", "manager", "reservation_staff", "marketing_staff", "read_only"].map((role) => `<option value="${escapeAttr(role)}" ${role === row.role ? "selected" : ""}>${escapeHtml(t(`restaurant_role_${role}`, role.replace("_", " ")))}</option>`).join("")}
+                  </select>
+                </td>
+                <td>${statusBadge(row.status || "active")}</td>
+                <td>
+                  <div class="button-row">
+                    <button class="ghost-button" type="button" data-restaurant-access-action="change_restaurant_role" data-restaurant-access-id="${escapeAttr(row.id)}">${escapeHtml(t("change_role_button", "Change role"))}</button>
+                    ${row.status === "active" ? `<button class="ghost-button warning" type="button" data-restaurant-access-action="deactivate_restaurant_access" data-restaurant-access-id="${escapeAttr(row.id)}">${escapeHtml(t("deactivate_access_button", "Deactivate access"))}</button>` : `<button class="ghost-button" type="button" data-restaurant-access-action="reactivate_restaurant_access" data-restaurant-access-id="${escapeAttr(row.id)}">${escapeHtml(t("reactivate_access_button", "Reactivate access"))}</button>`}
+                    <button class="ghost-button danger" type="button" data-restaurant-access-action="remove_restaurant_access" data-restaurant-access-id="${escapeAttr(row.id)}">${escapeHtml(t("remove_access_button", "Remove access"))}</button>
+                  </div>
+                </td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
+      </div>
+    ` : `<div class="empty-state">${escapeHtml(t("restaurant_access_empty", "No partner access assignments yet."))}</div>`}
+    <h4>${escapeHtml(t("partner_invitations_label", "Partner invitations"))}</h4>
+    ${invitations.length ? `<div class="status-list">${invitations.map((item) => `<span>${escapeHtml(item.email)} ${statusBadge(item.status || "pending")}</span>`).join("")}</div>` : `<p class="muted">${escapeHtml(t("partner_invitations_empty", "No partner invitations for this restaurant."))}</p>`}
+  `;
+}
+
+function restaurantRowsTable(rows = [], emptyLabel = "No records available.") {
+  if (!rows.length) return `<div class="empty-state">${escapeHtml(emptyLabel)}</div>`;
+  const keys = Object.keys(rows[0]).slice(0, 6);
+  return `<div class="table-wrap"><table><thead><tr>${keys.map((key) => `<th>${escapeHtml(key)}</th>`).join("")}</tr></thead><tbody>${rows.map((row) => `<tr>${keys.map((key) => `<td>${escapeHtml(String(row[key] ?? ""))}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`;
+}
+
+function restaurantSystemStatusPanel(detail) {
+  return `
+    <h4>${escapeHtml(t("restaurant_status_history_title", "Status history"))}</h4>
+    ${restaurantRowsTable(detail.status_history || [], t("restaurant_status_history_empty", "No status history has been recorded yet."))}
+    <h4>${escapeHtml(t("restaurant_system_status_title", "System status"))}</h4>
+    <pre class="admin-json-preview">${escapeHtml(JSON.stringify(detail.system_status || {}, null, 2))}</pre>
+  `;
+}
+
+function restaurantDetailPanel() {
+  const detail = state.adminRestaurantDetail;
+  if (!detail?.restaurant) return "";
+  const restaurant = detail.restaurant;
+  const tabs = [
+    ["overview", t("restaurant_tab_overview", "Overview")],
+    ["profile", t("restaurant_tab_public_profile", "Public Profile")],
+    ["hours", t("restaurant_tab_hours", "Hours")],
+    ["reservations", t("restaurant_tab_reservation_settings", "Reservation Settings")],
+    ["capacity", t("restaurant_tab_tables_capacity", "Tables and Capacity")],
+    ["access", t("restaurant_tab_partner_access", "Partner Access")],
+    ["offers", t("restaurant_tab_offers", "Offers")],
+    ["reservation_rows", t("restaurant_tab_reservations", "Reservations")],
+    ["audit", t("restaurant_tab_audit", "Audit History")],
+    ["system", t("restaurant_tab_system", "System Status")]
+  ];
+  const tab = state.adminRestaurantDetailTab;
+  const body = tab === "profile" ? restaurantDetailProfile(detail)
+    : tab === "hours" ? restaurantDetailHours(detail)
+      : tab === "reservations" ? restaurantDetailReservationSettings(detail)
+        : tab === "capacity" ? restaurantCapacityDetailPanel(detail)
+          : tab === "access" ? restaurantPartnerAccessDetailPanel(detail)
+            : tab === "offers" ? restaurantRowsTable(detail.offers || [], t("no_offers_yet", "No offers yet."))
+              : tab === "reservation_rows" ? restaurantRowsTable(detail.reservations || [], t("reservations_empty", "No reservations yet."))
+                : tab === "audit" ? restaurantRowsTable(detail.audit_logs || [], t("restaurant_audit_empty", "No audit events loaded for this restaurant yet."))
+                  : tab === "system" ? restaurantSystemStatusPanel(detail)
+                    : restaurantDetailOverview(detail);
+  return `
+    <div class="admin-restaurant-detail" id="admin-restaurant-detail">
+      <div class="section-title-row compact">
+        <div>
+          <span class="section-kicker">${escapeHtml(t("restaurant_detail_label", "Restaurant detail"))}</span>
+          <h3>${escapeHtml(restaurant.name || restaurant.id)}</h3>
+        </div>
+        <button class="ghost-button" type="button" data-close-restaurant-detail>${escapeHtml(t("close_button", "Close"))}</button>
+      </div>
+      <div class="restaurant-detail-tabs" role="tablist" aria-label="${escapeAttr(t("restaurant_detail_tabs_label", "Restaurant detail tabs"))}">
+        ${tabs.map(([key, label]) => restaurantDetailTabButton(key, label)).join("")}
+      </div>
+      <div class="restaurant-detail-body">${body}</div>
+    </div>
+  `;
+}
+
+function restaurantAdminPanel(includeAudit = true) {
+  return `
+    <article class="panel wide-panel" id="admin-restaurants">
+      <div class="section-title-row compact">
+        <div>
+          <span class="section-kicker">${escapeHtml(t("admin_nav_restaurants", "Restaurants"))}</span>
+          <h2>${escapeHtml(t("admin_restaurants_title", "Manage restaurants"))}</h2>
+        </div>
+        <button class="primary-button" type="button" data-focus-restaurant-form>${escapeHtml(t("add_restaurant_button", "Add Restaurant"))}</button>
+      </div>
+      <p class="form-note">${escapeHtml(t("restaurant_admin_scope_note", "Admins can create restaurants in Draft, invite partners, manage lifecycle status, and review audit history without manual SQL editing."))}</p>
+      ${restaurantOnboardingWizard()}
+      ${restaurantAdminFilters()}
+      ${restaurantTable()}
+      ${restaurantDetailPanel()}
+      ${includeAudit ? restaurantAuditHistoryPanel() : ""}
+    </article>
+  `;
+}
+
 function restaurantTable() {
-  if (!state.restaurants.length) return '<div class="empty-state">No restaurants yet.</div>';
-  const showAiControls = canShowFeature("ai.adminAIControls", { allowDemo: true });
+  if (!state.restaurants.length) return `<div class="empty-state">${escapeHtml(t("restaurants_empty_admin", "No restaurants yet."))}</div>`;
+  const filtered = filteredAdminRestaurants();
+  const totalPages = Math.max(1, Math.ceil(filtered.length / state.adminRestaurantPageSize));
+  state.adminRestaurantPage = Math.min(Math.max(1, state.adminRestaurantPage), totalPages);
+  const start = (state.adminRestaurantPage - 1) * state.adminRestaurantPageSize;
+  const rows = filtered.slice(start, start + state.adminRestaurantPageSize);
+  return `
+    <div class="status-title-row restaurant-list-summary">
+      <span>${escapeHtml(contentTemplate("restaurant_list_count", "{{count}} restaurants", { count: filtered.length }))}</span>
+      <span class="muted">${escapeHtml(contentTemplate("restaurant_page_count", "Page {{page}} of {{pages}}", { page: state.adminRestaurantPage, pages: totalPages }))}</span>
+    </div>
+    <div class="table-wrap">
+      <table class="admin-restaurant-table">
+        <thead><tr><th>${escapeHtml(t("restaurant_label", "Restaurant"))}</th><th>${escapeHtml(t("location_label", "Location"))}</th><th>${escapeHtml(t("restaurant_metrics_label", "Metrics"))}</th><th>${escapeHtml(t("status_label", "Status"))}</th><th>${escapeHtml(t("actions_label", "Actions"))}</th></tr></thead>
+        <tbody>
+          ${rows.map((restaurant) => {
+            const lifecycle = adminRestaurantLifecycleStatus(restaurant);
+            const highlightClass = String(state.adminRestaurantHighlightId || "") === String(restaurant.id || "") ? " admin-created-restaurant-highlight" : "";
+            return `
+            <tr class="admin-restaurant-row${highlightClass}" data-restaurant-row="${escapeAttr(restaurant.id)}">
+              <td>
+                <input data-field="name" value="${escapeAttr(restaurant.name)}" aria-label="Restaurant name">
+                <input data-field="slug" value="${escapeAttr(restaurant.slug || "")}" aria-label="${escapeAttr(t("restaurant_slug_label", "Public slug"))}" placeholder="${escapeAttr(t("restaurant_slug_label", "Public slug"))}">
+                <input data-field="legal_name" value="${escapeAttr(restaurant.legal_name || "")}" aria-label="${escapeAttr(t("restaurant_legal_name_label", "Legal business name"))}">
+                <input data-field="email" value="${escapeAttr(restaurant.email || restaurant.contact_email || "")}" aria-label="Restaurant email">
+                <input data-field="cuisine_type" value="${escapeAttr(restaurant.cuisine_type || restaurant.cuisine || "")}" aria-label="Cuisine">
+                ${restaurant.is_test_data || restaurant.is_test_restaurant ? statusBadge("test", t("test_data_badge", "TEST DATA")) : ""}
+              </td>
+              <td>
+                <input data-field="address" value="${escapeAttr(restaurant.address || "")}" aria-label="Address">
+                <input data-field="city" value="${escapeAttr(restaurant.city || "")}" placeholder="${escapeAttr(t("city_label", "City"))}">
+                <input data-field="district" value="${escapeAttr(restaurant.district || "")}" placeholder="Neighborhood">
+                <input data-field="country" value="${escapeAttr(restaurant.country || "")}" placeholder="${escapeAttr(t("country_label", "Country"))}">
+                <input data-field="latitude" type="number" step="0.000001" value="${escapeAttr(restaurant.latitude ?? "")}" placeholder="Latitude">
+                <input data-field="longitude" type="number" step="0.000001" value="${escapeAttr(restaurant.longitude ?? "")}" placeholder="Longitude">
+              </td>
+              <td>
+                <span>${escapeHtml(contentTemplate("partner_count_label", "{{count}} partners", { count: restaurant.assigned_partner_count || 0 }))}</span>
+                <span>${escapeHtml(contentTemplate("active_offer_count_label", "{{count}} active offers", { count: restaurant.active_offer_count || 0 }))}</span>
+                <span>${escapeHtml(contentTemplate("upcoming_reservation_count_label", "{{count}} upcoming reservations", { count: restaurant.upcoming_reservation_count || 0 }))}</span>
+                <span class="muted">${escapeHtml(t("created_at_label", "Created"))}: ${escapeHtml(formatDate(restaurant.created_at))}</span>
+                <span class="muted">${escapeHtml(t("updated_at_label", "Updated"))}: ${escapeHtml(formatDate(restaurant.updated_at))}</span>
+              </td>
+              <td>
+                ${restaurantLifecycleBadge(restaurant)}
+                <select data-field="status" aria-label="${escapeAttr(t("restaurant_status_label", "Restaurant status"))}">
+                  <option value="draft" ${lifecycle === "draft" ? "selected" : ""}>${escapeHtml(t("restaurant_status_draft", "Draft"))}</option>
+                  <option value="pending_review" ${lifecycle === "pending_review" ? "selected" : ""}>${escapeHtml(t("restaurant_status_pending_review", "Pending review"))}</option>
+                  <option value="active" ${lifecycle === "active" ? "selected" : ""}>${escapeHtml(t("restaurant_status_active", "Active"))}</option>
+                  <option value="suspended" ${lifecycle === "suspended" ? "selected" : ""}>${escapeHtml(t("restaurant_status_suspended", "Suspended"))}</option>
+                  <option value="archived" ${lifecycle === "archived" ? "selected" : ""}>${escapeHtml(t("restaurant_status_archived", "Archived"))}</option>
+                </select>
+              </td>
+              <td>
+                <div class="button-row">
+                  <button class="ghost-button" data-view-restaurant="${escapeAttr(restaurant.id)}" type="button">${escapeHtml(t("view_button", "View"))}</button>
+                  <button class="ghost-button" data-save-restaurant="${escapeAttr(restaurant.id)}" type="button">${escapeHtml(t("save_button", "Save"))}</button>
+                  <button class="ghost-button" data-invite-restaurant="${escapeAttr(restaurant.id)}" type="button">${escapeHtml(t("invite_partner_button", "Invite Partner"))}</button>
+                  <button class="ghost-button" data-manage-restaurant-access="${escapeAttr(restaurant.id)}" type="button">${escapeHtml(t("manage_access_button", "Manage Access"))}</button>
+                  ${lifecycle !== "active" ? `<button class="ghost-button" data-restaurant-status-action="${escapeAttr(restaurant.id)}" data-next-status="active" type="button">${escapeHtml(t("activate_button", "Activate"))}</button>` : ""}
+                  ${lifecycle !== "suspended" ? `<button class="ghost-button danger" data-restaurant-status-action="${escapeAttr(restaurant.id)}" data-next-status="suspended" type="button">${escapeHtml(t("suspend_button", "Suspend"))}</button>` : ""}
+                  ${lifecycle !== "archived" ? `<button class="ghost-button danger" data-restaurant-status-action="${escapeAttr(restaurant.id)}" data-next-status="archived" type="button">${escapeHtml(t("archive_button", "Archive"))}</button>` : ""}
+                  ${["suspended", "archived"].includes(lifecycle) ? `<button class="ghost-button" data-restaurant-status-action="${escapeAttr(restaurant.id)}" data-next-status="active" type="button">${escapeHtml(t("reactivate_button", "Reactivate"))}</button>` : ""}
+                  <button class="ghost-button" data-restaurant-audit="${escapeAttr(restaurant.id)}" type="button">${escapeHtml(t("view_audit_history_button", "View Audit History"))}</button>
+                </div>
+              </td>
+            </tr>
+          `; }).join("")}
+        </tbody>
+      </table>
+    </div>
+    <div class="pagination-row">
+      <button class="ghost-button" type="button" data-restaurant-page="prev" ${state.adminRestaurantPage <= 1 ? "disabled" : ""}>${escapeHtml(t("previous_button", "Previous"))}</button>
+      <span>${escapeHtml(contentTemplate("restaurant_page_count", "Page {{page}} of {{pages}}", { page: state.adminRestaurantPage, pages: totalPages }))}</span>
+      <button class="ghost-button" type="button" data-restaurant-page="next" ${state.adminRestaurantPage >= totalPages ? "disabled" : ""}>${escapeHtml(t("next_button", "Next"))}</button>
+    </div>
+  `;
+}
+
+function partnerTable() {
+  if (!state.partners.length) return '<div class="empty-state">No partner accounts yet.</div>';
   return `
     <div class="table-wrap">
       <table>
-        <thead><tr><th>Restaurant</th><th>Order / map</th><th>Social / images</th>${showAiControls ? "<th>AI guardrails</th>" : ""}<th>Status</th><th>Billing</th><th></th></tr></thead>
+        <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Invitation</th><th>Restaurant</th><th>${escapeHtml(t("actions_label", "Actions"))}</th></tr></thead>
         <tbody>
-          ${state.restaurants.map((restaurant) => `
-            <tr class="admin-restaurant-row" data-restaurant-row="${escapeAttr(restaurant.id)}">
-              <td>
-                <input data-field="name" value="${escapeAttr(restaurant.name)}" aria-label="Restaurant name">
-                <input data-field="email" value="${escapeAttr(restaurant.email || restaurant.contact_email || "")}" aria-label="Restaurant email">
-                <input data-field="address" value="${escapeAttr(restaurant.address || "")}" aria-label="Address">
-                <input data-field="cuisine_type" value="${escapeAttr(restaurant.cuisine_type || restaurant.cuisine || "")}" aria-label="Cuisine">
-                <input data-field="rating" type="number" min="0" max="5" step="0.1" value="${escapeAttr(restaurant.rating || 4.5)}" aria-label="Rating">
-              </td>
-              <td>
-                <input data-field="sort_order" type="number" min="0" value="${escapeAttr(restaurant.sort_order ?? "")}" placeholder="Sort order">
-                <input data-field="district" value="${escapeAttr(restaurant.district || "")}" placeholder="Neighborhood">
-                <input data-field="latitude" type="number" step="0.000001" value="${escapeAttr(restaurant.latitude ?? "")}" placeholder="Latitude">
-                <input data-field="longitude" type="number" step="0.000001" value="${escapeAttr(restaurant.longitude ?? "")}" placeholder="Longitude">
-                <input data-field="google_place_id" value="${escapeAttr(restaurant.google_place_id || "")}" placeholder="Google Place ID">
-              </td>
-              <td>
-                <input data-field="website" value="${escapeAttr(restaurant.website || "")}" placeholder="Website">
-                <input data-field="instagram" value="${escapeAttr(restaurant.instagram || "")}" placeholder="Instagram">
-                <input data-field="facebook" value="${escapeAttr(restaurant.facebook || "")}" placeholder="Facebook">
-                <input data-field="tiktok" value="${escapeAttr(restaurant.tiktok || "")}" placeholder="TikTok">
-                <input data-field="google_maps_url" value="${escapeAttr(restaurant.google_maps_url || "")}" placeholder="Google Maps">
-                <input data-field="card_image" value="${escapeAttr(restaurant.card_image || restaurant.cover_image || "")}" placeholder="Card image URL">
-              </td>
-              ${showAiControls ? `<td>
-                <select data-field="ai_discount_enabled">
-                  <option value="true" ${restaurant.ai_discount_enabled !== false ? "selected" : ""}>enabled</option>
-                  <option value="false" ${restaurant.ai_discount_enabled === false ? "selected" : ""}>disabled</option>
-                </select>
-                <input data-field="min_discount_percent" type="number" min="0" max="90" value="${escapeAttr(restaurant.min_discount_percent ?? 10)}" placeholder="Min discount %">
-                <input data-field="max_discount_percent" type="number" min="0" max="90" value="${escapeAttr(restaurant.max_discount_percent ?? 30)}" placeholder="Max discount %">
-                <input data-field="target_margin_percent" type="number" min="0" max="100" step="0.1" value="${escapeAttr(restaurant.target_margin_percent ?? 65)}" placeholder="Target margin %">
-                <input data-field="average_service_minutes" type="number" min="15" value="${escapeAttr(restaurant.average_service_minutes ?? 75)}" placeholder="Service minutes">
-              </td>` : ""}
-              <td>
-                ${statusBadge(restaurant.status)}
-                <select data-field="status">
-                  <option value="pending" ${restaurant.status === "pending" ? "selected" : ""}>pending</option>
-                  <option value="approved" ${restaurant.status === "approved" ? "selected" : ""}>approved</option>
-                  <option value="suspended" ${restaurant.status === "suspended" ? "selected" : ""}>suspended</option>
-                </select>
-              </td>
-              <td>${escapeHtml(restaurant.billing_plan || "free")}<br><span class="muted">${escapeHtml(restaurant.billing_status || "trialing")}</span></td>
+          ${state.partners.map((partner) => `
+            <tr>
+              <td>${escapeHtml(partner.full_name || "Partner")}</td>
+              <td>${escapeHtml(partner.email)}</td>
+              <td>${statusBadge(normalizeRole(partner.role))}<br><span class="muted">${escapeHtml(partner.restaurant_role || "")}</span></td>
+              <td>${statusBadge(partner.invitation_status || partner.status || "active")}</td>
+              <td>${escapeHtml(partner.restaurant_id || "Not linked")}</td>
               <td>
                 <div class="button-row">
-                  <button class="ghost-button" data-save-restaurant="${escapeAttr(restaurant.id)}" type="button">Save</button>
-                  ${restaurant.status !== "approved" ? `<button class="ghost-button" data-approve="${escapeAttr(restaurant.id)}" type="button">Approve</button>` : ""}
-                  <button class="ghost-button danger" data-disable-restaurant="${escapeAttr(restaurant.id)}" type="button">Disable</button>
+                  ${partnerInvitationActions(partner)}
+                  <button class="ghost-button" data-view-as-partner="${escapeAttr(partner.id)}" type="button">${escapeHtml(t("view_as_partner_button", "View as partner"))}</button>
                 </div>
               </td>
             </tr>
@@ -6968,25 +12508,13 @@ function restaurantTable() {
   `;
 }
 
-function partnerTable() {
-  if (!state.partners.length) return '<div class="empty-state">No partner accounts yet.</div>';
+function partnerInvitationActions(partner) {
+  const status = normalizedStatus(partner.invitation_status || partner.status || "active");
+  if (!["pending", "expired"].includes(status)) return "";
+  const invitationId = partner.invitation_id || partner.id;
   return `
-    <div class="table-wrap">
-      <table>
-        <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Restaurant</th>${isSuperAdmin() ? "<th></th>" : ""}</tr></thead>
-        <tbody>
-          ${state.partners.map((partner) => `
-            <tr>
-              <td>${escapeHtml(partner.full_name || "Partner")}</td>
-              <td>${escapeHtml(partner.email)}</td>
-              <td>${statusBadge(normalizeRole(partner.role))}</td>
-              <td>${escapeHtml(partner.restaurant_id || "Not linked")}</td>
-              ${isSuperAdmin() ? `<td><button class="ghost-button" data-view-as-partner="${escapeAttr(partner.id)}" type="button">View as partner</button></td>` : ""}
-            </tr>
-          `).join("")}
-        </tbody>
-      </table>
-    </div>
+    <button class="ghost-button" data-resend-partner-invitation="${escapeAttr(invitationId)}" type="button">${escapeHtml(t("partner_invitation_resend_button", "Resend invitation"))}</button>
+    ${status === "pending" ? `<button class="ghost-button danger" data-revoke-partner-invitation="${escapeAttr(invitationId)}" type="button">${escapeHtml(t("partner_invitation_revoke_button", "Revoke invitation"))}</button>` : ""}
   `;
 }
 
@@ -7069,34 +12597,184 @@ function notificationDropdown() {
   `;
 }
 
-function reviewAdminTable() {
-  if (!state.adminReviews.length) return '<div class="empty-state">No reviews yet.</div>';
+function adminReviewRestaurantOptions() {
+  return [...(state.restaurants || [])]
+    .sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")))
+    .map((restaurant) => [
+      restaurant.id,
+      [restaurant.name, restaurant.city, restaurant.country].filter(Boolean).join(" - ")
+    ]);
+}
+
+function adminReviewLocationOptions(field) {
+  const values = new Set((state.restaurants || []).map((restaurant) => cleanString(restaurant[field])).filter(Boolean));
+  return [...values].sort((a, b) => a.localeCompare(b));
+}
+
+function reviewModerationFilterForm() {
+  const filters = state.adminReviewFilters || {};
+  const restaurants = adminReviewRestaurantOptions();
+  const countries = adminReviewLocationOptions("country");
+  const cities = adminReviewLocationOptions("city");
+  const statusOptions = [
+    ["all", t("review_status_all", "All review statuses")],
+    ["pending_moderation", t("review_status_pending_moderation", "Pending moderation")],
+    ["published", t("review_status_published", "Published")],
+    ["approved", t("review_status_approved", "Approved")],
+    ["rejected", t("review_status_rejected", "Rejected")],
+    ["removed", t("review_status_removed", "Removed")]
+  ];
+  const photoStatusOptions = [
+    ["all", t("review_photo_status_all", "All photo statuses")],
+    ["has_photos", t("review_photo_status_has_photos", "Has photos")],
+    ["no_photos", t("review_photo_status_no_photos", "No photos")],
+    ["pending_moderation", t("review_status_pending_moderation", "Pending moderation")],
+    ["published", t("review_status_published", "Published")],
+    ["rejected", t("review_status_rejected", "Rejected")],
+    ["removed", t("review_status_removed", "Removed")]
+  ];
   return `
-    <div class="table-wrap">
-      <table>
-        <thead><tr><th>Restaurant</th><th>Guest</th><th>Ratings</th><th>Comment</th><th>Status</th><th></th></tr></thead>
+    <form class="mini-form admin-review-filter-form" id="adminReviewFilters">
+      <div class="section-title-row compact">
+        <div>
+          <span class="section-kicker">${escapeHtml(t("admin_review_filters_kicker", "Filters"))}</span>
+          <h3>${escapeHtml(t("admin_review_filters_title", "Find reviews quickly"))}</h3>
+        </div>
+      </div>
+      <input name="search" value="${escapeAttr(filters.search || "")}" placeholder="${escapeAttr(t("admin_review_search_placeholder", "Search restaurant, guest, note, reservation reference"))}" aria-label="${escapeAttr(t("admin_review_search_label", "Search reviews"))}">
+      <label>${escapeHtml(t("restaurant_label", "Restaurant"))}
+        <select name="restaurant_id">
+          <option value="all">${escapeHtml(t("all_restaurants_label", "All restaurants"))}</option>
+          ${restaurants.map(([value, label]) => `<option value="${escapeAttr(value)}" ${filters.restaurant_id === value ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}
+        </select>
+      </label>
+      <label>${escapeHtml(t("country_label", "Country"))}
+        <select name="country">
+          <option value="all">${escapeHtml(t("all_countries_label", "All countries"))}</option>
+          ${countries.map((value) => `<option value="${escapeAttr(value)}" ${filters.country === value ? "selected" : ""}>${escapeHtml(value)}</option>`).join("")}
+        </select>
+      </label>
+      <label>${escapeHtml(t("city_label", "City"))}
+        <select name="city">
+          <option value="all">${escapeHtml(t("all_cities_label", "All cities"))}</option>
+          ${cities.map((value) => `<option value="${escapeAttr(value)}" ${filters.city === value ? "selected" : ""}>${escapeHtml(value)}</option>`).join("")}
+        </select>
+      </label>
+      <label>${escapeHtml(t("status_label", "Status"))}
+        <select name="status">
+          ${statusOptions.map(([value, label]) => `<option value="${escapeAttr(value)}" ${filters.status === value ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}
+        </select>
+      </label>
+      <label>${escapeHtml(t("review_photos_label", "Photos"))}
+        <select name="photo_status">
+          ${photoStatusOptions.map(([value, label]) => `<option value="${escapeAttr(value)}" ${filters.photo_status === value ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}
+        </select>
+      </label>
+      <label>${escapeHtml(t("review_page_size_label", "Rows per page"))}
+        <select name="page_size">
+          ${["25", "50", "100"].map((value) => `<option value="${escapeAttr(value)}" ${String(filters.page_size || "25") === value ? "selected" : ""}>${escapeHtml(value)}</option>`).join("")}
+        </select>
+      </label>
+      <div class="button-row">
+        <button class="primary-button" type="submit">${escapeHtml(t("apply_filters_button", "Apply filters"))}</button>
+        <button class="ghost-button" data-clear-admin-review-filters type="button">${escapeHtml(t("clear_filters_button", "Clear"))}</button>
+      </div>
+    </form>
+  `;
+}
+
+function reviewAdminTable() {
+  const pagination = state.adminReviewPagination || {};
+  const page = Number(pagination.page || 1);
+  const totalPages = Number(pagination.total_pages || 1);
+  const total = Number(pagination.total || state.adminReviews.length || 0);
+  const restaurantLabel = t("restaurant_label", "Restaurant");
+  const guestLabel = t("guest_label", "Guest");
+  const ratingsLabel = t("review_ratings_label", "Ratings");
+  const commentLabel = t("review_comment_label", "Comment");
+  const responseLabel = t("partner_review_response_title", "Restaurant response");
+  const photosLabel = t("review_photos_label", "Photos");
+  const statusLabel = t("status_label", "Status");
+  const actionsLabel = t("actions_label", "Actions");
+  const footer = `
+    <div class="analytics-pagination admin-review-pagination" aria-label="${escapeAttr(t("admin_reviews_pagination_label", "Review moderation pagination"))}">
+      <span>${escapeHtml(contentTemplate("admin_reviews_pagination_summary", "{{total}} reviews - page {{page}} of {{total_pages}}", { total, page, total_pages: totalPages }))}</span>
+      <div class="button-row compact">
+        <button class="ghost-button" data-admin-review-page="${page - 1}" type="button" ${page <= 1 ? "disabled" : ""}>${escapeHtml(t("previous_page_button", "Previous"))}</button>
+        <button class="ghost-button" data-admin-review-page="${page + 1}" type="button" ${page >= totalPages ? "disabled" : ""}>${escapeHtml(t("next_page_button", "Next"))}</button>
+      </div>
+    </div>
+  `;
+  if (!state.adminReviews.length) return `<div class="empty-state">${escapeHtml(t("admin_reviews_empty", "No reviews match the selected filters."))}</div>${footer}`;
+  return `
+    <div class="table-wrap admin-reviews-table-wrap">
+      <table class="admin-reviews-table">
+        <thead><tr><th>${escapeHtml(restaurantLabel)}</th><th>${escapeHtml(guestLabel)}</th><th>${escapeHtml(ratingsLabel)}</th><th>${escapeHtml(commentLabel)}</th><th>${escapeHtml(responseLabel)}</th><th>${escapeHtml(photosLabel)}</th><th>${escapeHtml(statusLabel)}</th><th>${escapeHtml(actionsLabel)}</th></tr></thead>
         <tbody>
           ${state.adminReviews.map((review) => `
             <tr>
-              <td>${escapeHtml(review.restaurant_name || review.restaurant_id)}</td>
-              <td>${escapeHtml(review.guest_name || "Anonymous")}<br><span class="muted">${escapeHtml(review.guest_email || "")}</span></td>
-              <td>
+              <td data-label="${escapeAttr(restaurantLabel)}">${escapeHtml(review.restaurant_name || review.restaurant_id)}</td>
+              <td data-label="${escapeAttr(guestLabel)}">${escapeHtml(review.guest_name || t("anonymous_guest_label", "Anonymous guest"))}</td>
+              <td data-label="${escapeAttr(ratingsLabel)}">
                 ${escapeHtml(t("review_food_label", "Food"))}: ${escapeHtml(review.food_rating)}<br>
                 ${escapeHtml(t("review_service_label", "Service"))}: ${escapeHtml(review.service_rating)}<br>
-                ${escapeHtml(t("review_ambience_label", "Ambience"))}: ${escapeHtml(review.ambience_rating)}
+                ${escapeHtml(t("review_atmosphere_label", t("review_ambience_label", "Atmosphere")))}: ${escapeHtml(review.atmosphere_rating || review.ambience_rating || "")}
               </td>
-              <td>${escapeHtml(review.comment || "")}</td>
-              <td>${statusBadge(review.status)}</td>
-              <td>
+              <td data-label="${escapeAttr(commentLabel)}">${escapeHtml(review.written_review || review.comment || "")}</td>
+              <td data-label="${escapeAttr(responseLabel)}">${adminReviewResponseModeration(review)}</td>
+              <td data-label="${escapeAttr(photosLabel)}">${adminReviewPhotoModeration(review)}</td>
+              <td data-label="${escapeAttr(statusLabel)}">${statusBadge(review.moderation_status || review.status)}</td>
+              <td data-label="${escapeAttr(actionsLabel)}">
                 <div class="button-row">
-                  <button class="ghost-button" data-review-id="${escapeAttr(review.id)}" data-review-status="approved" type="button">Approve</button>
-                  <button class="ghost-button danger" data-review-id="${escapeAttr(review.id)}" data-review-status="rejected" type="button">Reject</button>
+                  <button class="ghost-button" data-review-id="${escapeAttr(review.id)}" data-review-status="approved" type="button">${escapeHtml(t("approve_review_button", "Approve review"))}</button>
+                  <button class="ghost-button danger" data-review-id="${escapeAttr(review.id)}" data-review-status="rejected" type="button">${escapeHtml(t("reject_review_button", "Reject review"))}</button>
                 </div>
               </td>
             </tr>
           `).join("")}
         </tbody>
       </table>
+    </div>
+    ${footer}
+  `;
+}
+
+function adminReviewResponseModeration(review = {}) {
+  const response = review.restaurant_response && cleanString(review.restaurant_response.text)
+    ? review.restaurant_response
+    : null;
+  if (!response) return `<span class="muted">${escapeHtml(t("partner_review_response_empty", "No restaurant response yet."))}</span>`;
+  const status = cleanString(response.status || "pending_moderation");
+  return `
+    <div class="review-response-moderation">
+      <p>${escapeHtml(response.text)}</p>
+      <div class="button-row compact">
+        ${statusBadge(status)}
+      </div>
+      <div class="button-row compact">
+        <button class="ghost-button tiny" data-review-id="${escapeAttr(review.id)}" data-review-response-status="published" type="button">${escapeHtml(t("partner_review_response_publish_button", "Publish response"))}</button>
+        <button class="ghost-button tiny danger" data-review-id="${escapeAttr(review.id)}" data-review-response-status="removed" type="button">${escapeHtml(t("partner_review_response_remove_button", "Remove response"))}</button>
+      </div>
+    </div>
+  `;
+}
+
+function adminReviewPhotoModeration(review = {}) {
+  const photos = Array.isArray(review.photos) ? review.photos : [];
+  if (!photos.length) return `<span class="muted">${escapeHtml(t("review_photos_empty", "No photos"))}</span>`;
+  return `
+    <div class="admin-review-photo-grid">
+      ${photos.map((photo) => `
+        <article>
+          <img src="${escapeAttr(photo.url)}" alt="${escapeAttr(t("guest_photos_label", "Guest photos"))}" loading="lazy" decoding="async" data-review-photo-img>
+          <em>${escapeHtml(t("review_photo_unavailable", "Image unavailable"))}</em>
+          <span>${escapeHtml(photo.moderation_status || "")}</span>
+          <div class="button-row compact">
+            <button class="ghost-button tiny" data-review-photo-id="${escapeAttr(photo.id)}" data-review-photo-status="published" type="button">${escapeHtml(t("publish_button", "Publish"))}</button>
+            <button class="ghost-button tiny danger" data-review-photo-id="${escapeAttr(photo.id)}" data-review-photo-status="removed" type="button">${escapeHtml(t("remove_button", "Remove"))}</button>
+          </div>
+        </article>
+      `).join("")}
     </div>
   `;
 }
@@ -7320,17 +12998,194 @@ async function openPartnerAiDemandPreview() {
   window.setTimeout(() => document.querySelector("#partner-ai-demand")?.scrollIntoView({ behavior: "smooth", block: "start" }), 80);
 }
 
+function applyAdminRestaurantFilters(form, focusName = "") {
+  if (!form) return;
+  const data = formObject(form);
+  state.adminRestaurantFilters = {
+    search: data.search || "",
+    status: data.status || "all",
+    city: data.city || "all",
+    country: data.country || "all",
+    district: data.district || "all",
+    testData: data.testData || "all",
+    sort: data.sort || "updated_desc"
+  };
+  state.adminRestaurantPage = 1;
+  renderAdmin();
+  if (focusName) {
+    const field = document.querySelector(`#adminRestaurantFilters [name="${CSS.escape(focusName)}"]`);
+    field?.focus();
+  }
+}
+
+function resetAdminRestaurantListForCreatedRestaurant(restaurantId = "") {
+  state.adminRestaurantFilters = {
+    search: "",
+    status: "all",
+    city: "all",
+    country: "all",
+    district: "all",
+    testData: "all",
+    sort: "updated_desc"
+  };
+  state.adminRestaurantPage = 1;
+  state.adminRestaurantHighlightId = String(restaurantId || "");
+}
+
+async function refreshAdminRestaurantListAfterCreate(createdRestaurant = null) {
+  const restaurantId = typeof createdRestaurant === "object"
+    ? createdRestaurant?.id
+    : createdRestaurant;
+  if (!restaurantId) throw new Error(t("restaurant_create_missing_id_error", "Restaurant creation did not return a database ID."));
+  resetAdminRestaurantListForCreatedRestaurant(restaurantId);
+  state.restaurants = [];
+  await replaceAdminRestaurantListFromServer({ forceFreshRestaurants: true });
+  const index = filteredAdminRestaurants().findIndex((restaurant) => String(restaurant.id || "") === String(restaurantId));
+  if (index < 0) {
+    state.adminRestaurantHighlightId = "";
+    throw new Error(t("restaurant_create_not_visible_error", "Restaurant was created but is not visible in the refreshed Admin Restaurants list."));
+  }
+  state.adminRestaurantPage = Math.floor(index / state.adminRestaurantPageSize) + 1;
+  renderAdmin();
+  if (adminRestaurantHighlightTimer) window.clearTimeout(adminRestaurantHighlightTimer);
+  adminRestaurantHighlightTimer = window.setTimeout(() => {
+    if (state.adminRestaurantHighlightId !== String(restaurantId)) return;
+    state.adminRestaurantHighlightId = "";
+    adminRestaurantHighlightTimer = null;
+    renderAdmin();
+  }, 8000);
+  window.setTimeout(() => {
+    const row = document.querySelector(`[data-restaurant-row="${CSS.escape(String(restaurantId))}"]`);
+    const reduceMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
+    row?.scrollIntoView({ behavior: reduceMotion ? "auto" : "smooth", block: "center" });
+    row?.querySelector("input, select, button")?.focus({ preventScroll: true });
+  }, 80);
+}
+
+async function verifyCreatedRestaurantPersisted(restaurant = {}) {
+  const restaurantId = String(restaurant?.id || "").trim();
+  if (!restaurantId) throw new Error(t("restaurant_create_missing_id_error", "Restaurant creation did not return a database ID."));
+  const detail = await api(`/admin/restaurant-detail?id=${encodeURIComponent(restaurantId)}&fresh=${encodeURIComponent(Date.now())}`, {
+    cache: "no-store",
+    headers: { "cache-control": "no-store" }
+  });
+  if (!detail?.restaurant?.id || String(detail.restaurant.id) !== String(restaurantId)) {
+    throw new Error(t("restaurant_create_readback_failed_error", "Restaurant creation could not be verified in the database."));
+  }
+  return detail.restaurant;
+}
+
+function restaurantCreateSuccessMessage(restaurant = {}) {
+  return contentTemplate("restaurant_added_confirmed_toast", "Restaurant added: {{name}} (ID: {{id}})", {
+    name: restaurant.name || t("restaurant_label", "Restaurant"),
+    id: restaurant.id || ""
+  });
+}
+
+async function viewRestaurantInAdmin(id) {
+  try {
+    const payload = await api("/admin/restaurant-detail?id=" + encodeURIComponent(id));
+    state.adminRestaurantDetailId = id;
+    state.adminRestaurantDetail = payload;
+    state.adminRestaurantDetailTab = "overview";
+    renderAdmin();
+    document.querySelector("#admin-restaurant-detail")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    showToast(t("restaurant_view_ready_toast", "Restaurant details are ready for review."));
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+function focusPartnerAccessForRestaurant(id) {
+  const form = document.querySelector("#partnerForm");
+  const select = form?.querySelector('[name="restaurant_id"]');
+  if (select) select.value = id;
+  document.querySelector("#admin-partners")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  form?.querySelector('[name="email"]')?.focus();
+  showToast(t("restaurant_partner_access_focus_toast", "Partner access form is ready for this restaurant."));
+}
+
+async function loadRestaurantAuditHistory(id, button = null) {
+  try {
+    setButtonPending(button, true);
+    const payload = await api("/admin/audit-logs?restaurant_id=" + encodeURIComponent(id));
+    state.adminAuditRestaurantId = id;
+    state.adminAuditLogs = payload.audit_logs || [];
+    renderAdmin();
+    document.querySelector("#admin-restaurant-audit")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  } catch (error) {
+    setButtonPending(button, false);
+    showToast(error.message);
+  }
+}
+
+async function saveRestaurantCapacityFromPayload(restaurantId, payload = {}) {
+  if (!restaurantId) return null;
+  const hasCapacityConfig = ["dining_areas", "tables", "capacity_overrides"].some((field) => String(payload[field] || "").trim());
+  if (!hasCapacityConfig) return null;
+  return await api("/admin/restaurant-capacity", {
+    method: "POST",
+    body: JSON.stringify({
+      restaurant_id: restaurantId,
+      dining_areas: payload.dining_areas || "[]",
+      tables: payload.tables || "[]",
+      capacity_overrides: payload.capacity_overrides || "[]"
+    })
+  });
+}
+
 async function submitRestaurant(event) {
   event.preventDefault();
+  const form = event.currentTarget;
+  const payload = formObject(form);
   try {
-    await api("/admin/restaurants", {
+    const result = await api("/admin/restaurants", {
       method: "POST",
-      body: JSON.stringify(formObject(event.currentTarget))
+      body: JSON.stringify(payload)
     });
-    await loadAdminData();
-    renderAdmin();
-    showToast(t("restaurant_added_toast", "Restaurant added."));
+    const persistedRestaurant = await verifyCreatedRestaurantPersisted(result.restaurant);
+    await refreshAdminRestaurantListAfterCreate(persistedRestaurant);
+    form.reset();
+    const successMessage = restaurantCreateSuccessMessage(persistedRestaurant);
+    if (result.partner_access?.status === "failed") {
+      throw new Error(t("restaurant_create_partner_access_failed", "Restaurant creation was not completed because partner access could not be created."));
+    } else if (result.partner_access?.status) {
+      showToast(`${successMessage} ${t("restaurant_partner_access_prepared_toast", "Partner access prepared.")}`);
+    } else {
+      showToast(successMessage);
+    }
   } catch (error) {
+    if (error.payload?.code === "DUPLICATE_RESTAURANT_POSSIBLE") {
+      const duplicates = (error.payload.duplicates || [])
+        .map((item) => `${item.name || item.id}: ${(item.matched_fields || []).join(", ")}`)
+        .join("\n");
+      const reason = window.prompt(`${t("duplicate_restaurant_warning", "Possible duplicate restaurant found.")}\n${duplicates}\n\n${t("duplicate_restaurant_override_prompt", "Enter an override reason to create it anyway.")}`);
+      if (!reason) {
+        showToast(t("duplicate_restaurant_override_cancelled", "Restaurant creation cancelled."));
+        return;
+      }
+      try {
+        const result = await api("/admin/restaurants", {
+          method: "POST",
+          body: JSON.stringify({ ...payload, duplicate_override: true, duplicate_override_reason: reason })
+        });
+        const persistedRestaurant = await verifyCreatedRestaurantPersisted(result.restaurant);
+        await refreshAdminRestaurantListAfterCreate(persistedRestaurant);
+        form.reset();
+        const successMessage = restaurantCreateSuccessMessage(persistedRestaurant);
+        if (result.partner_access?.status === "failed") {
+          throw new Error(t("restaurant_create_partner_access_failed", "Restaurant creation was not completed because partner access could not be created."));
+        } else if (result.partner_access?.status) {
+          showToast(`${successMessage} ${t("restaurant_partner_access_prepared_toast", "Partner access prepared.")}`);
+        } else {
+          showToast(successMessage);
+        }
+        return;
+      } catch (overrideError) {
+        showToast(overrideError.message);
+        return;
+      }
+    }
     showToast(error.message);
   }
 }
@@ -7350,27 +13205,144 @@ async function submitPartner(event) {
   }
 }
 
-async function viewAsPartner(partnerId) {
+async function updatePartnerInvitation(id, action, button = null) {
+  const revoke = action === "revoke_invitation";
+  if (revoke && !window.confirm(t("partner_invitation_revoke_confirm", "Revoke this partner invitation?"))) return;
   try {
-    const adminSession = state.session;
-    const payload = await api("/admin/impersonate-partner", {
+    setButtonPending(button, true);
+    await api("/admin/partners", {
+      method: "PATCH",
+      body: JSON.stringify({ id, action })
+    });
+    await loadAdminData();
+    renderAdmin();
+    showToast(revoke
+      ? t("partner_invitation_revoked_toast", "Partner invitation revoked.")
+      : t("partner_invitation_resent_toast", "Partner invitation resent."));
+  } catch (error) {
+    setButtonPending(button, false);
+    showToast(error.message);
+  }
+}
+
+async function saveRestaurantCapacityConfig(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const submitButton = form.querySelector('[type="submit"]');
+  try {
+    setButtonPending(submitButton, true);
+    const payload = await api("/admin/restaurant-capacity", {
       method: "POST",
-      body: JSON.stringify({ partner_id: partnerId })
+      body: JSON.stringify(formObject(form))
+    });
+    state.adminRestaurantDetail = await api("/admin/restaurant-detail?id=" + encodeURIComponent(payload.restaurant?.id || form.restaurant_id.value));
+    await loadAdminData();
+    renderAdmin();
+    showToast(t("restaurant_capacity_saved_toast", "Restaurant capacity configuration saved."));
+  } catch (error) {
+    setButtonPending(submitButton, false);
+    showToast(error.message);
+  }
+}
+
+async function updateRestaurantAccess(button) {
+  const action = button.dataset.restaurantAccessAction;
+  const id = button.dataset.restaurantAccessId;
+  if (action === "remove_restaurant_access" && !confirm(t("remove_access_confirm", "Remove this restaurant access? The user account will not be deleted."))) return;
+  const roleSelect = document.querySelector(`[data-restaurant-access-role="${CSS.escape(id)}"]`);
+  const reasonRequired = ["remove_restaurant_access", "deactivate_restaurant_access", "change_restaurant_role"].includes(action);
+  const reason = reasonRequired ? (window.prompt(t("restaurant_access_reason_prompt", "Enter an audit reason for this access change.")) || "") : "";
+  if (reasonRequired && !reason.trim()) {
+    showToast(t("audit_reason_required", "An audit reason is required."));
+    return;
+  }
+  try {
+    setButtonPending(button, true);
+    await api("/admin/partners", {
+      method: "PATCH",
+      body: JSON.stringify({
+        id,
+        action,
+        restaurant_role: roleSelect?.value || undefined,
+        reason
+      })
+    });
+    if (state.adminRestaurantDetailId) {
+      state.adminRestaurantDetail = await api("/admin/restaurant-detail?id=" + encodeURIComponent(state.adminRestaurantDetailId));
+    }
+    await loadAdminData();
+    renderAdmin();
+    showToast(t("restaurant_access_updated_toast", "Restaurant access updated."));
+  } catch (error) {
+    setButtonPending(button, false);
+    showToast(error.message);
+  }
+}
+
+async function viewAsAccount({ targetRole, targetUserId = "", targetEmail = "", restaurantId = "" } = {}) {
+  try {
+    const reason = window.prompt(t("impersonation_reason_prompt", "Enter an audit reason for view-as access.")) || "";
+    if (!reason.trim()) {
+      showToast(t("impersonation_reason_required", "An audit reason is required."));
+      return;
+    }
+    const adminSession = state.session;
+    const payload = await api("/admin/impersonate-account", {
+      method: "POST",
+      body: JSON.stringify({
+        target_role: targetRole,
+        target_user_id: targetUserId,
+        target_email: targetEmail,
+        restaurant_id: restaurantId,
+        reason,
+        write_mode: false
+      })
     });
     payload.profile.role = normalizeRole(payload.profile.role);
     state.originalAdminSession = adminSession;
     saveSession(payload);
-    state.mode = "partner";
-    await loadPartnerData();
-    renderPartner();
-    showToast(t("viewing_partner_dashboard_toast", "Viewing partner dashboard."));
+    state.mode = payload.profile.role === "guest" ? "guest" : payload.profile.role === "partner" ? "partner" : "admin";
+    if (state.mode === "guest") {
+      history.pushState(null, "", "/account");
+      await loadGuestAccountData();
+      renderGuestAccount();
+    } else if (state.mode === "partner") {
+      await loadPartnerData();
+      renderPartner();
+    } else {
+      await loadAdminData();
+      renderAdmin();
+    }
+    showToast(t("viewing_account_dashboard_toast", "View-as mode started."));
   } catch (error) {
     showToast(error.message);
   }
 }
 
+async function viewAsPartner(partnerId) {
+  return viewAsAccount({ targetRole: "partner", targetUserId: partnerId });
+}
+
+async function viewAsGuest(email) {
+  return viewAsAccount({ targetRole: "guest", targetEmail: email });
+}
+
 async function returnToSuperAdmin() {
   if (!state.originalAdminSession) return;
+  const impersonation = currentImpersonation();
+  const viewedProfile = state.session?.profile || {};
+  await fetch("/api/admin/impersonation/end", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      Authorization: `Bearer ${state.originalAdminSession.access_token}`
+    },
+    body: JSON.stringify({
+      impersonation_session_id: impersonation?.session_id || "",
+      target_user_id: viewedProfile.id || "",
+      target_role: viewedProfile.role || ""
+    })
+  }).catch(() => null);
   saveSession(state.originalAdminSession);
   state.originalAdminSession = null;
   state.mode = "admin";
@@ -7384,14 +13356,27 @@ async function approveRestaurant(id, button) {
 }
 
 async function updateRestaurantStatus(id, status, button = null) {
+  const activating = status === "active" || status === "approved";
   if (status === "suspended" && !confirm(t("restaurant_suspend_confirm", "Suspend this restaurant? It will no longer appear publicly."))) return;
+  if (status === "archived" && !confirm(t("restaurant_archive_confirm", "Archive this restaurant? It will stay hidden until reactivated."))) return;
+  if (activating && !confirm(t("restaurant_activate_confirm", "Activate this restaurant for the guest site if visibility is enabled?"))) return;
+  const reason = ["suspended", "archived"].includes(status)
+    ? (window.prompt(t("restaurant_status_reason_prompt", "Enter a reason for this status change.")) || "")
+    : "";
+  if (["suspended", "archived"].includes(status) && !reason.trim()) {
+    showToast(t("restaurant_status_reason_required", "A reason is required for suspension or archive."));
+    return;
+  }
   try {
     setButtonPending(button, true);
     await api("/admin/restaurants", {
       method: "PATCH",
-      body: JSON.stringify({ id, status })
+      body: JSON.stringify({ id, status, status_reason: reason, activate_confirmed: activating })
     });
     await loadAdminData();
+    if (state.adminRestaurantDetailId === id) {
+      state.adminRestaurantDetail = await api("/admin/restaurant-detail?id=" + encodeURIComponent(id));
+    }
     renderAdmin();
     showToast(contentTemplate("restaurant_status_changed_toast", "Restaurant {{status}}.", { status }));
   } catch (error) {
@@ -7452,6 +13437,123 @@ async function updateReviewStatus(id, status) {
   }
 }
 
+async function updateReviewPhotoStatus(id, status) {
+  try {
+    await api("/admin/reviews", {
+      method: "PATCH",
+      body: JSON.stringify({ photo_id: id, photo_status: status })
+    });
+    await loadAdminData();
+    renderAdmin();
+    showToast(t("review_updated_toast", "Review updated."));
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+async function updateReviewResponseStatus(id, status) {
+  try {
+    await api("/admin/reviews", {
+      method: "PATCH",
+      body: JSON.stringify({ id, response_status: status })
+    });
+    await loadAdminData();
+    renderAdmin();
+    showToast(t("partner_review_response_moderated_toast", "Restaurant response updated."));
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+async function submitPartnerReviewResponse(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const button = form.querySelector("[data-partner-review-response-submit]");
+  const id = cleanString(form.dataset.reviewId);
+  const responseText = cleanString(new FormData(form).get("response_text"));
+  if (!id) {
+    showToast(t("review_not_found_error", "Review not found."));
+    return;
+  }
+  if (responseText.length < 2) {
+    showToast(t("partner_review_response_required", "Write a response before sending it for approval."));
+    return;
+  }
+  try {
+    setButtonPending(button, true, t("saving_button", "Saving..."));
+    await api("/partner/reviews", {
+      method: "PATCH",
+      body: JSON.stringify({ id, response_text: responseText })
+    });
+    await loadPartnerData();
+    renderPartner();
+    showToast(t("partner_review_response_submitted_toast", "Restaurant response sent for approval."));
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    setButtonPending(button, false);
+  }
+}
+
+async function refreshAdminReviews() {
+  const response = await api(`/admin/reviews${queryStringFromFilters(state.adminReviewFilters)}`);
+  state.adminReviews = response.reviews || [];
+  state.adminReviewPagination = response.pagination || { page: 1, page_size: state.adminReviewFilters.page_size || 25, total: state.adminReviews.length, total_pages: 1 };
+  renderAdmin();
+}
+
+function readAdminReviewFilters(form) {
+  const data = Object.fromEntries(new FormData(form).entries());
+  return {
+    search: cleanString(data.search),
+    restaurant_id: cleanString(data.restaurant_id) || "all",
+    country: cleanString(data.country) || "all",
+    city: cleanString(data.city) || "all",
+    status: cleanString(data.status) || "all",
+    photo_status: cleanString(data.photo_status) || "all",
+    page: "1",
+    page_size: cleanString(data.page_size) || "25"
+  };
+}
+
+async function applyAdminReviewFilters(form, focusName = "") {
+  state.adminReviewFilters = readAdminReviewFilters(form);
+  await refreshAdminReviews();
+  if (focusName) {
+    const input = document.querySelector(`#adminReviewFilters [name="${CSS.escape(focusName)}"]`);
+    input?.focus();
+    if (input?.setSelectionRange && input.type !== "select-one") {
+      const valueLength = String(input.value || "").length;
+      input.setSelectionRange(valueLength, valueLength);
+    }
+  }
+}
+
+async function clearAdminReviewFilters() {
+  state.adminReviewFilters = {
+    search: "",
+    restaurant_id: "all",
+    country: "all",
+    city: "all",
+    status: "all",
+    photo_status: "all",
+    page: "1",
+    page_size: "25"
+  };
+  await refreshAdminReviews();
+}
+
+async function setAdminReviewPage(pageValue) {
+  const pagination = state.adminReviewPagination || {};
+  const maxPage = Math.max(Number(pagination.total_pages || 1), 1);
+  const page = Math.min(Math.max(Number.parseInt(pageValue, 10) || 1, 1), maxPage);
+  state.adminReviewFilters = {
+    ...(state.adminReviewFilters || {}),
+    page: String(page)
+  };
+  await refreshAdminReviews();
+}
+
 async function updatePhotoSubmissionStatus(id, status) {
   try {
     await api("/admin/photo-reward-submissions", {
@@ -7468,15 +13570,24 @@ async function updatePhotoSubmissionStatus(id, status) {
 
 async function loadPartnerData() {
   const aiEnabled = canShowFeature("ai.partnerDemand", { allowDemo: true });
-  const [profile, offers, reservations, stats, forecast, recommendation, intelligence, feedback, integrations, imports] = await Promise.all([
+  const basicMode = isBasicMode();
+  const [profile, offers, reservations, stats, analytics, reviews, foodFeed, billing, campaigns, smsCampaigns, alertSettings, reservationAlerts, forecast, recommendation, intelligence, feedback, integrations, imports] = await Promise.all([
     api("/partner/profile"),
     api("/partner/offers"),
     api(`/partner/reservations${queryStringFromFilters(state.partnerReservationFilters)}`),
     api("/partner/stats"),
+    api(`/partner/analytics${queryStringFromFilters(state.partnerAnalyticsFilters)}`).catch(() => ({ analytics: null })),
+    api("/partner/reviews").catch(() => ({ reviews: [] })),
+    api("/partner/food-feed").catch(() => ({ videos: [] })),
+    api("/partner/billing").catch(() => ({ billing: null, plans: [], invoices: [], stripe: { configured: false } })),
+    basicMode ? Promise.resolve({ campaigns: [], templates: [] }) : api("/partner/campaigns").catch(() => ({ campaigns: [], templates: [] })),
+    basicMode ? Promise.resolve({ campaigns: [], provider: { configured: false } }) : api("/partner/sms-campaigns").catch(() => ({ campaigns: [], provider: { configured: false } })),
+    api("/partner/notification-settings").catch(() => ({ preferences: null, devices: [], push: { enabled: false }, sms: { configured: false }, voice: { configured: false }, instructions: {}, poll_seconds: 5 })),
+    api("/partner/reservation-alerts").catch(() => ({ alerts: [], pending_count: 0, poll_seconds: 5, push: { enabled: false } })),
     aiEnabled ? api("/ai/demand-forecast").catch(() => ({ forecast: null })) : Promise.resolve({ forecast: null }),
     aiEnabled ? api("/ai/recommendations/restaurant").catch(() => ({ recommendation: null })) : Promise.resolve({ recommendation: null }),
     aiEnabled ? api("/ai/restaurant-intelligence").catch(() => ({ summary: null })) : Promise.resolve({ summary: null }),
-    api("/partner/photo-reward-submissions").catch(() => ({ submissions: [], insights: null })),
+    basicMode ? Promise.resolve({ submissions: [], insights: null }) : api("/partner/photo-reward-submissions").catch(() => ({ submissions: [], insights: null })),
     aiEnabled ? api("/partner/integrations").catch(() => ({ providers: [], sync_runs: [], errors: [], import_jobs: [] })) : Promise.resolve({ providers: [], sync_runs: [], errors: [], import_jobs: [] }),
     aiEnabled ? api("/integrations/import-reservations").catch(() => ({ jobs: [], imported_reservations: [], manual_uploads: [] })) : Promise.resolve({ jobs: [], imported_reservations: [], manual_uploads: [] })
   ]);
@@ -7484,6 +13595,22 @@ async function loadPartnerData() {
   state.offersMine = offers.offers || [];
   state.reservations = reservations.reservations || [];
   state.partnerStats = stats.stats || {};
+  state.partnerAnalytics = analytics.analytics || null;
+  state.partnerReviews = reviews.reviews || [];
+  state.partnerFoodFeedVideos = foodFeed.videos || [];
+  state.partnerBilling = billing || null;
+  state.partnerCampaigns = campaigns || null;
+  state.partnerSmsCampaigns = smsCampaigns || null;
+  state.partnerAlertSettings = alertSettings.preferences || null;
+  state.partnerAlertDevices = alertSettings.devices || [];
+  state.partnerAlertInstructions = alertSettings.instructions || {};
+  state.partnerAlertPush = alertSettings.push || reservationAlerts.push || null;
+  state.partnerAlertSms = alertSettings.sms || null;
+  state.partnerAlertVoice = alertSettings.voice || null;
+  state.partnerAlertPollSeconds = Number(reservationAlerts.poll_seconds || alertSettings.poll_seconds || 5) || 5;
+  state.partnerReservationAlerts = reservationAlerts.alerts || [];
+  state.partnerAlertDeliveries = reservationAlerts.deliveries || [];
+  state.partnerReservationAlertCount = Number(reservationAlerts.pending_count || 0);
   state.aiDemandForecast = forecast.forecast || null;
   state.partnerAiRecommendation = recommendation.recommendation || null;
   state.restaurantIntelligence = intelligence.summary || null;
@@ -7494,18 +13621,22 @@ async function loadPartnerData() {
 }
 
 function partnerKpiCards(stats, forecast) {
+  const totalReservations = stats.bookings ?? 0;
+  const accepted = stats.accepted ?? 0;
+  const rejected = stats.rejected ?? 0;
+  const activeOffers = stats.active_offers ?? state.offersMine.filter((offer) => offer.status === "active").length;
   return `
     <section class="stats-grid compact-stats premium-kpis" id="partner-stats">
-      ${statCard(t("partner_kpi_views", "Views"), stats.views ?? 0)}
-      ${statCard(t("partner_kpi_bookings", "Bookings"), stats.bookings ?? 0)}
-      ${statCard(t("partner_kpi_accepted", "Accepted"), stats.accepted ?? 0)}
-      ${statCard(t("partner_kpi_rejected", "Rejected"), stats.rejected ?? 0)}
-      ${statCard(t("partner_kpi_favorites", "Favorites"), stats.favorites_total ?? 0)}
-      ${statCard(t("partner_kpi_favorites_week", "Favorites this week"), stats.favorites_this_week ?? 0)}
-      ${statCard(t("partner_kpi_favorites_month", "Favorites this month"), stats.favorites_this_month ?? 0)}
-      ${statCard(t("partner_kpi_conversion", "Conversion rate"), `${stats.conversion_rate ?? 0}%`)}
-      ${statCard(t("partner_kpi_revenue_recovered", "Revenue recovered"), formatMoney(stats.estimated_revenue_recovered ?? forecast.estimated_revenue_lift ?? 0))}
-      ${statCard(t("partner_kpi_active_offers", "Active offers"), stats.active_offers ?? state.offersMine.filter((offer) => offer.status === "active").length)}
+      ${kpiStatCard("partner_kpi_profile_views", "Profile views", stats.views ?? 0, "partner_kpi_profile_views_desc", "Restaurant profile views recorded for this restaurant", { key: "profile_views" })}
+      ${kpiStatCard("partner_kpi_total_reservations", "Total reservations", totalReservations, "partner_kpi_total_reservations_desc", "All reservation requests received for this restaurant", { key: "total_reservations" })}
+      ${kpiStatCard("partner_kpi_confirmed_reservations", "Confirmed reservations", accepted, "partner_kpi_confirmed_reservations_desc", "Reservations accepted by the restaurant", { key: "confirmed_reservations" })}
+      ${kpiStatCard("partner_kpi_declined_requests", "Declined requests", rejected, "partner_kpi_declined_requests_desc", "Reservation requests declined by the restaurant", { key: "declined_requests" })}
+      ${kpiStatCard("partner_kpi_favorites", "Favorites", stats.favorites_total ?? 0, "partner_kpi_favorites_desc", "Guests following or favoriting this restaurant", { key: "favorites" })}
+      ${kpiStatCard("partner_kpi_favorites_week", "Favorites this week", stats.favorites_this_week ?? 0, "partner_kpi_favorites_week_desc", "New favorites added in the last 7 days", { key: "favorites_this_week" })}
+      ${kpiStatCard("partner_kpi_favorites_month", "Favorites this month", stats.favorites_this_month ?? 0, "partner_kpi_favorites_month_desc", "New favorites added this month", { key: "favorites_this_month" })}
+      ${kpiStatCard("partner_kpi_conversion", "Conversion rate", `${stats.conversion_rate ?? 0}%`, "partner_kpi_conversion_desc", "Reservation requests divided by profile views", { key: "conversion_rate" })}
+      ${kpiStatCard("partner_kpi_revenue_recovered", "Estimated revenue recovered", formatMoney(stats.estimated_revenue_recovered ?? forecast.estimated_revenue_lift ?? 0), "partner_kpi_revenue_recovered_desc", "Estimated value from accepted SmartTable reservations", { key: "estimated_revenue_recovered" })}
+      ${kpiStatCard("partner_kpi_active_offers", "Active offers", activeOffers, "partner_kpi_active_offers_desc", "Offers currently visible to eligible guests", { key: "active_offers" })}
     </section>
   `;
 }
@@ -8797,6 +14928,7 @@ function advisorAnswer(question) {
 }
 
 function partnerAdvisorWidget() {
+  if (!canShowFeature("ai.partnerDemand", { audience: "partner" })) return "";
   const messages = state.advisorMessages.length ? state.advisorMessages : advisorSeedMessages();
   return `
     <aside class="advisor-widget ${state.advisorOpen ? "open" : ""}" aria-live="polite">
@@ -8996,25 +15128,198 @@ function partnerPostVisitFeedbackPanel() {
   `;
 }
 
-function partnerTodayOffersPanel() {
-  const activeOffers = state.offersMine.filter((offer) => offer.status === "active").slice(0, 4);
+function partnerReviewAverage(rows = [], key) {
+  const values = rows.map((row) => Number(row[key])).filter((value) => Number.isFinite(value) && value > 0);
+  if (!values.length) return "-";
+  return values.length ? (values.reduce((sum, value) => sum + value, 0) / values.length).toFixed(1) : "—";
+}
+
+function partnerReviewMetricInline(labelKey, labelFallback, value) {
+  return `
+    <div class="partner-review-breakdown-item">
+      <span>${escapeHtml(t(labelKey, labelFallback))}</span>
+      <strong>${escapeHtml(value)}</strong>
+    </div>
+  `;
+}
+
+function partnerReviewPhotoGrid(review = {}) {
+  const photos = Array.isArray(review.photos) ? review.photos : [];
+  if (!photos.length) return `<span class="muted">${escapeHtml(t("partner_review_no_photos", "No photos"))}</span>`;
+  return `
+    <div class="admin-review-photo-grid partner-review-photo-grid">
+      ${photos.map((photo) => `
+        <article>
+          <img src="${escapeAttr(photo.url)}" alt="${escapeAttr(t("partner_review_photo_alt", "Guest review photo"))}" loading="lazy" decoding="async" data-review-photo-img>
+          <em>${escapeHtml(t("review_photo_unavailable", "Image unavailable"))}</em>
+          <span>${escapeHtml(photo.moderation_status || "")}</span>
+        </article>
+      `).join("")}
+    </div>
+  `;
+}
+
+function partnerReviewResponseEditor(review = {}) {
+  const response = review.restaurant_response && cleanString(review.restaurant_response.text)
+    ? review.restaurant_response
+    : {};
+  const status = cleanString(response.status || "");
+  const statusLine = status
+    ? `<div class="button-row compact partner-review-response-status">${statusBadge(status)}<span class="muted">${escapeHtml(t("partner_review_response_pending_note", "Responses appear publicly only after admin approval."))}</span></div>`
+    : `<p class="muted">${escapeHtml(t("partner_review_response_empty", "No restaurant response yet."))}</p>`;
+  return `
+    <form class="partner-review-response-form" data-review-id="${escapeAttr(review.id)}">
+      <label>
+        <span>${escapeHtml(t("partner_review_response_label", "Your response"))}</span>
+        <textarea name="response_text" rows="3" maxlength="800" placeholder="${escapeAttr(t("partner_review_response_placeholder", "Write a short, professional reply to this guest review."))}">${escapeHtml(response.text || "")}</textarea>
+      </label>
+      ${statusLine}
+      <button class="ghost-button tiny" data-partner-review-response-submit type="submit">${escapeHtml(t("partner_review_response_submit", "Send for approval"))}</button>
+    </form>
+  `;
+}
+
+function partnerReviewsPanel() {
+  const reviews = state.partnerReviews || [];
+  const publishedReviews = reviews.filter((review) => ["published", "approved"].includes(String(review.moderation_status || review.status || "").toLowerCase()));
+  const ratingRows = publishedReviews.length ? publishedReviews : reviews;
+  const photoCount = reviews.reduce((count, review) => count + (Array.isArray(review.photos) ? review.photos.length : 0), 0);
+  const pendingCount = reviews.filter((review) => ["pending", "pending_moderation", "draft"].includes(String(review.moderation_status || review.status || "").toLowerCase())).length;
+  const foodAverage = partnerReviewAverage(ratingRows, "food_rating");
+  const serviceAverage = partnerReviewAverage(ratingRows, "service_rating");
+  const atmosphereAverage = partnerReviewAverage(ratingRows, "atmosphere_rating");
+  const guestLabel = t("guest_label", "Guest");
+  const dateLabel = t("review_date_label", "Date");
+  const ratingsLabel = t("review_ratings_label", "Ratings");
+  const commentLabel = t("review_comment_label", "Comment");
+  const responseLabel = t("partner_review_response_title", "Restaurant response");
+  const photosLabel = t("review_photos_label", "Photos");
+  const statusLabel = t("status_label", "Status");
+  return `
+    <article class="panel partner-reviews-panel" id="partner-reviews-panel">
+      <div class="section-title-row compact">
+        <div>
+          <span class="section-kicker">${escapeHtml(t("partner_nav_reviews", "Reviews"))}</span>
+          <h2>${escapeHtml(t("partner_reviews_title", "Guest reviews"))}</h2>
+          <p class="muted">${escapeHtml(t("partner_reviews_intro", "Verified SmartTable reviews and guest photos for this restaurant."))}</p>
+        </div>
+      </div>
+      <section class="stats-grid compact-stats partner-review-summary-grid">
+        ${kpiStatCard("partner_reviews_summary_overall", "Overall rating", partnerReviewAverage(ratingRows, "overall_rating"), "partner_reviews_summary_overall_desc", "Average from visible verified reviews", { key: "partner_review_overall" })}
+        ${kpiStatCard("partner_reviews_summary_count", "Verified reviews", reviews.length, "partner_reviews_summary_count_desc", "Reviews submitted by verified guests", { key: "partner_review_count" })}
+        ${kpiStatCard("partner_reviews_summary_photos", "Review photos", photoCount, "partner_reviews_summary_photos_desc", "Guest photos attached to reviews", { key: "partner_review_photos" })}
+        ${kpiStatCard("partner_reviews_summary_pending", "Awaiting moderation", pendingCount, "partner_reviews_summary_pending_desc", "Reviews or photos waiting for admin approval", { key: "partner_review_pending" })}
+      </section>
+      <section class="partner-review-breakdown" aria-label="${escapeAttr(t("partner_reviews_breakdown_label", "Rating breakdown"))}">
+        ${partnerReviewMetricInline("review_food_label", "Food", foodAverage)}
+        ${partnerReviewMetricInline("review_service_label", "Service", serviceAverage)}
+        ${partnerReviewMetricInline("review_atmosphere_label", "Atmosphere", atmosphereAverage)}
+      </section>
+      <div class="notice-card subtle">
+        <strong>${escapeHtml(t("partner_review_response_title", "Restaurant response"))}</strong>
+        <p>${escapeHtml(t("partner_review_response_body", "Reply to guest reviews here. Your response is sent to Admin or Superadmin for approval before it appears publicly."))}</p>
+      </div>
+      ${reviews.length ? `
+        <div class="table-wrap partner-reviews-table-wrap">
+          <table class="partner-data-table partner-reviews-table">
+            <thead>
+              <tr>
+                <th>${escapeHtml(guestLabel)}</th>
+                <th>${escapeHtml(dateLabel)}</th>
+                <th>${escapeHtml(ratingsLabel)}</th>
+                <th>${escapeHtml(commentLabel)}</th>
+                <th>${escapeHtml(responseLabel)}</th>
+                <th>${escapeHtml(photosLabel)}</th>
+                <th>${escapeHtml(statusLabel)}</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${reviews.map((review) => `
+                <tr>
+                  <td data-label="${escapeAttr(guestLabel)}">
+                    <strong>${escapeHtml(review.guest_name || t("anonymous_guest_label", "Anonymous guest"))}</strong>
+                    <br><span class="tag">${escapeHtml(t("partner_review_verified_badge", "Verified SmartTable visit"))}</span>
+                  </td>
+                  <td data-label="${escapeAttr(dateLabel)}">${escapeHtml(formatDateTime(review.submitted_at || review.published_at || review.created_at))}</td>
+                  <td data-label="${escapeAttr(ratingsLabel)}">
+                    ${escapeHtml(t("review_food_label", "Food"))}: ${escapeHtml(review.food_rating || "—")}<br>
+                    ${escapeHtml(t("review_service_label", "Service"))}: ${escapeHtml(review.service_rating || "—")}<br>
+                    ${escapeHtml(t("review_atmosphere_label", "Atmosphere"))}: ${escapeHtml(review.atmosphere_rating || review.ambience_rating || "—")}
+                  </td>
+                  <td data-label="${escapeAttr(commentLabel)}">${escapeHtml(review.written_review || review.comment || t("no_review_text", "No written review yet."))}</td>
+                  <td data-label="${escapeAttr(responseLabel)}">${partnerReviewResponseEditor(review)}</td>
+                  <td data-label="${escapeAttr(photosLabel)}">${partnerReviewPhotoGrid(review)}</td>
+                  <td data-label="${escapeAttr(statusLabel)}">${statusBadge(review.moderation_status || review.status || "pending_moderation")}</td>
+                </tr>
+              `).join("")}
+            </tbody>
+          </table>
+        </div>
+      ` : `<div class="empty-state">${escapeHtml(t("partner_reviews_empty", "No verified guest reviews yet. Completed eligible visits will appear here after guests submit a review."))}</div>`}
+    </article>
+  `;
+}
+
+function partnerOfferTitle(offer = {}) {
+  return localizedContentField(offer, "title", state.lang) || offer.offer_title || t("discounted_table_label", "Discounted table");
+}
+
+function partnerActiveOffers() {
+  return state.offersMine.filter((offer) => String(offer.status || "").toLowerCase() === "active");
+}
+
+function partnerReservationDate(row = {}) {
+  return row.reservation_date || row.offer_date || row.date || "";
+}
+
+function partnerReservationTime(row = {}) {
+  return row.reservation_time || row.offer_time || row.start_time || "";
+}
+
+function partnerTodayIsoDate() {
+  try {
+    return new Intl.DateTimeFormat("en-CA", {
+      timeZone: state.partnerProfile?.primary_timezone || state.partnerProfile?.timezone || "America/New_York"
+    }).format(new Date());
+  } catch {
+    return new Date().toISOString().slice(0, 10);
+  }
+}
+
+function isPartnerTodayReservation(row = {}) {
+  return partnerReservationDate(row) === partnerTodayIsoDate();
+}
+
+function isFuturePartnerOffer(offer = {}, maxDays = null) {
+  const date = offer.offer_date || offer.reservation_date;
+  if (!date) return false;
+  const time = offer.start_time || offer.offer_time || "23:59";
+  const timestamp = new Date(`${date}T${time}`).getTime();
+  if (!Number.isFinite(timestamp) || timestamp < Date.now()) return false;
+  if (!Number.isFinite(Number(maxDays))) return true;
+  return timestamp <= Date.now() + Number(maxDays) * 24 * 60 * 60 * 1000;
+}
+
+function partnerTodayOffersPanel(options = {}) {
+  const limit = Number(options.limit || 4);
+  const activeOffers = partnerActiveOffers().slice(0, limit);
   return `
     <article class="panel today-operational-panel" id="partner-today-offers">
       <div class="section-title-row compact">
         <div><div class="status-title-row"><span class="section-kicker">${escapeHtml(t("partner_nav_offers", "Offers"))}</span>${featureBadge("guest_booking_leads", "live")}</div><h2>${escapeHtml(t("today_active_offers_title", "Active offers"))}</h2></div>
-        <a class="ghost-button" href="#partner-deals">${escapeHtml(t("manage_offers_button", "Manage offers"))}</a>
+        <a class="ghost-button" href="/partner/offers">${escapeHtml(t("manage_offers_button", "Manage offers"))}</a>
       </div>
       ${activeOffers.length ? `
         <div class="today-list">
           ${activeOffers.map((offer) => `
             <section class="today-list-item">
               <div>
-                <strong>${escapeHtml(offer.title_en || offer.title || "SmartTable offer")}</strong>
+                <strong>${escapeHtml(partnerOfferTitle(offer))}</strong>
                 <span>${escapeHtml(formatDate(offer.offer_date, offer.start_time || offer.offer_time, offer.end_time))}</span>
               </div>
               <div class="today-list-meta">
                 <b>${escapeHtml(discountLabel(offer))}</b>
-                <small>${escapeHtml(offer.available_tables || offer.seat_count || 0)} tables</small>
+                <small>${escapeHtml(offer.available_tables || offer.seat_count || 0)} ${escapeHtml(t("tables_short_label", "tables"))}</small>
               </div>
             </section>
           `).join("")}
@@ -9024,18 +15329,20 @@ function partnerTodayOffersPanel() {
   `;
 }
 
-function partnerTodayReservationLeadsPanel() {
-  const rows = state.reservations.slice(0, 5);
-  const pendingCount = state.reservations.filter((row) => ["pending", "requested"].includes(String(row.status))).length;
+function partnerTodayReservationLeadsPanel(options = {}) {
+  const limit = Number(options.limit || 5);
+  const rows = state.reservations.slice(0, limit);
+  const pendingCount = state.reservations.filter((row) => normalizeReservationStatusValue(row.status) === "pending").length;
+  const totalRequests = state.partnerStats?.bookings ?? state.reservations.length;
   return `
     <article class="panel today-operational-panel" id="partner-today-reservation-leads">
       <div class="section-title-row compact">
         <div><div class="status-title-row"><span class="section-kicker">${escapeHtml(t("partner_nav_reservations", "Reservations"))}</span>${featureBadge("guest_booking_leads", "live")}</div><h2>${escapeHtml(t("today_reservation_leads_title", "Reservation leads"))}</h2></div>
-        <a class="ghost-button" href="#partner-reservations">${escapeHtml(t("manage_reservations_button", "Manage reservations"))}</a>
+        <a class="ghost-button" href="/partner/reservations">${escapeHtml(t("manage_reservations_button", "Manage reservations"))}</a>
       </div>
       <div class="owner-value-grid compact-grid">
-        ${statCard(t("reservations_pending_label", "Pending"), pendingCount)}
-        ${statCard(t("partner_kpi_bookings", "Bookings"), state.partnerStats?.bookings ?? state.reservations.length)}
+        ${kpiStatCard("partner_kpi_pending_requests", "Pending requests", pendingCount, "partner_kpi_pending_requests_desc", "Reservation requests awaiting your response", { key: "pending_requests" })}
+        ${kpiStatCard("partner_leads_total_requests", "Total requests", totalRequests, "partner_leads_total_requests_desc", "All reservation requests in the current list", { key: "reservation_leads_total" })}
       </div>
       ${rows.length ? `
         <div class="today-list">
@@ -9053,6 +15360,149 @@ function partnerTodayReservationLeadsPanel() {
           `).join("")}
         </div>
       ` : `<div class="empty-state">${escapeHtml(t("today_reservations_empty", "No reservation leads yet. New guest requests will appear here."))}</div>`}
+    </article>
+  `;
+}
+
+function partnerProfileMissingFields() {
+  const restaurant = state.partnerProfile || {};
+  const checks = [
+    restaurant.name,
+    restaurant.description_hu || restaurant.description_en || restaurant.description,
+    restaurant.address,
+    restaurant.phone,
+    restaurant.email || restaurant.contact_email,
+    restaurant.cuisine_type || restaurant.cuisine,
+    restaurant.card_image || restaurant.cover_image || restaurant.logo_url
+  ];
+  return checks.filter((value) => !String(value || "").trim()).length;
+}
+
+function partnerCapacityIssueCount() {
+  return partnerActiveOffers().filter((offer) => Number(offer.available_tables || offer.seat_count || 0) <= Number(offer.reserved_tables || 0)).length;
+}
+
+function partnerNotificationReady() {
+  const prefs = state.partnerAlertSettings || {};
+  const emailReady = prefs.email_enabled !== false;
+  const popupReady = prefs.dashboard_popup_enabled !== false;
+  const pushReady = Boolean(state.partnerAlertPush?.enabled && state.partnerAlertDevices?.length);
+  const smsReady = prefs.sms_fallback_enabled === true && (prefs.primary_sms_number_configured || String(prefs.primary_sms_number || "").trim());
+  return emailReady || popupReady || pushReady || smsReady;
+}
+
+function partnerUrgentActionsPanel() {
+  const pendingCount = state.reservations.filter((row) => normalizeReservationStatusValue(row.status) === "pending").length;
+  const missingProfileFields = partnerProfileMissingFields();
+  const capacityIssues = partnerCapacityIssueCount();
+  const expiringOffers = partnerActiveOffers().filter((offer) => isFuturePartnerOffer(offer, 2)).length;
+  const actions = [
+    pendingCount > 0 ? {
+      priority: "high",
+      title: contentTemplate("partner_urgent_pending_title", "{{count}} reservation request needs a response", { count: pendingCount }),
+      body: t("partner_urgent_pending_body", "Accept or decline the request before the guest waits too long."),
+      button: t("partner_urgent_pending_button", "Manage reservation"),
+      href: "/partner/reservations"
+    } : null,
+    missingProfileFields > 0 ? {
+      priority: "medium",
+      title: t("partner_urgent_profile_title", "The restaurant profile is incomplete"),
+      body: t("partner_urgent_profile_body", "Complete the public information so guests can make a confident decision."),
+      button: t("partner_urgent_profile_button", "Complete profile"),
+      href: "/partner/profile"
+    } : null,
+    capacityIssues > 0 ? {
+      priority: "medium",
+      title: t("partner_urgent_capacity_title", "A capacity period needs attention"),
+      body: t("partner_urgent_capacity_body", "Some active offers have no remaining table capacity."),
+      button: t("partner_urgent_capacity_button", "Manage capacity"),
+      href: "/partner/capacity"
+    } : null,
+    !partnerNotificationReady() ? {
+      priority: "medium",
+      title: t("partner_urgent_notifications_title", "Notifications are not configured"),
+      body: t("partner_urgent_notifications_body", "Set up dashboard, email, push or SMS alerts for new reservation requests."),
+      button: t("partner_urgent_notifications_button", "Set notifications"),
+      href: "/partner/notifications"
+    } : null,
+    expiringOffers > 0 ? {
+      priority: "low",
+      title: t("partner_urgent_offer_title", "An offer starts soon"),
+      body: t("partner_urgent_offer_body", "Review availability and make sure the team is ready."),
+      button: t("partner_urgent_offer_button", "Manage offers"),
+      href: "/partner/offers"
+    } : null
+  ].filter(Boolean);
+  return `
+    <article class="panel urgent-actions-panel" id="partner-urgent-actions">
+      <div class="section-title-row compact">
+        <div><span class="section-kicker">${escapeHtml(t("partner_urgent_kicker", "Priority"))}</span><h2>${escapeHtml(t("partner_urgent_title", "Urgent actions"))}</h2></div>
+      </div>
+      ${actions.length ? `
+        <div class="urgent-action-list">
+          ${actions.map((item) => `
+            <section class="urgent-action-card ${escapeAttr(item.priority)}">
+              <span class="priority-pill ${escapeAttr(item.priority)}">${escapeHtml(t(`priority_${item.priority}`, item.priority))}</span>
+              <div>
+                <strong>${escapeHtml(item.title)}</strong>
+                <p>${escapeHtml(item.body)}</p>
+              </div>
+              <a class="ghost-button" href="${escapeAttr(item.href)}">${escapeHtml(item.button)}</a>
+            </section>
+          `).join("")}
+        </div>
+      ` : `<div class="empty-state">${escapeHtml(t("partner_urgent_empty", "No urgent action right now."))}</div>`}
+    </article>
+  `;
+}
+
+function partnerHealthComponentScore(health = {}, key, fallbackScore) {
+  const component = (health.components || []).find((item) => item.key === key || String(item.key || "").includes(key));
+  const value = Number(component?.score);
+  return Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : fallbackScore;
+}
+
+function partnerOverviewHealthSummaryPanel() {
+  const analytics = state.partnerAnalytics || {};
+  const health = analytics.health_score || {};
+  const rows = state.reservations || [];
+  const pendingCount = rows.filter((row) => normalizeReservationStatusValue(row.status) === "pending").length;
+  const acceptedCount = rows.filter((row) => normalizeReservationStatusValue(row.status) === "accepted").length;
+  const profileScore = Math.max(20, Math.round(((7 - partnerProfileMissingFields()) / 7) * 100));
+  const reservationScore = rows.length ? Math.round((acceptedCount / Math.max(1, rows.length)) * 100) : 70;
+  const offerScore = partnerActiveOffers().length ? 82 : 35;
+  const communicationScore = pendingCount ? 58 : 86;
+  const operationScore = (state.partnerProfile?.opening_hours || state.partnerProfile?.capacity || state.partnerProfile?.table_capacity) ? 78 : 45;
+  const components = [
+    { key: "profile_completeness", label: t("partner_health_profile_completeness", "Profile completeness"), score: partnerHealthComponentScore(health, "profile", profileScore) },
+    { key: "reservation_handling", label: t("partner_health_reservation_handling", "Reservation handling"), score: partnerHealthComponentScore(health, "reservation", reservationScore) },
+    { key: "offers_activity", label: t("partner_health_offers", "Offers"), score: partnerHealthComponentScore(health, "offer", offerScore) },
+    { key: "communication_response_time", label: t("partner_health_communication", "Communication and response time"), score: partnerHealthComponentScore(health, "communication", communicationScore) },
+    { key: "operational_settings", label: t("partner_health_operations", "Operational settings"), score: partnerHealthComponentScore(health, "operational", operationScore) }
+  ];
+  const derivedScore = Math.round(components.reduce((sum, item) => sum + Number(item.score || 0), 0) / components.length);
+  const score = Number.isFinite(Number(health.score)) ? Number(health.score) : derivedScore;
+  const recommendations = (analytics.recommendations || []).slice(0, 3);
+  return `
+    <article class="panel partner-overview-health" id="partner-overview-health">
+      <div class="section-title-row compact">
+        <div><span class="section-kicker">${escapeHtml(t("analytics_health_kicker", "Restaurant health"))}</span><h2>${escapeHtml(t("analytics_health_title", "Restaurant Health Score"))}</h2></div>
+        <a class="ghost-button" href="/partner/analytics">${escapeHtml(t("partner_health_details_button", "View detailed status"))}</a>
+      </div>
+      <div class="compact-health-score"><strong>${escapeHtml(formatNumber(score))}</strong><span>/100</span></div>
+      <div class="compact-health-components">
+        ${components.map((component) => `
+          <div class="compact-health-row">
+            <span>${escapeHtml(component.label)}</span>
+            <div class="analytics-bar-track"><i style="width:${Math.max(0, Math.min(100, Number(component.score || 0)))}%"></i></div>
+            <strong>${escapeHtml(formatNumber(component.score))}</strong>
+          </div>
+        `).join("")}
+      </div>
+      <div class="compact-recommendations">
+        <strong>${escapeHtml(t("partner_health_top_recommendations", "Most important improvements"))}</strong>
+        ${recommendations.length ? `<ul>${recommendations.map((item) => `<li>${escapeHtml(analyticsRecommendationText(item))}</li>`).join("")}</ul>` : `<p class="muted">${escapeHtml(t("analytics_no_recommendations", "No recommendations right now."))}</p>`}
+      </div>
     </article>
   `;
 }
@@ -9113,13 +15563,552 @@ function comingSoonModulesPanel() {
   `;
 }
 
+async function runPartnerBillingAction(button) {
+  if (!button || button.disabled) return;
+  const action = button.dataset.partnerBillingAction;
+  if (action === "cancel_at_period_end" && !window.confirm(t("billing_cancel_confirm", "Cancel this subscription at the end of the current billing period?"))) return;
+  const restaurantId = cleanString(button.dataset.restaurantId || state.partnerBilling?.restaurant_id || state.partnerProfile?.id || "");
+  try {
+    setButtonPending(button, true, t("billing_processing", "Processing..."));
+    const payload = await api("/partner/billing", {
+      method: "POST",
+      body: JSON.stringify({
+        action,
+        restaurant_id: restaurantId,
+        plan_id: button.dataset.planId || "",
+        package_key: button.dataset.packageKey || "",
+        billing_interval: button.dataset.interval || "monthly"
+      })
+    });
+    if (payload.url) {
+      window.location.assign(payload.url);
+      return;
+    }
+    await loadPartnerData();
+    renderPartner();
+    showToast(payload.message || t("billing_action_saved", "Billing action saved."));
+  } catch (error) {
+    setButtonPending(button, false);
+    showToast(error.message);
+  }
+}
+
+function partnerCampaignPayload(form, action) {
+  const data = formObject(form);
+  return {
+    ...data,
+    action,
+    audience_followers: Boolean(data.audience_followers),
+    audience_reservations: Boolean(data.audience_reservations)
+  };
+}
+
+async function runPartnerCampaignAction(button) {
+  const form = document.querySelector("#partnerCampaignForm");
+  if (!form) return;
+  const action = button.dataset.campaignAction;
+  if (action === "send_now" && !confirm(t("campaign_send_now_confirm", "Queue this campaign for opted-in recipients?"))) return;
+  setButtonPending(button, true, action === "estimate_audience" ? t("campaign_estimating", "Estimating...") : t("saving_button", "Saving..."));
+  try {
+    const payload = partnerCampaignPayload(form, action);
+    const response = await api("/partner/campaigns", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    });
+    if (action === "estimate_audience") {
+      showToast(contentTemplate("campaign_audience_count_toast", "{{count}} eligible opted-in recipients.", { count: response.audience_count || 0 }));
+    } else if (action === "test_email") {
+      showToast(response.accepted ? t("campaign_test_email_sent", "Test email accepted by the provider.") : t("campaign_test_email_failed", "Test email was not accepted."));
+    } else if (action === "send_now") {
+      showToast(contentTemplate("campaign_queued_toast", "Campaign queued for {{count}} recipients.", { count: response.queued_count || response.campaign?.recipient_count || 0 }));
+    } else {
+      showToast(t("campaign_saved_toast", "Campaign saved."));
+    }
+    await loadPartnerData();
+    renderPartner();
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    setButtonPending(button, false);
+  }
+}
+
+async function notifyFavoriteGuestsForOffer(button) {
+  const offerId = button?.dataset?.notifyFavoriteOffer;
+  if (!offerId || button.disabled) return;
+  if (!confirm(t("favorite_offer_notify_confirm", "Email guests who favorited this restaurant and opted in to restaurant updates about this offer?"))) return;
+  setButtonPending(button, true, t("favorite_offer_notify_sending", "Queueing..."));
+  try {
+    const response = await api("/partner/campaigns", {
+      method: "POST",
+      body: JSON.stringify({
+        action: "notify_favorite_guests_for_offer",
+        offer_id: offerId
+      })
+    });
+    await loadPartnerData();
+    renderPartner();
+    if (response.duplicate_prevented) {
+      showToast(t("favorite_offer_notify_duplicate_toast", "This offer was already sent to favorite guests recently."));
+      return;
+    }
+    const count = response.queued_count || response.campaign?.recipient_count || 0;
+    showToast(count
+      ? contentTemplate("favorite_offer_notify_queued_toast", "Queued offer email for {{count}} opted-in favorite guests.", { count })
+      : t("favorite_offer_notify_no_recipients_toast", "No opted-in favorite guests are eligible for this offer yet."));
+  } catch (error) {
+    setButtonPending(button, false);
+    showToast(error.message);
+  }
+}
+
+function fillPartnerCampaignTemplate(templateId) {
+  const templateRow = (partnerCampaignsData().templates || []).find((item) => item.id === templateId);
+  const form = document.querySelector("#partnerCampaignForm");
+  if (!templateRow || !form) return;
+  for (const field of ["name", "subject_en", "subject_es", "subject_hu", "preheader_en", "preheader_es", "preheader_hu", "body_en", "body_es", "body_hu"]) {
+    if (form.elements[field] && templateRow[field] !== undefined) form.elements[field].value = templateRow[field] || "";
+  }
+}
+
+function applyPartnerCampaignFormatting(button) {
+  const form = document.querySelector("#partnerCampaignForm");
+  const textarea = form?.elements?.[button.dataset.campaignTarget];
+  if (!textarea) return;
+  const action = button.dataset.campaignFormat;
+  const start = textarea.selectionStart || 0;
+  const end = textarea.selectionEnd || start;
+  const selected = textarea.value.slice(start, end);
+  const fallback = selected || t("campaign_format_selected_text", "selected text");
+  const replacement = action === "bold"
+    ? `**${fallback}**`
+    : action === "list"
+      ? fallback.split(/\r?\n/).map((line) => `- ${line || t("campaign_format_list_item", "List item")}`).join("\n")
+      : `[${fallback}](https://)`;
+  textarea.setRangeText(replacement, start, end, "end");
+  textarea.focus();
+}
+
+async function runPartnerCampaignRowAction(button) {
+  const action = button.dataset.campaignRowAction;
+  const id = button.dataset.campaignId;
+  if (!action || !id) return;
+  if (action === "cancel" && !confirm(t("campaign_cancel_confirm", "Cancel this campaign?"))) return;
+  setButtonPending(button, true);
+  try {
+    await api("/partner/campaigns", {
+      method: "POST",
+      body: JSON.stringify({ action, id })
+    });
+    await loadPartnerData();
+    renderPartner();
+    showToast(t("campaign_action_saved", "Campaign updated."));
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    setButtonPending(button, false);
+  }
+}
+
+function partnerSmsCampaignPayload(form, action) {
+  const data = formObject(form);
+  return {
+    ...data,
+    action,
+    audience_followers: Boolean(data.audience_followers),
+    audience_reservations: Boolean(data.audience_reservations)
+  };
+}
+
+async function runPartnerSmsCampaignAction(button) {
+  const form = document.querySelector("#partnerSmsCampaignForm");
+  if (!form) return;
+  const action = button.dataset.smsCampaignAction;
+  if (action === "send_now" && !confirm(t("sms_campaign_send_now_confirm", "Queue this SMS campaign for opted-in recipients?"))) return;
+  setButtonPending(button, true, action === "estimate_audience" ? t("campaign_estimating", "Estimating...") : t("saving_button", "Saving..."));
+  try {
+    const response = await api("/partner/sms-campaigns", {
+      method: "POST",
+      body: JSON.stringify(partnerSmsCampaignPayload(form, action))
+    });
+    if (action === "estimate_audience") {
+      showToast(contentTemplate("sms_campaign_audience_toast", "{{count}} eligible SMS recipients. Estimated segments: {{segments}}.", {
+        count: response.audience_count || 0,
+        segments: response.segment_count_estimate || 0
+      }));
+    } else if (action === "test_sms") {
+      showToast(response.accepted ? t("sms_test_accepted_toast", "Test SMS accepted by the provider.") : t("sms_test_failed_toast", "Test SMS was not accepted."));
+    } else {
+      showToast(t("sms_campaign_saved_toast", "SMS campaign updated."));
+    }
+    await loadPartnerData();
+    renderPartner();
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    setButtonPending(button, false);
+  }
+}
+
+async function runPartnerSmsCampaignRowAction(button) {
+  const action = button.dataset.smsCampaignRowAction;
+  const id = button.dataset.smsCampaignId;
+  if (!action || !id) return;
+  if (action === "cancel" && !confirm(t("sms_campaign_cancel_confirm", "Cancel this SMS campaign?"))) return;
+  setButtonPending(button, true);
+  try {
+    await api("/partner/sms-campaigns", {
+      method: "POST",
+      body: JSON.stringify({ action, id })
+    });
+    await loadPartnerData();
+    renderPartner();
+    showToast(t("sms_campaign_action_saved", "SMS campaign updated."));
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    setButtonPending(button, false);
+  }
+}
+
+function foodFeedStatusLabel(status = "") {
+  const normalized = String(status || "pending_moderation").toLowerCase();
+  const labels = {
+    pending_moderation: t("food_feed_status_pending_moderation", "Pending review"),
+    published: t("food_feed_status_published", "Published"),
+    rejected: t("food_feed_status_rejected", "Rejected"),
+    archived: t("food_feed_status_archived", "Archived")
+  };
+  return labels[normalized] || normalized;
+}
+
+function partnerFoodFeedPanel() {
+  const offerOptions = [
+    `<option value="">${escapeHtml(t("partner_food_feed_offer", "Linked offer (optional)"))}</option>`,
+    ...state.offersMine.map((offer) => `<option value="${escapeAttr(offer.id)}">${escapeHtml(offer.title_en || offer.title || formatDate(offer.offer_date, offer.start_time, offer.end_time))}</option>`)
+  ].join("");
+  const videos = state.partnerFoodFeedVideos || [];
+  return `
+    <article class="panel food-feed-manager" id="partner-food-feed">
+      <div class="section-title-row compact">
+        <div>
+          <span class="section-kicker">What to Eat</span>
+          <h2>${escapeHtml(t("partner_food_feed_title", "3-second food videos"))}</h2>
+          <p class="muted">${escapeHtml(t("partner_food_feed_intro", "Upload a vertical 3-second dish video. SmartTable reviews it before it appears publicly."))}</p>
+        </div>
+      </div>
+      <form class="mini-form food-feed-upload-form" id="partnerFoodFeedForm">
+        <div class="form-grid">
+          ${textInput("title", t("partner_food_feed_video_title", "Video title"), "", "text", "required maxlength=\"120\"")}
+          <label>${escapeHtml(t("partner_food_feed_offer", "Linked offer (optional)"))}<select name="offer_id">${offerOptions}</select></label>
+        </div>
+        ${textArea("caption", t("partner_food_feed_caption", "Short caption"), "", "maxlength=\"600\"")}
+        <label>${escapeHtml(t("partner_food_feed_file", "Vertical MP4 or WebM video"))}
+          <input name="video" type="file" accept="video/mp4,video/webm" required>
+        </label>
+        <p class="form-note">${escapeHtml(t("partner_food_feed_rules", "Required: 9:16 vertical format, at least 720x1280 pixels (1080x1920 recommended), 2.5-3.5 seconds, MP4 or WebM, maximum 20 MB."))}</p>
+        <button class="primary-button" type="submit">${escapeHtml(t("partner_food_feed_upload", "Submit for review"))}</button>
+      </form>
+      <div class="food-feed-management-grid">
+        ${videos.map((video) => `
+          <article class="food-feed-management-card">
+            <video src="${escapeAttr(video.video_url || "")}" controls muted loop playsinline preload="metadata" aria-label="${escapeAttr(video.title || t("food_feed_video_label", "3-second food video"))}"></video>
+            <div class="food-feed-management-copy">
+              <div class="status-title-row">
+                <strong>${escapeHtml(video.title || t("food_feed_video_label", "3-second food video"))}</strong>
+                <span class="status ${escapeAttr(video.status || "pending_moderation")}">${escapeHtml(foodFeedStatusLabel(video.status))}</span>
+              </div>
+              ${video.caption ? `<p>${escapeHtml(video.caption)}</p>` : ""}
+              <p class="form-note">${escapeHtml(`${Math.round(Number(video.duration_ms || 0)) / 1000}s · ${video.width || "—"}×${video.height || "—"}`)}</p>
+              ${video.moderation_reason ? `<p class="inline-error">${escapeHtml(video.moderation_reason)}</p>` : ""}
+              <div class="button-row">
+                ${video.status === "rejected" ? `<button class="ghost-button" type="button" data-partner-food-feed-status="pending_moderation" data-food-feed-id="${escapeAttr(video.id)}">${escapeHtml(t("partner_food_feed_resubmit", "Resubmit"))}</button>` : ""}
+                ${video.status !== "archived" ? `<button class="ghost-button danger-button" type="button" data-partner-food-feed-status="archived" data-food-feed-id="${escapeAttr(video.id)}">${escapeHtml(t("partner_food_feed_archive", "Archive"))}</button>` : ""}
+              </div>
+            </div>
+          </article>
+        `).join("") || `<div class="empty-state compact-empty"><p>${escapeHtml(t("partner_food_feed_empty", "No What to Eat videos have been submitted yet."))}</p></div>`}
+      </div>
+    </article>
+  `;
+}
+
+function adminFoodFeedPanel() {
+  const videos = state.adminFoodFeedVideos || [];
+  const restaurantOptions = (state.restaurants || [])
+    .slice()
+    .sort((a, b) => String(a.display_name || a.name || "").localeCompare(String(b.display_name || b.name || "")))
+    .map((restaurant) => `<option value="${escapeAttr(restaurant.id)}">${escapeHtml(restaurant.display_name || restaurant.name || restaurant.id)}</option>`)
+    .join("");
+  return `
+    <article class="panel food-feed-manager" id="admin-food-feed">
+      <div class="section-title-row compact">
+        <div>
+          <span class="section-kicker">What to Eat</span>
+          <h2>${escapeHtml(t("admin_food_feed_title", "What to Eat moderation"))}</h2>
+          <p class="muted">${escapeHtml(t("admin_food_feed_intro", "Review restaurant media before it becomes visible in the public feed."))}</p>
+        </div>
+      </div>
+      ${isSuperAdmin() ? `
+        <form class="mini-form food-feed-upload-form admin-food-feed-upload" id="adminFoodFeedForm">
+          <div class="form-grid">
+            <label>${escapeHtml(t("admin_food_feed_restaurant", "Restaurant"))}<select name="restaurant_id" required><option value="">${escapeHtml(t("admin_food_feed_select_restaurant", "Select a restaurant"))}</option>${restaurantOptions}</select></label>
+            ${textInput("title", t("admin_food_feed_media_title", "Media title"), "", "text", "required maxlength=\"120\"")}
+          </div>
+          ${textArea("caption", t("partner_food_feed_caption", "Short caption"), "", "maxlength=\"600\"")}
+          <label>${escapeHtml(t("admin_food_feed_file", "Vertical video or image"))}<input name="media" type="file" accept="video/mp4,video/webm,image/jpeg,image/png,image/webp" required></label>
+          <label class="checkbox-row"><input name="publish_immediately" type="checkbox" checked><span>${escapeHtml(t("admin_food_feed_publish_immediately", "Publish immediately"))}</span></label>
+          <p class="form-note">${escapeHtml(t("admin_food_feed_rules", "9:16 vertical MP4/WebM video (at least 720x1280 pixels, 1080x1920 recommended, 2.5-3.5 seconds, max 20 MB) or JPEG/PNG/WebP image (same resolution, max 10 MB)."))}</p>
+          <button class="primary-button" type="submit">${escapeHtml(t("admin_food_feed_upload", "Upload media"))}</button>
+        </form>
+      ` : ""}
+      <div class="food-feed-management-grid admin-food-feed-grid">
+        ${videos.map((video) => `
+          <article class="food-feed-management-card">
+            ${video.media_type === "image" || String(video.mime_type || "").startsWith("image/")
+              ? `<img src="${escapeAttr(video.media_url || video.video_url || "")}" loading="lazy" alt="${escapeAttr(video.title || t("food_feed_image_label", "Food photo"))}">`
+              : `<video src="${escapeAttr(video.media_url || video.video_url || "")}" controls muted loop playsinline preload="metadata" aria-label="${escapeAttr(video.title || t("food_feed_video_label", "3-second food video"))}"></video>`}
+            <div class="food-feed-management-copy">
+              <div class="status-title-row">
+                <strong>${escapeHtml(video.title || t("food_feed_video_label", "3-second food video"))}</strong>
+                <span class="status ${escapeAttr(video.status || "pending_moderation")}">${escapeHtml(foodFeedStatusLabel(video.status))}</span>
+              </div>
+              <p><strong>${escapeHtml(video.restaurant?.display_name || video.restaurant?.name || t("restaurant_label", "Restaurant"))}</strong>${video.restaurant?.city ? ` · ${escapeHtml(video.restaurant.city)}` : ""}</p>
+              ${video.caption ? `<p>${escapeHtml(video.caption)}</p>` : ""}
+              <p class="form-note">${escapeHtml(`${video.media_type === "image" || String(video.mime_type || "").startsWith("image/") ? t("food_feed_image_type", "Image") : `${Math.round(Number(video.duration_ms || 0)) / 1000}s`} · ${video.width || "—"}×${video.height || "—"}`)}</p>
+              <label>${escapeHtml(t("admin_food_feed_reason", "Moderation reason"))}<input type="text" maxlength="500" data-food-feed-reason="${escapeAttr(video.id)}" value="${escapeAttr(video.moderation_reason || "")}"></label>
+              <div class="button-row">
+                <button class="primary-button" type="button" data-admin-food-feed-status="published" data-food-feed-id="${escapeAttr(video.id)}">${escapeHtml(t("admin_food_feed_publish", "Publish"))}</button>
+                <button class="ghost-button danger-button" type="button" data-admin-food-feed-status="rejected" data-food-feed-id="${escapeAttr(video.id)}">${escapeHtml(t("admin_food_feed_reject", "Reject"))}</button>
+                <button class="ghost-button" type="button" data-admin-food-feed-status="archived" data-food-feed-id="${escapeAttr(video.id)}">${escapeHtml(t("admin_food_feed_archive", "Archive"))}</button>
+              </div>
+            </div>
+          </article>
+        `).join("") || `<div class="empty-state compact-empty"><p>${escapeHtml(t("admin_food_feed_empty", "No restaurant videos require moderation."))}</p></div>`}
+      </div>
+    </article>
+  `;
+}
+
+function readFoodFeedVideoMetadata(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const video = document.createElement("video");
+    let validationTimeout = null;
+    let settled = false;
+    const cleanup = () => {
+      video.onloadedmetadata = null;
+      video.onloadeddata = null;
+      video.ondurationchange = null;
+      video.onseeked = null;
+      video.ontimeupdate = null;
+      video.onerror = null;
+      if (validationTimeout) clearTimeout(validationTimeout);
+      URL.revokeObjectURL(url);
+    };
+    const rejectInvalidVideo = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(new Error(t("partner_food_feed_rules", "Required: 9:16 vertical format, at least 720x1280 pixels (1080x1920 recommended), 2.5-3.5 seconds, MP4 or WebM, maximum 20 MB.")));
+    };
+    const validateMetadata = () => {
+      if (settled || !Number.isFinite(video.duration) || !video.videoWidth || !video.videoHeight) return false;
+      const metadata = {
+        duration_ms: Math.round(video.duration * 1000),
+        width: video.videoWidth,
+        height: video.videoHeight
+      };
+      settled = true;
+      cleanup();
+      if (metadata.duration_ms < 2500 || metadata.duration_ms > 3500) {
+        reject(new Error(t("partner_food_feed_rules", "Required: 9:16 vertical format, at least 720x1280 pixels (1080x1920 recommended), 2.5-3.5 seconds, MP4 or WebM, maximum 20 MB.")));
+        return true;
+      }
+      if (!metadata.width || !metadata.height || metadata.height <= metadata.width || metadata.width < 720 || metadata.height < 1280) {
+        reject(new Error(t("partner_food_feed_rules", "Required: 9:16 vertical format, at least 720x1280 pixels (1080x1920 recommended), 2.5-3.5 seconds, MP4 or WebM, maximum 20 MB.")));
+        return true;
+      }
+      resolve(metadata);
+      return true;
+    };
+    const probeDuration = () => validateMetadata();
+    video.preload = "metadata";
+    video.onloadedmetadata = () => {
+      if (validateMetadata()) return;
+      // MediaRecorder WebM files may expose Infinity until the browser seeks once.
+      try {
+        video.currentTime = Number.MAX_SAFE_INTEGER;
+      } catch {
+        rejectInvalidVideo();
+      }
+    };
+    video.onloadeddata = probeDuration;
+    video.ondurationchange = probeDuration;
+    video.onseeked = probeDuration;
+    video.ontimeupdate = probeDuration;
+    video.onerror = rejectInvalidVideo;
+    validationTimeout = setTimeout(rejectInvalidVideo, 5000);
+    video.muted = true;
+    video.playsInline = true;
+    video.src = url;
+  });
+}
+
+function readFoodFeedImageMetadata(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const image = new Image();
+    const cleanup = () => URL.revokeObjectURL(url);
+    image.onload = () => {
+      const metadata = { duration_ms: null, width: image.naturalWidth, height: image.naturalHeight };
+      cleanup();
+      if (!metadata.width || !metadata.height || metadata.height <= metadata.width || metadata.width < 720 || metadata.height < 1280) {
+        reject(new Error(t("admin_food_feed_rules", "9:16 vertical MP4/WebM video (at least 720x1280 pixels, 1080x1920 recommended, 2.5-3.5 seconds, max 20 MB) or JPEG/PNG/WebP image (same resolution, max 10 MB).")));
+        return;
+      }
+      resolve(metadata);
+    };
+    image.onerror = () => {
+      cleanup();
+      reject(new Error(t("admin_food_feed_rules", "9:16 vertical MP4/WebM video (at least 720x1280 pixels, 1080x1920 recommended, 2.5-3.5 seconds, max 20 MB) or JPEG/PNG/WebP image (same resolution, max 10 MB).")));
+    };
+    image.src = url;
+  });
+}
+
+async function submitAdminFoodFeed(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const button = form.querySelector('button[type="submit"]');
+  const data = new FormData(form);
+  const file = data.get("media");
+  const allowed = ["video/mp4", "video/webm", "image/jpeg", "image/png", "image/webp"];
+  const isImage = file instanceof File && file.type.startsWith("image/");
+  const maxSize = isImage ? 10 * 1024 * 1024 : 20 * 1024 * 1024;
+  if (!(file instanceof File) || !file.size || !allowed.includes(file.type) || file.size > maxSize) {
+    return showToast(t("admin_food_feed_rules", "9:16 vertical MP4/WebM video (at least 720x1280 pixels, 1080x1920 recommended, 2.5-3.5 seconds, max 20 MB) or JPEG/PNG/WebP image (same resolution, max 10 MB)."));
+  }
+  setButtonPending(button, true, t("admin_food_feed_uploading", "Uploading media..."));
+  try {
+    const metadata = isImage ? await readFoodFeedImageMetadata(file) : await readFoodFeedVideoMetadata(file);
+    const restaurantId = data.get("restaurant_id");
+    const signed = await api("/admin/food-feed", {
+      method: "POST",
+      body: JSON.stringify({ action: "sign_upload", restaurant_id: restaurantId, filename: file.name, content_type: file.type })
+    });
+    if (!signed.upload_url || !signed.path) throw new Error(t("food_feed_load_error", "What to Eat could not be loaded right now."));
+    const uploadResponse = await fetch(signed.upload_url, { method: "PUT", headers: { "content-type": file.type }, body: file });
+    if (!uploadResponse.ok) throw new Error(t("food_feed_load_error", "What to Eat could not be loaded right now."));
+    await api("/admin/food-feed", {
+      method: "POST",
+      body: JSON.stringify({
+        restaurant_id: restaurantId,
+        title: data.get("title"),
+        caption: data.get("caption"),
+        storage_path: signed.path,
+        mime_type: file.type,
+        file_size_bytes: file.size,
+        publish_immediately: data.get("publish_immediately") === "on",
+        ...metadata
+      })
+    });
+    form.reset();
+    await loadAdminData();
+    renderAdmin();
+    showToast(t("admin_food_feed_uploaded", "What to Eat media uploaded."));
+  } catch (error) {
+    showToast(error.message || t("food_feed_load_error", "What to Eat could not be loaded right now."));
+  } finally {
+    setButtonPending(button, false);
+  }
+}
+
+async function submitPartnerFoodFeed(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const button = form.querySelector('button[type="submit"]');
+  const data = new FormData(form);
+  const file = data.get("video");
+  if (!(file instanceof File) || !file.size) return showToast(t("partner_food_feed_rules", "Required: 9:16 vertical format, at least 720x1280 pixels (1080x1920 recommended), 2.5-3.5 seconds, MP4 or WebM, maximum 20 MB."));
+  if (!["video/mp4", "video/webm"].includes(file.type) || file.size > 20 * 1024 * 1024) return showToast(t("partner_food_feed_rules", "Required: 9:16 vertical format, at least 720x1280 pixels (1080x1920 recommended), 2.5-3.5 seconds, MP4 or WebM, maximum 20 MB."));
+  setButtonPending(button, true, t("partner_food_feed_uploading", "Uploading video..."));
+  try {
+    const metadata = await readFoodFeedVideoMetadata(file);
+    const signed = await api("/partner/food-feed", {
+      method: "POST",
+      body: JSON.stringify({ action: "sign_upload", filename: file.name, content_type: file.type })
+    });
+    if (!signed.upload_url || !signed.path) throw new Error(t("food_feed_load_error", "What to Eat could not be loaded right now."));
+    const uploadResponse = await fetch(signed.upload_url, {
+      method: "PUT",
+      headers: { "content-type": file.type },
+      body: file
+    });
+    if (!uploadResponse.ok) throw new Error(t("food_feed_load_error", "What to Eat could not be loaded right now."));
+    await api("/partner/food-feed", {
+      method: "POST",
+      body: JSON.stringify({
+        title: data.get("title"),
+        caption: data.get("caption"),
+        offer_id: data.get("offer_id"),
+        storage_path: signed.path,
+        mime_type: file.type,
+        file_size_bytes: file.size,
+        ...metadata
+      })
+    });
+    form.reset();
+    await loadPartnerData();
+    renderPartner();
+    showToast(t("partner_food_feed_submitted", "Video submitted for moderation."));
+  } catch (error) {
+    showToast(error.message || t("food_feed_load_error", "What to Eat could not be loaded right now."));
+  } finally {
+    setButtonPending(button, false);
+  }
+}
+
+async function updatePartnerFoodFeedStatus(button) {
+  setButtonPending(button, true);
+  try {
+    await api("/partner/food-feed", { method: "PATCH", body: JSON.stringify({ id: button.dataset.foodFeedId, status: button.dataset.partnerFoodFeedStatus }) });
+    await loadPartnerData();
+    renderPartner();
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    setButtonPending(button, false);
+  }
+}
+
+async function updateAdminFoodFeedStatus(button) {
+  const id = button.dataset.foodFeedId;
+  const reason = document.querySelector(`[data-food-feed-reason="${CSS.escape(id)}"]`)?.value || "";
+  setButtonPending(button, true);
+  try {
+    await api("/admin/food-feed", { method: "PATCH", body: JSON.stringify({ id, status: button.dataset.adminFoodFeedStatus, moderation_reason: reason }) });
+    await loadAdminData();
+    renderAdmin();
+    showToast(t("admin_food_feed_updated", "What to Eat media status updated."));
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    setButtonPending(button, false);
+  }
+}
+
 function bindPartnerCoreEvents(includeAi = true) {
   document.querySelector("#refreshPartner")?.addEventListener("click", async () => {
     await loadPartnerData();
     renderPartner();
   });
   document.querySelector("#returnAdmin")?.addEventListener("click", returnToSuperAdmin);
-  document.querySelector("#profileForm")?.addEventListener("submit", submitProfile);
+  const profileForms = new Set([
+    document.querySelector("#profileForm"),
+    ...document.querySelectorAll("[data-partner-profile-form]")
+  ].filter(Boolean));
+  profileForms.forEach((form) => form.addEventListener("submit", submitProfile));
   document.querySelector("#reservationImportForm")?.addEventListener("submit", submitReservationImport);
   document.querySelector("#manualPerformanceForm")?.addEventListener("submit", submitManualPerformance);
   document.querySelector("#offerForm")?.addEventListener("submit", submitOffer);
@@ -9132,8 +16121,39 @@ function bindPartnerCoreEvents(includeAi = true) {
   document.querySelectorAll("[data-delete-partner-offer]").forEach((button) => {
     button.addEventListener("click", () => deleteOffer("/partner/offers", button.dataset.deletePartnerOffer, loadPartnerData, renderPartner, button));
   });
+  document.querySelectorAll("[data-notify-favorite-offer]").forEach((button) => {
+    button.addEventListener("click", () => notifyFavoriteGuestsForOffer(button));
+  });
   bindReservationStatusButtons("/partner/reservations", loadPartnerData, renderPartner);
   bindReservationFilterForms();
+  document.querySelectorAll("[data-partner-billing-action]").forEach((button) => {
+    button.addEventListener("click", () => runPartnerBillingAction(button));
+  });
+  document.querySelectorAll(".partner-review-response-form").forEach((form) => {
+    form.addEventListener("submit", submitPartnerReviewResponse);
+  });
+  document.querySelectorAll("[data-campaign-action]").forEach((button) => {
+    button.addEventListener("click", () => runPartnerCampaignAction(button));
+  });
+  document.querySelectorAll("[data-campaign-row-action]").forEach((button) => {
+    button.addEventListener("click", () => runPartnerCampaignRowAction(button));
+  });
+  document.querySelectorAll("[data-sms-campaign-action]").forEach((button) => {
+    button.addEventListener("click", () => runPartnerSmsCampaignAction(button));
+  });
+  document.querySelectorAll("[data-sms-campaign-row-action]").forEach((button) => {
+    button.addEventListener("click", () => runPartnerSmsCampaignRowAction(button));
+  });
+  document.querySelectorAll("[data-fill-campaign-template]").forEach((button) => {
+    button.addEventListener("click", () => fillPartnerCampaignTemplate(button.dataset.fillCampaignTemplate));
+  });
+  document.querySelectorAll("[data-campaign-format]").forEach((button) => {
+    button.addEventListener("click", () => applyPartnerCampaignFormatting(button));
+  });
+  document.querySelector("#partnerFoodFeedForm")?.addEventListener("submit", submitPartnerFoodFeed);
+  document.querySelectorAll("[data-partner-food-feed-status]").forEach((button) => {
+    button.addEventListener("click", () => updatePartnerFoodFeedStatus(button));
+  });
 
   if (!includeAi) return;
   bindAdvisorEvents();
@@ -9167,13 +16187,15 @@ function bindPartnerCoreEvents(includeAi = true) {
 }
 
 function basicPartnerOverviewPanel(stats = {}) {
-  const pendingCount = state.reservations.filter((row) => ["pending", "requested"].includes(String(row.status))).length;
-  const activeOffers = state.offersMine.filter((offer) => offer.status === "active").length;
-  const accepted = stats.accepted || state.reservations.filter((row) => normalizeReservationStatusValue(row.status) === "accepted").length;
-  const rejected = stats.rejected || state.reservations.filter((row) => normalizeReservationStatusValue(row.status) === "rejected").length;
+  const pendingCount = state.reservations.filter((row) => normalizeReservationStatusValue(row.status) === "pending").length;
+  const activeOffers = partnerActiveOffers().length;
+  const todayReservations = state.reservations.filter(isPartnerTodayReservation);
+  const todayGuestCount = todayReservations.reduce((sum, row) => sum + Number(row.party_size || 0), 0);
+  const accepted = stats.accepted ?? state.reservations.filter((row) => normalizeReservationStatusValue(row.status) === "accepted").length;
+  const declinedOrCancelled = state.reservations.filter((row) => ["rejected", "cancelled"].includes(normalizeReservationStatusValue(row.status))).length;
   return `
-    <section class="dashboard-grid two-col" id="partner-overview">
-      <article class="panel wide-panel">
+    <section class="partner-overview-layout" id="partner-overview">
+      <article class="panel wide-panel partner-shift-summary">
         <div class="section-title-row compact">
           <div>
             <span class="section-kicker">${escapeHtml(t("platform_mode_basic_label", "Basic"))}</span>
@@ -9182,19 +16204,648 @@ function basicPartnerOverviewPanel(stats = {}) {
           ${featureBadge("guest_booking_leads", "live")}
         </div>
         <p class="muted">${escapeHtml(t("basic_partner_overview_body", "Manage discounted table offers, review guest reservation requests, and keep your restaurant profile current."))}</p>
-        <div class="stats-grid compact-grid">
-          ${statCard(t("partner_kpi_bookings", "Bookings"), stats.bookings ?? state.reservations.length)}
-          ${statCard(t("reservations_pending_label", "Pending"), pendingCount)}
-          ${statCard(t("partner_kpi_accepted", "Accepted"), accepted)}
-          ${statCard(t("partner_kpi_rejected", "Rejected"), rejected)}
-          ${statCard(t("partner_kpi_active_offers", "Active offers"), activeOffers)}
-          ${statCard(t("partner_kpi_favorites", "Favorites"), stats.favorites_total ?? 0)}
+        <div class="stats-grid compact-grid partner-overview-kpis">
+          ${kpiStatCard("partner_kpi_today_reservations", "Today's reservations", todayReservations.length, "partner_kpi_today_reservations_desc", "Reservations scheduled for today", { key: "today_reservations" })}
+          ${kpiStatCard("partner_kpi_pending_requests", "Pending requests", pendingCount, "partner_kpi_pending_requests_desc", "Reservation requests awaiting your response", { key: "pending_requests" })}
+          ${kpiStatCard("partner_kpi_today_guests", "Today's guests", todayGuestCount, "partner_kpi_today_guests_desc", "Total guests expected today", { key: "today_guests" })}
+          ${kpiStatCard("partner_kpi_active_offers", "Active offers", activeOffers, "partner_kpi_active_offers_desc", "Offers currently visible to eligible guests", { key: "active_offers" })}
+          ${kpiStatCard("partner_kpi_confirmed_reservations", "Confirmed reservations", accepted, "partner_kpi_confirmed_reservations_desc", "Reservations accepted by the restaurant", { key: "confirmed_reservations" })}
+          ${kpiStatCard("partner_kpi_declined_or_cancelled", "Declined or cancelled", declinedOrCancelled, "partner_kpi_declined_or_cancelled_desc", "Requests declined, rejected, or cancelled", { key: "declined_or_cancelled" })}
+        </div>
+        <div class="partner-quick-actions" aria-label="${escapeAttr(t("partner_quick_actions_label", "Quick actions"))}">
+          <a class="primary-button" href="/partner/reservations">${escapeHtml(t("manage_reservations_button", "Manage reservations"))}</a>
+          <a class="ghost-button" href="/partner/offers#offerForm">${escapeHtml(t("partner_quick_create_offer", "Create new offer"))}</a>
+          <a class="ghost-button" href="/partner/offers">${escapeHtml(t("manage_offers_button", "Manage offers"))}</a>
+          <a class="ghost-button" href="/partner/profile">${escapeHtml(t("partner_quick_edit_profile", "Edit restaurant profile"))}</a>
+          <a class="ghost-button" href="/partner/capacity">${escapeHtml(t("partner_quick_manage_capacity", "Manage tables and capacity"))}</a>
         </div>
       </article>
-      ${partnerTodayReservationLeadsPanel()}
-      ${partnerTodayOffersPanel()}
+      <section class="dashboard-grid two-col partner-overview-grid">
+        ${partnerUrgentActionsPanel()}
+        ${partnerOverviewHealthSummaryPanel()}
+      </section>
+      <section class="dashboard-grid two-col partner-overview-grid">
+        ${partnerTodayReservationLeadsPanel({ limit: 5 })}
+        ${partnerTodayOffersPanel({ limit: 4 })}
+      </section>
     </section>
   `;
+}
+
+function analyticsFormatValue(key, value) {
+  if (value === null || value === undefined || value === "") return t("not_available", "Not available");
+  if (String(key).includes("rate") || String(key).includes("growth") || String(key).includes("conversion")) return `${formatNumber(value, { maximumFractionDigits: 1 })}%`;
+  if (String(key).includes("lead_time")) return `${formatNumber(value, { maximumFractionDigits: 1 })} ${t("analytics_hours_short", "h")}`;
+  if (typeof value === "number") return formatNumber(value, { maximumFractionDigits: 1 });
+  return String(value);
+}
+
+function analyticsMetricLabel(key) {
+  const labels = {
+    todays_reservations: t("analytics_todays_reservations", "Today's Reservations"),
+    this_week: t("analytics_this_week", "This Week"),
+    this_month: t("analytics_this_month", "This Month"),
+    total_reservations: t("analytics_total_reservations", "Total Reservations"),
+    reservation_growth: t("analytics_reservation_growth", "Reservation Growth"),
+    total_profile_views: t("analytics_total_profile_views", "Total Profile Views"),
+    offer_views: t("analytics_offer_views", "Offer Views"),
+    favorites: t("analytics_favorites", "Favorites"),
+    reservation_conversion_rate: t("analytics_reservation_conversion_rate", "Reservation Conversion Rate"),
+    returning_guests: t("analytics_returning_guests", "Returning Guests"),
+    new_guests: t("analytics_new_guests", "New Guests"),
+    average_party_size: t("analytics_average_party_size", "Average Party Size"),
+    cancellation_rate: t("analytics_cancellation_rate", "Cancellation Rate"),
+    no_show_rate: t("analytics_no_show_rate", "No-show Rate"),
+    average_booking_lead_time_hours: t("analytics_average_booking_lead_time", "Average Booking Lead Time"),
+    active_restaurants: t("analytics_active_restaurants", "Active restaurants"),
+    draft_restaurants: t("analytics_draft_restaurants", "Draft restaurants"),
+    suspended_restaurants: t("analytics_suspended_restaurants", "Suspended restaurants"),
+    archived_restaurants: t("analytics_archived_restaurants", "Archived restaurants"),
+    trial_restaurants: t("analytics_trial_restaurants", "Trial restaurants"),
+    paid_restaurants: t("analytics_paid_restaurants", "Paid restaurants"),
+    revenue_placeholder: t("analytics_revenue_placeholder", "Revenue placeholder"),
+    new_restaurants: t("analytics_new_restaurants", "New restaurants"),
+    restaurants: t("analytics_restaurants", "Restaurants"),
+    countries: t("analytics_countries", "Countries"),
+    cities: t("analytics_cities", "Cities"),
+    languages: t("analytics_languages", "Languages"),
+    reservations: t("analytics_reservations", "Reservations"),
+    platform_usage: t("analytics_platform_usage", "Platform usage"),
+    average_conversion: t("analytics_average_conversion", "Average conversion"),
+    health_score_average: t("analytics_health_score_average", "Health Score average")
+  };
+  return labels[key] || String(key || "").replaceAll("_", " ");
+}
+
+function analyticsMetricDescription(key) {
+  const descriptions = {
+    total_reservations: t("analytics_total_reservations_desc", "All reservation requests in the selected period"),
+    reservation_conversion_rate: t("analytics_reservation_conversion_rate_desc", "Reservations divided by measured offer or profile interest"),
+    new_guests: t("analytics_new_guests_desc", "First-time guests in the selected period"),
+    returning_guests: t("analytics_returning_guests_desc", "Guests with previous SmartTable activity"),
+    cancellation_rate: t("analytics_cancellation_rate_desc", "Cancelled or declined reservations as a share of total requests"),
+    no_show_rate: t("analytics_no_show_rate_desc", "No-show reservations where the outcome is recorded"),
+    average_party_size: t("analytics_average_party_size_desc", "Average number of guests per reservation"),
+    average_booking_lead_time_hours: t("analytics_average_booking_lead_time_desc", "Average time between booking and visit"),
+    todays_reservations: t("analytics_todays_reservations_desc", "Reservations scheduled for today"),
+    this_week: t("analytics_this_week_desc", "Reservations in the current week"),
+    this_month: t("analytics_this_month_desc", "Reservations in the current month"),
+    total_profile_views: t("analytics_total_profile_views_desc", "Profile views recorded in analytics"),
+    offer_views: t("analytics_offer_views_desc", "Offer views recorded in analytics"),
+    favorites: t("analytics_favorites_desc", "Guests who favorited this restaurant")
+  };
+  return descriptions[key] || "";
+}
+
+function analyticsMetricCards(cards = {}, keys = []) {
+  return `
+    <div class="stats-grid compact-grid analytics-metric-grid">
+      ${keys.map((key) => statCard(analyticsMetricLabel(key), analyticsFormatValue(key, cards[key]), analyticsMetricDescription(key))).join("")}
+    </div>
+  `;
+}
+
+function analyticsRangeOptions() {
+  return [
+    ["today", t("analytics_range_today", "Today")],
+    ["yesterday", t("analytics_range_yesterday", "Yesterday")],
+    ["7d", t("analytics_range_7d", "7 days")],
+    ["30d", t("analytics_range_30d", "30 days")],
+    ["90d", t("analytics_range_90d", "90 days")],
+    ["year", t("analytics_range_year", "Year")],
+    ["custom", t("analytics_range_custom", "Custom")]
+  ];
+}
+
+function analyticsFilterSelect(name, label, value, options = []) {
+  return `
+    <label>${escapeHtml(label)}
+      <select name="${escapeAttr(name)}">
+        ${options.map(([optionValue, optionLabel]) => `<option value="${escapeAttr(optionValue)}" ${String(value) === String(optionValue) ? "selected" : ""}>${escapeHtml(optionLabel)}</option>`).join("")}
+      </select>
+    </label>
+  `;
+}
+
+function partnerAnalyticsFiltersPanel() {
+  const filters = state.partnerAnalyticsFilters;
+  const offerOptions = [["all", t("all_label", "All")], ...state.offersMine.map((offer) => [offer.id, offer.title_en || offer.title || offer.offer_title || t("offer_label", "Offer")])];
+  const statusOptions = [["all", t("all_label", "All")], ["pending", t("reservations_pending_label", "Pending")], ["accepted", t("partner_kpi_accepted", "Accepted")], ["rejected", t("partner_kpi_rejected", "Rejected")], ["cancelled", t("reservation_status_cancelled", "Cancelled")], ["completed", t("reservation_status_completed", "Completed")], ["no_show", t("reservation_status_no_show", "No-show")]];
+  const weekdayOptions = [["all", t("all_label", "All")], ["1", t("weekday_monday", "Monday")], ["2", t("weekday_tuesday", "Tuesday")], ["3", t("weekday_wednesday", "Wednesday")], ["4", t("weekday_thursday", "Thursday")], ["5", t("weekday_friday", "Friday")], ["6", t("weekday_saturday", "Saturday")], ["0", t("weekday_sunday", "Sunday")]];
+  const hourOptions = [["all", t("all_label", "All")], ...Array.from({ length: 24 }, (_, hour) => [String(hour), `${String(hour).padStart(2, "0")}:00`])];
+  return `
+    <form class="analytics-filter-bar" id="partnerAnalyticsFilters">
+      ${analyticsFilterSelect("date_range", t("analytics_filter_date", "Date range"), filters.date_range, analyticsRangeOptions())}
+      <label>${escapeHtml(t("analytics_filter_from", "From"))}<input name="from" type="date" value="${escapeAttr(filters.from || "")}"></label>
+      <label>${escapeHtml(t("analytics_filter_to", "To"))}<input name="to" type="date" value="${escapeAttr(filters.to || "")}"></label>
+      ${analyticsFilterSelect("offer_id", t("analytics_filter_offer", "Offer"), filters.offer_id, offerOptions)}
+      ${analyticsFilterSelect("reservation_status", t("analytics_filter_status", "Reservation status"), filters.reservation_status, statusOptions)}
+      <label>${escapeHtml(t("analytics_filter_party_size", "Party size"))}<input name="party_size" type="number" min="1" max="20" value="${escapeAttr(filters.party_size || "")}"></label>
+      ${analyticsFilterSelect("weekday", t("analytics_filter_weekday", "Weekday"), filters.weekday, weekdayOptions)}
+      ${analyticsFilterSelect("hour", t("analytics_filter_hour", "Time of day"), filters.hour, hourOptions)}
+      <div class="analytics-filter-actions">
+        <button class="primary-button" type="submit">${escapeHtml(t("analytics_apply_filters", "Apply filters"))}</button>
+        <button class="ghost-button" data-clear-partner-analytics type="button">${escapeHtml(t("clear_filters_button", "Clear"))}</button>
+      </div>
+    </form>
+  `;
+}
+
+function adminAnalyticsFiltersPanel() {
+  const filters = state.adminAnalyticsFilters;
+  const uniqueOptions = (values) => [["all", t("all_label", "All")], ...[...new Set(values.map((value) => String(value || "").trim()).filter(Boolean))].sort().map((value) => [value, value])];
+  const restaurantOptions = [["all", t("all_label", "All")], ...state.restaurants.map((restaurant) => [restaurant.id, restaurant.name])];
+  const statusOptions = [["all", t("all_label", "All")], ["draft", t("restaurant_status_draft", "Draft")], ["pending_review", t("restaurant_status_pending_review", "Pending review")], ["active", t("restaurant_status_active", "Active")], ["approved", t("restaurant_status_approved", "Approved")], ["suspended", t("restaurant_status_suspended", "Suspended")], ["archived", t("restaurant_status_archived", "Archived")]];
+  const subscriptionOptions = [["all", t("all_label", "All")], ["trialing", t("billing_status_trialing", "Trialing")], ["active", t("billing_status_active", "Active")], ["past_due", t("billing_status_past_due", "Past due")], ["unpaid", t("billing_status_unpaid", "Unpaid")], ["canceled", t("billing_status_canceled", "Canceled")], ["no_subscription", t("billing_filter_no_subscription", "No subscription")]];
+  const subscriptionFilter = !isBasicMode()
+    ? analyticsFilterSelect("subscription", t("analytics_filter_subscription", "Subscription"), filters.subscription, subscriptionOptions)
+    : "";
+  return `
+    <form class="analytics-filter-bar" id="adminAnalyticsFilters">
+      ${analyticsFilterSelect("date_range", t("analytics_filter_date", "Date"), filters.date_range, analyticsRangeOptions())}
+      <label>${escapeHtml(t("analytics_filter_from", "From"))}<input name="from" type="date" value="${escapeAttr(filters.from || "")}"></label>
+      <label>${escapeHtml(t("analytics_filter_to", "To"))}<input name="to" type="date" value="${escapeAttr(filters.to || "")}"></label>
+      ${analyticsFilterSelect("country", t("analytics_filter_country", "Country"), filters.country, uniqueOptions(state.restaurants.map((restaurant) => restaurant.country || restaurant.country_code)))}
+      ${analyticsFilterSelect("city", t("analytics_filter_city", "City"), filters.city, uniqueOptions(state.restaurants.map((restaurant) => restaurant.city || restaurant.district)))}
+      ${analyticsFilterSelect("restaurant_id", t("analytics_filter_restaurant", "Restaurant"), filters.restaurant_id, restaurantOptions)}
+      ${analyticsFilterSelect("status", t("analytics_filter_status", "Status"), filters.status, statusOptions)}
+      ${subscriptionFilter}
+      <button class="primary-button" type="submit">${escapeHtml(t("analytics_apply_filters", "Apply filters"))}</button>
+    </form>
+  `;
+}
+
+function analyticsExportButtons(scope) {
+  return `
+    <div class="button-row analytics-export-row">
+      <button class="ghost-button" data-analytics-export="${escapeAttr(scope)}" data-format="csv" type="button">${escapeHtml(t("analytics_export_csv", "CSV"))}</button>
+      <button class="ghost-button" data-analytics-export="${escapeAttr(scope)}" data-format="excel" type="button">${escapeHtml(t("analytics_export_excel", "Excel"))}</button>
+      <button class="ghost-button" data-analytics-export="${escapeAttr(scope)}" data-format="pdf" type="button">${escapeHtml(t("analytics_export_pdf", "PDF"))}</button>
+    </div>
+  `;
+}
+
+function analyticsChartValue(row = {}) {
+  return Number(row.count ?? row.reservations ?? row.views ?? row.favorites ?? row.returning_guests ?? row.value ?? 0);
+}
+
+function analyticsHasMeaningfulRows(rows = []) {
+  return Array.isArray(rows) && rows.some((row) => analyticsChartValue(row) > 0);
+}
+
+function analyticsEmptyChartCard(title) {
+  return `
+    <article class="analytics-chart-card">
+      <h3>${escapeHtml(title)}</h3>
+      <div class="empty-state">${escapeHtml(t("analytics_no_sufficient_data", "Not enough data for this report yet."))}</div>
+    </article>
+  `;
+}
+
+function analyticsBarChart(title, rows = [], labelField = "date") {
+  if (!analyticsHasMeaningfulRows(rows)) return analyticsEmptyChartCard(title);
+  const max = Math.max(1, ...rows.map((row) => analyticsChartValue(row)));
+  return `
+    <article class="analytics-chart-card">
+      <h3>${escapeHtml(title)}</h3>
+      <div class="analytics-bars" role="img" aria-label="${escapeAttr(title)}">
+        ${rows.slice(-14).map((row) => {
+          const value = analyticsChartValue(row);
+          const label = row[labelField] || row.name || row.title || "";
+          return `
+            <div class="analytics-bar-row">
+              <span>${escapeHtml(label)}</span>
+              <div class="analytics-bar-track"><i style="width:${Math.max(2, Math.round((value / max) * 100))}%"></i></div>
+              <strong>${escapeHtml(formatNumber(value))}</strong>
+            </div>
+          `;
+        }).join("") || `<div class="empty-state">${escapeHtml(t("analytics_no_data", "No analytics data yet."))}</div>`}
+      </div>
+    </article>
+  `;
+}
+
+function analyticsHeatmap(rows = []) {
+  if (!analyticsHasMeaningfulRows(rows)) return analyticsEmptyChartCard(t("analytics_heatmap_title", "Reservation Heatmap"));
+  const max = Math.max(1, ...rows.map((row) => Number(row.count || 0)));
+  const dayLabels = [
+    t("weekday_sunday_short", "Sun"),
+    t("weekday_monday_short", "Mon"),
+    t("weekday_tuesday_short", "Tue"),
+    t("weekday_wednesday_short", "Wed"),
+    t("weekday_thursday_short", "Thu"),
+    t("weekday_friday_short", "Fri"),
+    t("weekday_saturday_short", "Sat")
+  ];
+  const byKey = new Map(rows.map((row) => [`${row.day}-${row.hour}`, Number(row.count || 0)]));
+  return `
+    <article class="analytics-chart-card analytics-heatmap-card">
+      <h3>${escapeHtml(t("analytics_heatmap_title", "Reservation Heatmap"))}</h3>
+      <div class="analytics-heatmap" role="img" aria-label="${escapeAttr(t("analytics_heatmap_title", "Reservation Heatmap"))}">
+        ${dayLabels.map((day, dayIndex) => `
+          <div class="analytics-heatmap-row">
+            <span>${escapeHtml(day)}</span>
+            ${Array.from({ length: 24 }, (_, hour) => {
+              const value = byKey.get(`${dayIndex}-${hour}`) || 0;
+              return `<i title="${escapeAttr(`${day} ${hour}:00 - ${value}`)}" style="opacity:${0.18 + (value / max) * 0.82}"></i>`;
+            }).join("")}
+          </div>
+        `).join("")}
+      </div>
+    </article>
+  `;
+}
+
+function sortOfferAnalyticsRows(rows = []) {
+  const sort = state.partnerOfferAnalyticsSort || { key: "reservations", direction: "desc" };
+  const direction = sort.direction === "asc" ? 1 : -1;
+  return [...rows].sort((a, b) => {
+    const av = a[sort.key];
+    const bv = b[sort.key];
+    if (typeof av === "number" || typeof bv === "number") return (Number(av || 0) - Number(bv || 0)) * direction;
+    return String(av || "").localeCompare(String(bv || "")) * direction;
+  });
+}
+
+function offerAnalyticsHeader(key, label) {
+  const sort = state.partnerOfferAnalyticsSort || {};
+  const active = sort.key === key;
+  const indicator = active ? (sort.direction === "asc" ? " ↑" : " ↓") : "";
+  return `<th><button class="table-sort-button" data-offer-analytics-sort="${escapeAttr(key)}" type="button">${escapeHtml(label)}${escapeHtml(indicator)}</button></th>`;
+}
+
+function analyticsRecommendationKey(text = "") {
+  const value = String(text || "").toLowerCase();
+  if (value.includes("complete") && value.includes("profile")) return "complete_profile";
+  if (value.includes("upload") && (value.includes("photo") || value.includes("image"))) return "upload_photos";
+  if (value.includes("create") && value.includes("offer")) return "create_offer";
+  if (value.includes("monday") && value.includes("low")) return "monday_low_bookings";
+  if (value.includes("friday") && (value.includes("best") || value.includes("perform"))) return "friday_best";
+  if (value.includes("response") && value.includes("high")) return "response_time_high";
+  if (value.includes("enable") && value.includes("lunch")) return "enable_lunch";
+  if (value.includes("outdoor")) return "add_outdoor_seating";
+  if (value.includes("discount") && value.includes("tuesday")) return "increase_tuesday_discount";
+  if (value.includes("notification")) return "enable_notifications";
+  if (value.includes("cancellation")) return "improve_cancellation_rate";
+  if (value.includes("description")) return "improve_profile_description";
+  return "";
+}
+
+function analyticsRecommendationText(item = {}) {
+  const message = item.message || item.title || "";
+  const key = analyticsRecommendationKey(message);
+  if (key) return t(`analytics_recommendation_${key}`, message);
+  if (state.lang !== "en") return t("analytics_recommendation_review", "Review this item.");
+  return translateInlineText(message || t("analytics_recommendation_review", "Review this item."));
+}
+
+function analyticsRecommendationAction(item = {}) {
+  const action = item.action || "";
+  const key = analyticsRecommendationKey(action || item.message || "");
+  if (key) return t(`analytics_recommendation_action_${key}`, action || t("analytics_recommendation_review", "Review this item."));
+  if (state.lang !== "en") return t("analytics_recommendation_review", "Review this item.");
+  return translateInlineText(action || t("analytics_recommendation_review", "Review this item."));
+}
+
+function analyticsComponentDisplayLabel(component = {}) {
+  const normalized = String(component.key || "").toLowerCase();
+  const labels = {
+    profile_completeness: t("partner_health_profile_completeness", "Profile completeness"),
+    images_uploaded: t("analytics_component_images_uploaded", "Images uploaded"),
+    opening_hours_completed: t("analytics_component_opening_hours_completed", "Opening hours completed"),
+    reservation_settings: t("analytics_component_reservation_settings", "Reservation settings"),
+    reservation_handling: t("partner_health_reservation_handling", "Reservation handling"),
+    response_speed: t("analytics_component_response_speed", "Response speed"),
+    accepted_reservations: t("analytics_component_accepted_reservations", "Accepted reservations"),
+    canceled_reservations: t("analytics_component_cancelled_reservations", "Cancelled reservations"),
+    cancelled_reservations: t("analytics_component_cancelled_reservations", "Cancelled reservations"),
+    no_show_rate: t("analytics_component_no_show_rate", "No-show rate"),
+    offers_activity: t("partner_health_offers", "Offers"),
+    guest_ratings: t("analytics_component_guest_ratings", "Guest ratings"),
+    pending_ratings: t("analytics_component_guest_ratings", "Guest ratings"),
+    communication_response_time: t("partner_health_communication", "Communication and response time"),
+    operational_settings: t("partner_health_operations", "Operational settings"),
+    partner_activity: t("analytics_component_partner_activity", "Partner activity"),
+    subscription_status: t("analytics_component_subscription_status", "Subscription status")
+  };
+  return labels[normalized] || t(`analytics_component_${component.key}`, translateInlineText(component.label || component.key || ""));
+}
+
+function offerAnalyticsTable(rows = [], pagination = {}) {
+  const page = Number(pagination.page || 1);
+  const totalPages = Number(pagination.total_pages || 1);
+  const total = Number(pagination.total || rows.length || 0);
+  const sortedRows = sortOfferAnalyticsRows(rows);
+  return `
+    <div class="table-wrap">
+      <table class="content-table analytics-table">
+        <thead><tr>
+          ${offerAnalyticsHeader("title", t("offer_label", "Offer"))}
+          ${offerAnalyticsHeader("views", t("analytics_views", "Views"))}
+          ${offerAnalyticsHeader("clicks", t("analytics_clicks", "Clicks"))}
+          ${offerAnalyticsHeader("reservations", t("analytics_reservations", "Reservations"))}
+          ${offerAnalyticsHeader("conversion_rate", t("analytics_conversion", "Conversion"))}
+          ${offerAnalyticsHeader("average_reservation_size", t("analytics_average_party_size", "Average Party Size"))}
+          ${offerAnalyticsHeader("cancellation_rate", t("analytics_cancellation_rate", "Cancellation Rate"))}
+          ${offerAnalyticsHeader("status", t("status_label", "Status"))}
+        </tr></thead>
+        <tbody>
+          ${sortedRows.map((offer) => `
+            <tr>
+              <td>${escapeHtml(offer.title)}</td>
+              <td>${escapeHtml(formatNumber(offer.views || 0))}</td>
+              <td>${escapeHtml(formatNumber(offer.clicks || 0))}</td>
+              <td>${escapeHtml(formatNumber(offer.reservations || 0))}</td>
+              <td>${escapeHtml(analyticsFormatValue("conversion_rate", offer.conversion_rate))}</td>
+              <td>${escapeHtml(formatNumber(offer.average_reservation_size || 0, { maximumFractionDigits: 1 }))}</td>
+              <td>${escapeHtml(analyticsFormatValue("cancellation_rate", offer.cancellation_rate))}</td>
+              <td>${statusBadge(offer.status)}</td>
+            </tr>
+          `).join("") || `<tr><td colspan="8">${escapeHtml(t("analytics_no_offer_data", "No offer analytics yet."))}</td></tr>`}
+        </tbody>
+      </table>
+    </div>
+    <div class="analytics-pagination" aria-label="${escapeAttr(t("analytics_offer_pagination_label", "Offer analytics pagination"))}">
+      <button class="secondary-button" type="button" data-analytics-page="${Math.max(1, page - 1)}" ${page <= 1 ? "disabled" : ""}>${escapeHtml(t("pagination_previous", "Previous"))}</button>
+      <span>${escapeHtml(t("analytics_page_status", "Page"))} ${escapeHtml(formatNumber(page))} / ${escapeHtml(formatNumber(totalPages))} (${escapeHtml(formatNumber(total))})</span>
+      <button class="secondary-button" type="button" data-analytics-page="${Math.min(totalPages, page + 1)}" ${page >= totalPages ? "disabled" : ""}>${escapeHtml(t("pagination_next", "Next"))}</button>
+    </div>
+  `;
+}
+
+function analyticsHealthScorePanel(health = {}) {
+  return `
+    <article class="panel analytics-health-panel">
+      <div class="section-title-row compact">
+        <div><span class="section-kicker">${escapeHtml(t("analytics_health_kicker", "Restaurant health"))}</span><h2>${escapeHtml(t("analytics_health_title", "Restaurant Health Score"))}</h2></div>
+        ${statusBadge("health", health.grade || "E")}
+      </div>
+      <div class="analytics-health-score">
+        <strong>${escapeHtml(formatNumber(health.score || 0))}</strong>
+        <span>/100</span>
+      </div>
+      <div class="analytics-component-list">
+        ${(health.components || []).map((component) => `
+          <div class="analytics-component-row">
+            <span>${escapeHtml(analyticsComponentDisplayLabel(component))}</span>
+            <div class="analytics-bar-track"><i style="width:${Math.max(0, Math.min(100, Number(component.score || 0)))}%"></i></div>
+            <strong>${escapeHtml(formatNumber(component.score || 0))}</strong>
+          </div>
+        `).join("")}
+      </div>
+    </article>
+  `;
+}
+
+function analyticsRecommendationsPanel(recommendations = []) {
+  return `
+    <article class="panel analytics-recommendations-panel">
+      <div class="section-title-row compact">
+        <div><span class="section-kicker">${escapeHtml(t("analytics_recommendations_kicker", "Rules"))}</span><h2>${escapeHtml(t("analytics_recommendations_title", "Recommended next actions"))}</h2></div>
+      </div>
+      <div class="analytics-recommendation-list">
+        ${recommendations.map((item) => `
+          <section class="analytics-recommendation ${escapeAttr(item.severity || "medium")}">
+            <strong>${escapeHtml(analyticsRecommendationText(item))}</strong>
+            <p>${escapeHtml(analyticsRecommendationAction(item))}</p>
+            <small>${escapeHtml(t("analytics_rule_based_label", "Rule-based, not AI"))}</small>
+          </section>
+        `).join("") || `<div class="empty-state">${escapeHtml(t("analytics_no_recommendations", "No recommendations right now."))}</div>`}
+      </div>
+    </article>
+  `;
+}
+
+function partnerAnalyticsPanel() {
+  const analytics = state.partnerAnalytics;
+  if (!analytics) {
+    return `<section class="owner-dashboard-level" id="partner-analytics"><article class="panel wide-panel"><span class="section-kicker">${escapeHtml(t("partner_nav_analytics", "Analytics"))}</span><h2>${escapeHtml(t("partner_analytics_title", "Analytics & Reporting"))}</h2><div class="empty-state">${escapeHtml(t("analytics_no_data", "No analytics data yet."))}</div></article></section>`;
+  }
+  const cardKeys = ["total_reservations", "reservation_conversion_rate", "new_guests", "returning_guests", "cancellation_rate", "no_show_rate", "average_party_size", "average_booking_lead_time_hours"];
+  const dayNames = [
+    t("weekday_sunday_short", "Sun"),
+    t("weekday_monday_short", "Mon"),
+    t("weekday_tuesday_short", "Tue"),
+    t("weekday_wednesday_short", "Wed"),
+    t("weekday_thursday_short", "Thu"),
+    t("weekday_friday_short", "Fri"),
+    t("weekday_saturday_short", "Sat")
+  ];
+  const dayDistribution = (analytics.charts?.reservation_day_distribution || []).map((row) => ({ ...row, name: dayNames[Number(row.day)] || row.name || row.day }));
+  return `
+    <section class="owner-dashboard-level analytics-dashboard" id="partner-analytics">
+      <article class="panel wide-panel">
+        <div class="section-title-row compact">
+          <div><span class="section-kicker">${escapeHtml(t("partner_nav_analytics", "Analytics"))}</span><h2>${escapeHtml(t("partner_analytics_title", "Analytics & Reporting"))}</h2></div>
+          ${analyticsExportButtons("partner")}
+        </div>
+        ${partnerAnalyticsFiltersPanel()}
+        ${analyticsMetricCards(analytics.cards || {}, cardKeys)}
+      </article>
+      <section class="dashboard-grid two-col analytics-chart-grid primary-analytics-grid" aria-label="${escapeAttr(t("analytics_primary_charts_label", "Primary analytics charts"))}">
+        ${analyticsBarChart(t("analytics_reservations_over_time", "Reservations over time"), analytics.charts?.daily_reservations || [], "date")}
+        ${analyticsBarChart(t("analytics_day_distribution", "Reservation Day Distribution"), dayDistribution, "name")}
+        ${analyticsBarChart(t("analytics_hour_distribution", "Reservation Hour Distribution"), analytics.charts?.reservation_hour_distribution || [], "hour")}
+        ${analyticsBarChart(t("analytics_top_offers", "Top Performing Offers"), analytics.charts?.top_performing_offers || [], "title")}
+        ${analyticsBarChart(t("analytics_returning_guest_trend", "Returning Guest Trend"), analytics.charts?.returning_guest_trend || [], "date")}
+      </section>
+      <details class="panel wide-panel analytics-secondary-details">
+        <summary>${escapeHtml(t("analytics_secondary_details_title", "Detailed analytics"))}</summary>
+        <section class="dashboard-grid two-col analytics-chart-grid">
+          ${analyticsBarChart(t("analytics_weekly_reservations", "Weekly Reservations"), analytics.charts?.weekly_reservations || [], "week")}
+          ${analyticsBarChart(t("analytics_monthly_reservations", "Monthly Reservations"), analytics.charts?.monthly_reservations || [], "month")}
+          ${analyticsBarChart(t("analytics_offer_performance", "Offer Performance"), analytics.charts?.offer_performance || [], "title")}
+          ${analyticsBarChart(t("analytics_profile_views", "Profile Views"), analytics.charts?.profile_views || [], "date")}
+          ${analyticsBarChart(t("analytics_favorites_trend", "Favorites Trend"), analytics.charts?.favorites_trend || [], "date")}
+          ${analyticsHeatmap(analytics.charts?.reservation_heatmap || [])}
+        </section>
+      </details>
+      <article class="panel wide-panel">
+        <div class="section-title-row compact">
+          <div><span class="section-kicker">${escapeHtml(t("analytics_offer_detail_kicker", "Offer analytics"))}</span><h2>${escapeHtml(t("analytics_offer_detail_title", "Offer performance details"))}</h2></div>
+        </div>
+        ${offerAnalyticsTable(analytics.offer_analytics || [], analytics.offer_pagination || {})}
+      </article>
+      <section class="dashboard-grid two-col analytics-chart-grid">
+        ${analyticsHealthScorePanel(analytics.health_score || {})}
+        ${analyticsRecommendationsPanel(analytics.recommendations || [])}
+      </section>
+    </section>
+  `;
+}
+
+function adminAnalyticsPanel() {
+  const analytics = state.adminAnalytics;
+  if (!analytics) {
+    return `<section class="owner-dashboard-level" id="admin-analytics"><article class="panel wide-panel"><h2>${escapeHtml(t("admin_analytics_title", "Admin Analytics"))}</h2><div class="empty-state">${escapeHtml(t("analytics_no_data", "No analytics data yet."))}</div></article></section>`;
+  }
+  const adminCardKeys = isBasicMode()
+    ? ["active_restaurants", "draft_restaurants", "suspended_restaurants", "archived_restaurants", "new_restaurants", "total_reservations", "reservation_conversion_rate", "total_profile_views", "favorites"]
+    : ["active_restaurants", "draft_restaurants", "suspended_restaurants", "archived_restaurants", "trial_restaurants", "paid_restaurants", "revenue_placeholder", "new_restaurants", "total_reservations", "reservation_conversion_rate", "total_profile_views", "favorites"];
+  return `
+    <section class="owner-dashboard-level analytics-dashboard" id="admin-analytics">
+      <article class="panel wide-panel">
+        <div class="section-title-row compact">
+          <div><span class="section-kicker">${escapeHtml(t("analytics_kicker", "Analytics"))}</span><h2>${escapeHtml(t("admin_analytics_title", "Admin Analytics"))}</h2></div>
+          ${analyticsExportButtons(isSuperAdmin() ? "superadmin" : "admin")}
+        </div>
+        ${adminAnalyticsFiltersPanel()}
+        ${analyticsMetricCards(analytics.cards || {}, adminCardKeys)}
+      </article>
+      <section class="dashboard-grid two-col analytics-chart-grid">
+        ${analyticsBarChart(t("analytics_reservations_by_city", "Reservations by city"), analytics.charts?.reservations_by_city || [], "name")}
+        ${analyticsBarChart(t("analytics_reservations_by_country", "Reservations by country"), analytics.charts?.reservations_by_country || [], "name")}
+        ${analyticsBarChart(t("analytics_top_restaurants", "Top restaurants"), analytics.charts?.top_restaurants || [], "restaurant_name")}
+        ${analyticsBarChart(t("analytics_top_offers", "Top offers"), analytics.charts?.top_performing_offers || [], "title")}
+        ${analyticsBarChart(t("analytics_daily_reservations", "Daily Reservations"), analytics.charts?.daily_reservations || [], "date")}
+        ${analyticsBarChart(t("analytics_monthly_reservations", "Monthly Reservations"), analytics.charts?.monthly_reservations || [], "month")}
+      </section>
+      <article class="panel wide-panel">
+        <div class="section-title-row compact">
+          <div><span class="section-kicker">${escapeHtml(t("analytics_system_activity", "System activity"))}</span><h2>${escapeHtml(t("analytics_recent_activity", "Recent platform activity"))}</h2></div>
+        </div>
+        <div class="audit-list">
+          ${(analytics.charts?.system_activity || []).map((row) => `<div class="log-row"><strong>${escapeHtml(row.action || row.entity_type || "activity")}</strong><span>${escapeHtml(row.actor_role || "")}</span><small>${escapeHtml(formatDateTime(row.created_at || ""))}</small></div>`).join("") || `<div class="empty-state">${escapeHtml(t("analytics_no_activity", "No system activity in this range."))}</div>`}
+        </div>
+      </article>
+      ${isSuperAdmin() && analytics.platform ? `
+        <section class="owner-dashboard-level analytics-dashboard" id="superadmin-analytics">
+          <article class="panel wide-panel">
+            <div class="section-title-row compact">
+              <div><span class="section-kicker">${escapeHtml(t("superadmin_analytics_kicker", "Global platform"))}</span><h2>${escapeHtml(t("superadmin_analytics_title", "Superadmin platform analytics"))}</h2></div>
+            </div>
+            ${analyticsMetricCards({
+              countries: analytics.platform.countries?.length || 0,
+              cities: analytics.platform.cities?.length || 0,
+              languages: analytics.platform.languages?.length || 0,
+              reservations: analytics.platform.reservations || 0,
+              platform_usage: analytics.platform.platform_usage || 0,
+              average_conversion: analytics.platform.average_conversion || 0,
+              health_score_average: analytics.platform.health_score_average || 0
+            }, ["countries", "cities", "languages", "reservations", "platform_usage", "average_conversion", "health_score_average"])}
+          </article>
+          <section class="dashboard-grid two-col analytics-chart-grid">
+            ${analyticsBarChart(t("analytics_largest_cities", "Largest cities"), analytics.platform.largest_cities || [], "name")}
+            ${analyticsBarChart(t("analytics_user_growth", "User growth"), analytics.platform.user_growth || [], "month")}
+            ${analyticsBarChart(t("analytics_subscription_growth", "Subscription growth"), analytics.platform.subscription_growth || [], "month")}
+            ${analyticsBarChart(t("analytics_restaurant_growth", "Restaurant growth"), analytics.platform.restaurant_growth || [], "month")}
+          </section>
+        </section>
+      ` : ""}
+    </section>
+  `;
+}
+
+async function downloadAnalyticsReport(scope, format, button) {
+  if (!button || button.dataset.exporting === "true") return;
+  const endpoint = scope === "partner" ? "/partner/analytics/export" : "/admin/analytics/export";
+  const filters = scope === "partner" ? { ...state.partnerAnalyticsFilters } : {
+    ...state.adminAnalyticsFilters,
+    scope: scope === "superadmin" ? "superadmin" : "admin"
+  };
+  const exportFormat = format === "excel" ? "xlsx" : format;
+  const query = queryStringFromFilters({ ...filters, format: exportFormat, lang: state.lang });
+  const exportButtons = Array.from(document.querySelectorAll("[data-analytics-export]")).filter((item) => item.dataset.analyticsExport === scope);
+  button.dataset.exporting = "true";
+  exportButtons.forEach((item) => {
+    if (item !== button) item.disabled = true;
+  });
+  setButtonPending(button, true, t("analytics_exporting", "Exporting..."));
+  try {
+    const response = await fetch(`/api${endpoint}${query}`, {
+      headers: {
+        ...sessionAuthHeaders(currentSession())
+      }
+    });
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      throw new Error(payload.error || t("analytics_export_failed", "Analytics export failed."));
+    }
+    const contentType = response.headers.get("content-type") || "";
+    const expectedType = exportFormat === "csv"
+      ? "text/csv"
+      : exportFormat === "pdf"
+        ? "application/pdf"
+        : "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+    if (!contentType.includes(expectedType)) {
+      throw new Error(t("analytics_export_invalid_response", "The export service returned an invalid file type."));
+    }
+    const blob = await response.blob();
+    if (!blob.size) {
+      throw new Error(t("analytics_export_empty_file", "The export file was empty."));
+    }
+    const disposition = response.headers.get("content-disposition") || "";
+    const filename = decodeURIComponent(disposition.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i)?.[1] || `smarttable-${scope}-analytics.${exportFormat}`);
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 10_000);
+    showToast(t("analytics_export_ready", "Analytics export is ready."));
+  } catch (error) {
+    showToast(error.message || t("analytics_export_failed", "Analytics export failed."));
+  } finally {
+    setButtonPending(button, false);
+    delete button.dataset.exporting;
+    exportButtons.forEach((item) => {
+      item.disabled = false;
+    });
+  }
+}
+
+function bindAnalyticsControls() {
+  document.querySelector("#partnerAnalyticsFilters")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    state.partnerAnalyticsFilters = { ...state.partnerAnalyticsFilters, ...formObject(event.currentTarget), offer_page: "1" };
+    await loadPartnerData();
+    renderPartner();
+  });
+  document.querySelector("[data-clear-partner-analytics]")?.addEventListener("click", async () => {
+    state.partnerAnalyticsFilters = {
+      date_range: "30d",
+      from: "",
+      to: "",
+      offer_id: "all",
+      reservation_status: "all",
+      party_size: "",
+      weekday: "all",
+      hour: "all",
+      offer_page: "1",
+      offer_page_size: "25"
+    };
+    await loadPartnerData();
+    renderPartner();
+  });
+  document.querySelector("#adminAnalyticsFilters")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    state.adminAnalyticsFilters = { ...state.adminAnalyticsFilters, ...formObject(event.currentTarget) };
+    await loadAdminData();
+    renderAdmin();
+  });
+  document.querySelectorAll("[data-analytics-export]").forEach((button) => {
+    button.addEventListener("click", () => downloadAnalyticsReport(button.dataset.analyticsExport, button.dataset.format, button));
+  });
+  document.querySelectorAll("[data-analytics-page]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      state.partnerAnalyticsFilters = { ...state.partnerAnalyticsFilters, offer_page: button.dataset.analyticsPage || "1" };
+      await loadPartnerData();
+      renderPartner();
+    });
+  });
+  document.querySelectorAll("[data-offer-analytics-sort]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const key = button.dataset.offerAnalyticsSort || "reservations";
+      const current = state.partnerOfferAnalyticsSort || {};
+      state.partnerOfferAnalyticsSort = {
+        key,
+        direction: current.key === key && current.direction === "desc" ? "asc" : "desc"
+      };
+      renderPartner();
+    });
+  });
 }
 
 function partnerEmailDiagnosticNotice(restaurant = {}) {
@@ -9209,19 +16860,1163 @@ function partnerEmailDiagnosticNotice(restaurant = {}) {
   return `<p class="form-note warning">${escapeHtml(t(messageKey, fallback))}</p>`;
 }
 
+function billingPaymentMethodSummary(summary = {}) {
+  if (!summary || typeof summary !== "object" || !Object.keys(summary).length) return t("not_available", "Not available");
+  const brand = summary.brand || summary.card_brand || summary.type || t("payment_method_label", "Payment method");
+  const last4 = summary.last4 || summary.card_last4;
+  const exp = summary.exp_month && summary.exp_year ? ` ${summary.exp_month}/${summary.exp_year}` : "";
+  return `${brand}${last4 ? ` ending ${last4}` : ""}${exp}`;
+}
+
+function billingUsd(value = 0) {
+  const language = supportedLanguages[state.lang] || supportedLanguages.en;
+  return new Intl.NumberFormat(language.locale, {
+    style: "currency",
+    currency: "USD",
+    maximumFractionDigits: 0
+  }).format(Number(value || 0));
+}
+
+function billingLocalizedField(item = {}, field = "display_name") {
+  return item[`${field}_${state.lang}`] || item[`${field}_en`] || item[field] || item.key || "";
+}
+
+function billingPlanUnavailableReason(plan = {}, stripe = {}) {
+  if (!plan.checkout_available) return t("billing_plan_not_self_service", "This plan is managed by SmartTable and is not available for self-service checkout.");
+  if (!stripe.configured) return t("billing_stripe_setup_required_short", "Stripe setup is required before checkout can start.");
+  if (!plan.stripe_monthly_configured) return t("billing_price_id_required_short", "A monthly Stripe Price ID is required before this plan can be sold.");
+  return "";
+}
+
+function partnerBillingPanel() {
+  const data = state.partnerBilling || {};
+  const billing = data.billing || {};
+  const subscription = billing.subscription || {};
+  const plan = billing.plan || {};
+  const plans = (data.plans || []).filter((item) => item.internal_name === "basic");
+  const invoices = data.invoices || [];
+  const videoPackages = data.video_packages || [];
+  const videoOrders = data.video_orders || [];
+  const stripe = data.stripe || billing.stripe || {};
+  const restaurantId = cleanString(data.restaurant_id || state.partnerProfile?.id || subscription.restaurant_id || "");
+  const currentStatus = billing.status || subscription.subscription_status || subscription.status || "none";
+  const currentPlanName = billingPlanDisplayName(plan) || subscription.plan_name || t("billing_no_plan", "No active plan");
+  const canManageBilling = Boolean(subscription.stripe_customer_id);
+  const hasStripeSubscription = Boolean(subscription.stripe_customer_id && subscription.stripe_subscription_id);
+  const isPastDue = currentStatus === "past_due" || String(subscription.last_payment_status || "").toLowerCase() === "failed";
+  const isReadOnly = Boolean(billing.read_only);
+  const features = billing.feature_gates || billing.entitlements?.features || plan.entitlements?.features || plan.features || {};
+  return `
+    <article class="panel wide-panel partner-billing-panel" id="partner-billing">
+      <div class="section-title-row compact">
+        <div>
+          <span class="section-kicker">${escapeHtml(t("partner_billing_kicker", "Billing"))}</span>
+          <h2>${escapeHtml(t("partner_billing_title", "Partner subscription"))}</h2>
+        </div>
+        ${statusBadge(currentStatus, t(`billing_status_${currentStatus}`, currentStatus === "none" ? "No subscription" : currentStatus))}
+      </div>
+      ${billing.warning || isPastDue ? `<p class="form-note warning">${escapeHtml(billing.warning || t("partner_billing_past_due_warning", "Payment is past due. Please update billing to avoid read-only access."))}</p>` : ""}
+      ${isReadOnly ? `<p class="form-note warning">${escapeHtml(t("partner_billing_read_only_notice", "Partner access is read-only until billing is resolved. Existing restaurant and reservation data has not been deleted."))}</p>` : ""}
+      <div class="stats-grid compact-grid">
+        ${statCard(t("billing_current_plan", "Current plan"), currentPlanName)}
+        ${statCard(t("billing_subscription_status", "Subscription status"), currentStatus)}
+        ${statCard(t("billing_interval_label", "Billing interval"), t("billing_monthly_interval", "Monthly"))}
+        ${statCard(t("billing_trial_expiration", "Trial expiration"), billingSafeDate(subscription.trial_end))}
+        ${statCard(t("billing_current_period", "Current period"), [subscription.current_period_start, subscription.current_period_end].filter(Boolean).map(billingSafeDate).join(" - ") || t("not_available", "Not available"))}
+        ${statCard(t("billing_next_payment", "Next payment"), billingSafeDate(subscription.current_period_end))}
+        ${statCard(t("billing_cancel_at_period_end", "Cancel at period end"), subscription.cancel_at_period_end ? t("yes_label", "Yes") : t("no_label", "No"))}
+        ${statCard(t("billing_grace_period", "Grace period"), billingSafeDate(subscription.payment_grace_period_end || subscription.grace_period_ends_at))}
+        ${statCard(t("billing_last_invoice", "Last invoice"), subscription.last_invoice_number || subscription.last_invoice_status || t("not_available", "Not available"))}
+        ${statCard(t("billing_payment_status", "Payment status"), subscription.last_payment_status || currentStatus)}
+        ${statCard(t("billing_payment_method", "Payment method"), billingPaymentMethodSummary(subscription.default_payment_method_summary))}
+        ${statCard(t("billing_email_label", "Billing email"), subscription.billing_email || data.billing_account?.billing_email || t("not_available", "Not available"))}
+      </div>
+      <section>
+        <h3>${escapeHtml(t("billing_available_entitlements", "Available features"))}</h3>
+        <div class="guest-chip-grid">${billingFeatureList(features)}</div>
+      </section>
+      <div class="button-row">
+        <button class="primary-button" data-partner-billing-action="portal" data-restaurant-id="${escapeAttr(restaurantId)}" type="button" ${canManageBilling ? "" : "disabled"}>${escapeHtml(t("billing_manage_button", "Manage billing"))}</button>
+        <button class="ghost-button" data-partner-billing-action="portal" data-restaurant-id="${escapeAttr(restaurantId)}" type="button" ${canManageBilling ? "" : "disabled"}>${escapeHtml(t("billing_retry_payment_button", "Retry payment"))}</button>
+        <button class="ghost-button danger" data-partner-billing-action="cancel_at_period_end" data-restaurant-id="${escapeAttr(restaurantId)}" type="button" ${subscription.stripe_subscription_id && !subscription.cancel_at_period_end ? "" : "disabled"}>${escapeHtml(t("billing_cancel_period_end_button", "Cancel at period end"))}</button>
+      </div>
+      <section>
+        <h3>${escapeHtml(t("billing_available_plans", "Available plans"))}</h3>
+        <div class="marketplace-insight-grid">
+          ${plans.map((item) => {
+            const unavailableReason = billingPlanUnavailableReason(item, stripe);
+            const checkoutEnabled = item.checkout_available && item.stripe_monthly_configured && stripe.configured;
+            return `
+            <section class="marketplace-insight-card">
+              <span>${escapeHtml(billingPlanDisplayName(item))}</span>
+              <strong>${escapeHtml(`${billingUsd(item.monthly_price || 149)} ${t("billing_per_month", "per month")}`)}</strong>
+              <p>${escapeHtml(item[`description_${state.lang}`] || item.description_en || t("billing_partner_plan_description", "Complete restaurant partner access with automatic monthly renewal."))}</p>
+              <small>${escapeHtml(unavailableReason || t("billing_checkout_available", "Checkout available when Stripe confirms payment."))}</small>
+              <div class="guest-chip-grid">${billingFeatureList(item.entitlements?.features || item.features || {})}</div>
+              <div class="button-row">
+                <button class="ghost-button" data-partner-billing-action="${hasStripeSubscription ? "change_plan" : "checkout"}" data-restaurant-id="${escapeAttr(restaurantId)}" data-plan-id="${escapeAttr(item.id)}" data-interval="monthly" type="button" ${checkoutEnabled ? "" : "disabled"}>${escapeHtml(hasStripeSubscription ? t("billing_upgrade_button", "Upgrade") : t("billing_start_subscription_button", "Start subscription"))}</button>
+              </div>
+            </section>
+          `;
+          }).join("") || `<div class="empty-state">${escapeHtml(t("billing_no_public_plans", "No active subscription plans are available yet."))}</div>`}
+        </div>
+        <p class="form-note">${escapeHtml(t("billing_no_additional_fees", "No setup fee or mandatory per-reservation platform fee."))}</p>
+      </section>
+      <section>
+        <div class="section-title-row compact">
+          <div>
+            <h3>${escapeHtml(t("billing_video_packages_title", "3-second promotional video packages"))}</h3>
+            <p>${escapeHtml(t("billing_video_packages_intro", "Optional one-time production services. They do not change your monthly subscription."))}</p>
+          </div>
+        </div>
+        <div class="marketplace-insight-grid">
+          ${videoPackages.map((item) => `
+            <section class="marketplace-insight-card">
+              <span>${escapeHtml(billingLocalizedField(item))}</span>
+              <strong>${escapeHtml(`${billingUsd(item.amount)} ${t("billing_one_time", "one time")}`)}</strong>
+              <p>${escapeHtml(billingLocalizedField(item, "description"))}</p>
+              <button class="ghost-button" data-partner-billing-action="video_checkout" data-restaurant-id="${escapeAttr(restaurantId)}" data-package-key="${escapeAttr(item.key)}" type="button" ${item.checkout_available ? "" : "disabled"}>${escapeHtml(t("billing_buy_video_package", "Purchase video package"))}</button>
+              ${item.checkout_available ? "" : `<small>${escapeHtml(t("billing_video_price_not_configured", "This package will be available after its Stripe price is configured."))}</small>`}
+            </section>
+          `).join("")}
+        </div>
+        ${videoOrders.length ? `
+          <div class="table-wrap partner-table-wrap">
+            <table class="partner-data-table">
+              <thead><tr><th>${escapeHtml(t("date_label", "Date"))}</th><th>${escapeHtml(t("package_label", "Package"))}</th><th>${escapeHtml(t("amount_label", "Amount"))}</th><th>${escapeHtml(t("status_label", "Status"))}</th></tr></thead>
+              <tbody>${videoOrders.slice(0, 10).map((order) => {
+                const item = videoPackages.find((candidate) => candidate.key === order.package_key) || { key: order.package_key };
+                return `<tr><td>${escapeHtml(billingSafeDate(order.created_at))}</td><td>${escapeHtml(billingLocalizedField(item))}</td><td>${escapeHtml(billingUsd(Number(order.amount_cents || 0) / 100))}</td><td>${statusBadge(order.order_status || "processing")}</td></tr>`;
+              }).join("")}</tbody>
+            </table>
+          </div>
+        ` : ""}
+      </section>
+      <section>
+        <h3>${escapeHtml(t("billing_invoice_history", "Invoice history"))}</h3>
+        ${invoices.length ? `
+          <div class="table-wrap partner-table-wrap">
+            <table class="partner-data-table">
+              <thead><tr><th>${escapeHtml(t("date_label", "Date"))}</th><th>${escapeHtml(t("amount_label", "Amount"))}</th><th>${escapeHtml(t("status_label", "Status"))}</th><th>${escapeHtml(t("invoice_label", "Invoice"))}</th></tr></thead>
+              <tbody>
+                ${invoices.slice(0, 10).map((invoice) => `
+                  <tr>
+                    <td>${escapeHtml(billingSafeDate(invoice.created_at || invoice.period_start || ""))}</td>
+                    <td>${escapeHtml(formatMoney(invoice.amount_paid || invoice.amount_due || 0))}</td>
+                    <td>${statusBadge(invoice.status || "open")}</td>
+                    <td>${invoice.hosted_invoice_url ? `<a class="ghost-button" href="${escapeAttr(invoice.hosted_invoice_url)}" target="_blank" rel="noopener">${escapeHtml(t("billing_open_invoice", "Open invoice"))}</a>` : escapeHtml(invoice.invoice_number || t("not_available", "Not available"))}</td>
+                  </tr>
+                `).join("")}
+              </tbody>
+            </table>
+          </div>
+        ` : `<div class="empty-state">${escapeHtml(t("billing_no_invoices", "No Stripe invoices are available yet."))}</div>`}
+      </section>
+      <p class="form-note">${escapeHtml(stripe.configured ? t("billing_stripe_configured_note", "Stripe billing is configured. Checkout and billing portal sessions are created securely on the server.") : t("billing_stripe_not_configured_note", "Stripe billing needs production Stripe keys and active price IDs before partners can start a subscription."))}</p>
+    </article>
+  `;
+}
+
+function partnerCampaignsData() {
+  return state.partnerCampaigns || { campaigns: [], templates: [] };
+}
+
+function partnerCampaignDraft() {
+  const templates = partnerCampaignsData().templates || [];
+  const first = templates[0] || {};
+  return {
+    name: first.name || "New SmartTable offer announcement",
+    subject_en: first.subject_en || "",
+    subject_es: first.subject_es || "",
+    subject_hu: first.subject_hu || "",
+    preheader_en: first.preheader_en || "",
+    preheader_es: first.preheader_es || "",
+    preheader_hu: first.preheader_hu || "",
+    body_en: first.body_en || "",
+    body_es: first.body_es || "",
+    body_hu: first.body_hu || "",
+    audience_definition: { followers: true, reservations: true },
+    scheduled_at: ""
+  };
+}
+
+function partnerSmsCampaignsData() {
+  return state.partnerSmsCampaigns || { campaigns: [], provider: { configured: false }, limits: {} };
+}
+
+function partnerSmsCampaignDraft() {
+  return {
+    name: t("sms_campaign_default_name", "Limited table SMS alert"),
+    body_en: t("sms_campaign_default_body_en", "A new SmartTable offer is available. Reserve while tables are available."),
+    body_es: "",
+    body_hu: "",
+    audience_definition: { followers: true, reservations: true },
+    scheduled_at: ""
+  };
+}
+
+function campaignStatusBadge(status) {
+  const value = String(status || "draft").toLowerCase();
+  const labels = {
+    draft: t("campaign_status_draft", "Draft"),
+    scheduled: t("campaign_status_scheduled", "Scheduled"),
+    queued: t("campaign_status_queued", "Queued"),
+    sending: t("campaign_status_sending", "Sending"),
+    sent: t("campaign_status_sent", "Sent"),
+    cancelled: t("campaign_status_cancelled", "Cancelled"),
+    failed: t("campaign_status_failed", "Failed"),
+    archived: t("campaign_status_archived", "Archived")
+  };
+  return statusBadge(value, labels[value] || value);
+}
+
+function partnerSmsCampaignTable() {
+  const rows = partnerSmsCampaignsData().campaigns || [];
+  if (!rows.length) return `<div class="empty-state">${escapeHtml(t("sms_campaign_empty_state", "No SMS campaigns yet. Create a draft for opted-in restaurant guests."))}</div>`;
+  return `
+    <div class="table-wrap partner-table-wrap">
+      <table class="partner-data-table">
+        <thead>
+          <tr>
+            <th>${escapeHtml(t("campaign_name_label", "Campaign"))}</th>
+            <th>${escapeHtml(t("status_label", "Status"))}</th>
+            <th>${escapeHtml(t("campaign_recipients_label", "Recipients"))}</th>
+            <th>${escapeHtml(t("sms_segments_cost_label", "Segments / Cost"))}</th>
+            <th>${escapeHtml(t("actions_label", "Actions"))}</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows.map((campaign) => `
+            <tr>
+              <td><strong>${escapeHtml(campaign.name || t("campaign_untitled", "Untitled campaign"))}</strong><br><small>${escapeHtml(campaign.body_en || campaign.body_es || campaign.body_hu || "")}</small></td>
+              <td>${campaignStatusBadge(campaign.status)}</td>
+              <td>${escapeHtml(formatNumber(campaign.recipient_count || 0))}</td>
+              <td>${escapeHtml(`${campaign.segment_count_estimate || 0} / ${formatMoney((campaign.cost_estimate_cents || 0) / 100)}`)}</td>
+              <td>
+                <div class="button-row compact">
+                  ${["draft", "scheduled", "queued", "sending"].includes(String(campaign.status || "")) ? `<button class="ghost-button danger" data-sms-campaign-row-action="cancel" data-sms-campaign-id="${escapeAttr(campaign.id)}" type="button">${escapeHtml(t("campaign_cancel_button", "Cancel"))}</button>` : ""}
+                  ${(campaign.failed_count || campaign.status === "failed") ? `<button class="ghost-button" data-sms-campaign-row-action="retry_failed" data-sms-campaign-id="${escapeAttr(campaign.id)}" type="button">${escapeHtml(t("sms_campaign_retry_failed", "Retry failed"))}</button>` : ""}
+                  <button class="ghost-button" data-sms-campaign-row-action="clone" data-sms-campaign-id="${escapeAttr(campaign.id)}" type="button">${escapeHtml(t("campaign_clone_button", "Clone"))}</button>
+                </div>
+              </td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+function partnerSmsCampaignPanel() {
+  const draft = partnerSmsCampaignDraft();
+  const provider = partnerSmsCampaignsData().provider || {};
+  const limits = partnerSmsCampaignsData().limits || {};
+  return `
+    <article class="panel wide-panel partner-communications-panel">
+      <div class="section-title-row compact">
+        <div>
+          <span class="section-kicker">${escapeHtml(t("sms_campaign_kicker", "SMS"))}</span>
+          <h2>${escapeHtml(t("sms_campaign_title", "Partner SMS campaigns"))}</h2>
+          <p class="muted">${escapeHtml(t("sms_campaign_body", "Send short, consent-scoped SMS campaigns without exposing guest phone lists."))}</p>
+        </div>
+        ${statusBadge(provider.configured ? "configured" : "not-configured", provider.configured ? t("sms_provider_configured", "SMS configured") : t("sms_provider_not_configured", "SMS not configured"))}
+      </div>
+      <div class="stats-grid compact-grid">
+        ${statCard(t("sms_daily_limit", "Daily limit"), limits.daily ?? "-")}
+        ${statCard(t("sms_monthly_limit", "Monthly limit"), limits.monthly ?? "-")}
+        ${statCard(t("sms_provider_label", "Provider"), provider.provider || "twilio")}
+      </div>
+      <form class="mini-form campaign-form" id="partnerSmsCampaignForm">
+        ${textInput("name", t("campaign_name_label", "Campaign name"), draft.name, "text", "required")}
+        <div class="form-grid three">
+          ${textArea("body_en", t("sms_body_en", "SMS body English"), draft.body_en, "required maxlength=\"900\"")}
+          ${textArea("body_es", t("sms_body_es", "SMS body Spanish"), draft.body_es, "maxlength=\"900\"")}
+          ${textArea("body_hu", t("sms_body_hu", "SMS body Hungarian"), draft.body_hu, "maxlength=\"900\"")}
+        </div>
+        <div class="form-grid three">
+          ${textInput("scheduled_at", t("campaign_scheduled_label", "Scheduled time"), draft.scheduled_at, "datetime-local")}
+          ${textInput("test_phone", t("sms_test_phone_label", "Test phone (E.164)"), "", "tel", "placeholder=\"+12125550123\"")}
+          <label>${escapeHtml(t("sms_quiet_hours_label", "Quiet hours"))}<input value="21:00-09:00" readonly></label>
+        </div>
+        <fieldset>
+          <legend>${escapeHtml(t("campaign_audience_label", "Audience"))}</legend>
+          <div class="channel-grid">
+            <label class="check-row"><input name="audience_followers" type="checkbox" value="true" checked> ${escapeHtml(t("campaign_audience_followers", "Guests who favorited this restaurant"))}</label>
+            <label class="check-row"><input name="audience_reservations" type="checkbox" value="true" checked> ${escapeHtml(t("campaign_audience_reservations", "Guests with accepted or completed reservations"))}</label>
+          </div>
+          <p class="form-note">${escapeHtml(t("sms_campaign_privacy_note", "SMS recipients are resolved server-side from opted-in, restaurant-scoped guests. Partners never see raw phone lists."))}</p>
+        </fieldset>
+        <div class="button-row">
+          <button class="ghost-button" data-sms-campaign-action="save_draft" type="button">${escapeHtml(t("campaign_save_draft", "Save draft"))}</button>
+          <button class="ghost-button" data-sms-campaign-action="estimate_audience" type="button">${escapeHtml(t("campaign_estimate_audience", "Estimate audience"))}</button>
+          <button class="ghost-button" data-sms-campaign-action="test_sms" type="button">${escapeHtml(t("sms_send_test", "Send test SMS"))}</button>
+          <button class="ghost-button" data-sms-campaign-action="schedule" type="button">${escapeHtml(t("campaign_schedule", "Schedule"))}</button>
+          <button class="primary-button" data-sms-campaign-action="send_now" type="button">${escapeHtml(t("campaign_send_now", "Queue send now"))}</button>
+        </div>
+      </form>
+      ${partnerSmsCampaignTable()}
+    </article>
+  `;
+}
+
+function partnerCampaignTemplatesPanel() {
+  const templates = partnerCampaignsData().templates || [];
+  if (!templates.length) return "";
+  return `
+    <div class="campaign-template-grid">
+      ${templates.map((templateRow) => `
+        <article class="campaign-template-card">
+          <strong>${escapeHtml(templateRow.name || templateRow.id)}</strong>
+          <p class="muted">${escapeHtml(templateRow.subject_en || "")}</p>
+          <button class="ghost-button" data-fill-campaign-template="${escapeAttr(templateRow.id)}" type="button">${escapeHtml(t("campaign_use_template", "Use template"))}</button>
+        </article>
+      `).join("")}
+    </div>
+  `;
+}
+
+function partnerCampaignTable() {
+  const rows = partnerCampaignsData().campaigns || [];
+  if (!rows.length) return `<div class="empty-state">${escapeHtml(t("campaign_empty_state", "No campaigns yet. Create a draft to contact opted-in restaurant guests."))}</div>`;
+  return `
+    <div class="table-wrap partner-table-wrap">
+      <table class="partner-data-table">
+        <thead>
+          <tr>
+            <th>${escapeHtml(t("campaign_name_label", "Campaign"))}</th>
+            <th>${escapeHtml(t("status_label", "Status"))}</th>
+            <th>${escapeHtml(t("campaign_recipients_label", "Recipients"))}</th>
+            <th>${escapeHtml(t("campaign_progress_label", "Progress"))}</th>
+            <th>${escapeHtml(t("campaign_scheduled_label", "Scheduled"))}</th>
+            <th>${escapeHtml(t("actions_label", "Actions"))}</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows.map((campaign) => `
+            <tr>
+              <td><strong>${escapeHtml(campaign.name || t("campaign_untitled", "Untitled campaign"))}</strong><br><small>${escapeHtml(campaign.subject_en || campaign.subject_es || campaign.subject_hu || "")}</small></td>
+              <td>${campaignStatusBadge(campaign.status)}</td>
+              <td>${escapeHtml(formatNumber(campaign.recipient_count || 0))}</td>
+              <td>${escapeHtml(`${campaign.sent_count || 0} ${t("campaign_sent_short", "sent")} / ${campaign.delivered_count || 0} ${t("campaign_delivered_short", "delivered")} / ${campaign.failed_count || 0} ${t("campaign_failed_short", "failed")}`)}</td>
+              <td>${escapeHtml(campaign.scheduled_at ? formatDateTime(campaign.scheduled_at) : t("not_scheduled_label", "Not scheduled"))}</td>
+              <td>
+                <div class="button-row compact">
+                  ${["draft", "scheduled", "queued"].includes(String(campaign.status || "")) ? `<button class="ghost-button danger" data-campaign-row-action="cancel" data-campaign-id="${escapeAttr(campaign.id)}" type="button">${escapeHtml(t("campaign_cancel_button", "Cancel"))}</button>` : ""}
+                  <button class="ghost-button" data-campaign-row-action="clone" data-campaign-id="${escapeAttr(campaign.id)}" type="button">${escapeHtml(t("campaign_clone_button", "Clone"))}</button>
+                  <button class="ghost-button" data-campaign-row-action="archive" data-campaign-id="${escapeAttr(campaign.id)}" type="button">${escapeHtml(t("campaign_archive_button", "Archive"))}</button>
+                </div>
+              </td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+function partnerCommunicationsPanel() {
+  const draft = partnerCampaignDraft();
+  const offers = state.offersMine || [];
+  return `
+    <section class="owner-dashboard-level" id="partner-communications">
+      <article class="panel wide-panel partner-communications-panel">
+        <div class="section-title-row compact">
+          <div>
+            <span class="section-kicker">${escapeHtml(t("partner_communications_kicker", "Communications"))}</span>
+            <h2>${escapeHtml(t("partner_communications_title", "Partner email campaigns"))}</h2>
+            <p class="muted">${escapeHtml(t("partner_communications_body", "Create email campaigns for opted-in guests who favorited or reserved with your restaurant. Raw recipient lists are never shown to restaurant users."))}</p>
+          </div>
+          ${statusBadge("consent", t("campaign_consent_scoped_badge", "Consent scoped"))}
+        </div>
+        ${partnerCampaignTemplatesPanel()}
+        <form class="mini-form campaign-form" id="partnerCampaignForm">
+          ${textInput("name", t("campaign_name_label", "Campaign name"), draft.name, "text", "required")}
+          <div class="form-grid three">
+            ${textInput("subject_en", t("campaign_subject_en", "Subject English"), draft.subject_en, "text", "required")}
+            ${textInput("subject_es", t("campaign_subject_es", "Subject Spanish"), draft.subject_es, "text")}
+            ${textInput("subject_hu", t("campaign_subject_hu", "Subject Hungarian"), draft.subject_hu, "text")}
+          </div>
+          <div class="form-grid three">
+            ${textInput("preheader_en", t("campaign_preheader_en", "Preheader English"), draft.preheader_en, "text")}
+            ${textInput("preheader_es", t("campaign_preheader_es", "Preheader Spanish"), draft.preheader_es, "text")}
+            ${textInput("preheader_hu", t("campaign_preheader_hu", "Preheader Hungarian"), draft.preheader_hu, "text")}
+          </div>
+          <div class="form-grid three">
+            ${campaignRichTextArea("body_en", t("campaign_body_en", "Body English"), draft.body_en, "rows=\"7\" required")}
+            ${campaignRichTextArea("body_es", t("campaign_body_es", "Body Spanish"), draft.body_es, "rows=\"7\"")}
+            ${campaignRichTextArea("body_hu", t("campaign_body_hu", "Body Hungarian"), draft.body_hu, "rows=\"7\"")}
+          </div>
+          <div class="form-grid three">
+            <label>${escapeHtml(t("campaign_offer_link_label", "Linked offer"))}
+              <select name="offer_id">
+                <option value="">${escapeHtml(t("campaign_no_offer_link", "No linked offer"))}</option>
+                ${offers.map((offer) => `<option value="${escapeAttr(offer.id || offer.offer_id)}">${escapeHtml(offer.title_en || offer.title || offer.offer_title || t("offer_label", "Offer"))}</option>`).join("")}
+              </select>
+            </label>
+            ${textInput("scheduled_at", t("campaign_scheduled_label", "Scheduled time"), draft.scheduled_at, "datetime-local")}
+            ${textInput("test_email", t("campaign_test_email_label", "Test email recipient"), "", "email", "placeholder=\"name@example.com\"")}
+          </div>
+          <fieldset>
+            <legend>${escapeHtml(t("campaign_audience_label", "Audience"))}</legend>
+            <div class="channel-grid">
+              <label class="check-row"><input name="audience_followers" type="checkbox" value="true" checked> ${escapeHtml(t("campaign_audience_followers", "Guests who favorited this restaurant"))}</label>
+              <label class="check-row"><input name="audience_reservations" type="checkbox" value="true" checked> ${escapeHtml(t("campaign_audience_reservations", "Guests with accepted or completed reservations"))}</label>
+            </div>
+            <p class="form-note">${escapeHtml(t("campaign_audience_privacy_note", "Audience counts are calculated server-side from restaurant-scoped, opted-in guests. Partners cannot export raw email lists."))}</p>
+          </fieldset>
+          <div class="button-row">
+            <button class="ghost-button" data-campaign-action="save_draft" type="button">${escapeHtml(t("campaign_save_draft", "Save draft"))}</button>
+            <button class="ghost-button" data-campaign-action="estimate_audience" type="button">${escapeHtml(t("campaign_estimate_audience", "Estimate audience"))}</button>
+            <button class="ghost-button" data-campaign-action="test_email" type="button">${escapeHtml(t("campaign_send_test", "Send test"))}</button>
+            <button class="ghost-button" data-campaign-action="schedule" type="button">${escapeHtml(t("campaign_schedule", "Schedule"))}</button>
+            <button class="primary-button" data-campaign-action="send_now" type="button">${escapeHtml(t("campaign_send_now", "Queue send now"))}</button>
+          </div>
+        </form>
+      </article>
+      ${partnerSmsCampaignPanel()}
+      <article class="panel wide-panel">
+        <div class="section-title-row compact">
+          <div><span class="section-kicker">${escapeHtml(t("campaign_history_kicker", "History"))}</span><h2>${escapeHtml(t("campaign_history_title", "Campaign drafts and sends"))}</h2></div>
+        </div>
+        ${partnerCampaignTable()}
+      </article>
+    </section>
+  `;
+}
+
+function unacknowledgedReservationAlerts() {
+  return (state.partnerReservationAlerts || [])
+    .filter((alert) => !alert.acknowledged_at && !["acknowledged", "failed"].includes(String(alert.status || "").toLowerCase()));
+}
+
+function currentReservationAlert() {
+  return unacknowledgedReservationAlerts()[0] || null;
+}
+
+function alertPayload(alert = {}) {
+  return alert.payload || alert.safe_payload || {};
+}
+
+function reservationAlertSummary(alert = {}) {
+  const payload = alertPayload(alert);
+  const createdAt = alert.created_at ? new Date(alert.created_at).getTime() : Date.now();
+  const waitSeconds = Math.max(0, Math.round((Date.now() - createdAt) / 1000));
+  const waitLabel = waitSeconds >= 60
+    ? `${Math.floor(waitSeconds / 60)}m ${waitSeconds % 60}s`
+    : `${waitSeconds}s`;
+  const discount = payload.discount_percent ?? payload.discount_value ?? "";
+  return {
+    id: alert.id || "",
+    reservationId: alert.reservation_id || payload.reservation_id || "",
+    restaurantName: payload.restaurant_name || state.partnerProfile?.name || t("restaurant_label", "Restaurant"),
+    date: payload.reservation_date || "",
+    time: payload.reservation_time || "",
+    partySize: payload.party_size || "",
+    offer: payload.offer_title || t("reservation_alert_offer_fallback", "Discounted table"),
+    discount,
+    discountLabel: discount === "" || discount === null
+      ? t("reservation_alert_discount_not_applicable", "Not applicable")
+      : `${discount}%`,
+    reference: payload.reference || "",
+    deepLink: payload.deep_link || "#partner-reservations",
+    waitLabel,
+    status: alert.status || "sent"
+  };
+}
+
+function reservationAlertBadgeCount() {
+  const count = state.partnerReservationAlertCount || unacknowledgedReservationAlerts().length;
+  if (!count) return "";
+  return `<span class="nav-count" aria-label="${escapeAttr(contentTemplate("reservation_alert_pending_count_label", "{{count}} pending reservation alerts", { count }))}">${escapeHtml(count)}</span>`;
+}
+
+function reservationAlertStrip() {
+  const alerts = unacknowledgedReservationAlerts();
+  if (!alerts.length) return "";
+  const alert = reservationAlertSummary(alerts[0]);
+  return `
+    <section class="partner-alert-strip" role="status" aria-live="polite">
+      <div>
+        <strong>${escapeHtml(t("reservation_alert_strip_title", "New reservation request"))}</strong>
+        <span>${escapeHtml(alert.restaurantName)} - ${escapeHtml(alert.date)} ${escapeHtml(alert.time)} - ${escapeHtml(alert.partySize)} ${escapeHtml(t("guests_label", "guests"))}</span>
+      </div>
+      <div class="button-row compact">
+        <a class="ghost-button" href="${escapeAttr(alert.deepLink || "#partner-reservations")}">${escapeHtml(t("reservation_alert_view_button", "View"))}</a>
+        <button class="primary-button" data-open-current-alert type="button">${escapeHtml(t("reservation_alert_open_button", "Open alert"))}</button>
+      </div>
+    </section>
+  `;
+}
+
+function reservationAlertModal() {
+  const alert = currentReservationAlert();
+  if (!alert || state.partnerAlertSettings?.dashboard_popup_enabled === false) return "";
+  const summary = reservationAlertSummary(alert);
+  return `
+    <div class="reservation-alert-backdrop" role="presentation">
+      <section class="reservation-alert-card" role="alertdialog" aria-modal="true" aria-labelledby="reservationAlertTitle">
+        <div class="reservation-alert-head">
+          <span class="section-kicker">${escapeHtml(t("reservation_alert_kicker", "Immediate action"))}</span>
+          <h2 id="reservationAlertTitle">${escapeHtml(t("reservation_alert_title", "New reservation request"))}</h2>
+          <p>${escapeHtml(t("reservation_alert_no_auto_accept_note", "Acknowledging this alert does not accept the reservation."))}</p>
+        </div>
+        <dl class="reservation-alert-grid">
+          <div><dt>${escapeHtml(t("restaurant_label", "Restaurant"))}</dt><dd>${escapeHtml(summary.restaurantName)}</dd></div>
+          <div><dt>${escapeHtml(t("date_label", "Date"))}</dt><dd>${escapeHtml(summary.date)}</dd></div>
+          <div><dt>${escapeHtml(t("time_label", "Time"))}</dt><dd>${escapeHtml(summary.time)}</dd></div>
+          <div><dt>${escapeHtml(t("party_size_label", "Party size"))}</dt><dd>${escapeHtml(summary.partySize)} ${escapeHtml(t("guests_label", "guests"))}</dd></div>
+          <div><dt>${escapeHtml(t("offer_label", "Offer"))}</dt><dd>${escapeHtml(summary.offer)}</dd></div>
+          <div><dt>${escapeHtml(t("discount_label", "Discount"))}</dt><dd>${escapeHtml(summary.discountLabel)}</dd></div>
+          <div><dt>${escapeHtml(t("reservation_reference_label", "Reference"))}</dt><dd>${escapeHtml(summary.reference)}</dd></div>
+          <div><dt>${escapeHtml(t("reservation_alert_waiting_time", "Waiting time"))}</dt><dd>${escapeHtml(summary.waitLabel)}</dd></div>
+        </dl>
+        <p class="form-note">${escapeHtml(t("reservation_alert_privacy_note", "Guest contact details are hidden in this preview. Open the reservation list for authorized details."))}</p>
+        <div class="reservation-alert-actions">
+          ${summary.reservationId ? `<button class="primary-button success" data-alert-reservation-action="accepted" data-alert-id="${escapeAttr(summary.id)}" data-reservation="${escapeAttr(summary.reservationId)}" type="button">${escapeHtml(t("accept_button", "Accept"))}</button>` : ""}
+          ${summary.reservationId ? `<button class="ghost-button warning" data-alert-reservation-action="rejected" data-alert-id="${escapeAttr(summary.id)}" data-reservation="${escapeAttr(summary.reservationId)}" type="button">${escapeHtml(t("decline_button", "Decline"))}</button>` : ""}
+          <button class="ghost-button" data-acknowledge-alert="${escapeAttr(summary.id)}" type="button">${escapeHtml(t("reservation_alert_acknowledge_button", "Acknowledge"))}</button>
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function partnerDeviceList() {
+  const devices = (state.partnerAlertDevices || []).filter((device) => String(device.status || "active").toLowerCase() === "active");
+  if (!devices.length) return `<div class="empty-state">${escapeHtml(t("reservation_alert_no_devices", "No restaurant devices are registered yet."))}</div>`;
+  return `
+    <div class="device-list">
+      ${devices.map((device) => `
+        <article class="device-card">
+          <div>
+            <strong>${escapeHtml(device.device_name || t("reservation_alert_device_fallback", "Restaurant device"))}</strong>
+            <p class="muted">${escapeHtml(reservationAlertDisplayValue("reservation_alert_device_type", device.device_type, "browser"))} - ${escapeHtml(reservationAlertDisplayValue("reservation_alert_permission_status", device.permission_status, "unknown"))} - ${escapeHtml(reservationAlertDisplayValue("reservation_alert_device_status", device.status, "active"))}</p>
+            <small>${escapeHtml(t("reservation_alert_last_active", "Last active"))}: ${escapeHtml(formatDateTime(device.last_active_at))}</small>
+          </div>
+          <button class="ghost-button danger" data-remove-partner-device="${escapeAttr(device.id)}" type="button">${escapeHtml(t("remove_device_button", "Remove device"))}</button>
+        </article>
+      `).join("")}
+    </div>
+  `;
+}
+
+function partnerAlertDeliveryFailures() {
+  return (state.partnerAlertDeliveries || [])
+    .filter((delivery) => ["failed", "bounced", "complained", "delayed"].includes(String(delivery.status || "").toLowerCase()) || delivery.error_code)
+    .slice(0, 8);
+}
+
+function reservationAlertDisplayValue(prefix, value, fallback = "") {
+  const normalized = String(value || fallback || "").toLowerCase().replace(/[\s-]+/g, "_");
+  if (!normalized) return "";
+  return t(`${prefix}_${normalized}`, uiText(String(value || fallback).replaceAll("_", " ")));
+}
+
+function partnerAlertDeliveryFailureList() {
+  const failures = partnerAlertDeliveryFailures();
+  if (!failures.length) return `<div class="empty-state">${escapeHtml(t("reservation_alert_delivery_failures_empty", "No recent delivery failures."))}</div>`;
+  return `
+    <div class="simple-list alert-delivery-failures">
+      ${failures.map((delivery) => `
+        <article class="simple-list-card">
+          <div>
+            <strong>${escapeHtml(`${reservationAlertDisplayValue("reservation_alert_channel", delivery.channel, "alert")} - ${reservationAlertDisplayValue("reservation_alert_delivery_status", delivery.status, "failed")}`)}</strong>
+            <p class="muted">${escapeHtml(delivery.error_message_safe || delivery.error_code || t("reservation_alert_delivery_failure_status", "Delivery attempt needs attention."))}</p>
+            <small>${escapeHtml(formatDateTime(delivery.created_at))}</small>
+          </div>
+          ${statusBadge(delivery.channel || "alert")}
+        </article>
+      `).join("")}
+    </div>
+  `;
+}
+
+function partnerNotificationSettingsPanel() {
+  const prefs = state.partnerAlertSettings || {};
+  const push = state.partnerAlertPush || {};
+  const sms = state.partnerAlertSms || {};
+  const voice = state.partnerAlertVoice || {};
+  const instructions = state.partnerAlertInstructions || {};
+  const pushStatus = push.enabled
+    ? t("reservation_alert_push_configured", "Web push is configured")
+    : t("reservation_alert_push_not_configured", "Web push is waiting for VAPID configuration");
+  return `
+    <article class="panel wide-panel reservation-alert-settings-panel" id="partner-notification-settings">
+      <div class="section-title-row compact">
+        <div>
+          <span class="section-kicker">${escapeHtml(t("reservation_alert_settings_kicker", "Reservation notifications"))}</span>
+          <h2>${escapeHtml(t("reservation_alert_settings_title", "Immediate reservation alerts"))}</h2>
+          <p class="muted">${escapeHtml(t("reservation_alert_settings_body", "Configure dashboard alerts, sounds, web push, email, SMS fallback and optional voice escalation for new pending reservations."))}</p>
+        </div>
+        ${statusBadge(push.enabled ? "configured" : "disabled", pushStatus)}
+      </div>
+      <form class="mini-form" id="partnerReservationNotificationForm">
+        <div class="channel-grid">
+          ${checkboxInput("dashboard_popup_enabled", t("reservation_alert_dashboard_toggle", "Dashboard popup"), prefs.dashboard_popup_enabled !== false)}
+          ${checkboxInput("sound_enabled", t("reservation_alert_sound_toggle", "Audible alert"), prefs.sound_enabled !== false)}
+          ${checkboxInput("push_enabled", t("reservation_alert_push_toggle", "Web push notification"), prefs.push_enabled !== false)}
+          ${checkboxInput("email_enabled", t("reservation_alert_email_toggle", "Transactional email"), prefs.email_enabled !== false)}
+          ${checkboxInput("sms_fallback_enabled", t("reservation_alert_sms_toggle", "SMS fallback"), prefs.sms_fallback_enabled === true)}
+          ${checkboxInput("voice_call_enabled", t("reservation_alert_voice_toggle", "Voice call escalation"), prefs.voice_call_enabled === true)}
+        </div>
+        <div class="form-grid">
+          ${textInput("primary_sms_number", t("reservation_alert_primary_sms", "Primary SMS number"), "", "tel", `autocomplete="tel" placeholder="${escapeAttr(prefs.primary_sms_number_configured ? prefs.primary_sms_number : "+12125550100")}"`)}
+          ${textInput("escalation_sms_number", t("reservation_alert_escalation_sms", "Escalation SMS number"), "", "tel", `autocomplete="tel" placeholder="${escapeAttr(prefs.escalation_sms_number_configured ? prefs.escalation_sms_number : "+12125550101")}"`)}
+          ${textInput("sms_fallback_delay_seconds", t("reservation_alert_sms_delay", "SMS fallback delay seconds"), prefs.sms_fallback_delay_seconds || 60, "number", "min=\"30\" max=\"900\" step=\"30\"")}
+          ${textInput("sms_escalation_delay_seconds", t("reservation_alert_escalation_delay", "Escalation delay seconds"), prefs.sms_escalation_delay_seconds || 300, "number", "min=\"60\" max=\"3600\" step=\"60\"")}
+          ${textInput("voice_call_number", t("reservation_alert_voice_number", "Voice call number"), "", "tel", `autocomplete="tel" placeholder="${escapeAttr(prefs.voice_call_number_configured ? prefs.voice_call_number : "+12125550102")}"`)}
+          ${textInput("voice_call_delay_seconds", t("reservation_alert_voice_delay", "Voice call delay seconds"), prefs.voice_call_delay_seconds || 480, "number", "min=\"60\" max=\"86400\" step=\"60\"")}
+        </div>
+        <label>${escapeHtml(t("reservation_alert_language_label", "Notification language"))}
+          <select name="notification_language">
+            ${["en", "es", "hu"].map((lang) => `<option value="${escapeAttr(lang)}" ${(prefs.notification_language || state.lang) === lang ? "selected" : ""}>${escapeHtml(LANGUAGE_SHORT_LABELS[lang] || lang)}</option>`).join("")}
+          </select>
+        </label>
+        <div class="button-row">
+          <button class="primary-button" type="submit">${escapeHtml(t("save_button", "Save"))}</button>
+          <button class="ghost-button" data-register-push-device type="button">${escapeHtml(t("reservation_alert_register_device", "Enable push on this device"))}</button>
+          <button class="ghost-button" data-unlock-alert-sound type="button">${escapeHtml(t("reservation_alert_enable_sound", "Enable sound"))}</button>
+          <button class="ghost-button" data-send-test-alert type="button">${escapeHtml(t("reservation_alert_send_test", "Send Test Alert"))}</button>
+        </div>
+        <p class="form-note">${escapeHtml(sms.configured ? t("reservation_alert_sms_configured", "SMS fallback is configured server-side.") : t("reservation_alert_sms_not_configured", "SMS fallback remains disabled until Twilio environment variables are configured server-side."))}</p>
+        <p class="form-note">${escapeHtml(voice.configured ? t("reservation_alert_voice_configured", "Voice escalation is configured server-side.") : t("reservation_alert_voice_not_configured", "Voice escalation remains disabled until Twilio Voice environment variables are configured server-side."))}</p>
+      </form>
+      <div class="alert-instructions">
+        <h3>${escapeHtml(t("reservation_alert_install_title", "Install on restaurant devices"))}</h3>
+        <ul>
+          <li>${escapeHtml(instructions.ios_ipados || t("reservation_alert_ios_instruction", "On iOS and iPadOS, open SmartTable Partner in Safari, tap Share, then Add to Home Screen before enabling notifications."))}</li>
+          <li>${escapeHtml(instructions.android_chrome || t("reservation_alert_android_instruction", "On Android Chrome, use the install prompt or browser menu, then allow notifications."))}</li>
+          <li>${escapeHtml(instructions.chrome_edge_desktop || t("reservation_alert_desktop_instruction", "On Chrome or Edge desktop, install from the address bar or browser menu, then allow notifications."))}</li>
+        </ul>
+      </div>
+      <div class="section-title-row compact">
+        <div><span class="section-kicker">${escapeHtml(t("reservation_alert_devices_kicker", "Registered devices"))}</span><h3>${escapeHtml(t("reservation_alert_devices_title", "Restaurant tablets and browsers"))}</h3></div>
+      </div>
+      ${partnerDeviceList()}
+      <div class="section-title-row compact">
+        <div><span class="section-kicker">${escapeHtml(t("reservation_alert_delivery_failures_kicker", "Delivery health"))}</span><h3>${escapeHtml(t("reservation_alert_delivery_failures_title", "Recent alert delivery failures"))}</h3></div>
+      </div>
+      ${partnerAlertDeliveryFailureList()}
+    </article>
+  `;
+}
+
+function updatePartnerBadges() {
+  const count = Number(state.partnerReservationAlertCount || unacknowledgedReservationAlerts().length || 0);
+  document.title = count ? `(${count}) SmartTable` : "SmartTable";
+  if ("setAppBadge" in navigator) {
+    if (count > 0) navigator.setAppBadge(count).catch(() => {});
+    else navigator.clearAppBadge?.().catch(() => {});
+  }
+}
+
+function playReservationAlertSound() {
+  if (state.partnerAlertSettings?.sound_enabled === false) return;
+  try {
+    const AudioContext = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContext) return;
+    partnerAlertAudioContext = partnerAlertAudioContext || new AudioContext();
+    if (partnerAlertAudioContext.state === "suspended") partnerAlertAudioContext.resume();
+    const now = partnerAlertAudioContext.currentTime;
+    const gain = partnerAlertAudioContext.createGain();
+    gain.gain.setValueAtTime(0.0001, now);
+    gain.gain.exponentialRampToValueAtTime(0.18, now + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.55);
+    gain.connect(partnerAlertAudioContext.destination);
+    [880, 1175].forEach((frequency, index) => {
+      const oscillator = partnerAlertAudioContext.createOscillator();
+      oscillator.type = "sine";
+      oscillator.frequency.value = frequency;
+      oscillator.connect(gain);
+      oscillator.start(now + index * 0.18);
+      oscillator.stop(now + 0.48 + index * 0.18);
+    });
+  } catch {
+    // Audio playback can be blocked until the user interacts with the page.
+  }
+}
+
+function maybePlayNewAlertSound(previousCount = 0, previousAlertIds = new Set()) {
+  const count = Number(state.partnerReservationAlertCount || unacknowledgedReservationAlerts().length || 0);
+  const hasNewAlert = unacknowledgedReservationAlerts().some((alert) => {
+    const alertId = String(alert.id || alert.alert_id || "").trim();
+    return alertId && !previousAlertIds.has(alertId);
+  });
+  if (!hasNewAlert && count <= previousCount) return;
+  if (state.partnerAlertSettings?.sound_enabled !== false) playReservationAlertSound();
+  if (state.partnerAlertSettings?.push_enabled !== false && typeof navigator.vibrate === "function") {
+    navigator.vibrate(RESERVATION_ALERT_VIBRATION_PATTERN);
+  }
+}
+
+function syncPartnerAlertSoundRepeater() {
+  const count = Number(state.partnerReservationAlertCount || unacknowledgedReservationAlerts().length || 0);
+  if (state.mode !== "partner" || !state.session || count < 1 || state.partnerAlertSettings?.sound_enabled === false) {
+    clearInterval(partnerAlertSoundRepeatTimer);
+    partnerAlertSoundRepeatTimer = null;
+    return;
+  }
+  if (partnerAlertSoundRepeatTimer) return;
+  partnerAlertSoundRepeatTimer = window.setInterval(() => {
+    if (Number(state.partnerReservationAlertCount || unacknowledgedReservationAlerts().length || 0) < 1) {
+      syncPartnerAlertSoundRepeater();
+      return;
+    }
+    playReservationAlertSound();
+    if (state.partnerAlertSettings?.push_enabled !== false && typeof navigator.vibrate === "function") {
+      navigator.vibrate(RESERVATION_ALERT_VIBRATION_PATTERN);
+    }
+  }, RESERVATION_ALERT_SOUND_REPEAT_MS);
+}
+
+async function refreshPartnerReservationAlerts(options = {}) {
+  if (state.mode !== "partner" || !state.session) return;
+  const previousCount = Number(state.partnerReservationAlertCount || 0);
+  const previousAlertIds = new Set(unacknowledgedReservationAlerts()
+    .map((alert) => String(alert.id || alert.alert_id || "").trim())
+    .filter(Boolean));
+  try {
+    const response = await api("/partner/reservation-alerts");
+    state.partnerReservationAlerts = response.alerts || [];
+    state.partnerAlertDeliveries = response.deliveries || state.partnerAlertDeliveries || [];
+    state.partnerReservationAlertCount = Number(response.pending_count || 0);
+    state.partnerAlertPollSeconds = Number(response.poll_seconds || state.partnerAlertPollSeconds || 5) || 5;
+    updatePartnerBadges();
+    if (!options.silent) maybePlayNewAlertSound(previousCount, previousAlertIds);
+    syncPartnerAlertSoundRepeater();
+    const current = currentReservationAlert();
+    const modalOpen = Boolean(document.querySelector(".reservation-alert-backdrop"));
+    if ((current && !modalOpen) || (!current && modalOpen)) renderPartner();
+  } catch {
+    // Keep the dashboard usable if a transient polling request fails.
+  }
+}
+
+function startPartnerAlertPolling() {
+  clearInterval(partnerAlertPollTimer);
+  if (state.mode !== "partner" || !state.session) {
+    updatePartnerBadges();
+    return;
+  }
+  updatePartnerBadges();
+  syncPartnerAlertSoundRepeater();
+  const seconds = Math.max(3, Number(state.partnerAlertPollSeconds || 5));
+  partnerAlertPollTimer = window.setInterval(() => refreshPartnerReservationAlerts({ silent: false }), seconds * 1000);
+}
+
+function stopPartnerAlertPolling() {
+  clearInterval(partnerAlertPollTimer);
+  clearInterval(partnerAlertSoundRepeatTimer);
+  partnerAlertPollTimer = null;
+  partnerAlertSoundRepeatTimer = null;
+  if (state.mode !== "partner") {
+    state.partnerReservationAlertCount = 0;
+    updatePartnerBadges();
+  }
+}
+
+async function savePartnerAlertSettings(event) {
+  event.preventDefault();
+  const button = event.currentTarget.querySelector('[type="submit"]');
+  try {
+    setButtonPending(button, true);
+    const response = await api("/partner/notification-settings", {
+      method: "PATCH",
+      body: JSON.stringify(formObject(event.currentTarget))
+    });
+    state.partnerAlertSettings = response.preferences || state.partnerAlertSettings;
+    await loadPartnerData();
+    renderPartner();
+    showToast(t("reservation_alert_settings_saved", "Reservation notification settings saved."));
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    setButtonPending(button, false);
+  }
+}
+
+function urlBase64ToUint8Array(value = "") {
+  const padding = "=".repeat((4 - value.length % 4) % 4);
+  const base64 = `${value}${padding}`.replace(/-/g, "+").replace(/_/g, "/");
+  const raw = atob(base64);
+  return Uint8Array.from([...raw].map((char) => char.charCodeAt(0)));
+}
+
+function partnerPushDeviceInstallationId() {
+  const storageKey = "smarttable.partner_push_device_id";
+  try {
+    const existing = String(localStorage.getItem(storageKey) || "").trim();
+    if (existing) return existing;
+    const generated = crypto.randomUUID();
+    localStorage.setItem(storageKey, generated);
+    return generated;
+  } catch {
+    if (!state.partnerPushDeviceInstallationId) {
+      state.partnerPushDeviceInstallationId = crypto.randomUUID();
+    }
+    return state.partnerPushDeviceInstallationId;
+  }
+}
+
+async function registerPartnerPushDevice(button = null) {
+  if (!("serviceWorker" in navigator) || !("PushManager" in window)) {
+    showToast(t("reservation_alert_push_unsupported", "This browser does not support web push notifications."));
+    return;
+  }
+  const publicKey = state.partnerAlertPush?.vapid_public_key || state.config?.partner_push?.vapid_public_key || "";
+  if (!publicKey) {
+    showToast(t("reservation_alert_push_missing_key", "Web push is not configured yet."));
+    return;
+  }
+  try {
+    setButtonPending(button, true);
+    await navigator.serviceWorker.register("/sw.js");
+    const registration = await navigator.serviceWorker.ready;
+    const permission = await Notification.requestPermission();
+    if (permission !== "granted") {
+      showToast(t("reservation_alert_push_denied", "Notification permission was not granted."));
+      return;
+    }
+    const existing = await registration.pushManager.getSubscription();
+    let subscription = existing || await registration.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: urlBase64ToUint8Array(publicKey)
+    });
+    const registrationPayload = () => ({
+        action: "register_push_device",
+        subscription: subscription.toJSON(),
+        permission_status: permission,
+        device_name: navigator.userAgentData?.platform || navigator.platform || "Restaurant device",
+        device_type: /iPad|iPhone|Android/i.test(navigator.userAgent) ? "tablet" : "desktop",
+        device_installation_id: partnerPushDeviceInstallationId()
+    });
+    let response = await api("/partner/notification-settings", {
+      method: "POST",
+      body: JSON.stringify(registrationPayload())
+    });
+    if (response.renewal_required) {
+      await subscription.unsubscribe().catch(() => false);
+      subscription = await registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(publicKey)
+      });
+      response = await api("/partner/notification-settings", {
+        method: "POST",
+        body: JSON.stringify(registrationPayload())
+      });
+    }
+    state.partnerAlertDevices = [response.device, ...state.partnerAlertDevices.filter((device) => device.id !== response.device?.id)].filter(Boolean);
+    await loadPartnerData();
+    renderPartner();
+    showToast(t("reservation_alert_device_registered", "This device is registered for reservation alerts."));
+  } catch (error) {
+    showToast(error.message || t("reservation_alert_device_failed", "Could not register this device."));
+  } finally {
+    setButtonPending(button, false);
+  }
+}
+
+async function removePartnerPushDevice(deviceId, button = null) {
+  if (!deviceId) return;
+  try {
+    setButtonPending(button, true);
+    await api("/partner/notification-settings", {
+      method: "POST",
+      body: JSON.stringify({ action: "remove_device", device_id: deviceId })
+    });
+    await loadPartnerData();
+    renderPartner();
+    showToast(t("reservation_alert_device_removed", "Device removed."));
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    setButtonPending(button, false);
+  }
+}
+
+async function acknowledgePartnerReservationAlert(alertId, button = null) {
+  if (!alertId) return;
+  try {
+    setButtonPending(button, true);
+    await api("/partner/reservation-alerts", {
+      method: "PATCH",
+      body: JSON.stringify({ action: "acknowledge", alert_id: alertId })
+    });
+    await refreshPartnerReservationAlerts({ silent: true });
+    renderPartner();
+    showToast(t("reservation_alert_acknowledged", "Reservation alert acknowledged."));
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    setButtonPending(button, false);
+  }
+}
+
+async function runAlertReservationAction(button) {
+  const reservationId = button.dataset.reservation;
+  const alertId = button.dataset.alertId;
+  const status = button.dataset.alertReservationAction;
+  if (!reservationId || !status) return;
+  if (status === "accepted" && !confirm(t("accept_reservation_confirm", "Accept this reservation request?"))) return;
+  if (status === "rejected" && !confirm(t("decline_reservation_confirm", "Decline this reservation request?"))) return;
+  try {
+    setButtonPending(button, true);
+    await api("/partner/reservations", {
+      method: "PATCH",
+      body: JSON.stringify({ id: reservationId, status })
+    });
+    if (alertId) {
+      await api("/partner/reservation-alerts", {
+        method: "PATCH",
+        body: JSON.stringify({ action: "acknowledge", alert_id: alertId })
+      }).catch(() => null);
+    }
+    await loadPartnerData();
+    renderPartner();
+    showToast(t("reservation_updated_toast", "Reservation updated."));
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    setButtonPending(button, false);
+  }
+}
+
+async function sendPartnerTestReservationAlert(button = null) {
+  try {
+    setButtonPending(button, true);
+    await api("/partner/notification-settings", {
+      method: "POST",
+      body: JSON.stringify({ action: "send_test_alert" })
+    });
+    await refreshPartnerReservationAlerts({ silent: false });
+    renderPartner();
+    showToast(t("reservation_alert_test_sent", "Test reservation alert sent."));
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    setButtonPending(button, false);
+  }
+}
+
+function bindReservationAlertEvents() {
+  document.querySelector("#partnerReservationNotificationForm")?.addEventListener("submit", savePartnerAlertSettings);
+  document.querySelectorAll("[data-register-push-device]").forEach((button) => {
+    button.addEventListener("click", () => registerPartnerPushDevice(button));
+  });
+  document.querySelectorAll("[data-remove-partner-device]").forEach((button) => {
+    button.addEventListener("click", () => removePartnerPushDevice(button.dataset.removePartnerDevice, button));
+  });
+  document.querySelectorAll("[data-acknowledge-alert]").forEach((button) => {
+    button.addEventListener("click", () => acknowledgePartnerReservationAlert(button.dataset.acknowledgeAlert, button));
+  });
+  document.querySelectorAll("[data-alert-reservation-action]").forEach((button) => {
+    button.addEventListener("click", () => runAlertReservationAction(button));
+  });
+  document.querySelectorAll("[data-send-test-alert]").forEach((button) => {
+    button.addEventListener("click", () => sendPartnerTestReservationAlert(button));
+  });
+  document.querySelectorAll("[data-unlock-alert-sound]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      state.partnerAlertSoundUnlocked = true;
+      playReservationAlertSound();
+      showToast(t("reservation_alert_sound_ready", "Reservation alert sound is ready on this device."));
+    });
+  });
+  document.querySelectorAll("[data-open-current-alert]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const panel = document.querySelector(".reservation-alert-card");
+      if (panel) panel.querySelector("button")?.focus();
+      else renderPartner();
+    });
+  });
+}
+
+function attachPartnerServiceWorkerListener() {
+  if (!("serviceWorker" in navigator)) return;
+  navigator.serviceWorker.addEventListener("message", (event) => {
+    if (event.data?.type === "reservation_alert") refreshPartnerReservationAlerts({ silent: false });
+  });
+}
+
 function renderBasicPartner(restaurant, stats, greeting) {
-  app.innerHTML = dashboardShell([
-    { id: "partner-overview", label: t("partner_nav_today", "Today") },
-    { id: "partner-deals", label: t("partner_nav_offers", "Offers") },
-    { id: "partner-reservations", label: t("partner_nav_reservations", "Reservations") },
-    { id: "partner-guests", label: t("partner_nav_guests", "Guests") },
-    { id: "partner-reviews", label: t("partner_nav_reviews", "Reviews") },
-    { id: "partner-settings", label: t("partner_nav_settings", "Settings") }
-  ], `
-    <section class="dashboard-head owner-focused-head">
+  const partnerProfilePanel = `
+    <article class="panel" id="partner-profile">
+      <div class="section-title-row compact">
+        <div><span class="section-kicker">${escapeHtml(t("profile_label", "Profile"))}</span><h2>${escapeHtml(t("restaurant_profile_title", "Restaurant profile"))}</h2></div>
+        <button class="primary-button" form="profileForm" type="submit">${escapeHtml(t("save_profile_button", "Save profile"))}</button>
+      </div>
+      <form class="mini-form profile-form" id="profileForm" data-partner-profile-form>
+        ${partnerEmailDiagnosticNotice(restaurant)}
+        ${textInput("name", t("restaurant_name_label", "Restaurant name"), restaurant.name, "text", "required")}
+        ${primaryRestaurantContentFields(restaurant)}
+        ${textInput("address", t("address_label", "Address"), restaurant.address, "text", "required")}
+        ${textInput("phone", t("phone_label", "Phone"), restaurant.phone)}
+        ${textInput("email", t("email_label", "Email"), restaurant.email || restaurant.contact_email, "email", "required")}
+        ${textInput("website", t("website_label", "Website"), restaurant.website, "url")}
+        ${textInput("instagram", "Instagram", restaurant.instagram)}
+        ${textInput("facebook", "Facebook", restaurant.facebook, "url")}
+        ${textInput("google_maps_url", "Google Maps", restaurant.google_maps_url, "url")}
+        <div class="form-grid">
+          ${textInput("cuisine_type", t("cuisine_label", "Cuisine"), restaurant.cuisine_type || restaurant.cuisine)}
+          ${textInput("price_range", t("price_range_label", "Price range"), restaurant.price_range || "$$")}
+        </div>
+        ${textInput("logo_url", t("logo_url_label", "Logo URL"), restaurant.logo_url || restaurant.icon_image || restaurant.card_image)}
+        ${mediaUploadControl("logo", "logo_url", t("upload_logo_button", "Upload logo"))}
+        ${textInput("card_image", t("card_image_url_label", "Restaurant card image URL"), restaurant.card_image || restaurant.cover_image)}
+        ${mediaUploadControl("card", "card_image", t("upload_card_image_button", "Upload card image"))}
+        ${textArea("gallery_images", t("gallery_image_urls_label", "Gallery image URLs"), (restaurant.gallery_images || []).join("\\n"))}
+        ${mediaUploadControl("gallery", "gallery_images", t("upload_gallery_image_button", "Upload gallery image"))}
+      </form>
+    </article>
+  `;
+  const partnerCapacityPanel = `
+    <article class="panel" id="partner-capacity">
+      <div class="section-title-row compact">
+        <div><span class="section-kicker">${escapeHtml(t("partner_tab_capacity", "Tables & Capacity"))}</span><h2>${escapeHtml(t("partner_capacity_title", "Capacity settings"))}</h2></div>
+        <button class="primary-button" form="partnerCapacityForm" type="submit">${escapeHtml(t("save_button", "Save"))}</button>
+      </div>
+      <form class="mini-form profile-form" id="partnerCapacityForm" data-partner-profile-form>
+        <div class="form-grid">
+          ${textInput("capacity", t("restaurant_capacity_label", "Guest capacity"), restaurant.capacity ?? "", "number", "min=\"0\"")}
+          ${textInput("table_capacity", t("restaurant_table_capacity_label", "Table availability"), restaurant.table_capacity ?? "", "number", "min=\"0\"")}
+          ${textInput("average_service_minutes", t("average_service_minutes_label", "Average service minutes"), restaurant.average_service_minutes ?? "", "number", "min=\"15\"")}
+        </div>
+        <p class="form-note">${escapeHtml(t("restaurant_table_allocation_note", "BASIC stores table and capacity configuration for operations. It does not claim automatic table optimization or exact table assignment."))}</p>
+      </form>
+    </article>
+  `;
+  const partnerAvailabilityPanel = `
+    <article class="panel" id="partner-availability">
+      <div class="section-title-row compact">
+        <div><span class="section-kicker">${escapeHtml(t("partner_tab_availability", "Availability"))}</span><h2>${escapeHtml(t("partner_availability_title", "Opening hours and booking availability"))}</h2></div>
+        <button class="primary-button" form="partnerAvailabilityForm" type="submit">${escapeHtml(t("save_button", "Save"))}</button>
+      </div>
+      <form class="mini-form profile-form" id="partnerAvailabilityForm" data-partner-profile-form>
+        ${textInput("opening_hours", t("business_hours_label", "Business hours"), restaurant.opening_hours)}
+        <div class="form-grid">
+          ${textInput("reservation_interval_minutes", t("restaurant_interval_label", "Reservation interval minutes"), restaurant.reservation_interval_minutes ?? "", "number", "min=\"5\"")}
+          ${textInput("booking_horizon_days", t("restaurant_booking_horizon_label", "Maximum booking horizon days"), restaurant.booking_horizon_days ?? "", "number", "min=\"1\"")}
+        </div>
+      </form>
+    </article>
+  `;
+  const partnerOffersPanel = `
+    <article class="panel" id="partner-deals">
+      <div class="section-title-row compact">
+        <div><span class="section-kicker">${escapeHtml(t("partner_nav_offers", "Offers"))}</span><h2>${escapeHtml(t("create_offers_title", "Create discounted table offers"))}</h2></div>
+      </div>
+      <form class="mini-form offer-form" id="offerForm">
+        ${primaryOfferContentFields(restaurant)}
+        <div class="form-grid">
+          ${textInput("offer_date", t("date_label", "Date"), "", "date", "required")}
+          ${textInput("start_time", t("start_time_label", "Start time"), "", "time", "required")}
+          ${textInput("end_time", t("end_time_label", "End time"), "", "time", "required")}
+          ${textInput("available_tables", t("available_tables_label", "Available tables"), "", "number", "min=\"1\" required")}
+          ${textInput("max_party_size", t("max_party_label", "Max party"), "4", "number", "min=\"1\" required")}
+          ${textInput("discount_value", t("discount_percent_label", "Discount %"), "", "number", "min=\"1\" max=\"90\" required")}
+        </div>
+        ${textInput("offer_image", t("offer_image_url_label", "Offer image URL"), "/assets/restaurant-hero.png")}
+        ${mediaUploadControl("offer", "offer_image", t("upload_offer_image_button", "Upload offer image"))}
+        <button class="primary-button wide" type="submit">${escapeHtml(t("create_offer_button", "Create offer"))}</button>
+      </form>
+    </article>
+    <article class="panel" id="partner-current-offers">
+      <div class="section-title-row compact">
+        <div><span class="section-kicker">${escapeHtml(t("partner_nav_offers", "Offers"))}</span><h2>${escapeHtml(t("current_offers_title", "Current offers"))}</h2></div>
+      </div>
+      ${partnerOfferTable()}
+    </article>
+  `;
+  const partnerReservationsPanel = `
+    <article class="panel" id="partner-reservations">
+      <div class="section-title-row compact">
+        <div><span class="section-kicker">${escapeHtml(t("partner_nav_reservations", "Reservations"))}</span><h2>${escapeHtml(t("manage_reservations_title", "Manage reservations"))}</h2></div>
+      </div>
+      ${reservationFilterForm("partner", state.partnerReservationFilters)}
+      ${reservationTable(state.reservations, false, "partner")}
+    </article>
+  `;
+  const partnerTabs = [
+    {
+      key: "overview",
+      label: t("dashboard_tab_overview", "Overview"),
+      compactLabel: t("dashboard_tab_overview_compact", "Overview"),
+      content: `
+        ${reservationAlertStrip()}
+        ${basicPartnerOverviewPanel(stats)}
+      `
+    },
+    {
+      key: "reservations",
+      label: t("dashboard_tab_reservations", "Reservations"),
+      compactLabel: t("dashboard_tab_reservations_compact", "Reservations"),
+      content: `<section class="dashboard-grid one-col">${partnerReservationsPanel}</section>`
+    },
+    {
+      key: "offers",
+      label: t("dashboard_tab_offers", "Offers"),
+      compactLabel: t("dashboard_tab_offers_compact", "Offers"),
+      content: `<section class="dashboard-grid two-col">${partnerOffersPanel}</section>`
+    },
+    {
+      key: "food-feed",
+      label: t("partner_food_feed_tab", "What to Eat"),
+      compactLabel: t("partner_food_feed_tab", "What to Eat"),
+      content: `<section class="dashboard-grid one-col">${partnerFoodFeedPanel()}</section>`
+    },
+    {
+      key: "profile",
+      label: t("partner_tab_profile", "Restaurant Profile"),
+      compactLabel: t("partner_tab_profile_compact", "Profile"),
+      content: `<section class="dashboard-grid one-col">${partnerProfilePanel}</section>`
+    },
+    {
+      key: "capacity",
+      label: t("partner_tab_capacity", "Tables & Capacity"),
+      compactLabel: t("partner_tab_capacity_compact", "Capacity"),
+      content: `<section class="dashboard-grid one-col">${partnerCapacityPanel}</section>`
+    },
+    {
+      key: "availability",
+      label: t("partner_tab_availability", "Availability"),
+      compactLabel: t("partner_tab_availability_compact", "Availability"),
+      content: `<section class="dashboard-grid one-col">${partnerAvailabilityPanel}</section>`
+    },
+    {
+      key: "notifications",
+      label: t("dashboard_tab_notifications", "Notifications"),
+      compactLabel: t("dashboard_tab_notifications_compact", "Notifications"),
+      content: `<section class="dashboard-grid one-col">${partnerNotificationSettingsPanel()}</section>`
+    },
+    {
+      key: "billing",
+      label: t("partner_nav_billing", "Billing"),
+      compactLabel: t("partner_tab_billing_compact", t("partner_nav_billing", "Billing")),
+      content: `<section class="dashboard-grid one-col">${partnerBillingPanel()}</section>`
+    },
+    {
+      key: "reviews",
+      label: t("dashboard_tab_reviews", t("partner_nav_reviews", "Reviews")),
+      compactLabel: t("dashboard_tab_reviews_compact", t("partner_nav_reviews", "Reviews")),
+      content: `<section class="dashboard-grid one-col">${partnerReviewsPanel()}</section>`
+    },
+    {
+      key: "analytics",
+      label: t("partner_analytics_title", "Analytics & Reporting"),
+      compactLabel: t("partner_tab_analytics_compact", "Analytics"),
+      content: partnerAnalyticsPanel()
+    }
+  ].map((tab) => ({
+    ...tab,
+    tabId: `partner-tab-${tab.key}`,
+    panelId: `partner-tab-panel-${tab.key}`
+  }));
+  const activePartnerTab = activeDashboardTab("partner", partnerTabs);
+  app.innerHTML = dashboardShellTabbed(`
+    <section class="dashboard-head owner-focused-head compact-dashboard-head partner-dashboard-head">
       <div>
         <span class="section-kicker">${escapeHtml(t("partner_dashboard_kicker_basic", "Partner dashboard"))}</span>
-        <h1>${escapeHtml(greeting)}</h1>
+        <h1>${escapeHtml(restaurant.name || state.session.profile.full_name || t("restaurant_label", "Restaurant"))}</h1>
         <p class="muted">${escapeHtml(t("partner_dashboard_intro_basic", "Manage offers, reservation requests, guest feedback, and restaurant profile details."))}</p>
       </div>
       <div class="button-row">
@@ -9229,85 +18024,14 @@ function renderBasicPartner(restaurant, stats, greeting) {
         <button class="primary-button" id="refreshPartner" type="button">${escapeHtml(t("partner_refresh", "Refresh"))}</button>
       </div>
     </section>
-    ${basicPartnerOverviewPanel(stats)}
-    <section class="owner-dashboard-level dashboard-grid two-col partner-management-grid" id="partner-settings">
-      <article class="panel" id="partner-profile">
-        <div class="section-title-row compact">
-          <div><span class="section-kicker">${escapeHtml(t("profile_label", "Profile"))}</span><h2>${escapeHtml(t("restaurant_profile_title", "Restaurant profile"))}</h2></div>
-          <button class="primary-button" form="profileForm" type="submit">${escapeHtml(t("save_profile_button", "Save profile"))}</button>
-        </div>
-        <form class="mini-form profile-form" id="profileForm">
-          ${partnerEmailDiagnosticNotice(restaurant)}
-          ${textInput("name", t("restaurant_name_label", "Restaurant name"), restaurant.name, "text", "required")}
-          ${textArea("description_en", t("description_english_label", "Description English"), restaurant.description_en || restaurant.description)}
-          ${textArea("description_es", t("description_spanish_label", "Description Spanish"), restaurant.description_es)}
-          ${textArea("description_hu", t("description_hungarian_label", "Description Hungarian"), restaurant.description_hu)}
-          ${textInput("address", t("address_label", "Address"), restaurant.address, "text", "required")}
-          ${textInput("phone", t("phone_label", "Phone"), restaurant.phone)}
-          ${textInput("email", t("email_label", "Email"), restaurant.email || restaurant.contact_email, "email", "required")}
-          ${textInput("website", t("website_label", "Website"), restaurant.website, "url")}
-          ${textInput("instagram", "Instagram", restaurant.instagram)}
-          ${textInput("facebook", "Facebook", restaurant.facebook, "url")}
-          ${textInput("google_maps_url", "Google Maps", restaurant.google_maps_url, "url")}
-          <div class="form-grid">
-            ${textInput("cuisine_type", t("cuisine_label", "Cuisine"), restaurant.cuisine_type || restaurant.cuisine)}
-            ${textInput("opening_hours", t("business_hours_label", "Business hours"), restaurant.opening_hours)}
-            ${textInput("price_range", t("price_range_label", "Price range"), restaurant.price_range || "$$")}
-          </div>
-          ${textInput("logo_url", t("logo_url_label", "Logo URL"), restaurant.logo_url || restaurant.icon_image || restaurant.card_image)}
-          ${mediaUploadControl("logo", "logo_url", t("upload_logo_button", "Upload logo"))}
-          ${textInput("card_image", t("card_image_url_label", "Restaurant card image URL"), restaurant.card_image || restaurant.cover_image)}
-          ${mediaUploadControl("card", "card_image", t("upload_card_image_button", "Upload card image"))}
-          ${textArea("gallery_images", t("gallery_image_urls_label", "Gallery image URLs"), (restaurant.gallery_images || []).join("\\n"))}
-          ${mediaUploadControl("gallery", "gallery_images", t("upload_gallery_image_button", "Upload gallery image"))}
-        </form>
-      </article>
-      <article class="panel" id="partner-deals">
-        <div class="section-title-row compact">
-          <div><span class="section-kicker">${escapeHtml(t("partner_nav_offers", "Offers"))}</span><h2>${escapeHtml(t("create_offers_title", "Create discounted table offers"))}</h2></div>
-        </div>
-        <form class="mini-form offer-form" id="offerForm">
-          ${textInput("title_en", t("title_english_label", "Title English"), "", "text", "required")}
-          ${textInput("title_es", t("title_spanish_label", "Title Spanish"))}
-          ${textInput("title_hu", t("title_hungarian_label", "Title Hungarian"))}
-          ${textArea("description_en", t("description_english_label", "Description English"))}
-          ${textArea("description_es", t("description_spanish_label", "Description Spanish"))}
-          ${textArea("description_hu", t("description_hungarian_label", "Description Hungarian"))}
-          <div class="form-grid">
-            ${textInput("offer_date", t("date_label", "Date"), "", "date", "required")}
-            ${textInput("start_time", t("start_time_label", "Start time"), "", "time", "required")}
-            ${textInput("end_time", t("end_time_label", "End time"), "", "time", "required")}
-            ${textInput("available_tables", t("available_tables_label", "Available tables"), "", "number", "min=\"1\" required")}
-            ${textInput("max_party_size", t("max_party_label", "Max party"), "4", "number", "min=\"1\" required")}
-            ${textInput("discount_value", t("discount_percent_label", "Discount %"), "", "number", "min=\"1\" max=\"90\" required")}
-          </div>
-          ${textInput("offer_image", t("offer_image_url_label", "Offer image URL"), "/assets/restaurant-hero.png")}
-          ${mediaUploadControl("offer", "offer_image", t("upload_offer_image_button", "Upload offer image"))}
-          <button class="primary-button wide" type="submit">${escapeHtml(t("create_offer_button", "Create offer"))}</button>
-        </form>
-      </article>
-      <article class="panel" id="partner-current-offers">
-        <div class="section-title-row compact">
-          <div><span class="section-kicker">${escapeHtml(t("partner_nav_offers", "Offers"))}</span><h2>${escapeHtml(t("current_offers_title", "Current offers"))}</h2></div>
-        </div>
-        ${partnerOfferTable()}
-      </article>
-      <article class="panel" id="partner-reservations">
-        <div class="section-title-row compact">
-          <div><span class="section-kicker">${escapeHtml(t("partner_nav_reservations", "Reservations"))}</span><h2>${escapeHtml(t("manage_reservations_title", "Manage reservations"))}</h2></div>
-        </div>
-        ${reservationFilterForm("partner", state.partnerReservationFilters)}
-        ${reservationTable(state.reservations, false)}
-      </article>
-    </section>
-    <section class="owner-dashboard-level" id="partner-guests">
-      ${partnerTodayReservationLeadsPanel()}
-    </section>
-    <section class="owner-dashboard-level" id="partner-reviews">
-      ${partnerPostVisitFeedbackPanel()}
-    </section>
+    ${dashboardTabbedInterface("partner", partnerTabs, activePartnerTab, t("partner_dashboard_tabs_label", "Partner dashboard sections"))}
+    ${reservationAlertModal()}
   `);
+  bindDashboardTabs(renderPartner);
   bindPartnerCoreEvents(false);
+  bindReservationAlertEvents();
+  bindAnalyticsControls();
+  startPartnerAlertPolling();
   finalizeRenderedLanguage();
 }
 
@@ -9330,6 +18054,7 @@ function renderPartner() {
     { id: "partner-reservations", label: t("partner_nav_reservations", "Reservations") },
     { id: "partner-guests", label: t("partner_nav_guests", "Guests") },
     { id: "partner-reviews", label: t("partner_nav_reviews", "Reviews") },
+    { id: "partner-billing", label: t("partner_nav_billing", "Billing") },
     { id: "partner-settings", label: t("partner_nav_settings", "Settings") }
   ], `
     <section class="dashboard-head owner-focused-head">
@@ -9345,6 +18070,7 @@ function renderPartner() {
       </div>
     </section>
     ${aiModeBanner("partner")}
+    ${reservationAlertStrip()}
     <section class="owner-dashboard-level today-level" id="partner-today-level">
       ${ownerTodayHeroPanel(stats, forecast)}
       ${partnerAiDemandEntryCard()}
@@ -9411,7 +18137,11 @@ function renderPartner() {
       ${ownerDashboardLevelHeader(t("partner_nav_reviews", "Reviews"), t("reviews_level_title", "Reviews and post-visit intelligence"), t("reviews_level_intro", "Aggregated guest feedback, photo rewards, and review signals stay here."))}
       ${partnerPostVisitFeedbackPanel()}
     </section>
+    <section class="owner-dashboard-level" id="partner-billing-level">
+      ${partnerBillingPanel()}
+    </section>
     <section class="owner-dashboard-level dashboard-grid two-col partner-management-grid" id="partner-settings">
+      ${partnerNotificationSettingsPanel()}
       <article class="panel" id="partner-profile">
         <div class="section-title-row compact">
           <div><span class="section-kicker">Profile</span><h2>Restaurant profile</h2></div>
@@ -9420,9 +18150,7 @@ function renderPartner() {
         <form class="mini-form profile-form" id="profileForm">
           ${partnerEmailDiagnosticNotice(restaurant)}
           ${textInput("name", "Restaurant name", restaurant.name, "text", "required")}
-          ${textArea("description_en", "Description English", restaurant.description_en || restaurant.description)}
-          ${textArea("description_es", "Description Spanish", restaurant.description_es)}
-          ${textArea("description_hu", "Description Hungarian", restaurant.description_hu)}
+          ${primaryRestaurantContentFields(restaurant)}
           ${textInput("address", "Address", restaurant.address, "text", "required")}
           ${textInput("phone", "Phone", restaurant.phone)}
           ${textInput("email", "Email", restaurant.email || restaurant.contact_email, "email", "required")}
@@ -9500,12 +18228,7 @@ function renderPartner() {
           <div><span class="section-kicker">Deals</span><h2>Create discounted table offers</h2></div>
         </div>
         <form class="mini-form offer-form" id="offerForm">
-          ${textInput("title_en", "Title English", "", "text", "required")}
-          ${textInput("title_es", "Title Spanish")}
-          ${textInput("title_hu", "Title Hungarian")}
-          ${textArea("description_en", "Description English")}
-          ${textArea("description_es", "Description Spanish")}
-          ${textArea("description_hu", "Description Hungarian")}
+          ${primaryOfferContentFields(restaurant)}
           <div class="form-grid">
             ${textInput("offer_date", "Date", "", "date", "required")}
             ${textInput("start_time", "Start time", "", "time", "required")}
@@ -9537,9 +18260,10 @@ function renderPartner() {
           <div><span class="section-kicker">Reservations</span><h2>Manage reservations</h2></div>
         </div>
         ${reservationFilterForm("partner", state.partnerReservationFilters)}
-        ${reservationTable(state.reservations, false)}
+        ${reservationTable(state.reservations, false, "partner")}
       </article>
     </section>
+    ${reservationAlertModal()}
   `);
   app.insertAdjacentHTML("beforeend", partnerAdvisorWidget());
   document.querySelector("#refreshPartner").addEventListener("click", async () => {
@@ -9588,8 +18312,16 @@ function renderPartner() {
   document.querySelectorAll("[data-delete-partner-offer]").forEach((button) => {
     button.addEventListener("click", () => deleteOffer("/partner/offers", button.dataset.deletePartnerOffer, loadPartnerData, renderPartner, button));
   });
+  document.querySelectorAll("[data-notify-favorite-offer]").forEach((button) => {
+    button.addEventListener("click", () => notifyFavoriteGuestsForOffer(button));
+  });
   bindReservationStatusButtons("/partner/reservations", loadPartnerData, renderPartner);
   bindReservationFilterForms();
+  bindReservationAlertEvents();
+  document.querySelectorAll("[data-partner-billing-action]").forEach((button) => {
+    button.addEventListener("click", () => runPartnerBillingAction(button));
+  });
+  startPartnerAlertPolling();
   finalizeRenderedLanguage();
 }
 
@@ -9611,30 +18343,38 @@ function bindAdvisorEvents() {
 
 function partnerOfferTable() {
   if (!state.offersMine.length) return `<div class="empty-state">${escapeHtml(t("no_offers_yet", "No offers yet."))}</div>`;
+  const titleField = `title_${primaryContentLanguageForRestaurant(state.partnerProfile || {})}`;
+  const canNotifyFavoriteGuests = (offer) => {
+    const status = String(offer.status || "active").toLowerCase();
+    const remaining = Math.max(Number(offer.available_tables || offer.seat_count || 0) - Number(offer.reserved_tables || 0), 0);
+    const date = String(offer.offer_date || "").trim();
+    return status === "active" && remaining > 0 && (!date || date >= new Date().toISOString().slice(0, 10));
+  };
   return `
+    <p class="form-note">${escapeHtml(t("favorite_offer_notify_note", "Use Notify favorite guests to email only opted-in guests who saved this restaurant. Guest email addresses stay hidden."))}</p>
     <div class="table-wrap partner-table-wrap">
       <table class="partner-data-table partner-offers-table">
         <thead><tr><th>${escapeHtml(t("offer_table_title_header", "Title"))}</th><th>${escapeHtml(t("offer_table_date_time_header", "Date/time"))}</th><th>${escapeHtml(t("offer_table_tables_header", "Tables"))}</th><th>${escapeHtml(t("offer_table_discount_header", "Discount"))}</th><th>${escapeHtml(t("status_label", "Status"))}</th><th></th></tr></thead>
         <tbody>
           ${state.offersMine.map((offer) => `
             <tr class="offer-edit-row" data-offer-row="${escapeAttr(offer.id)}">
-              <td>
-                <input data-field="title_en" value="${escapeAttr(offer.title_en || t("discounted_table_label", "Discounted table"))}">
+              <td data-label="${escapeAttr(t("offer_table_title_header", "Title"))}">
+                <input data-field="${escapeAttr(titleField)}" value="${escapeAttr(localizedContentField(offer, "title", primaryContentLanguageForRestaurant(state.partnerProfile || {})) || t("discounted_table_label", "Discounted table"))}" aria-label="${escapeAttr(t("offer_primary_title_label", "Offer title"))}">
                 <input data-field="offer_image" value="${escapeAttr(offer.offer_image || "")}" placeholder="${escapeAttr(t("offer_image_url_label", "Offer image URL"))}">
                 <span class="muted">${escapeHtml((offer.valid_days || []).join(", "))}</span>
               </td>
-              <td>
+              <td data-label="${escapeAttr(t("offer_table_date_time_header", "Date/time"))}">
                 <input data-field="offer_date" type="date" value="${escapeAttr(offer.offer_date || "")}">
                 <input data-field="start_time" type="time" value="${escapeAttr(offer.start_time || offer.offer_time || "")}">
                 <input data-field="end_time" type="time" value="${escapeAttr(offer.end_time || "")}">
               </td>
-              <td>
+              <td data-label="${escapeAttr(t("offer_table_tables_header", "Tables"))}">
                 <input data-field="available_tables" type="number" min="1" value="${escapeAttr(offer.available_tables || offer.seat_count || 1)}">
                 <input data-field="max_party_size" type="number" min="1" value="${escapeAttr(offer.max_party_size || 4)}">
                 <span class="muted">${escapeHtml(offer.reserved_tables || 0)} ${escapeHtml(t("reserved_label", "reserved"))}</span>
               </td>
-              <td><input data-field="discount_value" type="number" min="1" max="90" value="${escapeAttr(offer.discount_value || offer.discount_percent || 20)}"></td>
-              <td>
+              <td data-label="${escapeAttr(t("offer_table_discount_header", "Discount"))}"><input data-field="discount_value" type="number" min="1" max="90" value="${escapeAttr(offer.discount_value || offer.discount_percent || 20)}"></td>
+              <td data-label="${escapeAttr(t("status_label", "Status"))}">
                 ${statusBadge(offer.status, offerStatusLabel(offer.status))}
                 <select data-field="status">
                   <option value="active" ${offer.status === "active" ? "selected" : ""}>${escapeHtml(t("offer_status_active", "Active"))}</option>
@@ -9643,9 +18383,10 @@ function partnerOfferTable() {
                   <option value="expired" ${offer.status === "expired" ? "selected" : ""}>${escapeHtml(t("offer_status_expired", "Expired"))}</option>
                 </select>
               </td>
-              <td>
+              <td data-label="${escapeAttr(t("actions_label", "Actions"))}">
                 <div class="button-row">
                   <button class="ghost-button" data-save-partner-offer="${escapeAttr(offer.id)}" type="button">${escapeHtml(t("save_button", "Save"))}</button>
+                  <button class="ghost-button" data-notify-favorite-offer="${escapeAttr(offer.id)}" type="button" ${canNotifyFavoriteGuests(offer) ? "" : "disabled"}>${escapeHtml(t("notify_favorite_guests_button", "Notify favorite guests"))}</button>
                   <button class="ghost-button danger" data-delete-partner-offer="${escapeAttr(offer.id)}" type="button">${escapeHtml(t("delete_button", "Delete"))}</button>
                 </div>
               </td>
@@ -9665,7 +18406,7 @@ async function submitProfile(event) {
     setButtonPending(submitButton, true);
     await api("/partner/profile", {
       method: "PATCH",
-      body: JSON.stringify(formObject(event.currentTarget))
+      body: JSON.stringify(profilePayloadFromForm(event.currentTarget))
     });
     await loadPartnerData();
     renderPartner();
@@ -9960,7 +18701,7 @@ async function submitOffer(event) {
     setButtonPending(submitButton, true);
     await api("/partner/offers", {
       method: "POST",
-      body: JSON.stringify(formObject(event.currentTarget))
+      body: JSON.stringify(offerPayloadFromForm(event.currentTarget))
     });
     await loadPartnerData();
     renderPartner();
@@ -10010,27 +18751,37 @@ async function deleteOffer(endpoint, id, reload, render, button = null) {
   }
 }
 
-function reservationTable(rows, showRestaurant) {
+function reservationTable(rows, showRestaurant, scope = "partner") {
   if (!rows.length) return `<div class="empty-state">${escapeHtml(t("account_no_reservations", "No reservations yet."))}</div>`;
+  const tableClass = `partner-data-table partner-reservations-table${showRestaurant ? " has-restaurant-column" : ""}`;
+  const referenceLabel = t("reservation_reference_label", "Reference");
+  const restaurantLabel = t("restaurant_label", "Restaurant");
+  const guestLabel = t("guest_label", "Guest");
+  const tableLabel = t("reservation_table_label", "Table");
+  const statusLabel = t("status_label", "Status");
+  const visitStatusLabel = t("post_visit_status_label", "Visit status");
+  const notesLabel = t("internal_notes_label", "Internal notes");
+  const actionsLabel = t("actions_label", "Actions");
   return `
-    <div class="table-wrap partner-table-wrap">
-      <table class="partner-data-table partner-reservations-table">
-        <thead><tr><th>${escapeHtml(t("reservation_reference_label", "Reference"))}</th>${showRestaurant ? `<th>${escapeHtml(t("restaurant_label", "Restaurant"))}</th>` : ""}<th>${escapeHtml(t("guest_label", "Guest"))}</th><th>${escapeHtml(t("reservation_table_label", "Table"))}</th><th>${escapeHtml(t("status_label", "Status"))}</th><th>${escapeHtml(t("internal_notes_label", "Internal notes"))}</th><th></th></tr></thead>
+    <div class="table-wrap partner-table-wrap partner-reservations-table-wrap">
+      <table class="${escapeAttr(tableClass)}">
+        <thead><tr><th class="reservation-col-reference">${escapeHtml(referenceLabel)}</th>${showRestaurant ? `<th class="reservation-col-restaurant">${escapeHtml(restaurantLabel)}</th>` : ""}<th class="reservation-col-guest">${escapeHtml(guestLabel)}</th><th class="reservation-col-table">${escapeHtml(tableLabel)}</th><th class="reservation-col-status">${escapeHtml(statusLabel)}</th><th class="reservation-col-visit">${escapeHtml(visitStatusLabel)}</th><th class="reservation-col-notes">${escapeHtml(notesLabel)}</th><th class="reservation-col-actions">${escapeHtml(actionsLabel)}</th></tr></thead>
         <tbody>
           ${rows.map((reservation) => `
             <tr>
-              <td>${escapeHtml(reservation.reference)}</td>
-              ${showRestaurant ? `<td>${escapeHtml(reservation.restaurant_name)}</td>` : ""}
-              <td>${escapeHtml(reservation.guest_name)}<br><span class="muted">${escapeHtml(reservation.guest_email)}</span><br><span class="muted">${escapeHtml(reservation.guest_phone || "")}</span></td>
-              <td>${escapeHtml(formatDate(reservation.reservation_date || reservation.offer_date, reservation.reservation_time || reservation.offer_time))}<br><span class="muted">${escapeHtml(reservation.party_size)} ${escapeHtml(t("guests_label", "guests"))} - ${escapeHtml(reservation.discount_percent || reservation.discount_value || 0)}% ${escapeHtml(t("off_label", "off"))}</span></td>
-              <td>${statusBadge(reservation.status, reservationStatusLabel(reservation.status))}</td>
-              <td>
-                <textarea data-note-field="${escapeAttr(reservation.reservation_id)}" placeholder="${escapeAttr(t("reservation_internal_notes_placeholder", "Internal restaurant notes"))}">${escapeHtml(reservation.partner_notes || "")}</textarea>
+              <td class="reservation-reference-cell" data-label="${escapeAttr(referenceLabel)}">${escapeHtml(reservation.reference)}</td>
+              ${showRestaurant ? `<td class="reservation-restaurant-cell" data-label="${escapeAttr(restaurantLabel)}">${escapeHtml(reservation.restaurant_name)}</td>` : ""}
+              <td class="reservation-guest-cell" data-label="${escapeAttr(guestLabel)}"><strong>${escapeHtml(reservation.guest_name)}</strong><span class="muted">${escapeHtml(reservation.guest_email)}</span><span class="muted">${escapeHtml(reservation.guest_phone || "")}</span></td>
+              <td class="reservation-time-cell" data-label="${escapeAttr(tableLabel)}">${escapeHtml(formatDate(reservation.reservation_date || reservation.offer_date, reservation.reservation_time || reservation.offer_time))}<span class="muted">${escapeHtml(reservation.party_size)} ${escapeHtml(t("guests_label", "guests"))} - ${escapeHtml(reservation.discount_percent || reservation.discount_value || 0)}% ${escapeHtml(t("off_label", "off"))}</span></td>
+              <td class="reservation-status-cell" data-label="${escapeAttr(statusLabel)}">${statusBadge(reservation.status, reservationStatusLabel(reservation.status))}</td>
+              <td class="reservation-visit-cell" data-label="${escapeAttr(visitStatusLabel)}"><span class="muted">${escapeHtml(postVisitStatusLine(reservation))}</span>${reservation.verified_visit ? `<span class="status success">${escapeHtml(t("verified_visit_badge", "Verified SmartTable visit"))}</span>` : ""}</td>
+              <td class="reservation-notes-cell" data-label="${escapeAttr(notesLabel)}">
+                <textarea rows="2" data-note-field="${escapeAttr(reservation.reservation_id)}" placeholder="${escapeAttr(t("reservation_internal_notes_placeholder", "Internal restaurant notes"))}">${escapeHtml(reservation.partner_notes || "")}</textarea>
                 <button class="ghost-button" data-save-note="${escapeAttr(reservation.reservation_id)}" type="button">${escapeHtml(t("save_note_button", "Save note"))}</button>
               </td>
-              <td>
+              <td class="reservation-actions-cell" data-label="${escapeAttr(actionsLabel)}">
                 <div class="button-row">
-                  ${reservationActionButtons(reservation)}
+                  ${reservationActionButtons(reservation, scope)}
                 </div>
               </td>
             </tr>
@@ -10060,7 +18811,7 @@ function reservationFilterForm(scope, filters) {
   `;
 }
 
-function reservationActionButtons(reservation = {}) {
+function reservationActionButtons(reservation = {}, scope = "partner") {
   const status = normalizeReservationStatusValue(reservation.status);
   const id = escapeAttr(reservation.reservation_id);
   const buttons = [];
@@ -10069,12 +18820,20 @@ function reservationActionButtons(reservation = {}) {
     buttons.push(`<button class="ghost-button warning" data-status="rejected" data-reservation="${id}" type="button">${escapeHtml(t("decline_button", "Decline"))}</button>`);
     buttons.push(`<button class="ghost-button danger" data-status="cancelled" data-reservation="${id}" type="button">${escapeHtml(t("cancel_button", "Cancel"))}</button>`);
   } else if (status === "accepted") {
-    buttons.push(`<button class="ghost-button" data-status="completed" data-reservation="${id}" type="button">${escapeHtml(t("complete_button", "Complete"))}</button>`);
+    if (reservation.arrival_status !== "arrived") buttons.push(`<button class="ghost-button" data-visit-action="mark_arrived" data-reservation="${id}" type="button">${escapeHtml(t("mark_arrived_button", "Mark arrived"))}</button>`);
+    buttons.push(`<button class="ghost-button success" data-visit-action="mark_visit_completed" data-reservation="${id}" type="button">${escapeHtml(t("mark_visit_completed_button", "Mark visit completed"))}</button>`);
     buttons.push(`<button class="ghost-button danger" data-status="cancelled" data-reservation="${id}" type="button">${escapeHtml(t("cancel_button", "Cancel"))}</button>`);
-    buttons.push(`<button class="ghost-button" data-status="no_show" data-reservation="${id}" type="button">${escapeHtml(t("no_show_button", "No-show"))}</button>`);
+    buttons.push(`<button class="ghost-button" data-visit-action="mark_no_show" data-reservation="${id}" type="button">${escapeHtml(t("no_show_button", "No-show"))}</button>`);
   }
   if (status === "completed") {
     buttons.push(`<button class="ghost-button success" data-post-visit-email="${id}" type="button">${escapeHtml(t("post_visit_email_send_button", "Send post-visit email"))}</button>`);
+  }
+  if (scope === "admin" && isSuperAdmin()) {
+    buttons.push(`<button class="ghost-button" data-admin-resend-reservation-email="guest" data-reservation-email-id="${id}" type="button">${escapeHtml(t("resend_guest_email_button", "Resend guest email"))}</button>`);
+    buttons.push(`<button class="ghost-button" data-admin-resend-reservation-email="partner" data-reservation-email-id="${id}" type="button">${escapeHtml(t("resend_partner_email_button", "Resend partner email"))}</button>`);
+  }
+  if (scope === "admin" && reservation.guest_email) {
+    buttons.push(`<button class="ghost-button" data-view-as-guest="${escapeAttr(reservation.guest_email)}" type="button">${escapeHtml(t("view_as_guest_button", "View as guest"))}</button>`);
   }
   if (!buttons.length) return `<span class="muted">${escapeHtml(t("reservation_no_actions_available", "No actions available"))}</span>`;
   return buttons.join("");
@@ -10123,6 +18882,23 @@ function bindReservationStatusButtons(endpoint, reload, render) {
       const reservationId = button.dataset.reservation;
       const relatedButtons = Array.from(document.querySelectorAll(`[data-reservation="${CSS.escape(reservationId)}"], [data-post-visit-email="${CSS.escape(reservationId)}"]`));
       try {
+        const visitAction = button.dataset.visitAction;
+        if (visitAction) {
+          if (visitAction === "mark_no_show" && !confirm(t("mark_no_show_confirm", "Mark this guest as a no-show?"))) return;
+          if (visitAction === "mark_visit_completed" && !confirm(t("mark_visit_completed_confirm", "Mark this visit completed?"))) return;
+          relatedButtons.forEach((item) => setButtonPending(item, true));
+          await api(endpoint, {
+            method: "PATCH",
+            body: JSON.stringify({
+              id: reservationId,
+              action: visitAction
+            })
+          });
+          await reload();
+          render();
+          showToast(t("post_visit_action_saved", "Visit status saved."));
+          return;
+        }
         const nextStatus = button.dataset.status;
         if (nextStatus === "accepted" && !confirm(t("accept_reservation_confirm", "Accept this reservation request?"))) return;
         if (nextStatus === "rejected" && !confirm(t("decline_reservation_confirm", "Decline this reservation request?"))) return;
@@ -10183,9 +18959,43 @@ function bindReservationStatusButtons(endpoint, reload, render) {
       }
     });
   });
+  document.querySelectorAll("[data-admin-resend-reservation-email]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const target = button.dataset.adminResendReservationEmail;
+      const reservationId = button.dataset.reservationEmailId;
+      const confirmKey = target === "partner" ? "resend_partner_email_confirm" : "resend_guest_email_confirm";
+      const confirmText = target === "partner"
+        ? "Resend the partner notification email for this reservation?"
+        : "Resend the guest confirmation email for this reservation?";
+      if (!confirm(t(confirmKey, confirmText))) return;
+      try {
+        setButtonPending(button, true, t("sending_button", "Sending..."));
+        const payload = await api("/admin/email-queue", {
+          method: "POST",
+          body: JSON.stringify({
+            action: "resend_reservation_email",
+            id: reservationId,
+            target
+          })
+        });
+        await reload();
+        render();
+        const messageId = payload?.result?.provider_message_id || "";
+        showToast(payload.ok
+          ? t("resend_reservation_email_accepted", "Reservation email accepted by the provider.") + (messageId ? ` ${messageId}` : "")
+          : t("resend_reservation_email_failed", "Reservation email was not accepted by the provider."));
+      } catch (error) {
+        setButtonPending(button, false);
+        showToast(error.message);
+      }
+    });
+  });
 }
 
 async function renderCurrentMode() {
+  stopPartnerAlertPolling();
+  stopFoodFeedPlayback();
+  updateShellRouteClass();
   app.innerHTML = loadingSkeleton();
   await loadTranslations();
   await loadPublicConfig();
@@ -10199,9 +19009,34 @@ async function renderCurrentMode() {
       renderGuestSignup();
       return;
     }
+    if (accountRoute === "signup-check-email") {
+      state.mode = "guest";
+      renderSignupCheckEmail();
+      return;
+    }
+    if (accountRoute === "signup-welcome") {
+      state.mode = "guest";
+      renderSignupWelcome();
+      return;
+    }
+    if (accountRoute === "post-visit-action") {
+      state.mode = "guest";
+      await renderPostVisitActionPage();
+      return;
+    }
+    if (accountRoute === "verified-review") {
+      state.mode = "guest";
+      await renderVerifiedReviewPage();
+      return;
+    }
     if (accountRoute === "login") {
       state.mode = "guest";
       renderGuestLogin();
+      return;
+    }
+    if (accountRoute === "partner-invite") {
+      state.mode = "guest";
+      renderPartnerInvitation();
       return;
     }
     if (accountRoute === "forgot-password") {
@@ -10212,6 +19047,11 @@ async function renderCurrentMode() {
     if (accountRoute === "reset-password") {
       state.mode = "guest";
       renderResetPassword();
+      return;
+    }
+    if (accountRoute === "auth-callback") {
+      state.mode = "guest";
+      await renderAuthCallback();
       return;
     }
     if (accountRoute === "verify-email") {
@@ -10255,6 +19095,12 @@ async function renderCurrentMode() {
       return;
     }
     const publicRoute = currentPublicGuestRoute();
+    const publicSearchParams = new URLSearchParams(window.location.search);
+    if (publicSearchParams.has("search")) {
+      const publicSearchQuery = String(publicSearchParams.get("search") || "").trim();
+      state.filters.restaurantName = publicSearchQuery;
+      state.headerSearchQuery = publicSearchQuery;
+    }
     if (publicRoute.kind === "info") {
       renderPublicGuestInfoPage(publicRoute);
       return;
@@ -10263,7 +19109,11 @@ async function renderCurrentMode() {
       renderNotFoundRoute(publicRoute);
       return;
     }
-    await Promise.all([loadPublicOffers(), loadNewestRestaurants(), loadAiPreferences(), loadAiRecommendations(), loadRewardBookingContext()]);
+    if (publicRoute.kind === "food-feed") {
+      renderGuest(publicRoute);
+      return;
+    }
+    await Promise.all([loadPublicOffers(), loadPublicRestaurants(), loadNewestRestaurants(), loadGuestFavoritesForPublic(), loadAiPreferences(), loadAiRecommendations(), loadRewardBookingContext()]);
     if (publicRoute.kind === "restaurant-detail") {
       const restaurant = findPublicRestaurantBySlug(publicRoute.slug);
       if (!restaurant) {
@@ -10290,9 +19140,24 @@ async function renderCurrentMode() {
 }
 
 function bindNav() {
+  const themeToggleButton = document.querySelector("#themeToggleButton");
+  applyTheme(currentTheme(), { persist: false });
+  themeToggleButton?.addEventListener("click", () => applyTheme(currentTheme() === "dark" ? "light" : "dark"));
   document.querySelector("#guestNav").addEventListener("click", async () => {
     maybeTrackSignupAbandoned("guest_navigation");
-    history.pushState(null, "", "/");
+    history.pushState(null, "", "/offers");
+    state.mode = "guest";
+    await renderCurrentMode();
+  });
+  document.querySelector("#restaurantsNav")?.addEventListener("click", async () => {
+    maybeTrackSignupAbandoned("restaurants_navigation");
+    history.pushState(null, "", "/restaurants");
+    state.mode = "guest";
+    await renderCurrentMode();
+  });
+  document.querySelector("#foodFeedNav")?.addEventListener("click", async () => {
+    maybeTrackSignupAbandoned("food_feed_navigation");
+    history.pushState(null, "", "/food-feed");
     state.mode = "guest";
     await renderCurrentMode();
   });
@@ -10302,13 +19167,13 @@ function bindNav() {
     state.mode = "guest";
     await renderCurrentMode();
   });
-  document.querySelector("#adminNav").addEventListener("click", async () => {
+  document.querySelector("#adminNav")?.addEventListener("click", async () => {
     maybeTrackSignupAbandoned("admin_navigation");
     history.pushState(null, "", "/admin");
     state.mode = "admin";
     await renderCurrentMode();
   });
-  document.querySelector("#restaurantNav").addEventListener("click", async () => {
+  document.querySelector("#restaurantNav")?.addEventListener("click", async () => {
     maybeTrackSignupAbandoned("partner_navigation");
     history.pushState(null, "", "/partner");
     state.mode = "partner";
@@ -10319,10 +19184,151 @@ function bindNav() {
     state.mode = "guest";
     await renderCurrentMode();
   });
-  document.querySelectorAll("[data-lang]").forEach((button) => {
-    button.addEventListener("click", async () => {
-      await setLanguage(button.dataset.lang);
+  const headerSearchButton = document.querySelector("#headerSearchButton");
+  const headerSearchPanel = document.querySelector("#headerSearchPanel");
+  headerSearchButton?.addEventListener("click", () => {
+    state.headerSearchOpen ? closeHeaderSearch({ focusButton: true }) : openHeaderSearch();
+  });
+  headerSearchButton?.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") return;
+    event.preventDefault();
+    closeHeaderSearch({ focusButton: true });
+  });
+  const syncHeaderOfferFilter = (event) => {
+    const control = event.target.closest?.("#headerOfferSearchForm [name]");
+    if (!control || !(control.name in state.filters)) return;
+    state.filters[control.name] = control.value;
+    if (control.name === "restaurantName") state.headerSearchQuery = control.value;
+  };
+  headerSearchPanel?.addEventListener("input", syncHeaderOfferFilter);
+  headerSearchPanel?.addEventListener("change", syncHeaderOfferFilter);
+  headerSearchPanel?.addEventListener("submit", async (event) => {
+    if (!event.target.matches("#headerOfferSearchForm")) return;
+    event.preventDefault();
+    const formData = new FormData(event.target);
+    ["restaurantName", "date", "time", "partySize", "neighborhood", "cuisine", "discount"].forEach((name) => {
+      state.filters[name] = String(formData.get(name) || "");
     });
+    state.headerSearchQuery = state.filters.restaurantName;
+    closeHeaderSearch();
+    history.pushState(null, "", "/offers");
+    state.mode = "guest";
+    await renderCurrentMode();
+  });
+  headerSearchPanel?.addEventListener("click", async (event) => {
+    if (event.target.closest("[data-header-search-close]")) {
+      closeHeaderSearch({ focusButton: true });
+      return;
+    }
+    if (event.target.closest("[data-header-search-clear]")) {
+      state.filters = {
+        neighborhood: "",
+        cuisine: "",
+        discount: "",
+        date: "",
+        time: "",
+        partySize: "",
+        restaurantName: "",
+        availableOnly: false,
+        sort: "recommended"
+      };
+      state.headerSearchQuery = "";
+      updateHeaderSearch();
+      window.setTimeout(() => document.querySelector("#headerOfferRestaurantName")?.focus(), 0);
+      return;
+    }
+    const actionButton = event.target.closest("[data-header-search-action]");
+    if (!actionButton) return;
+    await runHeaderSearchAction(actionButton.dataset.headerSearchAction, actionButton.dataset.headerSearchQuery || "");
+  });
+  headerSearchPanel?.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") return;
+    event.preventDefault();
+    closeHeaderSearch({ focusButton: true });
+  });
+  const citySelector = document.querySelector("[data-city-selector]");
+  const cityButton = document.querySelector("#citySelectorButton");
+  cityButton?.addEventListener("click", () => {
+    state.citySelectorOpen ? closeCitySelector() : openCitySelector();
+  });
+  cityButton?.addEventListener("keydown", (event) => {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      openCitySelector({ focusCurrent: true });
+    } else if (event.key === "Escape") {
+      closeCitySelector({ focusButton: true });
+    } else if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      state.citySelectorOpen ? closeCitySelector() : openCitySelector({ focusCurrent: true });
+    }
+  });
+  citySelector?.addEventListener("click", (event) => {
+    if (!event.target.closest("[data-city-option]:not([disabled])")) return;
+    closeCitySelector({ focusButton: true });
+  });
+  citySelector?.addEventListener("keydown", (event) => {
+    if (!event.target.closest("[data-city-option]:not([disabled])")) return;
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeCitySelector({ focusButton: true });
+    } else if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      closeCitySelector({ focusButton: true });
+    }
+  });
+  const languageSelector = document.querySelector("[data-language-selector]");
+  const languageButton = document.querySelector("#languageSelectorButton");
+  languageButton?.addEventListener("click", () => {
+    state.languageSelectorOpen ? closeLanguageSelector() : openLanguageSelector();
+  });
+  languageButton?.addEventListener("keydown", (event) => {
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      openLanguageSelector({ focusCurrent: true });
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault();
+      openLanguageSelector({ focusLast: true });
+    } else if (event.key === "Escape") {
+      closeLanguageSelector({ focusButton: true });
+    } else if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      state.languageSelectorOpen ? closeLanguageSelector() : openLanguageSelector({ focusCurrent: true });
+    }
+  });
+  languageSelector?.addEventListener("click", async (event) => {
+    const option = event.target.closest("[data-language-option]");
+    if (!option) return;
+    await selectLanguageFromSelector(option.dataset.languageOption);
+  });
+  languageSelector?.addEventListener("keydown", async (event) => {
+    if (!event.target.closest("[data-language-option]")) return;
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      moveLanguageOptionFocus(1);
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault();
+      moveLanguageOptionFocus(-1);
+    } else if (event.key === "Home") {
+      event.preventDefault();
+      languageOptionButtons()[0]?.focus();
+    } else if (event.key === "End") {
+      event.preventDefault();
+      const options = languageOptionButtons();
+      options[options.length - 1]?.focus();
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      closeLanguageSelector({ focusButton: true });
+    } else if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      await selectLanguageFromSelector(event.target.dataset.languageOption);
+    }
+  });
+  adminDashboardNav?.addEventListener("click", async () => {
+    const role = normalizeRole(currentSession()?.profile?.role || "");
+    if (!isAdminRole(role)) return;
+    history.pushState(null, "", adminDashboardRouteForRole(role));
+    state.mode = "admin";
+    await renderCurrentMode();
   });
   sessionButton.addEventListener("click", async () => {
     maybeTrackSignupAbandoned("session_button");
@@ -10345,6 +19351,21 @@ function bindNav() {
     state.showAccountMenu = false;
     updateSessionButton();
   });
+  document.addEventListener("click", (event) => {
+    if (!state.headerSearchOpen) return;
+    if (event.target.closest("#headerSearchButton") || event.target.closest("#headerSearchPanel")) return;
+    closeHeaderSearch();
+  });
+  document.addEventListener("click", (event) => {
+    if (!state.citySelectorOpen) return;
+    if (event.target.closest("[data-city-selector]")) return;
+    closeCitySelector();
+  });
+  document.addEventListener("click", (event) => {
+    if (!state.languageSelectorOpen) return;
+    if (event.target.closest("[data-language-selector]")) return;
+    closeLanguageSelector();
+  });
 }
 
 window.addEventListener("beforeunload", () => {
@@ -10352,12 +19373,18 @@ window.addEventListener("beforeunload", () => {
 });
 
 async function boot() {
+  await clearAuthBrowserStateForEntryRoute();
   bindNav();
+  attachPartnerServiceWorkerListener();
   updateSessionButton();
   try {
     const health = await api("/health");
+    state.runtimeHealth = health;
+    state.runtimeHealthError = "";
     state.apiMode = health.mode;
-  } catch {
+  } catch (error) {
+    state.runtimeHealth = null;
+    state.runtimeHealthError = error?.message || "unavailable";
     state.apiMode = "offline";
   }
   if (state.session?.profile) state.session.profile.role = normalizeRole(state.session.profile.role);
