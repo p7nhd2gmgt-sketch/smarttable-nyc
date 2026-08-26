@@ -8975,13 +8975,13 @@ th {
   .compact-restaurant-card.guest-restaurant-card .restaurant-photo,
   .compact-restaurant-card .restaurant-tile-photo {
     aspect-ratio: auto;
-    height: clamp(118px, 31vw, 136px);
+    height: clamp(106px, 28vw, 120px);
   }
 
   .compact-restaurant-card.guest-restaurant-card .restaurant-body,
   .compact-restaurant-card .restaurant-tile-body {
-    gap: 7px;
-    padding: 10px 12px 12px;
+    gap: 6px;
+    padding: 9px 11px 10px;
   }
 
   .restaurant-tile-title-row {
@@ -8989,19 +8989,53 @@ th {
   }
 
   .restaurant-tile-title-row h3 {
-    font-size: clamp(1.25rem, 6vw, 1.5rem);
+    display: -webkit-box;
+    font-size: clamp(1.16rem, 5.4vw, 1.34rem);
+    line-height: 1.15;
+    overflow: hidden;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
   }
 
   .restaurant-discount-range {
-    font-size: 0.92rem;
-    max-width: 42vw;
+    font-size: 0.82rem;
+    line-height: 1.1;
+    max-width: 38vw;
+    min-width: 0;
+    padding: 5px 8px;
     text-align: right;
     white-space: normal;
   }
 
+  .restaurant-tile-meta {
+    flex-wrap: nowrap;
+    gap: 6px;
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+  }
+
   .restaurant-tile-meta,
   .restaurant-tile-availability {
-    font-size: 0.9rem;
+    font-size: 0.84rem;
+    line-height: 1.25;
+  }
+
+  .restaurant-tile-footer {
+    grid-template-columns: minmax(0, 1fr) 40px;
+    min-height: 40px;
+  }
+
+  .restaurant-tile-availability {
+    display: -webkit-box;
+    overflow: hidden;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+  }
+
+  .restaurant-favorite-button {
+    min-height: 40px;
+    min-width: 40px;
   }
 
   .restaurant-detail-page-hero {
