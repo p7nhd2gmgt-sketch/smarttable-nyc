@@ -1,0 +1,22 @@
+# Enterprise Security Review Checklist
+
+- [ ] Stripe webhook signature verification configured.
+- [ ] Twilio webhook signature verification configured.
+- [ ] Resend API key server-side only.
+- [ ] Stripe secret key server-side only.
+- [ ] Twilio auth token server-side only.
+- [ ] Supabase service role server-side only.
+- [ ] RLS enabled on new tables.
+- [ ] Partner campaign access is restaurant-scoped.
+- [ ] Partner subscription access is restaurant-scoped.
+- [ ] Guest preferences and notifications are user-scoped.
+- [ ] Marketing campaigns require valid consent.
+- [ ] Suppression list is checked before marketing sends.
+- [ ] Raw guest email and phone lists are not exposed to restaurants.
+- [ ] Campaign content is sanitized server-side.
+- [ ] Template variables use the allowlist.
+- [ ] Queue records use idempotency keys.
+- [ ] Queue records have retry and dead-letter limits.
+- [ ] Audit logs redact secrets and store aggregate metadata only.
+- [ ] No POS integration is present.
+- [ ] No unfinished AI features are enabled by this phase.

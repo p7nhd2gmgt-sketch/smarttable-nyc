@@ -25,6 +25,11 @@ for (const token of [
   '"/forgot-password"',
   '"/terms"',
   '"/privacy"',
+  '"/cookies"',
+  '"/reservation-policy"',
+  '"/review-policy"',
+  '"/partner-terms"',
+  '"/accessibility"',
   '"/contact"',
   '"/help"',
   '"/account/reservations"',
@@ -40,11 +45,16 @@ for (const token of [
   '"/partner/analytics"',
   '"/partner/settings"',
   '"/admin/restaurants"',
+  '"/admin/restaurant-detail',
+  '"/admin/restaurant-capacity',
+  '"/admin/audit-logs',
   '"/admin/offers"',
   '"/admin/users"',
   '"/admin/notifications"',
   '"/admin/content"',
-  '"/admin/platform-settings"'
+  '"/admin/platform-settings"',
+  '"/superadmin"',
+  '"/superadmin/settings"'
 ]) {
   assert(appSource.includes(token), `Route map is missing ${token}.`);
 }

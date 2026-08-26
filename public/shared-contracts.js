@@ -250,7 +250,7 @@ export const BOOKING_STATUSES = [
 
 export const ALLOWED_RESTAURANT_STATUSES = ["pending", "approved", "suspended"];
 export const ALLOWED_OFFER_STATUSES = ["active", "paused", "sold_out", "expired"];
-export const ALLOWED_REVIEW_STATUSES = ["pending", "approved", "rejected"];
+export const ALLOWED_REVIEW_STATUSES = ["pending", "approved", "rejected", "removed"];
 export const ALLOWED_DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
 
 export function normalizeLanguage(value) {

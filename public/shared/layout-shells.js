@@ -17,13 +17,15 @@ export function heroLayoutShell(options = {}) {
   const esc = options.escapeAttr || passthrough;
   const escHtml = options.escapeHtml || passthrough;
   const copy = options.copy || {};
+  const heroClassName = ["mvp-hero", options.heroClassName].filter(Boolean).join(" ");
   return `
-    <section class="mvp-hero" style="--hero-image: url('${esc(options.image || "")}')">
+    <section class="${esc(heroClassName)}" style="--hero-image: url('${esc(options.image || "")}')">
       <div class="hero-media" aria-hidden="true"></div>
       <div class="mvp-hero-copy">
         <p class="eyebrow">${escHtml(copy.kicker || "")}</p>
         <h1>${escHtml(copy.title || "")}</h1>
         <p>${escHtml(copy.subtitle || "")}</p>
+        ${options.actions || ""}
       </div>
       ${options.inner || ""}
     </section>
@@ -36,8 +38,18 @@ export function dashboardLayoutShell(options = {}) {
   const items = Array.isArray(options.items) ? options.items : [];
   const activeHash = options.activeHash || "";
   const area = String(options.area || "partner");
+  const layoutClassName = ["saas-layout", options.hideSidebar ? "dashboard-tabbed-layout" : ""].filter(Boolean).join(" ");
+  if (options.hideSidebar) {
+    return appAreaShell(area, `
+      <section class="${esc(layoutClassName)}" data-dashboard-area="${esc(area)}">
+        <div class="dashboard-content">
+          ${options.inner || ""}
+        </div>
+      </section>
+    `, { className: ["dashboard-app-layout", options.className].filter(Boolean).join(" "), escapeAttr: esc });
+  }
   return appAreaShell(area, `
-    <section class="saas-layout" data-dashboard-area="${esc(area)}">
+    <section class="${esc(layoutClassName)}" data-dashboard-area="${esc(area)}">
       <aside class="dashboard-sidebar">
         <div>
           <span class="section-kicker">${escHtml(options.kicker || "")}</span>

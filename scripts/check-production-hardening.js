@@ -111,6 +111,20 @@ resetEnv({
   SUPABASE_ANON_KEY: "anon-key",
   SUPABASE_SERVICE_ROLE_KEY: "service-role-key",
   PUBLIC_BASE_URL: "https://smarttablenyc.com",
+  EMAIL_FROM: "SmartTable <noreply@smarttable.com>",
+  RESEND_API_KEY: "test-resend-key"
+});
+const unexpectedSenderCore = await importCore("unexpected-sender");
+const unexpectedSenderHealth = await rawApi(unexpectedSenderCore, "GET", "/health");
+assert.equal(unexpectedSenderHealth.status, 503, "Production health must fail when EMAIL_FROM is not the approved SmartTable SMTP sender.");
+assert(unexpectedSenderHealth.body.production_configuration_issues.includes("EMAIL_FROM_UNEXPECTED_SENDER"));
+
+resetEnv({
+  SMARTTABLE_ENV: "production",
+  SUPABASE_URL: "https://example.supabase.co",
+  SUPABASE_ANON_KEY: "anon-key",
+  SUPABASE_SERVICE_ROLE_KEY: "service-role-key",
+  PUBLIC_BASE_URL: "https://smarttablenyc.com",
   EMAIL_FROM: "SmartTable <reservations@mail.smarttablenyc.com>",
   RESEND_API_KEY: "test-resend-key"
 });
@@ -123,6 +137,59 @@ assert.equal(configuredHealth.body.status, "ok");
 assert.equal(configuredHealth.body.database_reachable, true);
 assert.equal(configuredHealth.body.platform_mode_default, "basic");
 assert.equal(configuredHealth.body.public_base_url_uses_localhost, false);
+
+globalThis.fetch = async (url) => {
+  const target = String(url);
+  if (target.includes("public_restaurant_cards")) {
+    return {
+      ok: false,
+      status: 404,
+      text: async () => JSON.stringify({
+        code: "PGRST205",
+        message: "Could not find the table 'public.public_restaurant_cards' in the schema cache"
+      })
+    };
+  }
+  if (target.includes("example.supabase.co")) {
+    return {
+      ok: true,
+      status: 200,
+      text: async () => "[]"
+    };
+  }
+  return originalFetch(url);
+};
+const missingNewestViewCore = await importCore("missing-newest-view");
+const newestRestaurants = await rawApi(missingNewestViewCore, "GET", "/public/restaurants/newest?lang=en");
+assert.equal(newestRestaurants.status, 200, "Missing optional newest-restaurants view must not break the public homepage.");
+assert.deepEqual(newestRestaurants.body.restaurants, [], "Missing optional newest-restaurants view should render as an empty section.");
+
+resetEnv({
+  SMARTTABLE_ENV: "production",
+  SUPABASE_URL: "https://example.supabase.co",
+  SUPABASE_ANON_KEY: "sb_publishable_test_key",
+  SUPABASE_SERVICE_ROLE_KEY: "sb_secret_test_key",
+  PUBLIC_BASE_URL: "https://smarttablenyc.com",
+  EMAIL_FROM: "SmartTable <reservations@mail.smarttablenyc.com>",
+  RESEND_API_KEY: "test-resend-key"
+});
+let secretKeyRequestHeaders = null;
+globalThis.fetch = async (url, options = {}) => {
+  if (String(url).includes("example.supabase.co")) {
+    secretKeyRequestHeaders = options.headers || {};
+    return {
+      ok: true,
+      status: 200,
+      text: async () => "[]"
+    };
+  }
+  return originalFetch(url, options);
+};
+const secretKeyCore = await importCore("supabase-secret-key-headers");
+const secretKeyHealth = await rawApi(secretKeyCore, "GET", "/health");
+assert.equal(secretKeyHealth.status, 200, "Supabase secret keys should support production health checks.");
+assert.equal(secretKeyRequestHeaders.apikey, "sb_secret_test_key", "Supabase secret keys must be sent as apikey.");
+assert(!("authorization" in secretKeyRequestHeaders), "Opaque Supabase secret keys must not be sent as Bearer JWTs.");
 
 globalThis.fetch = async (url) => {
   if (String(url).includes("example.supabase.co")) {

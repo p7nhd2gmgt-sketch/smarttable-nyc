@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { handleApiRequest } from "../src/app-core.js";
+import { TEST_ACCOUNTS } from "./test-account-credentials.mjs";
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -142,11 +143,11 @@ async function assertFrontendWiring() {
 await assertPlatformTranslations();
 await assertFrontendWiring();
 
-const login = await api("POST", "/auth/login", { email: "admin@smarttable.com", password: "admin123" });
+const login = await api("POST", "/auth/login", { email: TEST_ACCOUNTS.superadmin.email, password: TEST_ACCOUNTS.superadmin.password });
 assert(login.access_token, "Super Admin login is required to test platform mode switching.");
 const adminHeaders = { authorization: `Bearer ${login.access_token}` };
 
-const regularAdminHeaders = await loginAs("ops@smarttable.com", "admin123");
+const regularAdminHeaders = await loginAs(TEST_ACCOUNTS.admin.email, TEST_ACCOUNTS.admin.password);
 const regularAdminSettings = await api("GET", "/admin/settings/platform-mode", {}, regularAdminHeaders);
 assert(regularAdminSettings.can_edit === false, "Regular admins may see the current platform mode but cannot edit it.");
 const regularAdminPatch = await apiRaw("PATCH", "/admin/settings/platform-mode", { platform_mode: "ai_concierge", ai_demo_visibility: true }, regularAdminHeaders);
@@ -195,7 +196,7 @@ assert(afterReservationSnapshot.restaurants === baselineSnapshot.restaurants, "B
 assert(afterReservationSnapshot.offers === baselineSnapshot.offers, "BASIC reservation flow must not alter offer records.");
 assert(afterReservationSnapshot.reservations >= baselineSnapshot.reservations + 1, "BASIC reservation flow must add one reservation lead.");
 
-const partnerLogin = await api("POST", "/auth/login", { email: "owner@hudsonhearth.com", password: "restaurant123" });
+const partnerLogin = await api("POST", "/auth/login", { email: TEST_ACCOUNTS.partner.email, password: TEST_ACCOUNTS.partner.password });
 assert(partnerLogin.access_token, "Partner login is required to verify platform mode permissions.");
 const forbidden = await apiRaw("PATCH", "/admin/settings/platform-mode", { platform_mode: "ai_concierge", ai_demo_visibility: true }, { authorization: `Bearer ${partnerLogin.access_token}` });
 assert(forbidden.status === 403, "Non-super-admin users must not be able to change platform mode.");

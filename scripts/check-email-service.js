@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createEmailService, isEmailAccepted } from "../src/email-service.js";
+import { TEST_ACCOUNTS } from "./test-account-credentials.mjs";
 
 const baseMessage = {
   to: "guest@example.com",
@@ -151,15 +152,29 @@ function validSignupPayload(overrides = {}) {
 
 function signedWebhookBody(payload, secret = process.env.RESEND_WEBHOOK_SECRET) {
   const raw = JSON.stringify(payload);
+  const id = payload.id || `evt_${crypto.randomUUID()}`;
+  const timestamp = String(Math.floor(Date.now() / 1000));
+  const encoded = String(secret || "").startsWith("whsec_") ? String(secret).slice(6) : String(secret || "");
+  let secretBytes;
+  try {
+    secretBytes = Buffer.from(encoded, "base64");
+  } catch {
+    secretBytes = Buffer.from(String(secret || ""));
+  }
+  const signature = crypto.createHmac("sha256", secretBytes).update(`${id}.${timestamp}.${raw}`).digest("base64");
   return {
     body: { ...payload, __rawBody: raw },
-    headers: { "x-smarttable-signature": crypto.createHmac("sha256", secret).update(raw).digest("hex") }
+    headers: {
+      "svix-id": id,
+      "svix-timestamp": timestamp,
+      "svix-signature": `v1,${signature}`
+    }
   };
 }
 
 const partnerSession = await api("POST", "/auth/login", {
-  email: "owner@hudsonhearth.com",
-  password: "restaurant123"
+  email: TEST_ACCOUNTS.partner.email,
+  password: TEST_ACCOUNTS.partner.password
 });
 const partnerHeaders = { authorization: `Bearer ${partnerSession.access_token}` };
 const publicOffers = await api("GET", "/public/offers");
@@ -201,8 +216,8 @@ assert.equal(postVisitAttempt.status, 409);
 assert.equal(postVisitAttempt.body.code, "POST_VISIT_FEEDBACK_ALREADY_SUBMITTED");
 
 const adminSession = await api("POST", "/auth/login", {
-  email: "admin@smarttable.com",
-  password: "admin123"
+  email: TEST_ACCOUNTS.superadmin.email,
+  password: TEST_ACCOUNTS.superadmin.password
 });
 const diagnostics = await api("GET", "/admin/email-diagnostics", {}, {
   authorization: `Bearer ${adminSession.access_token}`
@@ -225,14 +240,10 @@ const webhookPayload = {
   type: "email.delivered",
   data: { id: "resend-message-does-not-exist" }
 };
-const rawWebhookPayload = JSON.stringify(webhookPayload);
-const signature = crypto.createHmac("sha256", process.env.RESEND_WEBHOOK_SECRET).update(rawWebhookPayload).digest("hex");
+const signedDeliveredWebhook = signedWebhookBody(webhookPayload);
 const webhook = await rawApi("POST", "/webhooks/resend", {
-  ...webhookPayload,
-  __rawBody: rawWebhookPayload
-}, {
-  "x-smarttable-signature": signature
-});
+  ...signedDeliveredWebhook.body
+}, signedDeliveredWebhook.headers);
 assert.equal(webhook.status, 200);
 assert.equal(webhook.body.mapped_status, "delivered");
 assert.equal(webhook.body.reason, "EMAIL_LOG_NOT_FOUND");
@@ -242,14 +253,10 @@ const complaintPayload = {
   type: "email.complained",
   data: { id: "resend-message-does-not-exist" }
 };
-const rawComplaintPayload = JSON.stringify(complaintPayload);
-const complaintSignature = crypto.createHmac("sha256", process.env.RESEND_WEBHOOK_SECRET).update(rawComplaintPayload).digest("hex");
+const signedComplaintWebhook = signedWebhookBody(complaintPayload);
 const complaintWebhook = await rawApi("POST", "/webhooks/resend", {
-  ...complaintPayload,
-  __rawBody: rawComplaintPayload
-}, {
-  "x-smarttable-signature": complaintSignature
-});
+  ...signedComplaintWebhook.body
+}, signedComplaintWebhook.headers);
 assert.equal(complaintWebhook.status, 200);
 assert.equal(complaintWebhook.body.mapped_status, "complained");
 
@@ -325,21 +332,28 @@ async function runConfiguredProviderChecks() {
   }
 
   try {
-    const admin = await apiConfigured("POST", "/auth/login", { email: "admin@smarttable.com", password: "admin123" });
+    const admin = await apiConfigured("POST", "/auth/login", { email: TEST_ACCOUNTS.superadmin.email, password: TEST_ACCOUNTS.superadmin.password });
     const adminHeaders = { authorization: `Bearer ${admin.access_token}` };
     const diagnostics = await apiConfigured("GET", "/admin/email-diagnostics", {}, adminHeaders);
     assert.equal(diagnostics.configuration.can_send_real_email, true);
     assert.equal(diagnostics.configuration.sender.email, "reservations@mail.smarttablenyc.com");
+    assert.equal(diagnostics.configuration.sender.expected_email, "reservations@mail.smarttablenyc.com");
+    assert.equal(diagnostics.configuration.sender.matches_expected_sender, true);
     assert.equal(diagnostics.configuration.reply_to.email, "reply@example.com");
     assert.equal(diagnostics.configuration.webhook.configured, true);
     assert.equal(diagnostics.configuration.webhook.production_endpoint, "https://smarttablenyc.com/api/webhooks/resend");
     assert(diagnostics.configuration.webhook.required_events.includes("email.delivered"));
+    assert.equal(diagnostics.configuration.supabase_auth_email.transport_required, "custom_smtp");
+    assert.equal(diagnostics.configuration.supabase_auth_email.default_supabase_sender_allowed, false);
+    assert.equal(diagnostics.configuration.supabase_auth_email.expected_sender_email, "reservations@mail.smarttablenyc.com");
 
     const diagnosticSend = await apiConfigured("POST", "/admin/email-queue", { action: "send_test" }, adminHeaders);
     assert.equal(diagnosticSend.accepted, true, "Diagnostic queue send must be accepted by the mocked provider.");
     assert.equal(diagnosticSend.provider_response.id, diagnosticSend.message_id);
     assert(diagnosticSend.email_queue_id, "Provider-accepted messages must have a queue record.");
     assert(sentMessages.at(-1).from === "SmartTable <reservations@mail.smarttablenyc.com>", "Configured sender must be used.");
+    assert(sentMessages.at(-1).html.includes("prefers-color-scheme"), "Production HTML email shell must include dark-mode support.");
+    assert(sentMessages.at(-1).html.includes("aria-label=\"SmartTable logo\""), "Production HTML email shell must include SmartTable logo branding.");
 
     const delivered = await signedWebhookConfigured("email.delivered", diagnosticSend.message_id, "evt_mock_delivered");
     assert.equal(delivered.status, 200);
@@ -357,6 +371,13 @@ async function runConfiguredProviderChecks() {
     assert(deliveredQueue?.queue_id, "Diagnostics must expose a safe queue id.");
     assert(deliveredQueue?.template, "Diagnostics must expose the email template/type.");
     assert(deliveredQueue?.language, "Diagnostics must expose the locale/language.");
+
+    const delayedSend = await apiConfigured("POST", "/admin/email-queue", { action: "send_test", email_type: "delayed_test" }, adminHeaders);
+    const delayed = await signedWebhookConfigured("email.delivery_delayed", delayedSend.message_id, "evt_mock_delayed");
+    assert.equal(delayed.status, 200);
+    assert.equal(delayed.body.mapped_status, "delayed");
+    const delayedDiagnostics = await apiConfigured("GET", "/admin/email-queue?email_type=delayed_test&status=delayed", {}, adminHeaders);
+    assert(delayedDiagnostics.queue.some((row) => row.provider_message_id === delayedSend.message_id && row.status === "delayed"), "Delayed webhook must update queue status.");
 
     const filteredDiagnostics = await apiConfigured("GET", "/admin/email-diagnostics?email_type=diagnostic_test_email&status=delivered&recipient_type=user", {}, adminHeaders);
     assert(filteredDiagnostics.recent_logs.some((row) => row.provider_message_id === diagnosticSend.message_id), "Diagnostics must filter logs by type/status/recipient type.");
@@ -404,11 +425,21 @@ async function runConfiguredProviderChecks() {
     assert.equal(missingRecipient.status, 502);
     assert.equal(missingRecipient.body.errorCode, "INVALID_RECIPIENT");
 
-    const partner = await apiConfigured("POST", "/auth/login", { email: "owner@hudsonhearth.com", password: "restaurant123" });
+    const partner = await apiConfigured("POST", "/auth/login", { email: TEST_ACCOUNTS.partner.email, password: TEST_ACCOUNTS.partner.password });
     const partnerHeaders = { authorization: `Bearer ${partner.access_token}` };
     const offers = await apiConfigured("GET", "/public/offers");
     const configuredOffer = offers.offers?.find((item) => item.offer_id);
     assert(configuredOffer, "Configured provider checks need a public offer.");
+
+    const invitedPartner = await apiConfigured("POST", "/admin/partners", {
+      email: uniqueEmail("partner-invite"),
+      password: "PartnerStrong!12345",
+      full_name: "Invited Partner",
+      restaurant_id: configuredOffer.restaurant_id
+    }, adminHeaders);
+    assert.equal(invitedPartner.email_delivery?.accepted_count, 1, "Restaurant partner creation must trigger one invitation email.");
+    assert.equal(sentMessages.at(-1).from, "SmartTable <reservations@mail.smarttablenyc.com>", "Partner invitation must use the approved SmartTable sender.");
+    assert(!String(sentMessages.at(-1).text || "").includes("PartnerStrong!12345"), "Partner invitation email must not include the temporary password.");
 
     const missingGuestEmail = await rawApiConfigured("POST", "/reservations", {
       offer_id: configuredOffer.offer_id,
@@ -454,6 +485,60 @@ async function runConfiguredProviderChecks() {
     assert.equal(reservationDuringOutage.status, 201, "A valid reservation must remain saved when email delivery fails.");
     assert(reservationDuringOutage.body.reservation?.reservation_id, "Reservation id must be returned even when email sending fails.");
     assert(reservationDuringOutage.body.email_delivery?.failed_count > 0, "Email failures must be reported truthfully.");
+
+    providerMode = "permanent";
+    const reservationPermanentFailure = await rawApiConfigured("POST", "/reservations", {
+      offer_id: configuredOffer.offer_id,
+      reservation_date: configuredOffer.reservation_date || configuredOffer.offer_date,
+      reservation_time: configuredOffer.start_time || configuredOffer.offer_time,
+      party_size: 2,
+      guest_name: "Admin Resend Guest",
+      guest_email: uniqueEmail("admin-resend"),
+      guest_phone: "+1 212 555 0187",
+      guest_language: "en"
+    });
+    assert.equal(reservationPermanentFailure.status, 201, "A reservation must remain saved when permanent provider rejection occurs.");
+    const resendReservationId = reservationPermanentFailure.body.reservation?.reservation_id;
+    const failedBeforeResend = await apiConfigured("GET", `/admin/email-diagnostics?reservation=${resendReservationId}&status=failed`, {}, adminHeaders);
+    const failedBeforeTypes = new Set(failedBeforeResend.recent_logs.map((row) => row.email_type || row.event_type));
+    assert(failedBeforeTypes.has("guest_request_received"), "Permanent provider rejection must preserve the failed guest email log.");
+    assert(failedBeforeTypes.has("restaurant_request_notice"), "Permanent provider rejection must preserve the failed partner email log.");
+    const partnerResendForbidden = await rawApiConfigured("POST", "/admin/email-queue", {
+      action: "resend_reservation_email",
+      id: resendReservationId,
+      target: "guest"
+    }, partnerHeaders);
+    assert.equal(partnerResendForbidden.status, 403, "Only Super Admin users may use the reservation email resend action.");
+    providerMode = "success";
+    const adminGuestResend = await apiConfigured("POST", "/admin/email-queue", {
+      action: "resend_reservation_email",
+      id: resendReservationId,
+      target: "guest"
+    }, adminHeaders);
+    assert.equal(adminGuestResend.ok, true, "Super Admin guest resend must be accepted by the provider.");
+    assert(adminGuestResend.result.email_queue_id, "Guest resend must create a new queue attempt.");
+    assert(adminGuestResend.result.provider_message_id, "Guest resend must store a provider message id.");
+    const duplicateGuestResend = await rawApiConfigured("POST", "/admin/email-queue", {
+      action: "resend_reservation_email",
+      id: resendReservationId,
+      target: "guest"
+    }, adminHeaders);
+    assert.equal(duplicateGuestResend.status, 429, "Rapid duplicate guest resend attempts must be rate-limited.");
+    const adminPartnerResend = await apiConfigured("POST", "/admin/email-queue", {
+      action: "resend_reservation_email",
+      id: resendReservationId,
+      target: "partner"
+    }, adminHeaders);
+    assert.equal(adminPartnerResend.ok, true, "Super Admin partner resend must be accepted by the provider.");
+    assert(adminPartnerResend.result.email_queue_id, "Partner resend must create a new queue attempt.");
+    assert(adminPartnerResend.result.provider_message_id, "Partner resend must store a provider message id.");
+    const resendDiagnostics = await apiConfigured("GET", `/admin/email-diagnostics?reservation=${resendReservationId}&status=sent`, {}, adminHeaders);
+    assert(resendDiagnostics.recent_logs.some((row) => row.provider_message_id === adminGuestResend.result.provider_message_id), "Guest resend log must preserve the new provider message id.");
+    assert(resendDiagnostics.recent_logs.some((row) => row.provider_message_id === adminPartnerResend.result.provider_message_id), "Partner resend log must preserve the new provider message id.");
+    const failedAfterResend = await apiConfigured("GET", `/admin/email-diagnostics?reservation=${resendReservationId}&status=failed`, {}, adminHeaders);
+    const failedAfterTypes = new Set(failedAfterResend.recent_logs.map((row) => row.email_type || row.event_type));
+    assert(failedAfterTypes.has("guest_request_received"), "Guest resend must not overwrite the historical failed guest log.");
+    assert(failedAfterTypes.has("restaurant_request_notice"), "Partner resend must not overwrite the historical failed partner log.");
 
     providerMode = "success";
     const guest = await apiConfigured("POST", "/auth/signup-guest", validSignupPayload({ preferred_language: "es" }));
@@ -544,6 +629,7 @@ async function runConfiguredProviderChecks() {
       "email_verification",
       "password_reset",
       "password_changed",
+      "restaurant_partner_invitation",
       "guest_request_received",
       "restaurant_request_notice",
       "reservation_accepted",

@@ -83,7 +83,7 @@ assert(viewportMatrix.mobile.length === 5, "Mobile visual QA matrix must include
 
 for (const width of [320, 390, 768, 1024, 1366]) {
   const covered = Object.values(viewportMatrix).flat().some(([candidate]) => candidate === width);
-  assert(covered, `Signup stepper requested viewport width ${width}px must remain in the regression matrix.`);
+  assert(covered, `Guest signup requested viewport width ${width}px must remain in the regression matrix.`);
 }
 
 includesAll(indexHtml, [
@@ -92,9 +92,11 @@ includesAll(indexHtml, [
   "<main id=\"app\"",
   "aria-live=\"polite\"",
   "tabindex=\"-1\"",
-  "data-lang=\"en\"",
-  "data-lang=\"es\"",
-  "data-lang=\"hu\""
+  "data-language-selector",
+  "id=\"languageSelectorButton\"",
+  "aria-haspopup=\"listbox\"",
+  "id=\"languageSelectorMenu\"",
+  "role=\"listbox\""
 ], "Accessible localized application shell");
 
 includesAll(styles, [
@@ -110,7 +112,10 @@ includesAll(styles, [
   "min-height: 44px",
   ".topbar",
   ".top-actions",
-  ".language-switcher",
+  ".language-selector",
+  ".language-selector__button",
+  ".language-selector__menu",
+  ".language-selector__option",
   ".mvp-hero",
   "max-width: 1440px",
   "grid-template-columns: minmax(0, 1.65fr) minmax(0, 0.95fr)",
@@ -136,8 +141,9 @@ includesAll(styles, [
   "@media (max-width: 760px)",
   ".top-actions",
   "grid-template-columns: repeat(2, minmax(0, 1fr))",
-  ".language-switcher",
-  "display: contents",
+  ".language-selector",
+  "grid-column: 1 / -1",
+  ".language-selector__menu",
   "overflow-wrap: anywhere",
   "white-space: normal"
 ], "Mobile header action containment regression coverage");
@@ -145,36 +151,37 @@ includesAll(styles, [
 includesAll(app, [
   "function guestStandaloneShell(",
   "guestStandaloneShell(`",
-  "shortLabelKey: \"signup_step_short_account\"",
-  "function signupStepNavLabel(",
-  "signupStepNavLabel(index)",
-  "class=\"signup-progress-summary\"",
-  "aria-current=\"step\"",
-  "aria-hidden=\"true\"",
-  "function scrollActiveSignupStepIntoView(",
-  "scrollIntoView({ block: \"nearest\", inline: \"center\" })",
-  "signupStepTitle()"
-], "Signup stepper uses short navigation labels while preserving full content titles");
+  "function fastSignupErrors(",
+  "class=\"signup-card fast-signup-card\"",
+  "signup_phone_optional",
+  "legal_consent",
+  "terms_consent",
+  "privacy_consent",
+  "account_creation_phase: true",
+  "history.pushState(null, \"\", \"/signup/check-email\")",
+  "function renderSignupCheckEmail(",
+  "function accountWelcomePanel(",
+  "profile_setup_location_title",
+  "profile_setup_food_title",
+  "profile_setup_notifications_title"
+], "Simplified signup renders compact account creation and optional profile setup");
 
 includesAll(styles, [
   ".guest-standalone-page",
   "max-width: 1240px",
-  ".guest-signup-shell",
-  ".signup-progress-nav",
-  ".signup-progress-summary",
-  ".signup-progress",
-  "grid-template-columns: repeat(7, minmax(0, 1fr))",
-  ".signup-progress li",
-  "display: flex",
-  "min-width: 0",
-  "height: 100%",
-  "grid-template-rows: auto 1fr",
+  ".signup-page",
+  ".fast-signup-page",
+  ".fast-signup-card",
+  ".check-email-card",
+  ".signup-email-pill",
+  ".account-welcome-card",
+  ".preference-section",
+  ".account-tabs",
+  "grid-template-columns: minmax(0, 1fr)",
+  "min-height: 44px",
   "overflow-wrap: anywhere",
-  "white-space: normal",
-  "grid-template-columns: repeat(7, minmax(92px, 1fr))",
-  "overflow-x: auto",
-  "scroll-snap-type: x proximity"
-], "Signup stepper responsive non-overlap regression coverage");
+  "white-space: normal"
+], "Simplified signup and optional profile responsive non-overlap regression coverage");
 
 includesAll(styles, [
   ".modal-backdrop",
@@ -268,11 +275,15 @@ includesAll(app, [
   "function setLanguage(",
   "SUPPORTED_LANGUAGE_CONFIG as supportedLanguages",
   "localStorage.setItem(\"smarttable.lang\"",
-  "loadTranslations()",
+  "persistLanguagePreference",
   "document.documentElement.lang = state.lang",
-  "document.querySelectorAll(\"[data-lang]\")",
-  "button.setAttribute(\"aria-pressed\""
-], "Phase 20 language switch behavior");
+  "function updateLanguageSelector(",
+  "data-language-option",
+  "aria-selected",
+  "event.key === \"ArrowDown\"",
+  "event.key === \"Escape\"",
+  "selectLanguageFromSelector"
+], "Phase 20 language selector behavior");
 
 includesAll(app, [
   "if (!canShowFeature(\"ai.concierge\", { audience: \"guest\" })) return \"\";",
@@ -287,6 +298,12 @@ assertLocaleKeys(locales, [
   "nav_offers",
   "nav_restaurants",
   "nav_contact",
+  "footer_navigation_label",
+  "footer_about_link",
+  "footer_help_center_link",
+  "footer_for_restaurants_link",
+  "cookie_page_title",
+  "cookie_page_body",
   "nav_partner",
   "nav_admin",
   "signup_nav_button",
@@ -309,17 +326,21 @@ assertLocaleKeys(locales, [
 
 assert(!indexHtml.includes('id="adminNav"'), "Super Admin entry must not appear in the unauthenticated public header.");
 assert(!indexHtml.includes('id="restaurantNav"'), "Partner entry must not appear in the primary public header.");
+assert(!indexHtml.includes('id="contactNav"'), "Contact must not appear in the primary public header.");
 assert(indexHtml.includes("id=\"restaurantsNav\""), "Public header must include a consumer restaurant-list navigation link.");
-assert(indexHtml.includes("id=\"contactNav\""), "Public header must include a consumer contact navigation link.");
 includesAll(app, [
   "document.querySelector(\"#restaurantsNav\").textContent = t(\"nav_restaurants\", \"Restaurants\")",
-  "document.querySelector(\"#contactNav\").textContent = t(\"nav_contact\", \"Contact\")",
   "history.pushState(null, \"\", \"/offers\")",
   "history.pushState(null, \"\", \"/restaurants\")",
-  "history.pushState(null, \"\", \"/contact\")",
   "function publicFooter()",
-  "footer_partner_login_link",
-  "href=\"/partner\"",
+  "footer_about_link",
+  "href: \"/contact\"",
+  "href: \"/help\"",
+  "href: \"/privacy\"",
+  "href: \"/terms\"",
+  "href: \"/cookies\"",
+  "footer_for_restaurants_link",
+  "href: \"/partner\"",
   "if (state.mode === \"partner\")"
 ], "Public chrome internal-entry hardening");
 
@@ -330,6 +351,12 @@ assertLocaleKeys(locales, [
   "forgot_password_title",
   "reset_password_title",
   "signup_validation_summary_title",
+  "signup_legal_package_prefix",
+  "signup_legal_package_and",
+  "signup_legal_terms_link",
+  "signup_legal_privacy_link",
+  "signup_legal_reservations_link",
+  "signup_legal_reviews_link",
   "signup_terms_consent_prefix",
   "signup_terms_link",
   "signup_privacy_consent_prefix",
@@ -343,14 +370,24 @@ assertLocaleKeys(locales, [
 ], "Phase 20 auth and account localization");
 
 assertLocaleKeys(locales, [
-  "signup_step_short_account",
-  "signup_step_short_location",
-  "signup_step_short_preferences",
-  "signup_step_short_habits",
-  "signup_step_short_budget",
-  "signup_step_short_notifications",
-  "signup_step_short_consent"
-], "Signup stepper short-label localization");
+  "signup_subtitle_fast",
+  "signup_fast_kicker",
+  "signup_fast_title",
+  "signup_phone_optional",
+  "signup_optional_preferences_note",
+  "signup_check_email_title",
+  "signup_check_email_body",
+  "signup_welcome_title",
+  "signup_welcome_body",
+  "signup_welcome_browse_offers",
+  "signup_welcome_personalize",
+  "signup_welcome_later",
+  "profile_setup_location_title",
+  "profile_setup_food_title",
+  "profile_setup_notifications_title",
+  "account_tab_account_privacy",
+  "account_complete_profile_button"
+], "Simplified signup and optional profile localization");
 
 assertLocaleKeys(locales, [
   "reservation_success_title",
@@ -401,7 +438,9 @@ assertLocaleKeys(locales, [
   "app_error_title",
   "retry_button",
   "loading_label",
-  "skip_to_content"
+  "skip_to_content",
+  "language_selector_label",
+  "language_selector_menu_label"
 ], "Phase 20 admin, route, loading, and error localization");
 
 assert(locales.hu.reservation_status_declined.includes("Elutas"), "Hungarian declined status should be translated.");

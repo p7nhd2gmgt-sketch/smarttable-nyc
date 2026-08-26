@@ -258,6 +258,14 @@
     color: #7a5417;
   }
 
+  .guest-badge.test-restaurant-badge {
+    background: rgba(194, 138, 47, 0.16);
+    color: #684711;
+    margin-top: var(--guest-space-2);
+    max-width: 100%;
+    white-space: normal;
+  }
+
   .guest-modal-shell,
   .guest-drawer-shell {
     background: var(--guest-surface);

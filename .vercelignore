@@ -1,0 +1,28 @@
+# Dependencies and generated build/test output
+node_modules/
+coverage/
+playwright-report/
+test-results/
+
+# Local environment and Vercel project state
+.env
+.env.*
+!.env.example
+.vercel/
+
+# Local runtime state, browser profiles, caches, logs, and backups
+tmp
+tmp/
+data
+data/
+backups
+backups/
+tmp-*.json
+.tmp*
+*.log
+.autosave.*
+server-debug.*
+browser-cache
+browser-cache/
+.cache
+.cache/

@@ -1,0 +1,81 @@
+# SmartTable Enterprise Environment Variable List
+
+Do not commit real values.
+
+## Core
+
+- `NODE_ENV`
+- `PUBLIC_BASE_URL`
+- `APP_MODE`
+- `PLATFORM_MODE`
+
+## Supabase
+
+- `SUPABASE_URL`
+- `SUPABASE_ANON_KEY`
+- `SUPABASE_SERVICE_ROLE_KEY`
+- `NEXT_PUBLIC_SUPABASE_URL`
+- `NEXT_PUBLIC_SUPABASE_ANON_KEY`
+
+Service-role keys are server-only.
+
+## Email
+
+- `RESEND_API_KEY`
+- `EMAIL_FROM`
+- `EMAIL_REPLY_TO`
+- `RESEND_WEBHOOK_SECRET` when delivery webhooks are enabled
+- `BUSINESS_MAILING_ADDRESS`
+
+## Stripe
+
+- `STRIPE_SECRET_KEY`
+- `STRIPE_PUBLISHABLE_KEY`
+- `STRIPE_WEBHOOK_SECRET`
+- `STRIPE_API_VERSION`
+- `STRIPE_WEBHOOK_TOLERANCE_SECONDS`
+- `STRIPE_ALLOW_PROMOTION_CODES`
+- `STRIPE_ENABLE_ACH`
+- `STRIPE_BASIC_MONTHLY_PRICE_ID`
+- `STRIPE_PROFESSIONAL_MONTHLY_PRICE_ID`
+- `STRIPE_ENTERPRISE_MONTHLY_PRICE_ID`
+- `STRIPE_PORTAL_CONFIGURATION_ID`
+- `STRIPE_SELF_SERVICE_ENTERPRISE_ENABLED`
+- `BILLING_DEFAULT_TRIAL_DAYS`
+- `BILLING_GRACE_PERIOD_DAYS`
+- `BILLING_OVERRIDE_MAX_DAYS`
+- `BILLING_ENFORCEMENT_MODE`
+
+Compatibility aliases currently supported by the application:
+
+- `STRIPE_ENTERPRISE_SELF_SERVICE_ENABLED`
+- `STRIPE_TRIAL_PERIOD_DAYS`
+- `BILLING_PAYMENT_GRACE_PERIOD_DAYS`
+
+Only `STRIPE_PUBLISHABLE_KEY` may ever be exposed to browser code, and it is not required by the current server-created Checkout flow. All Stripe secret keys, webhook secrets, and Price IDs remain server-side.
+
+## Communications
+
+- `COMMUNICATION_CONSENT_VERSION`
+- `MESSAGE_CAMPAIGN_TEMPLATE_VERSION`
+- `PARTNER_CAMPAIGN_QUEUE_BATCH_LIMIT`
+
+## SMS
+
+- `SMS_PROVIDER`
+- `TWILIO_ACCOUNT_SID`
+- `TWILIO_AUTH_TOKEN`
+- `TWILIO_MESSAGING_SERVICE_SID`
+- `TWILIO_FROM_NUMBER`
+- `TWILIO_STATUS_CALLBACK_URL`
+- `SMS_DAILY_SEND_LIMIT`
+- `SMS_MONTHLY_SEND_LIMIT`
+- `SMS_QUIET_HOURS_START`
+- `SMS_QUIET_HOURS_END`
+- `SMS_SEGMENT_COST_CENTS`
+- `SMS_TEST_RECIPIENT_ALLOWLIST`
+- `SMS_CAMPAIGN_QUEUE_BATCH_LIMIT`
+
+## Security Rule
+
+Only explicitly public Supabase publishable values may be exposed to browser code. Stripe, Resend, Twilio, and Supabase service-role credentials must remain server-side.

@@ -40,6 +40,7 @@ function safeDiagnosticLog(result = {}, eventType = "email_send") {
     provider_message_id: result.messageId || result.provider_id || null,
     status: result.status || "unknown",
     error_code: result.errorCode || null,
+    provider_response: result.providerResponse || null,
     timestamp: new Date().toISOString()
   };
   console.info("[smarttable-email]", JSON.stringify(payload));

@@ -5,9 +5,12 @@ Disallow: /partner
 Disallow: /restaurant
 Disallow: /account
 Disallow: /login
+Disallow: /signup/check-email
+Disallow: /signup/welcome
 Disallow: /forgot-password
 Disallow: /reset-password
 Disallow: /verify-email
+Disallow: /auth/callback
 Disallow: /ai
 Disallow: /ai-concierge
 Disallow: /ai-preferences
@@ -15,4 +18,4 @@ Disallow: /partner-ai-demand
 Disallow: /admin-ai-controls
 Disallow: /guest/rewards/photo-upload
 
-Sitemap: https://smarttablenyc.com/sitemap.xml
+Sitemap: https://www.smarttablenyc.com/sitemap.xml

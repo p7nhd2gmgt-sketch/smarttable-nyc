@@ -1,9 +1,18 @@
 {
   "name": "SmartTable NYC",
   "short_name": "SmartTable",
-  "start_url": "/",
+  "start_url": "/partner",
+  "scope": "/",
   "display": "standalone",
   "background_color": "#fbfaf6",
   "theme_color": "#0f735d",
-  "description": "Discounted New York restaurant reservation requests."
+  "description": "Discounted New York restaurant reservation requests.",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
 }

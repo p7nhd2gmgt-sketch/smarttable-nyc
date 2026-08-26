@@ -12,6 +12,10 @@
 --   - Replaces functions/views only; table data is preserved.
 --   - Does not seed demo restaurants, demo users, or test reservations.
 --   - Does not enable AI Concierge or any POS integration.
+--   - The main schema body runs in one transaction after enum creation/value
+--     additions. Enum value additions intentionally run before BEGIN because
+--     PostgreSQL can reject use of newly added enum values inside the same
+--     transaction on partially initialized databases.
 --
 -- Important:
 --   The historical repository migration 0028_remove_pos_integration_references.sql
@@ -28,16 +32,28 @@ end $$;
 
 alter type public.profile_role add value if not exists 'partner';
 alter type public.profile_role add value if not exists 'super_admin';
+alter type public.profile_role add value if not exists 'admin';
+alter type public.profile_role add value if not exists 'restaurant';
+alter type public.profile_role add value if not exists 'guest';
 
 do $$ begin
   create type public.restaurant_status as enum ('pending', 'approved', 'suspended');
 exception when duplicate_object then null;
 end $$;
 
+alter type public.restaurant_status add value if not exists 'pending';
+alter type public.restaurant_status add value if not exists 'approved';
+alter type public.restaurant_status add value if not exists 'suspended';
+
 do $$ begin
   create type public.offer_status as enum ('active', 'paused', 'sold_out', 'expired');
 exception when duplicate_object then null;
 end $$;
+
+alter type public.offer_status add value if not exists 'active';
+alter type public.offer_status add value if not exists 'paused';
+alter type public.offer_status add value if not exists 'sold_out';
+alter type public.offer_status add value if not exists 'expired';
 
 do $$ begin
   create type public.reservation_status as enum (
@@ -57,6 +73,8 @@ do $$ begin
 exception when duplicate_object then null;
 end $$;
 
+alter type public.reservation_status add value if not exists 'requested';
+alter type public.reservation_status add value if not exists 'confirmed';
 alter type public.reservation_status add value if not exists 'pending';
 alter type public.reservation_status add value if not exists 'accepted';
 alter type public.reservation_status add value if not exists 'rejected';
@@ -67,6 +85,8 @@ alter type public.reservation_status add value if not exists 'completed';
 alter type public.reservation_status add value if not exists 'no_show';
 alter type public.reservation_status add value if not exists 'expired';
 alter type public.reservation_status add value if not exists 'waiting_external_confirmation';
+
+begin;
 
 create or replace function public.set_updated_at()
 returns trigger
@@ -170,7 +190,8 @@ begin
   ) then
     alter table public.profiles
       add constraint profiles_restaurant_id_fkey
-      foreign key (restaurant_id) references public.restaurants(id) on delete set null;
+      foreign key (restaurant_id) references public.restaurants(id) on delete set null
+      not valid;
   end if;
 end $$;
 
@@ -989,14 +1010,21 @@ begin
     raise exception 'OFFER_SOLD_OUT';
   end if;
 
-  select o, r into v_offer, v_restaurant
+  select o.* into v_offer
   from public.offers o
-  join public.restaurants r on r.id = o.restaurant_id
   where o.id = p_offer_id
     and o.status = 'active'
-    and r.status = 'approved'
     and coalesce(o.reserved_tables, 0) < coalesce(o.available_tables, 1)
-  for update of o;
+  for update;
+
+  if not found then
+    raise exception 'OFFER_UNAVAILABLE';
+  end if;
+
+  select r.* into v_restaurant
+  from public.restaurants r
+  where r.id = v_offer.restaurant_id
+    and r.status = 'approved';
 
   if not found then
     raise exception 'OFFER_UNAVAILABLE';
@@ -1304,14 +1332,7 @@ values
   ('post_visit_email_preheader', 'Share your SmartTable visit feedback after dining at {{restaurant_name}}.', 'Comparte tu experiencia de SmartTable despues de cenar en {{restaurant_name}}.', 'Oszd meg a SmartTable latogatasod tapasztalatait itt: {{restaurant_name}}.', 'text', 'email'),
   ('post_visit_email_body', 'Hi {{guest_name}}, thank you for dining at {{restaurant_name}} through SmartTable. We would love to hear about your experience from your visit on {{visit_date}}.', 'Hola {{guest_name}}, gracias por cenar en {{restaurant_name}} a traves de SmartTable. Nos encantaria conocer tu experiencia de tu visita del {{visit_date}}.', 'Szia {{guest_name}}, koszonjuk, hogy a SmartTable-en keresztul vacsoraztal itt: {{restaurant_name}}. Szeretnenk hallani a {{visit_date}} napi latogatasod tapasztalatait.', 'textarea', 'email'),
   ('post_visit_email_footer', 'You are receiving this because you completed a SmartTable reservation at {{restaurant_name}}.', 'Recibes esto porque completaste una reserva de SmartTable en {{restaurant_name}}.', 'Azert kapod ezt az uzenetet, mert teljesitett SmartTable foglalasod volt itt: {{restaurant_name}}.', 'textarea', 'email')
-on conflict (key) do update
-set
-  value_en = excluded.value_en,
-  value_es = excluded.value_es,
-  value_hu = excluded.value_hu,
-  content_type = excluded.content_type,
-  group_name = excluded.group_name,
-  updated_at = now();
+on conflict (key) do nothing;
 
 create or replace function pg_temp.create_policy_if_missing(
   p_table text,
@@ -1496,6 +1517,8 @@ grant select on public.restaurant_reviews_overview to authenticated;
 grant select on public.reservation_overview to authenticated;
 grant execute on function public.create_reservation(uuid, text, text, text, integer, date, time, text) to anon, authenticated;
 grant execute on function public.update_reservation_status(uuid, text) to authenticated;
+
+commit;
 
 -- Verification queries to run after this file:
 --
