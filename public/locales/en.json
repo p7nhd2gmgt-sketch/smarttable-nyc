@@ -352,6 +352,8 @@
   "admin_kpi_total_reservations_desc": "All reservation requests recorded by SmartTable",
   "admin_kpi_profile_views": "Profile views",
   "admin_kpi_profile_views_desc": "Public restaurant profile views where available",
+  "admin_kpi_guest_website_views": "Guest website views",
+  "admin_kpi_guest_website_views_desc": "Public guest website page views recorded by SmartTable",
   "admin_kpi_favorites": "Favorites",
   "admin_kpi_favorites_desc": "Active restaurant followers and favorites",
   "admin_kpi_favorites_week": "New favorites this week",

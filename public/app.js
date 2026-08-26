@@ -3730,6 +3730,9 @@ async function trackAiEvent(eventType, metadata = {}) {
 
 function safeSignupAnalyticsMetadata(metadata = {}) {
   const allowed = [
+    "path",
+    "route_kind",
+    "market_code",
     "step_index",
     "step_key",
     "field_key",
@@ -3799,11 +3802,12 @@ function trackGuestAccountEvent(eventType, metadata = {}, options = {}) {
 }
 
 function trackSafeAnalyticsEvent(eventType, metadata = {}, options = {}) {
-  const body = JSON.stringify({
-    profile_key: state.aiProfileKey,
+  const payload = {
     event_type: eventType,
     metadata: safeSignupAnalyticsMetadata(metadata)
-  });
+  };
+  if (eventType !== "guest_website_view") payload.profile_key = state.aiProfileKey;
+  const body = JSON.stringify(payload);
   try {
     if (options.keepalive && navigator.sendBeacon) {
       navigator.sendBeacon("/api/analytics/events", new Blob([body], { type: "application/json" }));
@@ -3818,6 +3822,39 @@ function trackSafeAnalyticsEvent(eventType, metadata = {}, options = {}) {
   } catch {
     // Analytics must never block account creation or navigation.
   }
+}
+
+const guestWebsiteAnalyticsHosts = new Set(["smarttablenyc.com", "www.smarttablenyc.com"]);
+const guestWebsiteAnalyticsRouteKinds = new Set(["home", "restaurants", "restaurant-detail", "offers", "food-feed", "info"]);
+let lastTrackedGuestWebsitePath = "";
+
+function guestWebsiteAnalyticsRoute(route = currentPublicGuestRoute()) {
+  const hostname = String(window.location.hostname || "").toLowerCase();
+  if (!guestWebsiteAnalyticsHosts.has(hostname)) return null;
+  if (currentAiRoute() || !guestWebsiteAnalyticsRouteKinds.has(route?.kind)) return null;
+  const path = window.location.pathname.replace(/\/+$/, "") || "/";
+  return { path, routeKind: route.kind };
+}
+
+function resetGuestWebsiteAnalyticsForCurrentRoute() {
+  if (!guestWebsiteAnalyticsRoute()) lastTrackedGuestWebsitePath = "";
+}
+
+function trackGuestWebsiteView(route = currentPublicGuestRoute()) {
+  const analyticsRoute = guestWebsiteAnalyticsRoute(route);
+  if (!analyticsRoute) {
+    lastTrackedGuestWebsitePath = "";
+    return;
+  }
+  if (lastTrackedGuestWebsitePath === analyticsRoute.path) return;
+  lastTrackedGuestWebsitePath = analyticsRoute.path;
+  trackSafeAnalyticsEvent("guest_website_view", {
+    path: analyticsRoute.path,
+    route_kind: analyticsRoute.routeKind,
+    language: state.lang,
+    market_code: state.config?.resolved_market_code || state.config?.default_market_code || "",
+    source: "guest_website"
+  });
 }
 
 function maybeTrackSignupAbandoned(reason = "navigation", keepalive = false) {
@@ -11487,6 +11524,7 @@ function renderAdmin() {
           ${kpiStatCard("admin_kpi_active_offers", "Active offers", stats.offers_active, "admin_kpi_active_offers_desc", "Offers currently marked active", { key: "offers_active" })}
           ${kpiStatCard("admin_kpi_total_reservations", "Total reservations", stats.reservations_total, "admin_kpi_total_reservations_desc", "All reservation requests recorded by SmartTable", { key: "reservations_total" })}
           ${kpiStatCard("admin_kpi_profile_views", "Profile views", stats.views_total, "admin_kpi_profile_views_desc", "Public restaurant profile views where available", { key: "views_total" })}
+          ${kpiStatCard("admin_kpi_guest_website_views", "Guest website views", stats.guest_website_views ?? 0, "admin_kpi_guest_website_views_desc", "Public guest website page views recorded by SmartTable", { key: "guest_website_views" })}
           ${kpiStatCard("admin_kpi_favorites", "Favorites", stats.favorites_total, "admin_kpi_favorites_desc", "Active restaurant followers and favorites", { key: "favorites_total" })}
           ${kpiStatCard("admin_kpi_favorites_week", "New favorites this week", stats.favorites_this_week, "admin_kpi_favorites_week_desc", "Favorites created during the last 7 days", { key: "favorites_this_week" })}
           ${kpiStatCard("admin_kpi_favorites_month", "New favorites this month", stats.favorites_this_month, "admin_kpi_favorites_month_desc", "Favorites created during the current month", { key: "favorites_this_month" })}
@@ -19002,6 +19040,7 @@ async function renderCurrentMode() {
   await loadPublicContent();
   await loadFeatureStatus();
   updateSessionButton();
+  resetGuestWebsiteAnalyticsForCurrentRoute();
   try {
     const accountRoute = currentGuestAccountRoute();
     if (accountRoute === "signup") {
@@ -19102,14 +19141,17 @@ async function renderCurrentMode() {
       state.headerSearchQuery = publicSearchQuery;
     }
     if (publicRoute.kind === "info") {
+      trackGuestWebsiteView(publicRoute);
       renderPublicGuestInfoPage(publicRoute);
       return;
     }
     if (publicRoute.kind === "not-found") {
+      trackGuestWebsiteView(publicRoute);
       renderNotFoundRoute(publicRoute);
       return;
     }
     if (publicRoute.kind === "food-feed") {
+      trackGuestWebsiteView(publicRoute);
       renderGuest(publicRoute);
       return;
     }
@@ -19122,6 +19164,7 @@ async function renderCurrentMode() {
       }
       state.restaurantDetail = restaurant.id;
     }
+    trackGuestWebsiteView(publicRoute);
     renderGuest(publicRoute);
     scrollToRouteTarget(route);
   } catch (error) {

@@ -299,6 +299,8 @@
   "admin_kpi_total_reservations_desc": "A SmartTable-ben r\u00f6gz\u00edtett \u00f6sszes foglal\u00e1si k\u00e9relem",
   "admin_kpi_profile_views": "Profilmegtekint\u00e9sek",
   "admin_kpi_profile_views_desc": "Publikus \u00e9ttermi profilmegtekint\u00e9sek, ahol el\u00e9rhet\u0151k",
+  "admin_kpi_guest_website_views": "Vend\u00e9goldal-megtekint\u00e9sek",
+  "admin_kpi_guest_website_views_desc": "A SmartTable \u00e1ltal r\u00f6gz\u00edtett nyilv\u00e1nos vend\u00e9goldal-megtekint\u00e9sek",
   "admin_kpi_favorites": "Kedvencek",
   "admin_kpi_favorites_desc": "Akt\u00edv \u00e9tteremk\u00f6vet\u0151k \u00e9s kedvencek",
   "admin_kpi_favorites_week": "\u00daj kedvencek ezen a h\u00e9ten",

@@ -451,6 +451,7 @@ const postVisitTokenTtlHours = {
   open_review: 14 * 24
 };
 const allowedSignupAnalyticsEvents = new Set([
+  "guest_website_view",
   "signup_started",
   "signup_validation_failed",
   "signup_submitted",
@@ -487,6 +488,9 @@ const allowedSignupAnalyticsEvents = new Set([
 const apiRateLimitBuckets = new Map();
 const reservationAlertRateLimitBuckets = new Map();
 const allowedSignupAnalyticsProperties = new Set([
+  "path",
+  "route_kind",
+  "market_code",
   "step_index",
   "step_key",
   "field_key",
@@ -5114,6 +5118,52 @@ async function supabaseFetch(path, options = {}) {
   return payload;
 }
 
+async function supabaseExactCount(path, options = {}) {
+  if (!supabaseConfigured) throw new Error("Supabase is not configured.");
+
+  const service = options.service !== false;
+  const key = service ? SUPABASE_SERVICE_ROLE_KEY : SUPABASE_ANON_KEY;
+  const token = options.token || key;
+  const requestHeaders = {
+    apikey: key,
+    Prefer: "count=exact",
+    Range: "0-0",
+    "Range-Unit": "items",
+    ...(options.headers || {})
+  };
+  if (token && looksLikeJwt(token)) {
+    requestHeaders.authorization = `Bearer ${token}`;
+  }
+  const timeoutMs = Math.max(500, Number(options.timeoutMs || SUPABASE_REQUEST_TIMEOUT_MS));
+  const controller = options.signal ? null : new AbortController();
+  const timeout = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+  let response;
+  try {
+    response = await fetch(`${SUPABASE_URL}${path}`, {
+      method: "HEAD",
+      headers: requestHeaders,
+      signal: options.signal || controller?.signal
+    });
+  } catch (error) {
+    const timeoutError = new Error(error.name === "AbortError" ? "Upstream request timed out." : "Upstream service is unavailable.");
+    timeoutError.status = error.name === "AbortError" ? 504 : 502;
+    timeoutError.code = error.name === "AbortError" ? "UPSTREAM_TIMEOUT" : "UPSTREAM_UNAVAILABLE";
+    throw timeoutError;
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+
+  if (!response.ok) {
+    const error = new Error("Supabase count request failed.");
+    error.status = response.status;
+    error.code = "SUPABASE_COUNT_FAILED";
+    throw error;
+  }
+  const contentRange = clean(response.headers.get("content-range"));
+  const total = Number(contentRange.split("/").pop());
+  return Number.isFinite(total) ? total : 0;
+}
+
 let supabaseOpenApiSchemaPromise = null;
 
 function openApiDefinitions(spec = {}) {
@@ -6521,13 +6571,18 @@ async function analyticsEvent(method, body) {
   const eventType = clean(body.event_type || body.eventType);
   if (!allowedSignupAnalyticsEvents.has(eventType)) return json(400, { error: "Unsupported analytics event." });
   const properties = sanitizeSignupAnalyticsProperties(body.metadata || body.properties || {});
+  if (eventType === "guest_website_view" && (!properties.path?.startsWith("/") || /[?#]/.test(properties.path))) {
+    return json(400, { error: "A safe public website path is required." });
+  }
   const row = {
     id: crypto.randomUUID(),
     event_type: eventType,
-    profile_key: aiProfileKey(body.profile_key),
-    entity_type: eventType.startsWith("signup_") || ["preference_selected", "terms_accepted", "privacy_accepted", "restaurant_followed_during_signup"].includes(eventType)
-      ? "guest_signup"
-      : "guest_account",
+    profile_key: eventType === "guest_website_view" ? null : aiProfileKey(body.profile_key),
+    entity_type: eventType === "guest_website_view"
+      ? "guest_website"
+      : eventType.startsWith("signup_") || ["preference_selected", "terms_accepted", "privacy_accepted", "restaurant_followed_during_signup"].includes(eventType)
+        ? "guest_signup"
+        : "guest_account",
     entity_id: null,
     properties,
     created_at: nowIso()
@@ -26637,6 +26692,7 @@ async function adminStats(headers) {
         reservations_rejected: reservations.filter((item) => item.status === "rejected").length,
         seats_reserved: reservations.reduce((sum, item) => sum + item.party_size, 0),
         views_total: demo.restaurants.reduce((sum, item) => sum + numberOr(item.views_count, 0), 0),
+        guest_website_views: demo.analyticsEvents.filter((item) => clean(item.event_type) === "guest_website_view").length,
         favorites_total: activeFollowers.length,
         favorites_this_week: activeFollowers.filter((item) => new Date(item.created_at) >= weekStart).length,
         favorites_this_month: activeFollowers.filter((item) => new Date(item.created_at) >= monthStart).length
@@ -26666,9 +26722,14 @@ async function adminStats(headers) {
       reservations_rejected: normalizedReservations.filter((item) => item.status === "rejected").length,
       seats_reserved: normalizedReservations.reduce((sum, item) => sum + numberOr(item.party_size, 0), 0),
       views_total: 0,
+      guest_website_views: 0,
       favorites_total: (followers || []).filter((item) => item.notification_enabled !== false).length
     };
   };
+  const guestWebsiteViews = await supabaseExactCount(
+    "/rest/v1/analytics_events?select=id&event_type=eq.guest_website_view",
+    { service: true }
+  ).catch(() => 0);
   const stats = await supabaseFetch("/rest/v1/rpc/admin_dashboard_stats", { method: "POST", service: true, body: {} })
     .catch((error) => {
       if (String(error?.code || "").startsWith("PGRST") || /schema cache|function/i.test(error?.message || "")) {
@@ -26676,7 +26737,12 @@ async function adminStats(headers) {
       }
       throw error;
     });
-  return json(200, { stats });
+  return json(200, {
+    stats: {
+      ...(stats || {}),
+      guest_website_views: guestWebsiteViews
+    }
+  });
 }
 
 async function getPartnerRestaurant(profile, query, body = {}) {

@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 
 const indexHtml = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
+const appJs = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+const appCore = await readFile(new URL("../src/app-core.js", import.meta.url), "utf8");
 const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
 const vercelJson = await readFile(new URL("../vercel.json", import.meta.url), "utf8");
 
@@ -48,5 +50,26 @@ assert(!indexHtml.includes("GTM-"), "GTM IDs must not be present.");
 assert(!indexHtml.includes("gtag("), "gtag must not be present.");
 assert(vercelJson.includes("connect-src 'self'"), "CSP must allow same-origin Vercel Analytics intake only.");
 assert(vercelJson.includes("script-src 'self'"), "CSP must allow same-origin Vercel Analytics script only.");
+
+includesAll(appJs, [
+  'const guestWebsiteAnalyticsHosts = new Set(["smarttablenyc.com", "www.smarttablenyc.com"])',
+  'const guestWebsiteAnalyticsRouteKinds = new Set(["home", "restaurants", "restaurant-detail", "offers", "food-feed", "info"])',
+  'trackSafeAnalyticsEvent("guest_website_view"',
+  'path: analyticsRoute.path',
+  'route_kind: analyticsRoute.routeKind',
+  'if (eventType !== "guest_website_view") payload.profile_key = state.aiProfileKey',
+  'fetch("/api/analytics/events"'
+], "First-party guest website view tracking");
+assert(!appJs.includes('trackSafeAnalyticsEvent("guest_website_view", {\n    profile_key:'), "Guest website views must not include a profile key.");
+
+includesAll(appCore, [
+  '"guest_website_view"',
+  'profile_key: eventType === "guest_website_view" ? null',
+  '? "guest_website"',
+  'async function supabaseExactCount',
+  'Prefer: "count=exact"',
+  'event_type=eq.guest_website_view',
+  'guest_website_views: guestWebsiteViews'
+], "Guest website view aggregation");
 
 console.log("Privacy-conscious visitor analytics checks passed.");

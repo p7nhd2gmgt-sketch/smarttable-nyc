@@ -723,7 +723,8 @@ test.describe.serial("SmartTable BASIC production E2E", () => {
     const admin = await login(request, TEST_ACCOUNTS.admin.email, TEST_ACCOUNTS.admin.password);
     await page.setViewportSize({ width: 1280, height: 900 });
     await replaceStoredSession(page, admin, "/admin");
-    await expectKpiCards(page.locator("#admin-stats [data-kpi-card]"), 9);
+    await expectKpiCards(page.locator("#admin-stats [data-kpi-card]"), 10);
+    await expect(page.locator('#admin-stats [data-kpi-key="guest_website_views"]')).toContainText("Guest website views");
   });
 
   test("partner dashboard overview and analytics are compact and Hungarian-ready", async ({ page, request }) => {
@@ -1086,8 +1087,26 @@ test.describe.serial("SmartTable BASIC production E2E", () => {
     const partnerAdmin = await request.get("/api/admin/stats", { headers: authHeaders(partner) });
     expect(partnerAdmin.status()).toBe(403);
 
-    const adminStats = await request.get("/api/admin/stats", { headers: authHeaders(admin) });
-    expect(adminStats.status()).toBe(200);
+    const adminStatsBefore = await json(await request.get("/api/admin/stats", { headers: authHeaders(admin) }));
+    expect(adminStatsBefore.response.status()).toBe(200);
+    const guestWebsiteViewsBefore = Number(adminStatsBefore.payload.stats?.guest_website_views || 0);
+
+    const websiteView = await request.post("/api/analytics/events", {
+      data: {
+        event_type: "guest_website_view",
+        metadata: {
+          path: "/offers",
+          route_kind: "offers",
+          language: "en",
+          source: "guest_website"
+        }
+      }
+    });
+    expect(websiteView.status()).toBe(201);
+
+    const adminStatsAfter = await json(await request.get("/api/admin/stats", { headers: authHeaders(admin) }));
+    expect(adminStatsAfter.response.status()).toBe(200);
+    expect(adminStatsAfter.payload.stats?.guest_website_views).toBe(guestWebsiteViewsBefore + 1);
 
     const regularFeatureFlagUpdate = await request.patch("/api/admin/feature-flags", {
       headers: authHeaders(admin),
