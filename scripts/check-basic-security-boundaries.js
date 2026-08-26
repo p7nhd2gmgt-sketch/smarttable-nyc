@@ -533,7 +533,7 @@ async function assertFrontendDirectRouteGuards() {
     'path.startsWith("/account/")',
     'path.startsWith("/partner/")',
     'path.startsWith("/admin/")',
-    "restaurant_onboarding_step_partner",
+    "data-restaurant-partner-mode",
     "partner_access_mode",
     "restaurant_partner_access_invite_new",
     '"/ai-concierge"',

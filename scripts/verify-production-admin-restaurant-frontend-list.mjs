@@ -150,6 +150,9 @@ async function forceDuplicatePayloadFromExistingRestaurant(page, payload) {
 
 async function fillRestaurantForm(page, payload) {
   const form = page.locator("#restaurantForm");
+  await form.locator("details.restaurant-create-options").evaluate((details) => {
+    details.open = true;
+  });
   await form.locator('[name="name"]').fill(payload.name);
   await form.locator('[name="slug"]').fill(payload.slug);
   await form.locator('[name="email"]').fill(payload.email);
@@ -161,7 +164,6 @@ async function fillRestaurantForm(page, payload) {
   await form.locator('[name="cuisine_type"]').fill(payload.cuisine_type);
   await form.locator('[name="short_description"]').fill(payload.short_description);
   await form.locator('[name="full_description"]').fill(payload.full_description);
-  await form.locator('[name="status"]').selectOption(payload.status);
   await form.locator('[name="is_test_data"]').check();
 }
 

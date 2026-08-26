@@ -248,13 +248,13 @@ includesAll(appCore, [
 includesAll(app, [
   '"/superadmin"',
   '"/superadmin/settings"',
-  "restaurant_onboarding_step_partner",
+  "data-restaurant-partner-mode",
   "partner_access_mode",
   "restaurant_partner_access_invite_new",
   "restaurant_partner_access_assign_existing",
   "pending_review",
   "archived",
-  "restaurant_onboarding_step_capacity",
+  "restaurantCapacityForm",
   "restaurantDetailPanel",
   "restaurantCapacityForm",
   "data-restaurant-access-action",
@@ -265,7 +265,7 @@ includesAll(app, [
 
 for (const [name, locale] of [["English", enLocale], ["Spanish", esLocale], ["Hungarian", huLocale]]) {
   includesAll(locale, [
-    "restaurant_onboarding_step_partner",
+    "restaurant_quick_create_title",
     "restaurant_partner_access_mode_label",
     "restaurant_partner_access_none",
     "restaurant_partner_access_invite_new",
@@ -273,7 +273,7 @@ for (const [name, locale] of [["English", enLocale], ["Spanish", esLocale], ["Hu
     "restaurant_partner_access_note",
     "restaurant_status_pending_review",
     "restaurant_status_archived",
-    "restaurant_onboarding_step_capacity",
+    "restaurant_service_periods_title",
     "restaurant_dining_areas_label",
     "restaurant_tables_label",
     "restaurant_capacity_overrides_label",
@@ -349,7 +349,7 @@ includesAll(routeMap, [
 ], "Route map checks");
 
 includesAll(uiReadiness + uiBehavior, [
-  "restaurant_onboarding_step_partner",
+  "data-restaurant-partner-mode",
   "partner_access_mode",
   "partner.invitation_id || partner.id"
 ], "BASIC UI readiness and behavior checks");

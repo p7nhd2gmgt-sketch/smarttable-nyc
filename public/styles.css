@@ -3629,6 +3629,28 @@ textarea {
   grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
 }
 
+.restaurant-onboarding-wizard {
+  background: color-mix(in srgb, var(--surface) 94%, var(--brand) 6%);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  margin: 18px 0 24px;
+  padding: 18px;
+}
+
+.restaurant-draft-intro {
+  grid-column: 1 / -1;
+  max-width: 720px;
+}
+
+.restaurant-draft-intro h3 {
+  margin: 4px 0 6px;
+}
+
+.restaurant-draft-intro p {
+  color: var(--muted);
+  margin: 0;
+}
+
 .restaurant-onboarding-wizard fieldset {
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -3638,6 +3660,53 @@ textarea {
   grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   margin: 0;
   padding: 14px;
+}
+
+.restaurant-onboarding-wizard .restaurant-draft-fields {
+  background: var(--surface);
+}
+
+.restaurant-create-options {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  grid-column: 1 / -1;
+  overflow: hidden;
+}
+
+.restaurant-create-options summary {
+  cursor: pointer;
+  font-weight: 800;
+  list-style-position: inside;
+  padding: 14px;
+}
+
+.restaurant-create-options[open] summary {
+  border-bottom: 1px solid var(--line);
+}
+
+.restaurant-create-options-grid,
+.restaurant-partner-create-fields {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  padding: 14px;
+}
+
+.restaurant-partner-create-fields {
+  background: color-mix(in srgb, var(--surface) 88%, var(--brand) 12%);
+  border-radius: 8px;
+  grid-column: 1 / -1;
+  padding: 12px;
+}
+
+.restaurant-draft-safety-note,
+.restaurant-create-draft-button {
+  grid-column: 1 / -1;
+}
+
+.restaurant-create-draft-button {
+  justify-self: start;
+  min-width: 190px;
 }
 
 .restaurant-onboarding-wizard legend {
@@ -8761,6 +8830,56 @@ th {
   grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
 }
 
+.restaurant-setup-form {
+  display: grid;
+  gap: 16px;
+}
+
+.restaurant-setup-form textarea {
+  min-height: 96px;
+}
+
+.restaurant-setup-advanced {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.restaurant-setup-advanced summary {
+  cursor: pointer;
+  font-weight: 800;
+  padding: 12px;
+}
+
+.restaurant-setup-advanced[open] summary {
+  border-bottom: 1px solid var(--line);
+}
+
+.restaurant-setup-advanced .restaurant-detail-grid {
+  padding: 14px;
+}
+
+.restaurant-setup-check {
+  align-self: end;
+  min-height: 48px;
+}
+
+.restaurant-service-period-list {
+  display: grid;
+  gap: 10px;
+}
+
+.restaurant-service-period-row {
+  align-items: end;
+  background: color-mix(in srgb, var(--surface) 94%, var(--brand) 6%);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: minmax(100px, 0.8fr) minmax(140px, 1fr) minmax(115px, 0.8fr) minmax(115px, 0.8fr) auto;
+  padding: 12px;
+}
+
 .admin-json-preview,
 .capacity-editor textarea {
   background: #0f172a;
@@ -8783,6 +8902,14 @@ th {
 }
 
 @media (max-width: 860px) {
+  .restaurant-service-period-row {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .restaurant-service-period-row [data-remove-service-period] {
+    grid-column: 1 / -1;
+  }
+
   .signup-progress {
     grid-template-columns: repeat(7, minmax(92px, 1fr));
     overflow-x: auto;

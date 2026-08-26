@@ -369,8 +369,12 @@ async function assertRestaurantAdministrationStaticContracts() {
     "adminRestaurantFilters",
     "restaurantWizardField",
     "restaurantWizardTextarea",
-    "restaurant_onboarding_step_basic",
-    "restaurant_onboarding_step_capacity",
+    "restaurant_quick_create_title",
+    "restaurant_create_draft_button",
+    "restaurantProfileSetupForm",
+    "restaurantHoursSetupForm",
+    "restaurantReservationSetupForm",
+    "data-service-period-row",
     "restaurantCapacityForm",
     "restaurantDetailPanel",
     "restaurantSystemStatusPanel",
@@ -390,7 +394,9 @@ async function assertRestaurantAdministrationStaticContracts() {
 
   for (const [label, locale] of [["en", en], ["es", es], ["hu", hu]]) {
     for (const key of [
-      "restaurant_onboarding_step_capacity",
+      "restaurant_quick_create_title",
+      "restaurant_create_draft_button",
+      "restaurant_service_periods_title",
       "restaurant_tab_tables_capacity",
       "restaurant_tab_partner_access",
       "restaurant_status_history_title",

@@ -1010,7 +1010,6 @@ test.describe.serial("SmartTable BASIC production E2E", () => {
     const duplicateSource = (existing.payload.restaurants || []).find((restaurant) => restaurant.address) || {};
     const restaurantStamp = stamp();
     const restaurantName = `E2E Visible Create ${restaurantStamp}`;
-    const slug = `e2e-visible-create-${restaurantStamp.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "")}`.slice(0, 80);
     const overrideReason = `E2E duplicate override ${restaurantStamp}`;
 
     await replaceStoredSession(page, admin, "/admin/restaurants");
@@ -1022,19 +1021,13 @@ test.describe.serial("SmartTable BASIC production E2E", () => {
     await expect(page.locator('#adminRestaurantFilters [name="status"]')).toHaveValue("active");
 
     const form = page.locator("#restaurantForm");
+    await expect(form.locator(".restaurant-draft-fields input[required]")).toHaveCount(4);
+    await expect(form.locator("details.restaurant-create-options")).not.toHaveAttribute("open", "");
+    await expect(form.locator('[name="status"]')).toHaveValue("draft");
     await form.locator('[name="name"]').fill(restaurantName);
-    await form.locator('[name="slug"]').fill(slug);
     await form.locator('[name="email"]').fill(uniqueEmail("e2e-visible-restaurant"));
-    await form.locator('[name="reservation_email"]').fill(uniqueEmail("e2e-visible-reservation"));
     await form.locator('[name="address"]').fill(duplicateSource.address || `${restaurantStamp} Visible Test Street`);
-    await form.locator('[name="city"]').fill(duplicateSource.city || "New York");
-    await form.locator('[name="country"]').fill(duplicateSource.country || "US");
-    await form.locator('[name="district"]').fill(duplicateSource.district || "West Village");
     await form.locator('[name="cuisine_type"]').fill("American");
-    await form.locator('[name="short_description"]').fill("E2E visible restaurant create test.");
-    await form.locator('[name="full_description"]').fill("E2E visible restaurant create test.");
-    await form.locator('[name="status"]').selectOption("draft");
-    await form.locator('[name="is_test_data"]').check();
 
     const postResponses = [];
     page.on("response", (response) => {
@@ -1063,6 +1056,12 @@ test.describe.serial("SmartTable BASIC production E2E", () => {
     await expect(page.locator('#adminRestaurantFilters [name="status"]')).toHaveValue("all");
     await expect(page.locator('#adminRestaurantFilters [name="testData"]')).toHaveValue("all");
     await expect(page.locator(".restaurant-list-summary")).toContainText(`${countBefore + 1} restaurants`);
+    await expect(page.locator("#admin-restaurant-detail")).toBeVisible();
+    await page.locator('[data-restaurant-detail-tab="profile"]').click();
+    await expect(page.locator("#restaurantProfileSetupForm")).toBeVisible();
+    await expect(page.locator('#restaurantProfileSetupForm [name="name"]')).toHaveValue(restaurantName);
+    await expect(page.locator('#restaurantProfileSetupForm details.restaurant-setup-advanced')).not.toHaveAttribute("open", "");
+    await expect(page.locator('#restaurantProfileSetupForm [name="gallery_images"]')).toBeAttached();
 
     const responseSummaries = await Promise.all(postResponses.map(async (item) => ({
       status: item.status(),

@@ -11722,6 +11722,19 @@ function renderAdmin() {
     button.addEventListener("click", () => updatePhotoSubmissionStatus(button.dataset.photoSubmissionId, button.dataset.photoSubmissionStatus));
   });
   document.querySelector("#restaurantForm").addEventListener("submit", submitRestaurant);
+  const restaurantPartnerMode = document.querySelector("[data-restaurant-partner-mode]");
+  const syncRestaurantPartnerCreateFields = () => {
+    const fields = document.querySelector("[data-restaurant-partner-fields]");
+    if (!fields) return;
+    const needsPartner = restaurantPartnerMode?.value === "invite_new" || restaurantPartnerMode?.value === "assign_existing";
+    fields.hidden = !needsPartner;
+    fields.querySelectorAll("input, select").forEach((field) => {
+      if (field.name === "partner_email") field.required = needsPartner;
+      field.disabled = !needsPartner;
+    });
+  };
+  restaurantPartnerMode?.addEventListener("change", syncRestaurantPartnerCreateFields);
+  syncRestaurantPartnerCreateFields();
   document.querySelector("[data-focus-restaurant-form]")?.addEventListener("click", () => {
     document.querySelector('#restaurantForm [name="name"]')?.focus();
   });
@@ -11875,6 +11888,14 @@ function renderAdmin() {
       renderAdmin();
     });
   });
+  document.querySelector("#restaurantProfileSetupForm")?.addEventListener("submit", saveRestaurantSetupForm);
+  document.querySelector("#restaurantHoursSetupForm")?.addEventListener("submit", saveRestaurantSetupForm);
+  document.querySelector("#restaurantReservationSetupForm")?.addEventListener("submit", saveRestaurantSetupForm);
+  document.querySelector("[data-add-service-period]")?.addEventListener("click", () => {
+    document.querySelector("[data-service-period-list]")?.insertAdjacentHTML("beforeend", restaurantServicePeriodRow({}, `new-${Date.now()}`));
+    bindServicePeriodRemoveButtons();
+  });
+  bindServicePeriodRemoveButtons();
   document.querySelector("#restaurantCapacityForm")?.addEventListener("submit", saveRestaurantCapacityConfig);
   document.querySelectorAll("[data-restaurant-access-action]").forEach((button) => {
     button.addEventListener("click", () => updateRestaurantAccess(button));
@@ -12008,148 +12029,56 @@ function restaurantWizardTextarea(name, label, value = "", attrs = "") {
 function restaurantOnboardingWizard() {
   return `
     <form class="mini-form admin-form restaurant-onboarding-wizard" id="restaurantForm">
-      <fieldset>
-        <legend>${escapeHtml(t("restaurant_onboarding_step_basic", "Step 1 - Basic information"))}</legend>
+      <div class="restaurant-draft-intro">
+        <span class="section-kicker">${escapeHtml(t("restaurant_quick_create_kicker", "QUICK CREATE"))}</span>
+        <h3>${escapeHtml(t("restaurant_quick_create_title", "Create a restaurant draft"))}</h3>
+        <p>${escapeHtml(t("restaurant_quick_create_description", "Enter four essentials now. Complete hours, profile, tables and partner access after the draft is saved."))}</p>
+      </div>
+      <fieldset class="restaurant-draft-fields">
+        <legend>${escapeHtml(t("restaurant_quick_create_essentials", "Essential details"))}</legend>
         ${restaurantWizardField("name", t("restaurant_name_label", "Restaurant name"), "", "required autocomplete=\"organization\"")}
-        ${restaurantWizardField("legal_name", t("restaurant_legal_name_label", "Legal business name"))}
-        ${restaurantWizardField("slug", t("restaurant_slug_label", "Public slug"), "", "placeholder=\"auto-generated-if-empty\"")}
-        ${restaurantWizardTextarea("short_description", t("restaurant_short_description_label", "Short description"))}
-        ${restaurantWizardTextarea("full_description", t("restaurant_full_description_label", "Full description"))}
-        ${restaurantWizardField("contact_name", t("restaurant_contact_name_label", "Contact name"))}
-        ${restaurantWizardField("email", t("restaurant_primary_email_label", "Primary email"), "", "type=\"email\" required")}
-        ${restaurantWizardField("reservation_email", t("restaurant_reservation_email_label", "Reservation email"), "", "type=\"email\"")}
-        ${restaurantWizardField("phone", t("phone_label", "Phone"))}
-        ${restaurantWizardField("website", t("website_label", "Website"), "", "type=\"url\"")}
-        ${restaurantWizardField("country", t("country_label", "Country"), "US", "required")}
-        ${restaurantWizardField("state_region", t("state_region_label", "State / region"))}
-        ${restaurantWizardField("city", t("city_label", "City"), "New York", "required")}
-        ${restaurantWizardField("district", t("filter_neighborhood_label", "Neighborhood"), "New York")}
-        ${restaurantWizardField("postal_code", t("postal_code_label", "Postal code"))}
-        ${restaurantWizardField("address", t("street_address_label", "Street address"), "", "required")}
-        ${restaurantWizardField("latitude", t("latitude_label", "Latitude"), "", "type=\"number\" step=\"0.000001\"")}
-        ${restaurantWizardField("longitude", t("longitude_label", "Longitude"), "", "type=\"number\" step=\"0.000001\"")}
-        ${restaurantWizardField("primary_timezone", t("timezone_label", "Timezone"), "America/New_York", "required")}
-        ${restaurantWizardField("currency_code", t("currency_label", "Currency"), "USD", "required")}
-        ${restaurantWizardField("default_language", t("default_language_label", "Default language"), "en")}
-        ${restaurantWizardField("supported_languages", t("supported_languages_label", "Supported languages"), "en,es,hu")}
-        ${restaurantWizardField("cuisine_type", t("filter_cuisine_label", "Cuisine"), "", "required")}
-        ${restaurantWizardField("price_level", t("price_level_label", "Price level"), "$$")}
+        ${restaurantWizardField("email", t("restaurant_primary_email_label", "Primary email"), "", "type=\"email\" required autocomplete=\"email\"")}
+        ${restaurantWizardField("address", t("street_address_label", "Street address"), "", "required autocomplete=\"street-address\"")}
+        ${restaurantWizardField("cuisine_type", t("filter_cuisine_label", "Cuisine"), "", "required autocomplete=\"off\"")}
       </fieldset>
-      <fieldset>
-        <legend>${escapeHtml(t("restaurant_onboarding_step_operations", "Step 2 - Profile and operations"))}</legend>
-        ${restaurantWizardField("logo_url", t("restaurant_logo_label", "Logo URL"), "", "type=\"url\"")}
-        ${restaurantWizardField("cover_image", t("restaurant_cover_image_label", "Cover image URL"), "/assets/restaurant-hero.png")}
-        ${restaurantWizardTextarea("gallery_images", t("restaurant_gallery_images_label", "Gallery image URLs"))}
-        ${restaurantWizardField("cuisine_categories", t("restaurant_cuisine_categories_label", "Cuisine categories"))}
-        ${restaurantWizardField("dining_style", t("restaurant_dining_style_label", "Dining style"))}
-        ${restaurantWizardField("dress_code", t("restaurant_dress_code_label", "Dress code"))}
-        ${restaurantWizardTextarea("accessibility_info", t("restaurant_accessibility_info_label", "Accessibility information"))}
-        ${restaurantWizardTextarea("parking_info", t("restaurant_parking_info_label", "Parking information"))}
-        ${restaurantWizardTextarea("public_contact_info", t("restaurant_public_contact_label", "Public contact information"))}
-        ${restaurantWizardField("instagram", "Instagram", "", "type=\"url\"")}
-        ${restaurantWizardField("facebook", "Facebook", "", "type=\"url\"")}
-        ${restaurantWizardField("tiktok", "TikTok", "", "type=\"url\"")}
-        ${restaurantWizardField("google_maps_url", "Google Maps", "", "type=\"url\"")}
-        <label class="check"><input name="visible_on_guest_site" type="checkbox" value="true"> ${escapeHtml(t("restaurant_visible_label", "Visible on guest site"))}</label>
-        <label class="check"><input name="is_featured" type="checkbox" value="true"> ${escapeHtml(t("restaurant_featured_label", "Featured restaurant"))}</label>
-        <label class="check"><input name="is_new_restaurant" type="checkbox" value="true"> ${escapeHtml(t("restaurant_new_label", "New restaurant label"))}</label>
-        <label class="check"><input name="is_test_data" type="checkbox" value="true"> ${escapeHtml(t("restaurant_test_data_label", "Test data"))}</label>
-        ${restaurantWizardField("seo_title", t("seo_title_label", "SEO title"))}
-        ${restaurantWizardTextarea("seo_description", t("seo_description_label", "SEO description"))}
-      </fieldset>
-      <fieldset>
-        <legend>${escapeHtml(t("restaurant_onboarding_step_hours", "Step 3 - Hours and availability"))}</legend>
-        ${restaurantWizardTextarea("service_periods", t("restaurant_service_periods_label", "Structured service periods JSON"), '[{"day":"mon","period":"dinner","opens":"17:00","closes":"22:00"}]')}
-        ${restaurantWizardTextarea("holiday_exceptions", t("restaurant_holiday_exceptions_label", "Holiday exceptions JSON"), "[]")}
-        ${restaurantWizardTextarea("temporary_closures", t("restaurant_temporary_closures_label", "Temporary closures JSON"), "[]")}
-        ${restaurantWizardField("reservation_interval_minutes", t("restaurant_interval_label", "Reservation interval minutes"), "30", "type=\"number\" min=\"5\" step=\"5\"")}
-        ${restaurantWizardField("booking_horizon_days", t("restaurant_booking_horizon_label", "Maximum booking horizon days"), "30", "type=\"number\" min=\"1\"")}
-        ${restaurantWizardField("minimum_booking_notice_minutes", t("restaurant_min_notice_label", "Minimum booking notice minutes"), "30", "type=\"number\" min=\"0\"")}
-        ${restaurantWizardField("default_table_duration_minutes", t("restaurant_default_duration_label", "Default table duration minutes"), "90", "type=\"number\" min=\"15\"")}
-        ${restaurantWizardField("grace_period_minutes", t("restaurant_grace_period_label", "Grace period minutes"), "15", "type=\"number\" min=\"0\"")}
-        ${restaurantWizardField("last_seating_time", t("restaurant_last_seating_label", "Last seating time"), "", "type=\"time\"")}
-      </fieldset>
-      <fieldset>
-        <legend>${escapeHtml(t("restaurant_onboarding_step_reservations", "Step 4 - Reservation configuration"))}</legend>
-        <label>${escapeHtml(t("restaurant_acceptance_mode_label", "Reservation acceptance mode"))}
-          <select name="reservation_acceptance_mode">
-            <option value="manual">${escapeHtml(t("restaurant_acceptance_manual", "Manual approval"))}</option>
-            <option value="automatic">${escapeHtml(t("restaurant_acceptance_automatic", "Automatic"))}</option>
-          </select>
-        </label>
-        ${restaurantWizardField("min_party_size", t("restaurant_min_party_size_label", "Minimum party size"), "1", "type=\"number\" min=\"1\"")}
-        ${restaurantWizardField("max_party_size", t("restaurant_max_party_size_label", "Maximum party size"), "8", "type=\"number\" min=\"1\"")}
-        ${restaurantWizardField("available_party_sizes", t("restaurant_party_options_label", "Available party-size options"), "1,2,3,4,5,6,7,8")}
-        ${restaurantWizardField("capacity", t("restaurant_capacity_label", "Guest capacity"), "", "type=\"number\" min=\"0\"")}
-        ${restaurantWizardField("table_capacity", t("restaurant_table_capacity_label", "Table availability"), "", "type=\"number\" min=\"0\"")}
-        ${restaurantWizardField("min_discount_percent", t("restaurant_min_discount_label", "Minimum discount %"), "", "type=\"number\" min=\"0\" max=\"90\"")}
-        ${restaurantWizardField("max_discount_percent", t("restaurant_max_discount_label", "Maximum discount %"), "", "type=\"number\" min=\"0\" max=\"90\"")}
-        <label class="check"><input name="accepts_reservation_requests" type="checkbox" value="true" checked> ${escapeHtml(t("restaurant_accepts_reservation_requests", "Accept reservation requests"))}</label>
-        <label class="check"><input name="same_day_reservations_enabled" type="checkbox" value="true" checked> ${escapeHtml(t("restaurant_same_day_label", "Same-day reservations"))}</label>
-        <label class="check"><input name="waitlist_enabled" type="checkbox" value="true"> ${escapeHtml(t("restaurant_waitlist_label", "Waitlist enabled"))}</label>
-        <label class="check"><input name="special_requests_enabled" type="checkbox" value="true" checked> ${escapeHtml(t("restaurant_special_requests_label", "Special requests"))}</label>
-        <label class="check"><input name="accessibility_requests_enabled" type="checkbox" value="true" checked> ${escapeHtml(t("restaurant_accessibility_requests_label", "Accessibility requests"))}</label>
-        <label class="check"><input name="high_chair_requests_enabled" type="checkbox" value="true" checked> ${escapeHtml(t("restaurant_high_chair_label", "Child / high-chair request"))}</label>
-        <label class="check"><input name="occasion_field_enabled" type="checkbox" value="true" checked> ${escapeHtml(t("restaurant_occasion_label", "Occasion field"))}</label>
-        ${restaurantWizardTextarea("cancellation_policy", t("restaurant_cancellation_policy_label", "Cancellation policy text"))}
-        ${restaurantWizardTextarea("no_show_policy", t("restaurant_no_show_policy_label", "No-show policy text"))}
-        ${restaurantWizardTextarea("confirmation_message", t("restaurant_confirmation_message_label", "Confirmation message"))}
-        ${restaurantWizardTextarea("arrival_instructions", t("restaurant_arrival_instructions_label", "Arrival instructions"))}
-      </fieldset>
-      <fieldset>
-        <legend>${escapeHtml(t("restaurant_onboarding_step_capacity", "Step 5 - Tables and capacity"))}</legend>
-        ${restaurantWizardTextarea("dining_areas", t("restaurant_dining_areas_label", "Dining areas JSON"), '[{"name":"Main dining room","code":"main","capacity":40,"status":"active"}]')}
-        ${restaurantWizardTextarea("tables", t("restaurant_tables_label", "Tables JSON"), '[{"table_identifier":"T1","min_capacity":2,"max_capacity":4,"seating_type":"indoor","is_accessible":true,"status":"active"}]')}
-        ${restaurantWizardTextarea("capacity_overrides", t("restaurant_capacity_overrides_label", "Service-period capacity overrides JSON"), "[]")}
-        <p class="form-note">${escapeHtml(t("restaurant_table_allocation_note", "BASIC stores table and capacity configuration for operations. It does not claim automatic table optimization or exact table assignment."))}</p>
-      </fieldset>
-      <fieldset>
-        <legend>${escapeHtml(t("restaurant_onboarding_step_partner", "Step 6 - Partner access"))}</legend>
-        <label>${escapeHtml(t("restaurant_partner_access_mode_label", "Partner access setup"))}
-          <select name="partner_access_mode">
-            <option value="none_later">${escapeHtml(t("restaurant_partner_access_none", "Create without a partner and invite one later"))}</option>
-            <option value="invite_new">${escapeHtml(t("restaurant_partner_access_invite_new", "Invite a new partner"))}</option>
-            <option value="assign_existing">${escapeHtml(t("restaurant_partner_access_assign_existing", "Assign an existing partner"))}</option>
-          </select>
-        </label>
-        ${restaurantWizardField("partner_full_name", t("restaurant_partner_contact_name_placeholder", "Partner contact name"))}
-        ${restaurantWizardField("partner_email", t("restaurant_partner_email_placeholder", "Partner email"), "", "type=\"email\"")}
-        <label>${escapeHtml(t("restaurant_role_label", "Restaurant-level role"))}
-          <select name="restaurant_role">
-            <option value="owner">${escapeHtml(t("restaurant_role_owner", "Owner"))}</option>
-            <option value="manager">${escapeHtml(t("restaurant_role_manager", "Manager"))}</option>
-            <option value="reservation_staff">${escapeHtml(t("restaurant_role_reservation_staff", "Reservation staff"))}</option>
-            <option value="marketing_staff">${escapeHtml(t("restaurant_role_marketing_staff", "Marketing staff"))}</option>
-            <option value="read_only">${escapeHtml(t("restaurant_role_read_only", "Read only"))}</option>
-          </select>
-        </label>
-        <p class="form-note">${escapeHtml(t("restaurant_partner_access_note", "Partner access uses secure invitations. New partners create their own password; temporary plaintext passwords are never sent."))}</p>
-      </fieldset>
-      <fieldset>
-        <legend>${escapeHtml(t("restaurant_onboarding_step_review", "Step 7 - Review and activation"))}</legend>
-        <label>${escapeHtml(t("restaurant_status_label", "Restaurant status"))}
-          <select name="status">
-            <option value="draft">${escapeHtml(t("restaurant_status_draft", "Draft"))}</option>
-            <option value="pending_review">${escapeHtml(t("restaurant_status_pending_review", "Pending review"))}</option>
-            <option value="active">${escapeHtml(t("restaurant_status_active", "Active"))}</option>
-            <option value="suspended">${escapeHtml(t("restaurant_status_suspended", "Suspended"))}</option>
-            <option value="archived">${escapeHtml(t("restaurant_status_archived", "Archived"))}</option>
-          </select>
-        </label>
-        ${restaurantWizardTextarea("status_reason", t("restaurant_status_reason_label", "Status change reason"))}
-        <label class="check"><input name="activate_confirmed" type="checkbox" value="true"> ${escapeHtml(t("restaurant_activation_confirm_label", "I confirm this restaurant passed the activation review."))}</label>
-        <ul class="restaurant-review-list">
-          <li>${escapeHtml(t("restaurant_review_required_fields", "Required fields complete"))}</li>
-          <li>${escapeHtml(t("restaurant_review_public_profile", "Public profile reviewed"))}</li>
-          <li>${escapeHtml(t("restaurant_review_hours", "Opening hours and service periods reviewed"))}</li>
-          <li>${escapeHtml(t("restaurant_review_reservation_settings", "Reservation settings reviewed"))}</li>
-          <li>${escapeHtml(t("restaurant_review_capacity", "Tables and capacity reviewed"))}</li>
-          <li>${escapeHtml(t("restaurant_review_partner_access", "Partner access status reviewed"))}</li>
-          <li>${escapeHtml(t("restaurant_review_duplicate_warnings", "Duplicate warnings resolved or overridden with an audit reason"))}</li>
-        </ul>
-        <p class="form-note">${escapeHtml(t("restaurant_default_draft_note", "New restaurants default to Draft and stay off the public site until Admin or Super Admin activates them."))}</p>
-      </fieldset>
-      <button class="primary-button" type="submit">${escapeHtml(t("add_restaurant_button", "Add Restaurant"))}</button>
+      <details class="restaurant-create-options">
+        <summary>${escapeHtml(t("restaurant_quick_create_optional", "Optional details"))}</summary>
+        <div class="restaurant-create-options-grid">
+          ${restaurantWizardField("slug", t("restaurant_slug_label", "Public slug"), "", "placeholder=\"auto-generated-if-empty\"")}
+          ${restaurantWizardField("reservation_email", t("restaurant_reservation_email_label", "Reservation email"), "", "type=\"email\" placeholder=\"same-as-primary-email\"")}
+          ${restaurantWizardField("phone", t("phone_label", "Phone"), "", "type=\"tel\" autocomplete=\"tel\"")}
+          ${restaurantWizardField("country", t("country_label", "Country"), "US", "autocomplete=\"country\"")}
+          ${restaurantWizardField("city", t("city_label", "City"), "New York", "autocomplete=\"address-level2\"")}
+          ${restaurantWizardField("district", t("filter_neighborhood_label", "Neighborhood"), "New York")}
+          ${restaurantWizardTextarea("short_description", t("restaurant_short_description_label", "Short description"))}
+          ${restaurantWizardTextarea("full_description", t("restaurant_full_description_label", "Full description"))}
+          <label class="check"><input name="is_test_data" type="checkbox" value="true"> ${escapeHtml(t("restaurant_test_data_label", "Test data"))}</label>
+          <label>${escapeHtml(t("restaurant_partner_access_mode_label", "Partner access setup"))}
+            <select name="partner_access_mode" data-restaurant-partner-mode>
+              <option value="none_later">${escapeHtml(t("restaurant_partner_access_none", "Create without a partner and invite one later"))}</option>
+              <option value="invite_new">${escapeHtml(t("restaurant_partner_access_invite_new", "Invite a new partner"))}</option>
+              <option value="assign_existing">${escapeHtml(t("restaurant_partner_access_assign_existing", "Assign an existing partner"))}</option>
+            </select>
+          </label>
+          <div class="restaurant-partner-create-fields" data-restaurant-partner-fields hidden>
+            ${restaurantWizardField("partner_full_name", t("restaurant_partner_contact_name_placeholder", "Partner contact name"))}
+            ${restaurantWizardField("partner_email", t("restaurant_partner_email_placeholder", "Partner email"), "", "type=\"email\"")}
+            <label>${escapeHtml(t("restaurant_role_label", "Restaurant-level role"))}
+              <select name="restaurant_role">
+                <option value="owner">${escapeHtml(t("restaurant_role_owner", "Owner"))}</option>
+                <option value="manager">${escapeHtml(t("restaurant_role_manager", "Manager"))}</option>
+                <option value="reservation_staff">${escapeHtml(t("restaurant_role_reservation_staff", "Reservation staff"))}</option>
+                <option value="marketing_staff">${escapeHtml(t("restaurant_role_marketing_staff", "Marketing staff"))}</option>
+                <option value="read_only">${escapeHtml(t("restaurant_role_read_only", "Read only"))}</option>
+              </select>
+            </label>
+          </div>
+        </div>
+      </details>
+      <input type="hidden" name="status" value="draft">
+      <input type="hidden" name="visible_on_guest_site" value="false">
+      <p class="form-note restaurant-draft-safety-note">${escapeHtml(t("restaurant_quick_create_safety", "The restaurant is created as a private draft. It cannot appear on the guest site until activation checks pass and an Admin explicitly activates it."))}</p>
+      <button class="primary-button restaurant-create-draft-button" type="submit">${escapeHtml(t("restaurant_create_draft_button", "Create draft"))}</button>
     </form>
   `;
 }
@@ -12240,6 +12169,16 @@ function restaurantDetailTabButton(tab, label) {
   return `<button class="ghost-button ${active ? "active" : ""}" type="button" data-restaurant-detail-tab="${escapeAttr(tab)}">${escapeHtml(label)}</button>`;
 }
 
+function restaurantBooleanSetupField(name, label, checked = false) {
+  return `
+    <label class="check restaurant-setup-check">
+      <input type="hidden" name="${escapeAttr(name)}" value="false">
+      <input type="checkbox" name="${escapeAttr(name)}" value="true" ${checked ? "checked" : ""}>
+      ${escapeHtml(label)}
+    </label>
+  `;
+}
+
 function restaurantDetailOverview(detail) {
   const restaurant = detail.restaurant || {};
   return `
@@ -12266,40 +12205,149 @@ function restaurantDetailOverview(detail) {
 function restaurantDetailProfile(detail) {
   const restaurant = detail.restaurant || {};
   return `
-    <div class="restaurant-detail-grid">
-      <p><strong>${escapeHtml(t("restaurant_slug_label", "Public slug"))}</strong><br>${escapeHtml(restaurant.slug || t("not_available_label", "Not available"))}</p>
-      <p><strong>${escapeHtml(t("filter_cuisine_label", "Cuisine"))}</strong><br>${escapeHtml(restaurant.cuisine_type || restaurant.cuisine || "")}</p>
-      <p><strong>${escapeHtml(t("price_level_label", "Price level"))}</strong><br>${escapeHtml(restaurant.price_level || restaurant.price_range || "")}</p>
-      <p><strong>${escapeHtml(t("restaurant_visible_label", "Visible on guest site"))}</strong><br>${escapeHtml(String(restaurant.visible_on_guest_site === true))}</p>
-      <p><strong>${escapeHtml(t("seo_title_label", "SEO title"))}</strong><br>${escapeHtml(restaurant.seo_title || "")}</p>
-      <p><strong>${escapeHtml(t("seo_description_label", "SEO description"))}</strong><br>${escapeHtml(restaurant.seo_description || "")}</p>
+    <form class="mini-form admin-form restaurant-setup-form" id="restaurantProfileSetupForm" data-restaurant-setup="profile">
+      <input type="hidden" name="id" value="${escapeAttr(restaurant.id || "")}">
+      <div class="restaurant-detail-grid">
+        ${restaurantWizardField("name", t("restaurant_name_label", "Restaurant name"), restaurant.name || "", "required autocomplete=\"organization\"")}
+        ${restaurantWizardField("legal_name", t("restaurant_legal_name_label", "Legal business name"), restaurant.legal_name || restaurant.name || "")}
+        ${restaurantWizardField("slug", t("restaurant_slug_label", "Public slug"), restaurant.slug || "")}
+        ${restaurantWizardField("email", t("restaurant_primary_email_label", "Primary email"), restaurant.email || restaurant.contact_email || restaurant.primary_email || "", "type=\"email\" required")}
+        ${restaurantWizardField("reservation_email", t("restaurant_reservation_email_label", "Reservation email"), restaurant.reservation_email || restaurant.primary_email || restaurant.email || "", "type=\"email\"")}
+        ${restaurantWizardField("phone", t("phone_label", "Phone"), restaurant.phone || "", "type=\"tel\"")}
+        ${restaurantWizardField("website", t("website_label", "Website"), restaurant.website || "", "type=\"url\"")}
+        ${restaurantWizardField("address", t("street_address_label", "Street address"), restaurant.address || restaurant.street_address || "", "required")}
+        ${restaurantWizardField("city", t("city_label", "City"), restaurant.city || "New York")}
+        ${restaurantWizardField("district", t("filter_neighborhood_label", "Neighborhood"), restaurant.district || "")}
+        ${restaurantWizardField("state_region", t("state_region_label", "State / region"), restaurant.state_region || "")}
+        ${restaurantWizardField("postal_code", t("postal_code_label", "Postal code"), restaurant.postal_code || "")}
+        ${restaurantWizardField("country", t("country_label", "Country"), restaurant.country || "US")}
+        ${restaurantWizardField("cuisine_type", t("filter_cuisine_label", "Cuisine"), restaurant.cuisine_type || restaurant.cuisine || "", "required")}
+        ${restaurantWizardField("price_level", t("price_level_label", "Price level"), restaurant.price_level || restaurant.price_range || "$$")}
+        ${restaurantWizardField("primary_timezone", t("timezone_label", "Timezone"), restaurant.primary_timezone || "America/New_York", "required")}
+        ${restaurantWizardField("currency_code", t("currency_label", "Currency"), restaurant.currency_code || "USD")}
+        ${restaurantWizardTextarea("short_description", t("restaurant_short_description_label", "Short description"), restaurant.short_description || restaurant.description_en || restaurant.description || "")}
+        ${restaurantWizardTextarea("full_description", t("restaurant_full_description_label", "Full description"), restaurant.full_description || restaurant.description_en || restaurant.description || "")}
+        ${restaurantBooleanSetupField("visible_on_guest_site", t("restaurant_visible_label", "Visible on guest site"), restaurant.visible_on_guest_site === true)}
+      </div>
+      <details class="restaurant-setup-advanced">
+        <summary>${escapeHtml(t("advanced_settings_label", "Advanced settings"))}</summary>
+        <div class="restaurant-detail-grid">
+          ${restaurantWizardField("logo_url", t("restaurant_logo_label", "Logo URL"), restaurant.logo_url || "", "type=\"url\"")}
+          ${restaurantWizardField("cover_image", t("restaurant_cover_image_label", "Cover image URL"), restaurant.cover_image || "/assets/restaurant-hero.png")}
+          ${restaurantWizardField("instagram", "Instagram", restaurant.instagram || "", "type=\"url\"")}
+          ${restaurantWizardField("facebook", "Facebook", restaurant.facebook || "", "type=\"url\"")}
+          ${restaurantWizardField("tiktok", "TikTok", restaurant.tiktok || "", "type=\"url\"")}
+          ${restaurantWizardField("google_maps_url", "Google Maps", restaurant.google_maps_url || "", "type=\"url\"")}
+          ${restaurantWizardField("default_language", t("default_language_label", "Default language"), restaurant.default_language || "en")}
+          ${restaurantWizardField("supported_languages", t("supported_languages_label", "Supported languages"), Array.isArray(restaurant.supported_languages) ? restaurant.supported_languages.join(",") : "en,es,hu")}
+          ${restaurantWizardField("dining_style", t("restaurant_dining_style_label", "Dining style"), restaurant.dining_style || "")}
+          ${restaurantWizardField("dress_code", t("restaurant_dress_code_label", "Dress code"), restaurant.dress_code || "")}
+          ${restaurantWizardField("latitude", t("latitude_label", "Latitude"), restaurant.latitude ?? "", "type=\"number\" step=\"any\"")}
+          ${restaurantWizardField("longitude", t("longitude_label", "Longitude"), restaurant.longitude ?? "", "type=\"number\" step=\"any\"")}
+          ${restaurantWizardTextarea("gallery_images", t("restaurant_gallery_images_label", "Gallery image URLs"), Array.isArray(restaurant.gallery_images) ? restaurant.gallery_images.join("\n") : "", "placeholder=\"https://...\"")}
+          ${restaurantWizardTextarea("cuisine_categories", t("restaurant_cuisine_categories_label", "Cuisine categories"), Array.isArray(restaurant.cuisine_categories) ? restaurant.cuisine_categories.join(",") : "")}
+          ${restaurantWizardTextarea("public_contact_info", t("restaurant_public_contact_label", "Public contact information"), restaurant.public_contact_info || "")}
+          ${restaurantWizardField("seo_title", t("seo_title_label", "SEO title"), restaurant.seo_title || "")}
+          ${restaurantWizardTextarea("seo_description", t("seo_description_label", "SEO description"), restaurant.seo_description || "")}
+          ${restaurantWizardTextarea("accessibility_info", t("restaurant_accessibility_info_label", "Accessibility information"), restaurant.accessibility_info || "")}
+          ${restaurantWizardTextarea("parking_info", t("restaurant_parking_info_label", "Parking information"), restaurant.parking_info || "")}
+          ${restaurantBooleanSetupField("is_featured", t("restaurant_featured_label", "Featured restaurant"), restaurant.is_featured === true)}
+          ${restaurantBooleanSetupField("is_new_restaurant", t("restaurant_new_label", "New restaurant label"), restaurant.is_new_restaurant === true)}
+          ${restaurantBooleanSetupField("is_test_data", t("restaurant_test_data_label", "Test data"), restaurant.is_test_data === true || restaurant.is_test_restaurant === true)}
+        </div>
+      </details>
+      <button class="primary-button" type="submit">${escapeHtml(t("save_profile_button", "Save profile"))}</button>
+    </form>
+  `;
+}
+
+function restaurantServicePeriodRow(period = {}, rowId = "new") {
+  const selectedDay = String(period.day || period.day_of_week || "mon").toLowerCase();
+  return `
+    <div class="restaurant-service-period-row" data-service-period-row="${escapeAttr(rowId)}">
+      <label>${escapeHtml(t("day_label", "Day"))}
+        <select data-service-period-field="day">
+          ${Object.entries(dayLabels).map(([value, label]) => `<option value="${escapeAttr(value)}" ${selectedDay === value ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}
+        </select>
+      </label>
+      ${restaurantWizardField("period_label", t("service_period_label", "Service"), period.period || "dinner", "data-service-period-field=\"period\"")}
+      ${restaurantWizardField("opens_at", t("opens_label", "Opens"), period.opens || period.start_time || "17:00", "type=\"time\" data-service-period-field=\"opens\" required")}
+      ${restaurantWizardField("closes_at", t("closes_label", "Closes"), period.closes || period.end_time || "22:00", "type=\"time\" data-service-period-field=\"closes\" required")}
+      <button class="ghost-button danger" type="button" data-remove-service-period>${escapeHtml(t("remove_button", "Remove"))}</button>
     </div>
   `;
 }
 
 function restaurantDetailHours(detail) {
   const restaurant = detail.restaurant || {};
+  const periods = Array.isArray(restaurant.service_periods) ? restaurant.service_periods : [];
   return `
-    <div class="restaurant-detail-grid">
-      <p><strong>${escapeHtml(t("timezone_label", "Timezone"))}</strong><br>${escapeHtml(restaurant.primary_timezone || restaurant.timezone || "")}</p>
-      <p><strong>${escapeHtml(t("restaurant_interval_label", "Reservation interval minutes"))}</strong><br>${escapeHtml(restaurant.reservation_interval_minutes || "")}</p>
-      <p><strong>${escapeHtml(t("restaurant_booking_horizon_label", "Maximum booking horizon days"))}</strong><br>${escapeHtml(restaurant.booking_horizon_days || "")}</p>
-      <pre class="admin-json-preview">${escapeHtml(jsonForTextarea(restaurant.service_periods || []))}</pre>
-    </div>
+    <form class="mini-form admin-form restaurant-setup-form" id="restaurantHoursSetupForm" data-restaurant-setup="hours">
+      <input type="hidden" name="id" value="${escapeAttr(restaurant.id || "")}">
+      <div class="section-title-row compact">
+        <div>
+          <h4>${escapeHtml(t("restaurant_service_periods_title", "Service periods"))}</h4>
+          <p class="form-note">${escapeHtml(t("restaurant_service_periods_help", "Add each opening window separately. Times for the same day cannot overlap."))}</p>
+        </div>
+        <button class="ghost-button" type="button" data-add-service-period>${escapeHtml(t("add_service_period_button", "Add service period"))}</button>
+      </div>
+      <div class="restaurant-service-period-list" data-service-period-list>
+        ${(periods.length ? periods : [{ day: "mon", period: "dinner", opens: "17:00", closes: "22:00" }]).map((period, index) => restaurantServicePeriodRow(period, String(index))).join("")}
+      </div>
+      <div class="restaurant-detail-grid">
+        ${restaurantWizardField("reservation_interval_minutes", t("restaurant_interval_label", "Reservation interval minutes"), restaurant.reservation_interval_minutes || "30", "type=\"number\" min=\"5\" step=\"5\"")}
+        ${restaurantWizardField("booking_horizon_days", t("restaurant_booking_horizon_label", "Maximum booking horizon days"), restaurant.booking_horizon_days || "30", "type=\"number\" min=\"1\"")}
+        ${restaurantWizardField("minimum_booking_notice_minutes", t("restaurant_min_notice_label", "Minimum booking notice minutes"), restaurant.minimum_booking_notice_minutes ?? "30", "type=\"number\" min=\"0\"")}
+        ${restaurantWizardField("default_table_duration_minutes", t("restaurant_default_duration_label", "Default table duration minutes"), restaurant.default_table_duration_minutes || "90", "type=\"number\" min=\"15\"")}
+        ${restaurantWizardField("grace_period_minutes", t("restaurant_grace_period_label", "Grace period minutes"), restaurant.grace_period_minutes ?? "15", "type=\"number\" min=\"0\"")}
+        ${restaurantWizardField("last_seating_time", t("restaurant_last_seating_label", "Last seating time"), restaurant.last_seating_time || "", "type=\"time\"")}
+      </div>
+      <details class="restaurant-setup-advanced">
+        <summary>${escapeHtml(t("advanced_settings_label", "Advanced settings"))}</summary>
+        <div class="restaurant-detail-grid">
+          ${restaurantWizardTextarea("holiday_exceptions", t("restaurant_holiday_exceptions_label", "Holiday exceptions JSON"), jsonForTextarea(restaurant.holiday_exceptions || []))}
+          ${restaurantWizardTextarea("temporary_closures", t("restaurant_temporary_closures_label", "Temporary closures JSON"), jsonForTextarea(restaurant.temporary_closures || []))}
+        </div>
+      </details>
+      <button class="primary-button" type="submit">${escapeHtml(t("save_hours_button", "Save hours"))}</button>
+    </form>
   `;
 }
 
 function restaurantDetailReservationSettings(detail) {
   const restaurant = detail.restaurant || {};
   return `
-    <div class="restaurant-detail-grid">
-      <p><strong>${escapeHtml(t("restaurant_acceptance_mode_label", "Reservation acceptance mode"))}</strong><br>${escapeHtml(restaurant.reservation_acceptance_mode || "manual")}</p>
-      <p><strong>${escapeHtml(t("restaurant_min_party_size_label", "Minimum party size"))}</strong><br>${escapeHtml(restaurant.min_party_size || 1)}</p>
-      <p><strong>${escapeHtml(t("restaurant_max_party_size_label", "Maximum party size"))}</strong><br>${escapeHtml(restaurant.max_party_size || 8)}</p>
-      <p><strong>${escapeHtml(t("restaurant_accepts_reservation_requests", "Accept reservation requests"))}</strong><br>${escapeHtml(String(restaurant.accepts_reservation_requests !== false))}</p>
-      <p><strong>${escapeHtml(t("restaurant_cancellation_policy_label", "Cancellation policy text"))}</strong><br>${escapeHtml(restaurant.cancellation_policy || "")}</p>
-      <p><strong>${escapeHtml(t("restaurant_arrival_instructions_label", "Arrival instructions"))}</strong><br>${escapeHtml(restaurant.arrival_instructions || "")}</p>
-    </div>
+    <form class="mini-form admin-form restaurant-setup-form" id="restaurantReservationSetupForm" data-restaurant-setup="reservations">
+      <input type="hidden" name="id" value="${escapeAttr(restaurant.id || "")}">
+      <div class="restaurant-detail-grid">
+        <label>${escapeHtml(t("restaurant_acceptance_mode_label", "Reservation acceptance mode"))}
+          <select name="reservation_acceptance_mode">
+            <option value="manual" ${restaurant.reservation_acceptance_mode !== "automatic" ? "selected" : ""}>${escapeHtml(t("restaurant_acceptance_manual", "Manual approval"))}</option>
+            <option value="automatic" ${restaurant.reservation_acceptance_mode === "automatic" ? "selected" : ""}>${escapeHtml(t("restaurant_acceptance_automatic", "Automatic"))}</option>
+          </select>
+        </label>
+        ${restaurantWizardField("min_party_size", t("restaurant_min_party_size_label", "Minimum party size"), restaurant.min_party_size || "1", "type=\"number\" min=\"1\"")}
+        ${restaurantWizardField("max_party_size", t("restaurant_max_party_size_label", "Maximum party size"), restaurant.max_party_size || "8", "type=\"number\" min=\"1\"")}
+        ${restaurantWizardField("available_party_sizes", t("restaurant_party_options_label", "Available party-size options"), Array.isArray(restaurant.available_party_sizes) ? restaurant.available_party_sizes.join(",") : "1,2,3,4,5,6,7,8")}
+        ${restaurantWizardField("capacity", t("restaurant_capacity_label", "Guest capacity"), restaurant.capacity ?? "", "type=\"number\" min=\"0\"")}
+        ${restaurantWizardField("table_capacity", t("restaurant_table_capacity_label", "Table availability"), restaurant.table_capacity ?? "", "type=\"number\" min=\"0\"")}
+        ${restaurantBooleanSetupField("accepts_reservation_requests", t("restaurant_accepts_reservation_requests", "Accept reservation requests"), restaurant.accepts_reservation_requests !== false)}
+        ${restaurantBooleanSetupField("same_day_reservations_enabled", t("restaurant_same_day_label", "Same-day reservations"), restaurant.same_day_reservations_enabled !== false)}
+        ${restaurantBooleanSetupField("waitlist_enabled", t("restaurant_waitlist_label", "Waitlist enabled"), restaurant.waitlist_enabled === true)}
+        ${restaurantBooleanSetupField("special_requests_enabled", t("restaurant_special_requests_label", "Special requests"), restaurant.special_requests_enabled !== false)}
+        ${restaurantBooleanSetupField("accessibility_requests_enabled", t("restaurant_accessibility_requests_label", "Accessibility requests"), restaurant.accessibility_requests_enabled !== false)}
+        ${restaurantBooleanSetupField("high_chair_requests_enabled", t("restaurant_high_chair_label", "Child / high-chair request"), restaurant.high_chair_requests_enabled !== false)}
+        ${restaurantBooleanSetupField("occasion_field_enabled", t("restaurant_occasion_label", "Occasion field"), restaurant.occasion_field_enabled !== false)}
+        ${restaurantBooleanSetupField("partner_approval_required", t("restaurant_partner_approval_required", "Partner approval required"), restaurant.partner_approval_required !== false)}
+        ${restaurantBooleanSetupField("guest_notes_enabled", t("restaurant_guest_notes_enabled", "Guest notes enabled"), restaurant.guest_notes_enabled !== false)}
+        ${restaurantBooleanSetupField("internal_notes_enabled", t("restaurant_internal_notes_enabled", "Internal notes enabled"), restaurant.internal_notes_enabled !== false)}
+        ${restaurantWizardTextarea("cancellation_policy", t("restaurant_cancellation_policy_label", "Cancellation policy text"), restaurant.cancellation_policy || "")}
+        ${restaurantWizardTextarea("no_show_policy", t("restaurant_no_show_policy_label", "No-show policy text"), restaurant.no_show_policy || "")}
+        ${restaurantWizardTextarea("confirmation_message", t("restaurant_confirmation_message_label", "Confirmation message"), restaurant.confirmation_message || "")}
+        ${restaurantWizardTextarea("arrival_instructions", t("restaurant_arrival_instructions_label", "Arrival instructions"), restaurant.arrival_instructions || "")}
+      </div>
+      <button class="primary-button" type="submit">${escapeHtml(t("save_reservation_settings_button", "Save reservation settings"))}</button>
+    </form>
   `;
 }
 
@@ -13120,6 +13168,27 @@ function restaurantCreateSuccessMessage(restaurant = {}) {
   });
 }
 
+async function openCreatedRestaurantSetup(restaurant = {}) {
+  const restaurantId = String(restaurant?.id || "").trim();
+  if (!restaurantId) return false;
+  try {
+    const detail = await api(`/admin/restaurant-detail?id=${encodeURIComponent(restaurantId)}&fresh=${encodeURIComponent(Date.now())}`, {
+      cache: "no-store",
+      headers: { "cache-control": "no-store" }
+    });
+    state.adminRestaurantDetailId = restaurantId;
+    state.adminRestaurantDetail = detail;
+    state.adminRestaurantDetailTab = "overview";
+    renderAdmin();
+    window.setTimeout(() => {
+      document.querySelector("#admin-restaurant-detail")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 80);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function viewRestaurantInAdmin(id) {
   try {
     const payload = await api("/admin/restaurant-detail?id=" + encodeURIComponent(id));
@@ -13184,6 +13253,7 @@ async function submitRestaurant(event) {
     const persistedRestaurant = await verifyCreatedRestaurantPersisted(result.restaurant);
     await refreshAdminRestaurantListAfterCreate(persistedRestaurant);
     form.reset();
+    await openCreatedRestaurantSetup(persistedRestaurant);
     const successMessage = restaurantCreateSuccessMessage(persistedRestaurant);
     if (result.partner_access?.status === "failed") {
       throw new Error(t("restaurant_create_partner_access_failed", "Restaurant creation was not completed because partner access could not be created."));
@@ -13210,6 +13280,7 @@ async function submitRestaurant(event) {
         const persistedRestaurant = await verifyCreatedRestaurantPersisted(result.restaurant);
         await refreshAdminRestaurantListAfterCreate(persistedRestaurant);
         form.reset();
+        await openCreatedRestaurantSetup(persistedRestaurant);
         const successMessage = restaurantCreateSuccessMessage(persistedRestaurant);
         if (result.partner_access?.status === "failed") {
           throw new Error(t("restaurant_create_partner_access_failed", "Restaurant creation was not completed because partner access could not be created."));
@@ -13239,6 +13310,58 @@ async function submitPartner(event) {
     renderAdmin();
     showToast(t("partner_login_created_toast", "Partner login created."));
   } catch (error) {
+    showToast(error.message);
+  }
+}
+
+function bindServicePeriodRemoveButtons() {
+  document.querySelectorAll("[data-remove-service-period]").forEach((button) => {
+    if (button.dataset.bound === "true") return;
+    button.dataset.bound = "true";
+    button.addEventListener("click", () => button.closest("[data-service-period-row]")?.remove());
+  });
+}
+
+async function saveRestaurantSetupForm(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const submitButton = form.querySelector('[type="submit"]');
+  const payload = formObject(form);
+  const setup = form.dataset.restaurantSetup || "profile";
+  const restaurantId = String(payload.id || state.adminRestaurantDetailId || "").trim();
+  if (!restaurantId) {
+    showToast(t("restaurant_create_missing_id_error", "Restaurant ID is missing."));
+    return;
+  }
+  if (setup === "hours") {
+    const servicePeriods = Array.from(form.querySelectorAll("[data-service-period-row]")).map((row) => ({
+      day: row.querySelector('[data-service-period-field="day"]')?.value || "mon",
+      period: row.querySelector('[data-service-period-field="period"]')?.value || "service",
+      opens: row.querySelector('[data-service-period-field="opens"]')?.value || "",
+      closes: row.querySelector('[data-service-period-field="closes"]')?.value || ""
+    }));
+    payload.service_periods = servicePeriods;
+    for (const field of ["period_label", "opens_at", "closes_at"]) delete payload[field];
+  }
+  try {
+    setButtonPending(submitButton, true);
+    await api("/admin/restaurants", {
+      method: "PATCH",
+      body: JSON.stringify({ ...payload, id: restaurantId })
+    });
+    await replaceAdminRestaurantListFromServer({ forceFreshRestaurants: true });
+    state.adminRestaurantDetail = await api(`/admin/restaurant-detail?id=${encodeURIComponent(restaurantId)}&fresh=${encodeURIComponent(Date.now())}`, {
+      cache: "no-store",
+      headers: { "cache-control": "no-store" }
+    });
+    renderAdmin();
+    showToast(setup === "hours"
+      ? t("restaurant_hours_saved_toast", "Restaurant hours saved.")
+      : setup === "reservations"
+        ? t("restaurant_reservation_settings_saved_toast", "Reservation settings saved.")
+        : t("restaurant_profile_saved_toast", "Restaurant profile saved."));
+  } catch (error) {
+    setButtonPending(submitButton, false);
     showToast(error.message);
   }
 }
