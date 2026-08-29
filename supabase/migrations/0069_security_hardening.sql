@@ -115,10 +115,28 @@ end
 $$;
 
 -- Public catalog tables remain readable, but all writes must pass through the
--- authenticated API and its role checks.
-revoke insert, update, delete on table public.legal_documents from public, anon, authenticated;
-revoke insert, update, delete on table public.subscription_plans from public, anon, authenticated;
-revoke insert, update, delete on table public.markets from public, anon, authenticated;
+-- authenticated API and its role checks. BASIC environments do not all carry
+-- every optional catalog relation, so guard each statement by relation
+-- existence instead of making the security migration schema-snapshot-specific.
+do $$
+declare
+  relation_name text;
+  public_catalog_relations constant text[] := array[
+    'legal_documents',
+    'subscription_plans',
+    'markets'
+  ];
+begin
+  foreach relation_name in array public_catalog_relations loop
+    if to_regclass(format('public.%I', relation_name)) is not null then
+      execute format(
+        'revoke insert, update, delete on table public.%I from public, anon, authenticated',
+        relation_name
+      );
+    end if;
+  end loop;
+end
+$$;
 
 -- PostgreSQL grants EXECUTE on new functions to PUBLIC by default. Revoke the
 -- high-impact RPC surface (including every overload) and require the server API.

@@ -60,6 +60,9 @@ assert(hardening.includes("new.role is distinct from old.role"), "The profile gu
 assert(hardening.includes("new.restaurant_id is distinct from old.restaurant_id"), "The profile guard must protect tenant reassignment.");
 assert(hardening.includes("auth.role() <> 'service_role' and not public.is_admin()"), "Admin aggregate RPC must authorize inside its SECURITY DEFINER body.");
 assert(hardening.includes("alter default privileges in schema public"), "Future functions must not regain PUBLIC execute by default.");
+assert(hardening.includes("public_catalog_relations constant text[]"), "Optional public catalog grants must use a schema-compatible relation guard.");
+assert(hardening.includes("if to_regclass(format('public.%I', relation_name)) is not null then"), "Optional catalog hardening must skip relations absent from a supported environment.");
+assert(!hardening.includes("revoke insert, update, delete on table public.subscription_plans"), "Optional catalog tables must not be referenced by an unconditional statement.");
 
 assert(!securityHeaders.includes("script-src 'self' 'unsafe-inline'"), "Executable inline JavaScript must be removed from the CSP.");
 assert(!vercelConfig.includes("script-src 'self' 'unsafe-inline'"), "Vercel CSP must not allow executable inline JavaScript.");
