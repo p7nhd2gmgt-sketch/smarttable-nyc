@@ -116,6 +116,10 @@ assert(!publicApp.includes("food-feed-sound"), "Public Food Feed must not includ
 assert(publicApp.includes('class="food-feed-restaurant-link" type="button" data-food-feed-open='), "The visible restaurant name must open the restaurant profile.");
 assert(!publicApp.includes('class="ghost-button" type="button" data-food-feed-open='), "What to Eat must not duplicate the restaurant profile link with a second button.");
 assert(publicApp.includes('class="primary-button" type="button" data-food-feed-book='), "What to Eat must retain the Book a table action.");
+assert(publicApp.includes('"/partner/food-feed": "#partner-food-feed"'), "Legacy Partner food-video links must target the embedded profile manager.");
+assert(publicApp.includes('"/partner/food-feed": "profile"'), "Legacy Partner food-video links must open the Restaurant Profile tab.");
+assert(!/key:\s*"food-feed",\s*label:\s*t\("partner_food_feed_tab"/.test(publicApp), "Food-video management must not occupy a primary Partner navigation tab.");
+assert(publicApp.includes('${partnerProfilePanel}${partnerFoodFeedPanel()}'), "Restaurant Profile must include Partner food-video management.");
 for (const token of [
   "foodFeedPreviewRequest",
   'query.set("include_test_data", preview.includeTestData ? "true" : "false")',

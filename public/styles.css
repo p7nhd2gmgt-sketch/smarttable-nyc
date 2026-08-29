@@ -872,7 +872,8 @@ body.dashboard-route .language-selector__button {
 .icon-button,
 .link-button,
 .slot-button,
-.ghost-button {
+.ghost-button,
+.secondary-button {
   align-items: center;
   border: 0;
   cursor: pointer;
@@ -910,6 +911,7 @@ body.dashboard-route .language-selector__button {
 
 .primary-button:disabled,
 .ghost-button:disabled,
+.secondary-button:disabled,
 .icon-button:disabled,
 .link-button:disabled,
 .slot-button:disabled {
@@ -943,7 +945,8 @@ body.dashboard-route .language-selector__button {
   padding: 0;
 }
 
-.ghost-button {
+.ghost-button,
+.secondary-button {
   background: rgba(255, 255, 255, 0.78);
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -10148,10 +10151,186 @@ html[data-theme="dark"] .platform-header-menu {
   color: var(--ink);
 }
 
+/* The dark palette deliberately uses a light brand green. Pair it with dark
+   ink instead of the light-theme white label so primary controls meet WCAG
+   contrast requirements throughout public, account and dashboard screens. */
+html[data-theme="dark"] .skip-link,
+html[data-theme="dark"] .brand-mark,
+html[data-theme="dark"] .header-search-submit,
+html[data-theme="dark"] .primary-button:not(.danger),
+html[data-theme="dark"] .guest-primary-action,
+html[data-theme="dark"] .ghost-button.active,
+html[data-theme="dark"] .slot-button.active,
+html[data-theme="dark"] .ai-chip input:checked + span,
+html[data-theme="dark"] .map-info button,
+html[data-theme="dark"] .demand-score-badge,
+html[data-theme="dark"] .advisor-bubble.user {
+  color: #101713;
+}
+
+html[data-theme="dark"] .ghost-button.active,
+html[data-theme="dark"] .slot-button.active {
+  background: var(--green);
+  border-color: var(--green);
+}
+
+html[data-theme="dark"] .primary-button:disabled,
+html[data-theme="dark"] .ghost-button:disabled,
+html[data-theme="dark"] .secondary-button:disabled,
+html[data-theme="dark"] .icon-button:disabled,
+html[data-theme="dark"] .link-button:disabled,
+html[data-theme="dark"] .slot-button:disabled,
+html[data-theme="dark"] .guest-primary-action:disabled,
+html[data-theme="dark"] .guest-secondary-action:disabled {
+  background: #52615a;
+  border-color: #65766d;
+  color: #f3f7f3;
+  opacity: 1;
+}
+
+html[data-theme="dark"] .guest-secondary-action,
+html[data-theme="dark"] .guest-icon-action,
+html[data-theme="dark"] .guest-choice,
+html[data-theme="dark"] .guest-filter-chip,
+html[data-theme="dark"] .guest-empty-state {
+  background: var(--guest-surface-raised);
+  border-color: var(--guest-line);
+  color: var(--guest-ink);
+}
+
+html[data-theme="dark"] .guest-error-state {
+  background: #3d211d;
+  border-color: #774139;
+  color: #ffb1aa;
+}
+
+html[data-theme="dark"] .guest-badge.warning,
+html[data-theme="dark"] .guest-badge.test-restaurant-badge {
+  background: #3b301c;
+  color: #f5cf81;
+}
+
+html[data-theme="dark"] .signup-page {
+  background: rgba(24, 33, 28, 0.97);
+  border-color: var(--guest-line);
+  color: var(--guest-ink);
+}
+
+html[data-theme="dark"] .discount-pill {
+  background: #4a251f;
+  border-color: #784036;
+  color: #ffb1aa;
+}
+
+html[data-theme="dark"] .restaurant-detail-tabs .active {
+  color: #101713;
+}
+
+html[data-theme="dark"] .dashboard-tabs-shell {
+  background: rgba(24, 33, 28, 0.97);
+  border-color: var(--line);
+  box-shadow: var(--shadow-soft);
+}
+
+html[data-theme="dark"] .dashboard-tab {
+  color: var(--ink);
+}
+
+html[data-theme="dark"] .dashboard-tab:hover,
+html[data-theme="dark"] .dashboard-tab.active,
+html[data-theme="dark"] .dashboard-tab[aria-selected="true"] {
+  background: #263329;
+  color: var(--green);
+}
+
+html[data-theme="dark"] .notification-button span {
+  color: #2c1210;
+}
+
+html[data-theme="dark"] .log-row.warning,
+html[data-theme="dark"] .warning-note {
+  background: #3b301c;
+  border-color: #705c2d;
+  color: #f5cf81;
+}
+
+/* Keep floating navigation controls readable in dark appearance. These
+   controls previously retained light hover/selected backgrounds while their
+   text inherited the dark-theme foreground color. */
+html[data-theme="dark"] .city-selector__button:hover,
+html[data-theme="dark"] .city-selector__button:focus-visible,
+html[data-theme="dark"] .city-selector.open .city-selector__button,
+html[data-theme="dark"] .header-search-toggle:hover,
+html[data-theme="dark"] .header-search-toggle:focus-visible,
+html[data-theme="dark"] .topbar.search-open .header-search-toggle {
+  background: #263329;
+  color: var(--green);
+}
+
+html[data-theme="dark"] .city-selector__menu,
+html[data-theme="dark"] .language-selector__menu,
+html[data-theme="dark"] .account-menu,
+html[data-theme="dark"] .header-search-panel {
+  background: var(--surface);
+  border-color: var(--line);
+  color: var(--ink);
+}
+
+html[data-theme="dark"] .city-selector__option,
+html[data-theme="dark"] .language-selector__option,
+html[data-theme="dark"] .account-menu button,
+html[data-theme="dark"] .top-actions a {
+  color: var(--ink);
+}
+
+html[data-theme="dark"] .city-selector__option:hover,
+html[data-theme="dark"] .city-selector__option:focus-visible,
+html[data-theme="dark"] .city-selector__option[aria-selected="true"],
+html[data-theme="dark"] .language-selector__option:hover,
+html[data-theme="dark"] .language-selector__option:focus-visible,
+html[data-theme="dark"] .account-menu button:hover {
+  background: #263329;
+  color: var(--ink);
+}
+
+html[data-theme="dark"] .language-selector__option[aria-selected="true"] {
+  background: #315343;
+  color: #f3f7f3;
+}
+
+html[data-theme="dark"] .city-selector__option:disabled {
+  background: transparent;
+  color: var(--muted);
+  opacity: 1;
+}
+
+html[data-theme="dark"] .city-selector__option:disabled strong,
+html[data-theme="dark"] .city-selector__option:disabled small {
+  color: var(--muted);
+}
+
+html[data-theme="dark"] .header-search-close,
+html[data-theme="dark"] .header-search-shortcut__icon {
+  background: var(--surface-2);
+  border-color: var(--line);
+  color: var(--green);
+}
+
+html[data-theme="dark"] .header-search-close:hover,
+html[data-theme="dark"] .header-search-shortcuts > button:hover .header-search-shortcut__icon,
+html[data-theme="dark"] .header-search-shortcuts > button:focus-visible .header-search-shortcut__icon {
+  background: #263329;
+  border-color: var(--line-strong);
+  color: var(--ink);
+}
+
 html[data-theme="dark"] .filters,
 html[data-theme="dark"] .dashboard-head,
 html[data-theme="dark"] .dashboard-sidebar,
 html[data-theme="dark"] .login-card,
+html[data-theme="dark"] .signup-card,
+html[data-theme="dark"] .signup-progress .active button,
+html[data-theme="dark"] .signup-progress .done button,
 html[data-theme="dark"] .panel,
 html[data-theme="dark"] .stat-card,
 html[data-theme="dark"] .newest-card,
@@ -10171,8 +10350,13 @@ html[data-theme="dark"] .portfolio-card,
 html[data-theme="dark"] .marketing-message-card,
 html[data-theme="dark"] .feedback-insight-card,
 html[data-theme="dark"] .feedback-card,
+html[data-theme="dark"] .public-review-card,
+html[data-theme="dark"] .review-lightbox-panel,
+html[data-theme="dark"] .review-photo-preview,
+html[data-theme="dark"] .review-photo-thumb,
 html[data-theme="dark"] .advisor-drawer,
 html[data-theme="dark"] .advisor-bubble.assistant,
+html[data-theme="dark"] .advisor-messages,
 html[data-theme="dark"] .public-info-grid article,
 html[data-theme="dark"] .site-footer,
 html[data-theme="dark"] .legal-document-section,
@@ -10181,12 +10365,64 @@ html[data-theme="dark"] .today-list-item,
 html[data-theme="dark"] .reservation-contact-block,
 html[data-theme="dark"] .account-settings-card,
 html[data-theme="dark"] .consent-status-card,
+html[data-theme="dark"] .compact-list > div,
+html[data-theme="dark"] .account-list-card,
+html[data-theme="dark"] .favorite-card,
+html[data-theme="dark"] .reservation-history-card,
+html[data-theme="dark"] .notification-card,
+html[data-theme="dark"] .locked-setting,
+html[data-theme="dark"] .disabled-channel,
+html[data-theme="dark"] .signup-review-grid article,
 html[data-theme="dark"] .food-feed-auth-dialog,
 html[data-theme="dark"] .saved-dish-card,
 html[data-theme="dark"] .food-feed-management-card {
   background: var(--surface);
   border-color: var(--line);
   color: var(--ink);
+}
+
+html[data-theme="dark"] .single-language-content-card {
+  background: var(--surface-2);
+  border-color: var(--line);
+  color: var(--ink);
+}
+
+html[data-theme="dark"] .marketplace-insight-card,
+html[data-theme="dark"] .analytics-chart-card {
+  background: var(--surface-2);
+  border-color: var(--line);
+  color: var(--ink);
+}
+
+html[data-theme="dark"] .guest-badge:not(.warning):not(.test-restaurant-badge) {
+  background: #263b32;
+  color: var(--ink);
+}
+
+html[data-theme="dark"] .secondary-button {
+  background: var(--surface-2);
+  border-color: var(--line);
+  color: var(--ink);
+}
+
+html[data-theme="dark"] th {
+  color: var(--ink);
+}
+
+html[data-theme="dark"] .reservation-alert-grid div,
+html[data-theme="dark"] .device-card,
+html[data-theme="dark"] .alert-instructions {
+  background: var(--surface-2);
+  border-color: var(--line);
+  color: var(--ink);
+}
+
+html[data-theme="dark"] .reservation-alert-grid dt {
+  color: var(--muted);
+}
+
+html[data-theme="dark"] .progress-bar {
+  background: #263329;
 }
 
 html[data-theme="dark"] .ai-metrics span,
@@ -10222,6 +10458,30 @@ html[data-theme="dark"] .benchmark-card {
   background: var(--surface-2);
   border-color: var(--line);
   color: var(--ink);
+}
+
+/* Several legacy dashboard cards use explicit light-theme text colors.
+   Their parent surfaces are converted above, so their descendants must use
+   the matching semantic dark-theme foregrounds as well. */
+html[data-theme="dark"] .executive-copy > strong,
+html[data-theme="dark"] .ceo-greeting,
+html[data-theme="dark"] .owner-hero-message,
+html[data-theme="dark"] .owner-why-grid strong,
+html[data-theme="dark"] .owner-recommendation-grid strong,
+html[data-theme="dark"] .ai-confidence-details summary,
+html[data-theme="dark"] .portfolio-card strong,
+html[data-theme="dark"] .feedback-insight-card strong,
+html[data-theme="dark"] .feedback-review,
+html[data-theme="dark"] .feedback-detail-list dd,
+html[data-theme="dark"] .mini-progress-row strong {
+  color: var(--ink);
+}
+
+html[data-theme="dark"] .skeleton-line,
+html[data-theme="dark"] .skeleton-card,
+html[data-theme="dark"] .skeleton-panel {
+  background: linear-gradient(90deg, #202b24, #35443a, #202b24);
+  background-size: 220% 100%;
 }
 
 html[data-theme="dark"] .tag,

@@ -229,7 +229,7 @@ async function reservationRow() {
     ...reservation,
     reservation_id: reservation.id,
     restaurant_name: restaurant.name,
-    restaurant_email: restaurant.reservation_notification_email || restaurant.email || restaurant.contact_email,
+    restaurant_email: restaurant.reservation_notification_email || restaurant.reservation_email || restaurant.email || restaurant.contact_email,
     offer_title: offer.title_en,
     discount_percent: offer.discount_percent || offer.discount_value,
     offer_date: offer.offer_date,

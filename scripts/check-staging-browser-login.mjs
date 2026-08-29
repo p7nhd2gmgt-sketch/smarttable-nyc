@@ -208,8 +208,9 @@ async function submitLogin(page, spec, route, env) {
 }
 
 async function acknowledgeBlockingReservationAlerts(page) {
+  const maxAcknowledgements = 50;
   let acknowledgedCount = 0;
-  while (acknowledgedCount < 5) {
+  while (acknowledgedCount < maxAcknowledgements) {
     const backdrop = page.locator(".reservation-alert-backdrop");
     if (!(await backdrop.isVisible().catch(() => false))) return acknowledgedCount;
 
@@ -230,7 +231,7 @@ async function acknowledgeBlockingReservationAlerts(page) {
     }, alertId, { timeout: 20_000 });
   }
   if (await page.locator(".reservation-alert-backdrop").isVisible().catch(() => false)) {
-    throw new Error("More than five reservation alerts blocked staging logout.");
+    throw new Error(`More than ${maxAcknowledgements} reservation alerts blocked staging logout.`);
   }
   return acknowledgedCount;
 }
@@ -252,6 +253,13 @@ async function logout(page, key) {
 
 async function runAccount(page, spec, env) {
   const route = ACCOUNT_ROUTES[spec.key];
+  const analyticsResponses = [];
+  const recordAnalyticsResponse = (response) => {
+    const request = response.request();
+    if (request.method() !== "POST" || !/(?:\/api\/analytics\/events|\/rest\/v1\/analytics_events)(?:\?|$)/.test(response.url())) return;
+    analyticsResponses.push({ status: response.status(), ok: response.ok() });
+  };
+  page.on("response", recordAnalyticsResponse);
   const result = {
     email: accountEmail(env, spec),
     role: displayRole(spec.role),
@@ -269,6 +277,8 @@ async function runAccount(page, spec, env) {
     forbidden_route: "FAIL",
     logout: "FAIL",
     staging_alerts_acknowledged_before_logout: 0,
+    staging_analytics_events_recorded: 0,
+    staging_analytics_event_failures: 0,
     final: "FAIL",
     failure_reason: ""
   };
@@ -285,6 +295,21 @@ async function runAccount(page, spec, env) {
     result.role_returned = session?.role || "";
     if (!session?.session_exists || session.role !== route.expectedRole) {
       throw new Error(`Unexpected stored role after login: ${session?.role || "none"}.`);
+    }
+
+    if (spec.key === "guest") {
+      const analyticsProbe = await page.evaluate(async () => {
+        const response = await fetch("/api/analytics/events", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            event_type: "signup_started",
+            metadata: { source: "staging_release_readiness" }
+          })
+        });
+        return { ok: response.ok, status: response.status };
+      });
+      if (!analyticsProbe.ok) throw new Error(`Analytics persistence probe failed with HTTP ${analyticsProbe.status}.`);
     }
 
     await page.reload({ waitUntil: "domcontentloaded" });
@@ -308,6 +333,13 @@ async function runAccount(page, spec, env) {
     const sessionAfterLogout = await storedSession(page);
     if (sessionAfterLogout?.session_exists) throw new Error("Session still exists after logout.");
     result.logout = "PASS";
+    await page.waitForTimeout(250);
+    result.staging_analytics_events_recorded = analyticsResponses.filter((response) => response.ok).length;
+    result.staging_analytics_event_failures = analyticsResponses.filter((response) => !response.ok).length;
+    if (result.staging_analytics_event_failures) {
+      const statuses = analyticsResponses.filter((response) => !response.ok).map((response) => response.status).join(", ");
+      throw new Error(`Analytics event persistence failed with HTTP ${statuses}.`);
+    }
     result.final = "PASS";
   } catch (error) {
     result.failure_reason = error.message;
@@ -338,6 +370,9 @@ async function runAccount(page, spec, env) {
       };
     }).catch(() => null);
   } finally {
+    result.staging_analytics_events_recorded = analyticsResponses.filter((response) => response.ok).length;
+    result.staging_analytics_event_failures = analyticsResponses.filter((response) => !response.ok).length;
+    page.off("response", recordAnalyticsResponse);
     await page.context().clearCookies().catch(() => null);
     await page.evaluate(() => {
       window.localStorage.removeItem("smarttable.session");
@@ -372,6 +407,11 @@ async function main() {
 
   const failed = results.filter((row) => row.final !== "PASS");
   const acknowledgedAlertCount = results.reduce((total, row) => total + Number(row.staging_alerts_acknowledged_before_logout || 0), 0);
+  const analyticsEventCount = results.reduce((total, row) => total + Number(row.staging_analytics_events_recorded || 0), 0);
+  const stagingWriteScopes = [
+    acknowledgedAlertCount > 0 ? "reservation_alert_acknowledgements" : "",
+    analyticsEventCount > 0 ? "analytics_events" : ""
+  ].filter(Boolean);
   console.log(JSON.stringify({
     status: failed.length ? "staging_browser_login_check_failed" : "staging_browser_login_check_passed",
     staging_project_ref: projectRef,
@@ -380,9 +420,10 @@ async function main() {
     browser_target_origin: new URL(target.baseUrl).origin,
     headed,
     secrets_printed: false,
-    staging_writes_performed: acknowledgedAlertCount > 0,
-    staging_write_scope: acknowledgedAlertCount > 0 ? "reservation_alert_acknowledgements_only" : "none",
+    staging_writes_performed: stagingWriteScopes.length > 0,
+    staging_write_scope: stagingWriteScopes.length ? stagingWriteScopes.join(",") : "none",
     staging_alert_acknowledgement_count: acknowledgedAlertCount,
+    staging_analytics_event_count: analyticsEventCount,
     accounts: results
   }, null, 2));
   if (failed.length) process.exit(1);

@@ -159,6 +159,10 @@ function isSessionExpired(session) {
   return Boolean(expiry && expiry <= Date.now());
 }
 
+function isPrivilegedWebSession(session = {}) {
+  return ["admin", "super_admin"].includes(normalizeRole(session?.profile?.role));
+}
+
 function withSessionExpiry(session, remember = true) {
   if (!session) return null;
   const existingExpiry = sessionExpiryMs(session);
@@ -168,8 +172,14 @@ function withSessionExpiry(session, remember = true) {
 }
 
 function storedSession() {
+  const persisted = readStoredJson(localStorage, "smarttable.session");
+  if (persisted && isPrivilegedWebSession(persisted)) {
+    // Privileged sessions must never survive a browser restart. Remove legacy
+    // persistent admin tokens and require an explicit sign-in instead.
+    localStorage.removeItem("smarttable.session");
+  }
   const candidates = [
-    readStoredJson(localStorage, "smarttable.session"),
+    isPrivilegedWebSession(persisted) ? null : persisted,
     readStoredJson(sessionStorage, "smarttable.session")
   ].filter(Boolean);
   const session = candidates.find((candidate) => !isSessionExpired(candidate));
@@ -1048,7 +1058,7 @@ function currentProtectedAreaRoute() {
   const partnerTargets = {
     "/partner": "#partner-tab-panel-overview",
     "/partner/offers": "#partner-tab-panel-offers",
-    "/partner/food-feed": "#partner-tab-panel-food-feed",
+    "/partner/food-feed": "#partner-food-feed",
     "/partner/reservations": "#partner-tab-panel-reservations",
     "/partner/profile": "#partner-tab-panel-profile",
     "/partner/capacity": "#partner-tab-panel-capacity",
@@ -1471,7 +1481,7 @@ function isAuthError(error) {
 function persistCurrentSession() {
   if (!state.session) return;
   const serialized = JSON.stringify(state.session);
-  if (state.session.remember_me === false) {
+  if (isPrivilegedWebSession(state.session) || state.session.remember_me === false) {
     sessionStorage.setItem("smarttable.session", serialized);
     localStorage.removeItem("smarttable.session");
   } else {
@@ -1481,7 +1491,9 @@ function persistCurrentSession() {
 }
 
 function saveSession(session, options = {}) {
-  const remember = options.remember === false ? false : session?.remember_me !== false;
+  const remember = isPrivilegedWebSession(session)
+    ? false
+    : options.remember === false ? false : session?.remember_me !== false;
   state.session = withSessionExpiry(session, remember);
   if (session) {
     state.session.remember_me = remember;
@@ -3281,6 +3293,7 @@ function activeDashboardTab(area, tabs) {
   };
   const legacyPartnerRoutes = {
     "/partner/deals": "offers",
+    "/partner/food-feed": "profile",
     "/partner/settings": "profile"
   };
   const legacy = area === "partner" ? legacyPartnerRoutes[path] : legacyAdminRoutes[path];
@@ -13739,7 +13752,7 @@ async function loadPartnerData() {
     api("/partner/stats"),
     api(`/partner/analytics${queryStringFromFilters(state.partnerAnalyticsFilters)}`).catch(() => ({ analytics: null })),
     api("/partner/reviews").catch(() => ({ reviews: [] })),
-    api("/partner/food-feed").catch(() => ({ videos: [] })),
+    api("/partner/food-feed").catch(() => ({ videos: [], unavailable: true })),
     api("/partner/billing").catch(() => ({ billing: null, plans: [], invoices: [], stripe: { configured: false } })),
     basicMode ? Promise.resolve({ campaigns: [], templates: [] }) : api("/partner/campaigns").catch(() => ({ campaigns: [], templates: [] })),
     basicMode ? Promise.resolve({ campaigns: [], provider: { configured: false } }) : api("/partner/sms-campaigns").catch(() => ({ campaigns: [], provider: { configured: false } })),
@@ -13759,6 +13772,7 @@ async function loadPartnerData() {
   state.partnerAnalytics = analytics.analytics || null;
   state.partnerReviews = reviews.reviews || [];
   state.partnerFoodFeedVideos = foodFeed.videos || [];
+  state.partnerFoodFeedUnavailable = Boolean(foodFeed.unavailable);
   state.partnerBilling = billing || null;
   state.partnerCampaigns = campaigns || null;
   state.partnerSmsCampaigns = smsCampaigns || null;
@@ -15953,11 +15967,16 @@ function partnerFoodFeedPanel() {
     <article class="panel food-feed-manager" id="partner-food-feed">
       <div class="section-title-row compact">
         <div>
-          <span class="section-kicker">What to Eat</span>
-          <h2>${escapeHtml(t("partner_food_feed_title", "3-second food videos"))}</h2>
+          <span class="section-kicker">${escapeHtml(t("partner_food_feed_tab", "Food videos"))}</span>
+          <h2>${escapeHtml(t("partner_food_feed_title", "Food videos for Crave"))}</h2>
           <p class="muted">${escapeHtml(t("partner_food_feed_intro", "Upload a vertical 3-second dish video. SmartTable reviews it before it appears publicly."))}</p>
         </div>
       </div>
+      ${state.partnerFoodFeedUnavailable ? `
+        <div class="notice-card subtle">
+          <p>${escapeHtml(t("partner_food_feed_unavailable", "Food video management is temporarily unavailable. Please try again."))}</p>
+        </div>
+      ` : ""}
       <form class="mini-form food-feed-upload-form" id="partnerFoodFeedForm">
         <div class="form-grid">
           ${textInput("title", t("partner_food_feed_video_title", "Video title"), "", "text", "required maxlength=\"120\"")}
@@ -18120,16 +18139,10 @@ function renderBasicPartner(restaurant, stats, greeting) {
       content: `<section class="dashboard-grid two-col">${partnerOffersPanel}</section>`
     },
     {
-      key: "food-feed",
-      label: t("partner_food_feed_tab", "What to Eat"),
-      compactLabel: t("partner_food_feed_tab", "What to Eat"),
-      content: `<section class="dashboard-grid one-col">${partnerFoodFeedPanel()}</section>`
-    },
-    {
       key: "profile",
       label: t("partner_tab_profile", "Restaurant Profile"),
       compactLabel: t("partner_tab_profile_compact", "Profile"),
-      content: `<section class="dashboard-grid one-col">${partnerProfilePanel}</section>`
+      content: `<section class="dashboard-grid one-col">${partnerProfilePanel}${partnerFoodFeedPanel()}</section>`
     },
     {
       key: "capacity",

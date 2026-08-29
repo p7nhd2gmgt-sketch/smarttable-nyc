@@ -12,7 +12,7 @@ import {
 } from "./offer-validity.js";
 import { createEmailService, isEmailAccepted } from "./email-service.js";
 import { DEFAULT_MARKET_CODE, defaultMarket, publicMarketConfig, resolveMarketContext } from "./market-config.js";
-import { createPushService } from "./push-service.js";
+import { createMobilePushService, createPushService, isExpoPushToken } from "./push-service.js";
 import { createSmsService } from "./sms-service.js";
 import { createVoiceService } from "./voice-service.js";
 import { createReservationProvider, reservationProviderCatalog } from "./reservation-providers.js";
@@ -164,7 +164,12 @@ const ADMIN_NOTIFICATION_EMAIL = envClean(process.env.ADMIN_NOTIFICATION_EMAIL |
 const SUPABASE_STORAGE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET || "smarttable-media";
 const FOOD_FEED_STORAGE_BUCKET = process.env.FOOD_FEED_STORAGE_BUCKET || "food-feed-videos";
 const GOOGLE_MAPS_API_KEY = process.env.VITE_GOOGLE_MAPS_API_KEY || process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY || process.env.GOOGLE_MAPS_API_KEY || "";
-const IMPERSONATION_SECRET = process.env.IMPERSONATION_SECRET || SUPABASE_SERVICE_ROLE_KEY || "smarttable-dev-secret";
+const RAW_IMPERSONATION_SECRET = envClean(process.env.IMPERSONATION_SECRET || "");
+// Impersonation tokens must never share a database credential. Local demo mode gets
+// an ephemeral process secret; production fails closed until a dedicated secret exists.
+const IMPERSONATION_SECRET = RAW_IMPERSONATION_SECRET || (!IS_PRODUCTION_RUNTIME ? crypto.randomBytes(32).toString("base64url") : "");
+const ADMIN_MFA_REQUIRED = envFlag(process.env.ADMIN_MFA_REQUIRED, false);
+const ADMIN_ACCESS_TOKEN_MAX_AGE_SECONDS = Math.max(300, Number(process.env.ADMIN_ACCESS_TOKEN_MAX_AGE_SECONDS || 3600));
 const TERMS_VERSION = process.env.TERMS_VERSION || "2026-07-17";
 const PRIVACY_POLICY_VERSION = process.env.PRIVACY_POLICY_VERSION || "2026-07-17";
 const LEGAL_DOCUMENT_VERSION = process.env.LEGAL_DOCUMENT_VERSION || TERMS_VERSION;
@@ -209,6 +214,9 @@ const PUSH_PROVIDER = envClean(process.env.PUSH_PROVIDER || "disabled").toLowerC
 const VAPID_PUBLIC_KEY = envClean(process.env.VAPID_PUBLIC_KEY || "");
 const VAPID_PRIVATE_KEY = envClean(process.env.VAPID_PRIVATE_KEY || "");
 const VAPID_SUBJECT = envClean(process.env.VAPID_SUBJECT || `mailto:support@smarttablenyc.com`);
+const MOBILE_PUSH_PROVIDER = envClean(process.env.MOBILE_PUSH_PROVIDER || "disabled").toLowerCase();
+const MOBILE_PUSH_TOKEN_ENCRYPTION_KEY = envClean(process.env.MOBILE_PUSH_TOKEN_ENCRYPTION_KEY || "");
+const EXPO_PUSH_ACCESS_TOKEN = envClean(process.env.EXPO_PUSH_ACCESS_TOKEN || "");
 const RESERVATION_ALERT_SMS_FALLBACK_SECONDS = Math.max(15, Number(process.env.RESERVATION_ALERT_SMS_FALLBACK_SECONDS || 60));
 const RESERVATION_ALERT_ESCALATION_SECONDS = Math.max(60, Number(process.env.RESERVATION_ALERT_ESCALATION_SECONDS || 300));
 const RESERVATION_ALERT_POLL_SECONDS = Math.max(3, Number(process.env.RESERVATION_ALERT_POLL_SECONDS || 5));
@@ -258,6 +266,25 @@ const SUPABASE_REQUEST_TIMEOUT_MS = Math.max(1000, Number(process.env.SUPABASE_R
 const API_RATE_LIMIT_WINDOW_MS = Math.max(1000, Number(process.env.API_RATE_LIMIT_WINDOW_MS || 60_000));
 const API_MUTATION_RATE_LIMIT = Math.max(1, Number(process.env.API_MUTATION_RATE_LIMIT || (IS_PRODUCTION_RUNTIME ? 180 : 2000)));
 const AUTH_MUTATION_RATE_LIMIT = Math.max(1, Number(process.env.AUTH_MUTATION_RATE_LIMIT || (IS_PRODUCTION_RUNTIME ? 60 : 2000)));
+const AUTH_LOGIN_RATE_LIMIT = Math.max(1, Number(process.env.AUTH_LOGIN_RATE_LIMIT || (IS_PRODUCTION_RUNTIME ? 10 : 2000)));
+const AUTH_LOGIN_RATE_LIMIT_WINDOW_MS = Math.max(60_000, Number(process.env.AUTH_LOGIN_RATE_LIMIT_WINDOW_MS || 15 * 60 * 1000));
+const AUTH_SIGNUP_RATE_LIMIT = Math.max(1, Number(process.env.AUTH_SIGNUP_RATE_LIMIT || (IS_PRODUCTION_RUNTIME ? 5 : 2000)));
+const AUTH_SIGNUP_RATE_LIMIT_WINDOW_MS = Math.max(60_000, Number(process.env.AUTH_SIGNUP_RATE_LIMIT_WINDOW_MS || 60 * 60 * 1000));
+const AUTH_RECOVERY_RATE_LIMIT = Math.max(1, Number(process.env.AUTH_RECOVERY_RATE_LIMIT || (IS_PRODUCTION_RUNTIME ? 3 : 2000)));
+const AUTH_RECOVERY_RATE_LIMIT_WINDOW_MS = Math.max(60_000, Number(process.env.AUTH_RECOVERY_RATE_LIMIT_WINDOW_MS || 10 * 60 * 1000));
+const RESERVATION_CREATE_RATE_LIMIT = Math.max(1, Number(process.env.RESERVATION_CREATE_RATE_LIMIT || (IS_PRODUCTION_RUNTIME ? 20 : 2000)));
+const RESERVATION_CREATE_RATE_LIMIT_WINDOW_MS = Math.max(60_000, Number(process.env.RESERVATION_CREATE_RATE_LIMIT_WINDOW_MS || 10 * 60 * 1000));
+const DISTRIBUTED_RATE_LIMIT_ENABLED = envFlag(process.env.DISTRIBUTED_RATE_LIMIT_ENABLED, false);
+const DISTRIBUTED_RATE_LIMIT_FAIL_CLOSED = envFlag(
+  process.env.DISTRIBUTED_RATE_LIMIT_FAIL_CLOSED,
+  RUNTIME_ENVIRONMENT !== "development"
+);
+const DISTRIBUTED_RATE_LIMIT_TIMEOUT_MS = Math.max(
+  500,
+  Math.min(5000, Number(process.env.DISTRIBUTED_RATE_LIMIT_TIMEOUT_MS || 1500))
+);
+const MOBILE_PUSH_DEVICE_MUTATION_LIMIT = Math.max(1, Number(process.env.MOBILE_PUSH_DEVICE_MUTATION_LIMIT || (IS_PRODUCTION_RUNTIME ? 30 : 500)));
+const MOBILE_PUSH_DEVICE_MUTATION_WINDOW_MS = Math.max(60_000, Number(process.env.MOBILE_PUSH_DEVICE_MUTATION_WINDOW_MS || 5 * 60 * 1000));
 const MAX_JSON_BODY_BYTES = Math.max(16 * 1024, Number(process.env.MAX_JSON_BODY_BYTES || 256 * 1024));
 const APPLICATION_VERSION = envClean(process.env.npm_package_version || process.env.SMARTTABLE_VERSION || "");
 const APPLICATION_COMMIT = envClean(process.env.VERCEL_GIT_COMMIT_SHA || process.env.GIT_COMMIT_SHA || "").slice(0, 40);
@@ -311,6 +338,16 @@ const pushService = createPushService({
   environment: RUNTIME_ENVIRONMENT,
   fetchImpl: fetch
 });
+const mobilePushKey = mobilePushEncryptionKey(MOBILE_PUSH_TOKEN_ENCRYPTION_KEY);
+const mobilePushService = createMobilePushService({
+  provider: MOBILE_PUSH_PROVIDER,
+  accessToken: EXPO_PUSH_ACCESS_TOKEN,
+  enabled: Boolean(mobilePushKey),
+  reason: MOBILE_PUSH_PROVIDER === "expo" && !mobilePushKey
+    ? "Native push token encryption is not configured."
+    : undefined,
+  fetchImpl: fetch
+});
 
 function productionConfigurationIssues() {
   if (!IS_PRODUCTION_RUNTIME) return [];
@@ -328,6 +365,10 @@ function productionConfigurationIssues() {
     }
   }
   if (!RESEND_API_KEY) issues.push("RESEND_API_KEY_MISSING");
+  if (!RAW_IMPERSONATION_SECRET || RAW_IMPERSONATION_SECRET.length < 32) {
+    issues.push("IMPERSONATION_SECRET_MISSING_OR_WEAK");
+  }
+  if (MOBILE_PUSH_PROVIDER === "expo" && !mobilePushKey) issues.push("MOBILE_PUSH_TOKEN_ENCRYPTION_KEY_MISSING_OR_INVALID");
   return issues;
 }
 
@@ -376,6 +417,8 @@ async function runtimeHealthPayload() {
   const issues = productionConfigurationIssues();
   const databaseReachable = await checkDatabaseReachable();
   const pushStatus = pushService.getStatus();
+  const nativePushSchema = await nativePushSchemaReady();
+  const nativePushStatus = nativePushCapability(nativePushSchema);
   const ok = issues.length === 0 && (!IS_PRODUCTION_RUNTIME || databaseReachable);
   const supabaseHostname = (() => {
     try {
@@ -404,6 +447,10 @@ async function runtimeHealthPayload() {
     email_configured: emailService.configured,
     resend_webhook_configured: Boolean(RESEND_WEBHOOK_SECRET),
     push_configured: Boolean(pushStatus.enabled),
+    native_push_configured: Boolean(nativePushStatus.enabled),
+    native_push_provider: nativePushStatus.provider,
+    native_push_schema_ready: Boolean(nativePushStatus.schema_ready),
+    native_push_accepts_tokens: Boolean(nativePushStatus.accepts_native_tokens),
     sms_configured: Boolean(smsService.configured),
     webhook_status: RESEND_WEBHOOK_SECRET ? "configured" : "deferred",
     production_configuration_issues: issues
@@ -487,6 +534,7 @@ const allowedSignupAnalyticsEvents = new Set([
 ]);
 const apiRateLimitBuckets = new Map();
 const reservationAlertRateLimitBuckets = new Map();
+const mobilePushDeviceRateLimitBuckets = new Map();
 const allowedSignupAnalyticsProperties = new Set([
   "path",
   "route_kind",
@@ -669,6 +717,8 @@ const demo = {
   reservationAlertDeliveries: [],
   reservationAlertAcknowledgements: [],
   partnerDeviceSubscriptions: [],
+  mobilePushDevices: [],
+  mobilePushDeliveries: [],
   restaurantNotificationPreferences: [],
   restaurantNotificationSmsRecipients: [],
   privacyRequests: [],
@@ -3250,6 +3300,39 @@ function clean(value) {
   return String(value ?? "").trim();
 }
 
+function mobilePushEncryptionKey(value = MOBILE_PUSH_TOKEN_ENCRYPTION_KEY) {
+  const source = clean(value);
+  if (!source) return null;
+  try {
+    const key = /^[0-9a-f]{64}$/i.test(source) ? Buffer.from(source, "hex") : Buffer.from(source, "base64");
+    return key.length === 32 ? key : null;
+  } catch {
+    return null;
+  }
+}
+
+function mobilePushTokenHash(token = "") {
+  return crypto.createHash("sha256").update(clean(token)).digest("hex");
+}
+
+function encryptMobilePushToken(token = "") {
+  if (!mobilePushKey) throw Object.assign(new Error("Native push token encryption is not configured."), { status: 503, code: "NATIVE_PUSH_ENCRYPTION_NOT_CONFIGURED" });
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", mobilePushKey, iv);
+  const ciphertext = Buffer.concat([cipher.update(clean(token), "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return `v1.${iv.toString("base64url")}.${tag.toString("base64url")}.${ciphertext.toString("base64url")}`;
+}
+
+function decryptMobilePushToken(value = "") {
+  if (!mobilePushKey) throw new Error("Native push token encryption is not configured.");
+  const [version, encodedIv, encodedTag, encodedCiphertext] = clean(value).split(".");
+  if (version !== "v1" || !encodedIv || !encodedTag || !encodedCiphertext) throw new Error("Native push token ciphertext is invalid.");
+  const decipher = crypto.createDecipheriv("aes-256-gcm", mobilePushKey, Buffer.from(encodedIv, "base64url"));
+  decipher.setAuthTag(Buffer.from(encodedTag, "base64url"));
+  return Buffer.concat([decipher.update(Buffer.from(encodedCiphertext, "base64url")), decipher.final()]).toString("utf8");
+}
+
 function looksLikeUuid(value) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(clean(value));
 }
@@ -4980,6 +5063,9 @@ function ensureDemo() {
 }
 
 function tokenForProfile(profile) {
+  if (IS_PRODUCTION_RUNTIME) {
+    throw Object.assign(new Error("Demo authentication is disabled."), { status: 503, code: "DEMO_AUTH_DISABLED" });
+  }
   return `demo.${Buffer.from(JSON.stringify({
     id: profile.id,
     role: normalizeRole(profile.role),
@@ -4989,6 +5075,7 @@ function tokenForProfile(profile) {
 }
 
 function profileFromDemoToken(token) {
+  if (IS_PRODUCTION_RUNTIME) return null;
   if (!token?.startsWith("demo.")) return null;
   try {
     const payload = JSON.parse(Buffer.from(token.slice(5), "base64url").toString("utf8"));
@@ -5003,6 +5090,9 @@ function profileFromDemoToken(token) {
 }
 
 function signedProfileToken(profile, kind = "impersonate", extra = {}) {
+  if (!IMPERSONATION_SECRET) {
+    throw Object.assign(new Error("Impersonation is unavailable."), { status: 503, code: "IMPERSONATION_NOT_CONFIGURED" });
+  }
   const payload = {
     id: profile.id,
     email: profile.email,
@@ -5018,6 +5108,7 @@ function signedProfileToken(profile, kind = "impersonate", extra = {}) {
 }
 
 function profileFromSignedToken(token, kind = "impersonate") {
+  if (!IMPERSONATION_SECRET) return null;
   if (!token?.startsWith(`${kind}.`)) return null;
   try {
     const [, encoded, signature] = token.split(".");
@@ -5060,6 +5151,37 @@ function isPlausibleAuthToken(token = "") {
   if (value.startsWith("impersonate.")) return /^impersonate\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(value);
   if (looksLikeJwt(value)) return /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(value);
   return false;
+}
+
+function verifiedJwtClaims(token = "") {
+  if (!looksLikeJwt(token)) return null;
+  try {
+    const [, encodedPayload] = token.split(".");
+    const claims = JSON.parse(Buffer.from(encodedPayload, "base64url").toString("utf8"));
+    return claims && typeof claims === "object" && !Array.isArray(claims) ? claims : null;
+  } catch {
+    return null;
+  }
+}
+
+function enforcePrivilegedSessionPolicy(profile = {}, token = "") {
+  if (!supabaseConfigured || !["admin", "super_admin"].includes(normalizeRole(profile.role))) return;
+  // Claims are only consulted after Supabase has accepted this exact token in getSupabaseProfile().
+  const claims = verifiedJwtClaims(token);
+  const issuedAt = Number(claims?.iat || 0);
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  if (!issuedAt || issuedAt > nowSeconds + 60 || nowSeconds - issuedAt > ADMIN_ACCESS_TOKEN_MAX_AGE_SECONDS) {
+    throw Object.assign(new Error("Please sign in again to continue."), {
+      status: 401,
+      code: "PRIVILEGED_REAUTH_REQUIRED"
+    });
+  }
+  if (ADMIN_MFA_REQUIRED && clean(claims?.aal).toLowerCase() !== "aal2") {
+    throw Object.assign(new Error("Multi-factor authentication is required."), {
+      status: 403,
+      code: "MFA_REQUIRED"
+    });
+  }
 }
 
 async function supabaseFetch(path, options = {}) {
@@ -5289,6 +5411,8 @@ async function requireProfile(headers, roles = []) {
     throw error;
   }
 
+  if (!isImpersonationToken) enforcePrivilegedSessionPolicy(profile, token);
+
   return { profile, token };
 }
 
@@ -5484,13 +5608,24 @@ function standardReservationAvailability(restaurant = {}, activeRows = [], party
   };
 }
 
+function restaurantNotificationEmail(restaurant = {}) {
+  return lower(
+    restaurant.reservation_notification_email
+    || restaurant.reservation_email
+    || restaurant.email
+    || restaurant.contact_email
+    || restaurant.restaurant_email
+    || ""
+  );
+}
+
 function standardReservationOverviewRow(reservation = {}, restaurant = {}) {
   return decorateReservationRow({
     reservation_id: reservation.id || reservation.reservation_id,
     reference: reservation.reference,
     restaurant_id: reservation.restaurant_id,
     restaurant_name: restaurant.name || restaurant.restaurant_name || "Restaurant",
-    restaurant_email: restaurant.email || restaurant.contact_email || restaurant.restaurant_email || "",
+    restaurant_email: restaurantNotificationEmail(restaurant),
     restaurant_phone: restaurant.phone || restaurant.restaurant_phone || "",
     restaurant_address: restaurant.address || restaurant.restaurant_address || "",
     restaurant_cuisine: restaurant.cuisine_type || restaurant.cuisine || restaurant.restaurant_cuisine || "",
@@ -5627,6 +5762,7 @@ async function createStandardReservation(body, headers, context = {}) {
       created_at: nowIso()
     });
     const row = reservationOverviewRows().find((item) => item.reservation_id === reservation.id) || standardReservationOverviewRow(reservation, restaurant);
+    row.restaurant_email = restaurantNotificationEmail(restaurant) || row.restaurant_email;
     const alertPreferences = await getRestaurantNotificationPreferences(row.restaurant_id);
     const emailTargets = alertPreferences.email_enabled === false ? ["guest", "admin"] : undefined;
     const emails = await sendReservationCreatedEmails(row, emailTargets ? { targets: emailTargets } : {});
@@ -5704,6 +5840,7 @@ async function createStandardReservation(body, headers, context = {}) {
   const inserted = insertedRows?.[0];
   let reservationRow = await refreshReservationOverview(inserted?.id);
   reservationRow = decorateReservationRow(reservationRow || standardReservationOverviewRow(inserted, restaurant));
+  reservationRow.restaurant_email = restaurantNotificationEmail(restaurant) || reservationRow.restaurant_email;
   await supabaseFetch("/rest/v1/ai_interaction_events", {
     method: "POST",
     service: true,
@@ -6602,7 +6739,6 @@ async function analyticsEvent(method, body) {
       headers: { Prefer: "return=representation" },
       body: {
         event_type: row.event_type,
-        profile_key: row.profile_key,
         user_id: null,
         metadata: row.properties,
         created_at: row.created_at
@@ -7252,7 +7388,7 @@ function reservationOverviewRows() {
       reference: reservation.reference,
       restaurant_id: reservation.restaurant_id,
       restaurant_name: restaurant?.name || "Restaurant",
-      restaurant_email: restaurant?.email || restaurant?.contact_email || "",
+      restaurant_email: restaurantNotificationEmail(restaurant),
       restaurant_phone: restaurant?.phone || "",
       restaurant_address: restaurant?.address || "",
       restaurant_cuisine: restaurant?.cuisine_type || restaurant?.cuisine || "",
@@ -7639,19 +7775,40 @@ function rateLimitKey(method, pathname, headers = {}) {
   return `${bucket}:${method}:${pathname}:${ip}`;
 }
 
-function mutationRateLimit(method, pathname, headers = {}) {
+function mutationRateLimitPolicy(pathname = "") {
+  if (pathname === "/auth/login") return { limit: AUTH_LOGIN_RATE_LIMIT, windowMs: AUTH_LOGIN_RATE_LIMIT_WINDOW_MS };
+  if (pathname === "/auth/signup-guest") return { limit: AUTH_SIGNUP_RATE_LIMIT, windowMs: AUTH_SIGNUP_RATE_LIMIT_WINDOW_MS };
+  if (["/auth/forgot-password", "/auth/resend-verification", "/auth/verification"].includes(pathname)) {
+    return { limit: AUTH_RECOVERY_RATE_LIMIT, windowMs: AUTH_RECOVERY_RATE_LIMIT_WINDOW_MS };
+  }
+  if (pathname === "/reservations") return { limit: RESERVATION_CREATE_RATE_LIMIT, windowMs: RESERVATION_CREATE_RATE_LIMIT_WINDOW_MS };
+  return {
+    limit: pathname.startsWith("/auth/") ? AUTH_MUTATION_RATE_LIMIT : API_MUTATION_RATE_LIMIT,
+    windowMs: API_RATE_LIMIT_WINDOW_MS
+  };
+}
+
+function mutationRateLimitSkipped(method, pathname) {
   if (["GET", "HEAD", "OPTIONS"].includes(method)) return null;
   if (pathname === "/webhooks/resend") return null;
   if (pathname === "/webhooks/stripe") return null;
   if (pathname === "/webhooks/sms/twilio") return null;
   if (pathname === "/webhooks/voice/twilio") return null;
+  // Recovery routes preserve enumeration-safe and route-specific responses.
+  // They use persistentSensitiveRateLimit inside their handlers instead of
+  // the generic mutation limiter so those response contracts remain stable.
+  if (["/auth/forgot-password", "/auth/resend-verification", "/auth/verification"].includes(pathname)) return null;
+  return false;
+}
+
+function localMutationRateLimit(method, pathname, headers = {}) {
   const now = Date.now();
   const key = rateLimitKey(method, pathname, headers);
-  const limit = pathname.startsWith("/auth/") ? AUTH_MUTATION_RATE_LIMIT : API_MUTATION_RATE_LIMIT;
-  const windowStart = now - API_RATE_LIMIT_WINDOW_MS;
+  const { limit, windowMs } = mutationRateLimitPolicy(pathname);
+  const windowStart = now - windowMs;
   const attempts = (apiRateLimitBuckets.get(key) || []).filter((timestamp) => timestamp > windowStart);
   if (attempts.length >= limit) {
-    const retryAfterSeconds = Math.max(1, Math.ceil((attempts[0] + API_RATE_LIMIT_WINDOW_MS - now) / 1000));
+    const retryAfterSeconds = Math.max(1, Math.ceil((attempts[0] + windowMs - now) / 1000));
     apiRateLimitBuckets.set(key, attempts);
     return {
       retryAfterSeconds,
@@ -7662,13 +7819,87 @@ function mutationRateLimit(method, pathname, headers = {}) {
   attempts.push(now);
   apiRateLimitBuckets.set(key, attempts);
   if (apiRateLimitBuckets.size > 5000) {
+    const retentionWindowMs = Math.max(
+      API_RATE_LIMIT_WINDOW_MS,
+      AUTH_LOGIN_RATE_LIMIT_WINDOW_MS,
+      AUTH_SIGNUP_RATE_LIMIT_WINDOW_MS,
+      AUTH_RECOVERY_RATE_LIMIT_WINDOW_MS,
+      RESERVATION_CREATE_RATE_LIMIT_WINDOW_MS
+    );
     for (const [bucketKey, timestamps] of apiRateLimitBuckets.entries()) {
-      const fresh = timestamps.filter((timestamp) => timestamp > windowStart);
+      const fresh = timestamps.filter((timestamp) => timestamp > now - retentionWindowMs);
       if (fresh.length) apiRateLimitBuckets.set(bucketKey, fresh);
       else apiRateLimitBuckets.delete(bucketKey);
     }
   }
   return null;
+}
+
+function distributedRateLimitBucket(method, pathname, headers = {}) {
+  return crypto.createHash("sha256")
+    .update(rateLimitKey(method, pathname, headers), "utf8")
+    .digest("hex");
+}
+
+async function distributedMutationRateLimit(method, pathname, headers = {}) {
+  const { limit, windowMs } = mutationRateLimitPolicy(pathname);
+  const rows = await supabaseFetch("/rest/v1/rpc/consume_api_rate_limit", {
+    method: "POST",
+    service: true,
+    timeoutMs: DISTRIBUTED_RATE_LIMIT_TIMEOUT_MS,
+    body: {
+      p_bucket_key_hash: distributedRateLimitBucket(method, pathname, headers),
+      p_category: pathname.startsWith("/auth/") ? "auth_mutation" : "api_mutation",
+      p_limit: limit,
+      p_window_seconds: Math.max(1, Math.ceil(windowMs / 1000))
+    }
+  });
+  const result = Array.isArray(rows) ? rows[0] : rows;
+  if (!result || typeof result.allowed !== "boolean") {
+    throw Object.assign(new Error("Distributed rate limiter returned an invalid response."), {
+      status: 502,
+      code: "RATE_LIMIT_RESPONSE_INVALID"
+    });
+  }
+  if (result.allowed) return null;
+  return {
+    status: 429,
+    retryAfterSeconds: Math.max(1, Number(result.retry_after_seconds || 1)),
+    error: "Too many requests. Please wait before trying again.",
+    code: "RATE_LIMITED"
+  };
+}
+
+async function mutationRateLimit(method, pathname, headers = {}) {
+  if (mutationRateLimitSkipped(method, pathname) !== false) return null;
+  if (!DISTRIBUTED_RATE_LIMIT_ENABLED) return localMutationRateLimit(method, pathname, headers);
+
+  if (!supabaseConfigured) {
+    if (!DISTRIBUTED_RATE_LIMIT_FAIL_CLOSED) return localMutationRateLimit(method, pathname, headers);
+    return {
+      status: 503,
+      retryAfterSeconds: 30,
+      error: "Service temporarily unavailable. Please try again.",
+      code: "RATE_LIMIT_UNAVAILABLE"
+    };
+  }
+
+  try {
+    return await distributedMutationRateLimit(method, pathname, headers);
+  } catch (error) {
+    console.error("Distributed rate limiter is unavailable.", {
+      code: clean(error?.code || "RATE_LIMIT_UPSTREAM_FAILURE"),
+      status: Number(error?.status || 502),
+      environment: RUNTIME_ENVIRONMENT
+    });
+    if (!DISTRIBUTED_RATE_LIMIT_FAIL_CLOSED) return localMutationRateLimit(method, pathname, headers);
+    return {
+      status: 503,
+      retryAfterSeconds: 30,
+      error: "Service temporarily unavailable. Please try again.",
+      code: "RATE_LIMIT_UNAVAILABLE"
+    };
+  }
 }
 
 function scopedRateLimit(bucketMap, key = "", options = {}) {
@@ -7684,8 +7915,8 @@ function scopedRateLimit(bucketMap, key = "", options = {}) {
     bucketMap.set(bucketKey, attempts);
     return {
       retryAfterSeconds,
-      error: "Too many reservation alert attempts. Please wait before trying again.",
-      code: "RESERVATION_ALERT_RATE_LIMITED"
+      error: clean(options.error || "Too many reservation alert attempts. Please wait before trying again."),
+      code: clean(options.code || "RESERVATION_ALERT_RATE_LIMITED")
     };
   }
   attempts.push(now);
@@ -12869,6 +13100,13 @@ async function createReservationAlertForReservation(row = {}, options = {}) {
         code: error.code || "PUSH_ALERT_FAILED"
       });
     });
+    await sendPartnerNativeReservationPush(alert).catch((error) => {
+      logSafeServerEvent("reservation_alert_native_push_failed", {
+        restaurant_id: restaurantId,
+        reservation_id: alert.reservation_id || "",
+        code: error.code || "NATIVE_PUSH_ALERT_FAILED"
+      });
+    });
   }
   return alert;
 }
@@ -13095,7 +13333,7 @@ async function reservationEmailRowById(reservationId = "") {
     ...reservation,
     reservation_id: reservation.id,
     restaurant_name: restaurant.name || "",
-    restaurant_email: restaurant.reservation_notification_email || restaurant.email || restaurant.contact_email || "",
+    restaurant_email: restaurantNotificationEmail(restaurant),
     restaurant_language: restaurant.preferred_language || "en",
     restaurant_address: restaurant.address || restaurant.full_address || "",
     offer_title: offer.title_en || offer.title || "",
@@ -13312,6 +13550,7 @@ async function createGuestPostVisitNotification(row) {
       metadata: { reservation_id: row.reservation_id, url: notification.url },
       created_at: nowIso()
     });
+    await sendGuestNativePush(row, notification).catch(() => null);
     return notification;
   }
 
@@ -13336,6 +13575,13 @@ async function createGuestPostVisitNotification(row) {
       metadata: { reservation_id: row.reservation_id, url: notification.url }
     }
   }).catch(() => null);
+  await sendGuestNativePush(row, notification).catch((error) => {
+    logSafeServerEvent("guest_native_push_failed", {
+      restaurant_id: row.restaurant_id || "",
+      reservation_id: row.reservation_id || "",
+      code: error.code || "GUEST_NATIVE_PUSH_FAILED"
+    });
+  });
   return notification;
 }
 
@@ -13385,6 +13631,7 @@ async function createGuestReservationNotification(row, {
       metadata: { reservation_id: row.reservation_id, url: notification.url },
       created_at: nowIso()
     });
+    await sendGuestNativePush(row, notification).catch(() => null);
     return notification;
   }
 
@@ -13409,6 +13656,13 @@ async function createGuestReservationNotification(row, {
       metadata: { reservation_id: row.reservation_id, url: notification.url }
     }
   }).catch(() => null);
+  await sendGuestNativePush(row, notification).catch((error) => {
+    logSafeServerEvent("guest_native_push_failed", {
+      restaurant_id: row.restaurant_id || "",
+      reservation_id: row.reservation_id || "",
+      code: error.code || "GUEST_NATIVE_PUSH_FAILED"
+    });
+  });
   return notification;
 }
 
@@ -13675,6 +13929,59 @@ function rateLimitEmailRequest(key, options = {}) {
   };
 }
 
+async function persistentSensitiveRateLimit(key, options = {}) {
+  const limit = Math.max(1, Number(options.limit || 3));
+  const windowMs = Math.max(1000, Number(options.windowMs || 10 * 60 * 1000));
+  const normalizedKey = clean(key) || "unknown";
+  if (!DISTRIBUTED_RATE_LIMIT_ENABLED) return rateLimitEmailRequest(normalizedKey, { limit, windowMs });
+
+  if (!supabaseConfigured) {
+    if (!DISTRIBUTED_RATE_LIMIT_FAIL_CLOSED) return rateLimitEmailRequest(normalizedKey, { limit, windowMs });
+    return { limited: false, unavailable: true, retryAfterSeconds: 30, remaining: 0 };
+  }
+
+  try {
+    const rows = await supabaseFetch("/rest/v1/rpc/consume_api_rate_limit", {
+      method: "POST",
+      service: true,
+      timeoutMs: DISTRIBUTED_RATE_LIMIT_TIMEOUT_MS,
+      body: {
+        p_bucket_key_hash: crypto.createHash("sha256").update(`sensitive:${normalizedKey}`, "utf8").digest("hex"),
+        p_category: clean(options.category || "auth_recovery").slice(0, 80),
+        p_limit: limit,
+        p_window_seconds: Math.max(1, Math.ceil(windowMs / 1000))
+      }
+    });
+    const result = Array.isArray(rows) ? rows[0] : rows;
+    if (!result || typeof result.allowed !== "boolean") {
+      throw Object.assign(new Error("Distributed rate limiter returned an invalid response."), {
+        status: 502,
+        code: "RATE_LIMIT_RESPONSE_INVALID"
+      });
+    }
+    return {
+      limited: !result.allowed,
+      unavailable: false,
+      retryAfterSeconds: result.allowed ? 0 : Math.max(1, Number(result.retry_after_seconds || 1)),
+      remaining: Math.max(0, Number(result.remaining || 0))
+    };
+  } catch (error) {
+    console.error("Distributed sensitive-action rate limiter is unavailable.", {
+      code: clean(error?.code || "RATE_LIMIT_UPSTREAM_FAILURE"),
+      status: Number(error?.status || 502),
+      environment: RUNTIME_ENVIRONMENT
+    });
+    if (!DISTRIBUTED_RATE_LIMIT_FAIL_CLOSED) return rateLimitEmailRequest(normalizedKey, { limit, windowMs });
+    return { limited: false, unavailable: true, retryAfterSeconds: 30, remaining: 0 };
+  }
+}
+
+function clearEmailRateLimit(key) {
+  const normalizedKey = clean(key);
+  if (!normalizedKey) return;
+  demo.emailRateLimits = (demo.emailRateLimits || []).filter((item) => item.key !== normalizedKey);
+}
+
 function genericLoginError(status = 401) {
   const error = new Error(status === 429
     ? "Too many login attempts. Please wait before trying again."
@@ -13789,6 +14096,11 @@ async function login(body) {
     });
   } catch (error) {
     const emailNotConfirmed = isSupabaseEmailNotConfirmedError(error);
+    const credentialLimitKey = `login-failure:${hashEmailValue(email).slice(0, 24)}`;
+    const credentialLimit = rateLimitEmailRequest(credentialLimitKey, {
+      limit: AUTH_LOGIN_RATE_LIMIT,
+      windowMs: AUTH_LOGIN_RATE_LIMIT_WINDOW_MS
+    });
     logSafeServerEvent("guest_login_rejected_by_auth_provider", {
       status: error.status || 401,
       code: emailNotConfirmed ? "EMAIL_NOT_CONFIRMED" : "AUTH_LOGIN_REJECTED",
@@ -13801,6 +14113,7 @@ async function login(body) {
       code: emailNotConfirmed ? "EMAIL_NOT_CONFIRMED" : "AUTH_LOGIN_REJECTED",
       email_hash: hashEmailValue(email).slice(0, 16)
     });
+    if (credentialLimit.limited || error.status === 429) throw genericLoginError(429);
     if (emailNotConfirmed) throw emailNotConfirmedError();
     throw genericLoginError(401);
   }
@@ -13850,6 +14163,7 @@ async function login(body) {
     user_hash: hashEmailValue(profile.id).slice(0, 16),
     role: normalizeRole(profile.role)
   });
+  clearEmailRateLimit(`login-failure:${hashEmailValue(email).slice(0, 24)}`);
   return json(200, {
     mode: "supabase",
     access_token: session.access_token,
@@ -13875,13 +14189,22 @@ async function authLogout(method, body, headers) {
   return json(200, { mode: supabaseConfigured ? "supabase" : "demo", logged_out: true });
 }
 
-async function forgotPassword(method, body) {
+async function forgotPassword(method, body, headers = {}) {
   if (method !== "POST") return json(405, { error: "Method not allowed." });
   const email = lower(body.email);
   if (!email || !isValidSignupEmail(email)) return json(200, {
     message: "If a SmartTable account exists for this email, a password reset message will be sent."
   });
-  const resetLimit = rateLimitEmailRequest(`password-reset:${hashEmailValue(email).slice(0, 24)}`);
+  const resetLimit = await persistentSensitiveRateLimit(
+    `password-reset:${hashEmailValue(email).slice(0, 24)}:${hashEmailValue(clientIpAddress(headers)).slice(0, 16)}`,
+    { limit: AUTH_RECOVERY_RATE_LIMIT, windowMs: AUTH_RECOVERY_RATE_LIMIT_WINDOW_MS, category: "password_reset" }
+  );
+  if (resetLimit.unavailable) {
+    return json(200, {
+      message: "If a SmartTable account exists for this email, a password reset message will be sent.",
+      retry_after: resetLimit.retryAfterSeconds
+    });
+  }
   if (resetLimit.limited) {
     return json(200, {
       message: "If a SmartTable account exists for this email, a password reset message will be sent.",
@@ -14126,7 +14449,11 @@ async function authVerification(method, body, headers) {
     ensureDemo();
     if (method === "GET") return json(200, { mode: "demo", verified: true, email: profile.email });
     if (method === "POST") {
-      const verifyLimit = rateLimitEmailRequest(`verification:${profile.id || hashEmailValue(profile.email).slice(0, 24)}`);
+      const verifyLimit = await persistentSensitiveRateLimit(
+        `verification:${profile.id || hashEmailValue(profile.email).slice(0, 24)}:${hashEmailValue(clientIpAddress(headers)).slice(0, 16)}`,
+        { limit: AUTH_RECOVERY_RATE_LIMIT, windowMs: AUTH_RECOVERY_RATE_LIMIT_WINDOW_MS, category: "email_verification" }
+      );
+      if (verifyLimit.unavailable) return json(503, { error: "Service temporarily unavailable. Please try again.", code: "RATE_LIMIT_UNAVAILABLE" }, { "retry-after": String(verifyLimit.retryAfterSeconds) });
       if (verifyLimit.limited) return json(429, { error: "Please wait before requesting another verification email.", retry_after: verifyLimit.retryAfterSeconds });
       const emailResult = await sendGuestVerificationEmail({
         email: profile.email,
@@ -14150,7 +14477,11 @@ async function authVerification(method, body, headers) {
     return json(200, { verified: Boolean(user.email_confirmed_at), email: user.email });
   }
   if (method === "POST") {
-    const verifyLimit = rateLimitEmailRequest(`verification:${profile.id || hashEmailValue(profile.email).slice(0, 24)}`);
+    const verifyLimit = await persistentSensitiveRateLimit(
+      `verification:${profile.id || hashEmailValue(profile.email).slice(0, 24)}:${hashEmailValue(clientIpAddress(headers)).slice(0, 16)}`,
+      { limit: AUTH_RECOVERY_RATE_LIMIT, windowMs: AUTH_RECOVERY_RATE_LIMIT_WINDOW_MS, category: "email_verification" }
+    );
+    if (verifyLimit.unavailable) return json(503, { error: "Service temporarily unavailable. Please try again.", code: "RATE_LIMIT_UNAVAILABLE" }, { "retry-after": String(verifyLimit.retryAfterSeconds) });
     if (verifyLimit.limited) return json(429, { error: "Please wait before requesting another verification email.", retry_after: verifyLimit.retryAfterSeconds });
     let emailResult;
     try {
@@ -14276,7 +14607,20 @@ async function publicResendVerification(method, body, headers = {}) {
   if (!isValidSignupEmail(email)) return json(400, { error: "Enter a valid email address.", code: "INVALID_EMAIL" });
 
   const limitKey = `public-verification:${hashEmailValue(email).slice(0, 24)}:${hashEmailValue(clientIpAddress(headers)).slice(0, 16)}`;
-  const verifyLimit = rateLimitEmailRequest(limitKey, { limit: 3, windowMs: 10 * 60 * 1000 });
+  const verifyLimit = await persistentSensitiveRateLimit(limitKey, {
+    limit: AUTH_RECOVERY_RATE_LIMIT,
+    windowMs: AUTH_RECOVERY_RATE_LIMIT_WINDOW_MS,
+    category: "public_verification_resend"
+  });
+  if (verifyLimit.unavailable) {
+    return json(503, {
+      error: "Service temporarily unavailable. Please try again.",
+      code: "RATE_LIMIT_UNAVAILABLE",
+      retry_after: verifyLimit.retryAfterSeconds
+    }, {
+      "retry-after": String(verifyLimit.retryAfterSeconds)
+    });
+  }
   if (verifyLimit.limited) {
     return json(429, {
       error: "Please wait before requesting another verification email.",
@@ -19701,6 +20045,7 @@ async function guestPrivacy(method, body, headers) {
         item.updated_at = nowIso();
       }
     });
+    await revokeAllNativeMobilePushForUser(profile.id, "PUSH_ACCOUNT_DELETED");
     await createAuditLog({
       profile: { ...profile, email: anonymizedEmail },
       action: "guest_account_deleted",
@@ -19869,6 +20214,7 @@ async function guestPrivacy(method, body, headers) {
     service: true,
     body: { guest_name: "Deleted guest", guest_email: anonymizedEmail, guest_phone: "", guest_id: null, updated_at: nowIso() }
   }).catch(() => null);
+  await revokeAllNativeMobilePushForUser(profile.id, "PUSH_ACCOUNT_DELETED");
   await supabaseFetch("/auth/v1/logout?scope=global", { method: "POST", service: false, token }).catch(() => null);
   await createAuditLog({
     profile: { ...profile, email: anonymizedEmail },
@@ -20823,7 +21169,7 @@ function emailProviderDiagnostics() {
 }
 
 function restaurantEmailDiagnostics(restaurant = {}) {
-  const email = lower(restaurant.reservation_notification_email || restaurant.email || restaurant.contact_email);
+  const email = lower(restaurant.reservation_notification_email || restaurant.reservation_email || restaurant.email || restaurant.contact_email);
   const status = !email
     ? "missing"
     : isValidSignupEmail(email)
@@ -23352,6 +23698,508 @@ async function guestNotifications(method, body, headers, query) {
   return json(200, { notifications: rows || [], unread_count: (rows || []).filter((item) => !item.read_at).length });
 }
 
+function clientMobilePushDevice(row = {}) {
+  return {
+    id: row.id,
+    device_id: row.device_id,
+    app_kind: row.app_kind,
+    platform: row.platform,
+    provider: row.provider,
+    enabled: row.enabled !== false,
+    permission_status: row.permission_status,
+    app_version: row.app_version || null,
+    locale: row.locale || null,
+    timezone: row.timezone || null,
+    last_registered_at: row.last_registered_at || null,
+    last_active_at: row.last_active_at || null,
+    created_at: row.created_at || null,
+    updated_at: row.updated_at || null
+  };
+}
+
+function nativePushCapability(schemaReady = true) {
+  const status = mobilePushService.getStatus();
+  const enabled = Boolean(status.enabled && schemaReady && mobilePushKey);
+  return {
+    ...status,
+    enabled,
+    status: enabled ? "configured" : status.enabled && !schemaReady ? "schema_missing" : status.status,
+    accepts_native_tokens: enabled,
+    native_token_endpoint: "/api/mobile/push-devices",
+    schema_ready: schemaReady
+  };
+}
+
+function validMobileDeviceId(value = "") {
+  return /^[A-Za-z0-9._:-]{8,160}$/.test(clean(value));
+}
+
+function validMobileLocale(value = "") {
+  return !value || /^[A-Za-z]{2,3}(?:[-_][A-Za-z0-9]{2,8}){0,2}$/.test(clean(value));
+}
+
+async function mobilePushDevices(method, body = {}, headers, query) {
+  if (!['GET', 'POST', 'DELETE'].includes(method)) return json(405, { error: "Method not allowed." });
+  let auth;
+  try {
+    auth = await requireProfile(headers, ["guest", "partner"]);
+  } catch (error) {
+    if (error?.status === 403) return json(403, { error: "Forbidden.", code: "FORBIDDEN" });
+    return json(401, { error: "Authentication required.", code: "AUTHENTICATION_REQUIRED" });
+  }
+  const { profile } = auth;
+  const expectedAppKind = normalizeRole(profile.role) === "partner" ? "partner" : "guest";
+  const requestedAppKind = clean(body.app_kind || query?.get("app_kind") || expectedAppKind).toLowerCase();
+  if (requestedAppKind !== expectedAppKind) return json(403, { error: "This device cannot be registered for another SmartTable app.", code: "MOBILE_APP_ROLE_MISMATCH" });
+
+  if (method !== "GET") {
+    const rateLimit = scopedRateLimit(mobilePushDeviceRateLimitBuckets, `${profile.id}:${expectedAppKind}:${method}`, {
+      limit: MOBILE_PUSH_DEVICE_MUTATION_LIMIT,
+      windowMs: MOBILE_PUSH_DEVICE_MUTATION_WINDOW_MS,
+      error: "Too many notification device updates. Please wait before trying again.",
+      code: "MOBILE_PUSH_RATE_LIMITED"
+    });
+    if (rateLimit) {
+      return json(429, { error: rateLimit.error, code: rateLimit.code, retry_after: rateLimit.retryAfterSeconds }, {
+        "retry-after": String(rateLimit.retryAfterSeconds)
+      });
+    }
+  }
+
+  const schemaReady = !supabaseConfigured || await supabaseTableExists("mobile_push_devices").catch(() => false);
+  const push = nativePushCapability(schemaReady);
+  if (method === "GET") {
+    if (!supabaseConfigured) {
+      ensureDemo();
+      const devices = demo.mobilePushDevices.filter((item) => item.user_id === profile.id && item.app_kind === expectedAppKind);
+      return json(200, { push, devices: devices.map(clientMobilePushDevice) });
+    }
+    if (!schemaReady) return json(200, { push, devices: [] });
+    const devices = await supabaseFetch(`/rest/v1/mobile_push_devices?select=*&user_id=eq.${encodeURIComponent(profile.id)}&app_kind=eq.${expectedAppKind}&order=updated_at.desc`, { service: true });
+    return json(200, { push, devices: (devices || []).map(clientMobilePushDevice) });
+  }
+
+  const deviceId = clean(body.device_id);
+  if (!validMobileDeviceId(deviceId)) return json(400, { error: "A valid device installation ID is required.", code: "MOBILE_DEVICE_ID_INVALID" });
+  if (method === "DELETE") {
+    if (!supabaseConfigured) {
+      ensureDemo();
+      const now = nowIso();
+      demo.mobilePushDevices.forEach((item) => {
+        if (item.user_id === profile.id && item.app_kind === expectedAppKind && item.device_id === deviceId) Object.assign(item, { enabled: false, permission_status: "denied", updated_at: now });
+      });
+      return json(200, { revoked: true, device_id: deviceId });
+    }
+    if (schemaReady) {
+      await supabaseFetch(`/rest/v1/mobile_push_devices?user_id=eq.${encodeURIComponent(profile.id)}&app_kind=eq.${expectedAppKind}&device_id=eq.${encodeURIComponent(deviceId)}`, {
+        method: "PATCH",
+        service: true,
+        headers: { Prefer: "return=minimal" },
+        body: { enabled: false, permission_status: "denied", updated_at: nowIso() }
+      });
+    }
+    return json(200, { revoked: true, device_id: deviceId });
+  }
+
+  if (!push.enabled) return json(503, { error: "Native notifications are not configured.", code: "NATIVE_PUSH_NOT_CONFIGURED", push });
+  const forbiddenOwnershipFields = ["id", "user_id", "restaurant_id", "token_hash", "push_token_ciphertext", "enabled"];
+  if (forbiddenOwnershipFields.some((key) => Object.prototype.hasOwnProperty.call(body, key))) {
+    return json(400, { error: "Device ownership is assigned by SmartTable.", code: "MOBILE_PUSH_OWNERSHIP_FORBIDDEN" });
+  }
+  const platform = clean(body.platform).toLowerCase();
+  const provider = clean(body.provider || "expo").toLowerCase();
+  const permissionStatus = clean(body.permission_status || "granted").toLowerCase();
+  const token = clean(body.push_token);
+  if (!['ios', 'android'].includes(platform)) return json(400, { error: "Unsupported mobile platform.", code: "MOBILE_PLATFORM_INVALID" });
+  if (provider !== "expo" || !isExpoPushToken(token)) return json(400, { error: "A valid Expo push token is required.", code: "MOBILE_PUSH_TOKEN_INVALID" });
+  if (permissionStatus !== "granted") return json(400, { error: "Notification permission must be granted before registration.", code: "MOBILE_PUSH_PERMISSION_REQUIRED" });
+  if (!validMobileLocale(body.locale)) return json(400, { error: "Notification locale is invalid.", code: "MOBILE_PUSH_LOCALE_INVALID" });
+
+  let restaurantId = null;
+  if (expectedAppKind === "partner") restaurantId = (await getPartnerRestaurant(profile, query, body)).id;
+  const now = nowIso();
+  const tokenHash = mobilePushTokenHash(token);
+  const device = {
+    user_id: profile.id,
+    restaurant_id: restaurantId,
+    device_id: deviceId,
+    app_kind: expectedAppKind,
+    platform,
+    provider,
+    push_token_ciphertext: encryptMobilePushToken(token),
+    token_hash: tokenHash,
+    enabled: true,
+    permission_status: "granted",
+    app_version: nullableClean(clean(body.app_version).slice(0, 40)),
+    locale: nullableClean(clean(body.locale).slice(0, 24)),
+    timezone: nullableClean(clean(body.timezone).slice(0, 80)),
+    last_registered_at: now,
+    last_active_at: now,
+    failure_count: 0,
+    last_error_code: null,
+    updated_at: now
+  };
+  if (!supabaseConfigured) {
+    ensureDemo();
+    demo.mobilePushDevices.forEach((item) => {
+      if (item.app_kind === expectedAppKind && item.token_hash === tokenHash && (item.user_id !== profile.id || item.device_id !== deviceId)) item.enabled = false;
+    });
+    const existing = demo.mobilePushDevices.find((item) => item.user_id === profile.id && item.app_kind === expectedAppKind && item.device_id === deviceId);
+    const saved = { ...(existing || { id: crypto.randomUUID(), created_at: now }), ...device };
+    if (existing) Object.assign(existing, saved);
+    else demo.mobilePushDevices.unshift(saved);
+    return json(200, { push, device: clientMobilePushDevice(saved) });
+  }
+  await supabaseFetch(`/rest/v1/mobile_push_devices?app_kind=eq.${expectedAppKind}&provider=eq.expo&token_hash=eq.${tokenHash}`, {
+    method: "PATCH",
+    service: true,
+    headers: { Prefer: "return=minimal" },
+    body: { enabled: false, updated_at: now }
+  }).catch(() => null);
+  const saved = await supabaseFetch("/rest/v1/mobile_push_devices?on_conflict=user_id,app_kind,device_id&select=*", {
+    method: "POST",
+    service: true,
+    headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+    body: device
+  });
+  return json(200, { push, device: clientMobilePushDevice(saved?.[0] || device) });
+}
+
+function nativeNotificationPayload(appKind, entityType, entityId) {
+  const app = appKind === "partner" ? "partner" : "guest";
+  const entity = ["restaurant", "offer", "reservation", "review"].includes(entityType) ? entityType : "reservation";
+  const id = clean(entityId);
+  const path = entity === "review" ? `/review/${encodeURIComponent(id)}` : `/${entity}/${encodeURIComponent(id)}`;
+  const scheme = app === "partner" ? "smarttable-partner" : "smarttable";
+  return {
+    version: 1,
+    app,
+    entity,
+    entity_id: id,
+    ...(entity === "reservation" || entity === "review" ? { reservation_id: id } : {}),
+    path,
+    url: `${scheme}://${entity}/${encodeURIComponent(id)}`
+  };
+}
+
+async function nativePushSchemaReady() {
+  return !supabaseConfigured || await supabaseTableExists("mobile_push_devices").catch(() => false);
+}
+
+async function guestMobilePushUserId(row = {}) {
+  const direct = clean(row.guest_user_id || row.user_id);
+  if (looksLikeUuid(direct)) return direct;
+  const email = lower(row.guest_email);
+  if (!email) return "";
+  if (!supabaseConfigured) {
+    ensureDemo();
+    return clean(demo.profiles.find((item) => normalizeRole(item.role) === "guest" && lower(item.email) === email)?.id);
+  }
+  const profiles = await supabaseFetch(`/rest/v1/profiles?select=id&email=eq.${encodeURIComponent(email)}&role=eq.guest&limit=1`, { service: true }).catch(() => []);
+  return clean(profiles?.[0]?.id);
+}
+
+async function revokeAllNativeMobilePushForUser(userId = "", reason = "PUSH_USER_REVOKED") {
+  const id = clean(userId);
+  if (!id) return;
+  const patch = {
+    enabled: false,
+    permission_status: "denied",
+    last_error_code: clean(reason).slice(0, 80),
+    updated_at: nowIso()
+  };
+  if (!supabaseConfigured) {
+    ensureDemo();
+    demo.mobilePushDevices.forEach((item) => {
+      if (clean(item.user_id) === id) Object.assign(item, patch);
+    });
+    return;
+  }
+  if (!await supabaseTableExists("mobile_push_devices").catch(() => false)) return;
+  await supabaseFetch(`/rest/v1/mobile_push_devices?user_id=eq.${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    service: true,
+    headers: { Prefer: "return=minimal" },
+    body: patch
+  }).catch(() => null);
+}
+
+async function currentPartnerPushAccess(device = {}, restaurantId = "") {
+  const userId = clean(device.user_id);
+  const targetRestaurantId = clean(restaurantId || device.restaurant_id);
+  if (!userId || !targetRestaurantId) return false;
+  const profile = !supabaseConfigured
+    ? (ensureDemo(), demo.profiles.find((item) => clean(item.id) === userId))
+    : (await supabaseFetch(`/rest/v1/profiles?select=*&id=eq.${encodeURIComponent(userId)}&limit=1`, { service: true }).catch(() => []))?.[0];
+  if (!profile || !roleMatches(profile.role, ["partner"])) return false;
+  try {
+    await getPartnerRestaurant(profile, new URLSearchParams({ restaurant_id: targetRestaurantId }), { restaurant_id: targetRestaurantId });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function listNativeMobilePushDevices({ appKind, userId = "", restaurantId = "" } = {}) {
+  if (!mobilePushService.getStatus().enabled || !await nativePushSchemaReady()) return [];
+  let devices;
+  if (!supabaseConfigured) {
+    ensureDemo();
+    devices = demo.mobilePushDevices.filter((item) => item.app_kind === appKind && item.enabled !== false && (
+      userId ? item.user_id === userId : restaurantId ? item.restaurant_id === restaurantId : false
+    ));
+  } else {
+    const scope = userId
+      ? `user_id=eq.${encodeURIComponent(userId)}`
+      : `restaurant_id=eq.${encodeURIComponent(restaurantId)}`;
+    devices = await supabaseFetch(`/rest/v1/mobile_push_devices?select=*&app_kind=eq.${appKind}&enabled=eq.true&permission_status=eq.granted&${scope}`, { service: true }).catch(() => []);
+  }
+  if (appKind !== "partner") return devices;
+  const authorized = [];
+  for (const device of devices) {
+    if (await currentPartnerPushAccess(device, restaurantId)) {
+      authorized.push(device);
+    } else {
+      await updateNativeMobilePushDevice(device, {
+        sent: false,
+        status: "expired",
+        errorCode: "PUSH_PARTNER_ACCESS_REVOKED"
+      });
+    }
+  }
+  return authorized;
+}
+
+async function findMobilePushDelivery(idempotencyKey = "") {
+  if (!supabaseConfigured) {
+    ensureDemo();
+    return demo.mobilePushDeliveries.find((item) => item.idempotency_key === idempotencyKey) || null;
+  }
+  if (!await supabaseTableExists("mobile_push_deliveries").catch(() => false)) return null;
+  const rows = await supabaseFetch(`/rest/v1/mobile_push_deliveries?select=*&idempotency_key=eq.${encodeURIComponent(idempotencyKey)}&limit=1`, { service: true }).catch(() => []);
+  return rows?.[0] || null;
+}
+
+async function saveMobilePushDelivery(row = {}) {
+  if (!supabaseConfigured) {
+    ensureDemo();
+    const existing = demo.mobilePushDeliveries.find((item) => item.idempotency_key === row.idempotency_key);
+    const saved = { ...(existing || { id: crypto.randomUUID(), created_at: nowIso() }), ...row, updated_at: nowIso() };
+    if (existing) Object.assign(existing, saved);
+    else demo.mobilePushDeliveries.unshift(saved);
+    return saved;
+  }
+  if (!await supabaseTableExists("mobile_push_deliveries").catch(() => false)) return null;
+  const rows = await supabaseFetch("/rest/v1/mobile_push_deliveries?on_conflict=idempotency_key&select=*", {
+    method: "POST",
+    service: true,
+    headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+    body: row
+  }).catch(() => null);
+  return rows?.[0] || row;
+}
+
+async function updateNativeMobilePushDevice(device = {}, result = {}) {
+  const now = nowIso();
+  const patch = result.sent
+    ? { last_success_at: now, last_active_at: now, failure_count: 0, last_error_code: null, updated_at: now }
+    : {
+      enabled: result.status === "expired" ? false : device.enabled !== false,
+      last_failure_at: now,
+      failure_count: Number(device.failure_count || 0) + 1,
+      last_error_code: clean(result.errorCode || "NATIVE_PUSH_SEND_FAILED").slice(0, 80),
+      updated_at: now
+    };
+  if (!supabaseConfigured) {
+    Object.assign(device, patch);
+    return;
+  }
+  await supabaseFetch(`/rest/v1/mobile_push_devices?id=eq.${encodeURIComponent(device.id)}`, {
+    method: "PATCH",
+    service: true,
+    headers: { Prefer: "return=minimal" },
+    body: patch
+  }).catch(() => null);
+}
+
+const NATIVE_PUSH_COPY = Object.freeze({
+  guest_review: {
+    en: { title: "How was your visit?", body: "Open SmartTable to share a verified review." },
+    es: { title: "¿Qué tal fue tu visita?", body: "Abre SmartTable para compartir una reseña verificada." },
+    hu: { title: "Milyen volt a látogatásod?", body: "Nyisd meg a SmartTable-t, és írj hitelesített értékelést." }
+  },
+  guest_confirmed: {
+    en: { title: "Reservation confirmed", body: "Open SmartTable to view your confirmed reservation." },
+    es: { title: "Reserva confirmada", body: "Abre SmartTable para ver tu reserva confirmada." },
+    hu: { title: "Foglalás megerősítve", body: "Nyisd meg a SmartTable-t a megerősített foglalás megtekintéséhez." }
+  },
+  guest_cancelled: {
+    en: { title: "Reservation cancelled", body: "Open SmartTable to view the latest reservation details." },
+    es: { title: "Reserva cancelada", body: "Abre SmartTable para ver los datos más recientes de la reserva." },
+    hu: { title: "Foglalás lemondva", body: "Nyisd meg a SmartTable-t a foglalás legfrissebb adatainak megtekintéséhez." }
+  },
+  guest_update: {
+    en: { title: "Reservation update", body: "Open SmartTable to view the latest reservation status." },
+    es: { title: "Actualización de reserva", body: "Abre SmartTable para ver el estado más reciente de la reserva." },
+    hu: { title: "Foglalási frissítés", body: "Nyisd meg a SmartTable-t a foglalás legfrissebb állapotának megtekintéséhez." }
+  },
+  partner_reservation: {
+    en: { title: "New reservation request", body: "Open SmartTable Partner to review the request." },
+    es: { title: "Nueva solicitud de reserva", body: "Abre SmartTable Partner para revisar la solicitud." },
+    hu: { title: "Új foglalási kérelem", body: "Nyisd meg a SmartTable Partner alkalmazást a kérelem ellenőrzéséhez." }
+  }
+});
+
+function nativePushCopy({ appKind, notificationType = "", entityType = "", locale = "en", title = "", body = "" } = {}) {
+  const language = normalizeLanguage(locale);
+  const type = lower(notificationType);
+  const key = appKind === "partner"
+    ? "partner_reservation"
+    : entityType === "review" || type.includes("review") || type === "booking_completed"
+      ? "guest_review"
+      : type.includes("accepted") || type.includes("confirmed")
+        ? "guest_confirmed"
+        : type.includes("cancelled") || type.includes("canceled")
+          ? "guest_cancelled"
+          : "guest_update";
+  return NATIVE_PUSH_COPY[key]?.[language]
+    || NATIVE_PUSH_COPY[key]?.en
+    || { title: clean(title).slice(0, 120), body: clean(body).slice(0, 220) };
+}
+
+async function sendNativeMobilePush({ appKind, userId = "", restaurantId = "", notificationType, entityType, entityId, title, body } = {}) {
+  if (!clean(entityId) || !mobilePushService.getStatus().enabled) return [];
+  const devices = await listNativeMobilePushDevices({ appKind, userId, restaurantId });
+  const outcomes = [];
+  for (const device of devices) {
+    const idempotencyKey = mobilePushTokenHash(`native-push:${appKind}:${notificationType}:${entityType}:${entityId}:${device.id}`);
+    const existing = await findMobilePushDelivery(idempotencyKey);
+    if (existing && ["sent", "delivered"].includes(clean(existing.status))) {
+      outcomes.push({ sent: false, skipped: true, reason: "duplicate_delivery" });
+      continue;
+    }
+    let token;
+    try { token = decryptMobilePushToken(device.push_token_ciphertext); }
+    catch {
+      await updateNativeMobilePushDevice(device, { sent: false, status: "expired", errorCode: "PUSH_TOKEN_DECRYPTION_FAILED" });
+      continue;
+    }
+    const localizedCopy = nativePushCopy({
+      appKind,
+      notificationType,
+      entityType,
+      locale: device.locale,
+      title,
+      body
+    });
+    const result = await mobilePushService.sendNotification({
+      token,
+      title: localizedCopy.title,
+      body: localizedCopy.body,
+      data: nativeNotificationPayload(appKind, entityType, entityId),
+      channelId: appKind === "partner" ? "reservation-alerts" : "smarttable-updates",
+      ttl: appKind === "partner" ? 300 : 3600
+    });
+    await saveMobilePushDelivery({
+      device_id: device.id || null,
+      user_id: device.user_id || null,
+      restaurant_id: device.restaurant_id || null,
+      app_kind: appKind,
+      notification_type: clean(notificationType || "update").slice(0, 80),
+      entity_type: entityType,
+      entity_id: clean(entityId),
+      provider: result.provider || "expo",
+      provider_message_id: result.provider_message_id || null,
+      idempotency_key: idempotencyKey,
+      status: result.sent ? "sent" : result.status === "expired" ? "expired" : "failed",
+      error_code: result.errorCode || null,
+      attempt_number: Number(existing?.attempt_number || 0) + 1,
+      sent_at: result.sent ? nowIso() : null,
+      updated_at: nowIso()
+    });
+    await updateNativeMobilePushDevice(device, result);
+    outcomes.push({ sent: Boolean(result.sent), status: result.status, provider: result.provider });
+  }
+  return outcomes;
+}
+
+async function sendGuestNativePush(row = {}, notification = {}) {
+  const userId = await guestMobilePushUserId(row);
+  if (!userId) return [];
+  const review = clean(notification.type) === "booking_completed" || clean(notification.type).includes("review");
+  const status = normalizeReservationStatus(row.status);
+  const title = review ? "How was your visit?" : status === "accepted" ? "Reservation confirmed" : status === "rejected" ? "Reservation update" : status === "cancelled" ? "Reservation cancelled" : "Reservation updated";
+  const message = review ? "Open SmartTable to share a verified review." : "Open SmartTable to view the latest reservation status.";
+  return sendNativeMobilePush({
+    appKind: "guest",
+    userId,
+    notificationType: notification.type || `reservation_${status || "updated"}`,
+    entityType: review ? "review" : "reservation",
+    entityId: row.reservation_id || row.id,
+    title,
+    body: message
+  });
+}
+
+async function sendPartnerNativeReservationPush(alert = {}) {
+  return sendNativeMobilePush({
+    appKind: "partner",
+    restaurantId: alert.restaurant_id,
+    notificationType: alert.alert_type || "new_reservation_request",
+    entityType: "reservation",
+    entityId: alert.reservation_id || alert.id,
+    title: "New reservation request",
+    body: "Open SmartTable Partner to review the request."
+  });
+}
+
+async function processMobilePushReceipts() {
+  if (!mobilePushService.getStatus().enabled || !await nativePushSchemaReady()) {
+    return { checked: 0, delivered: 0, failed: 0, expired: 0 };
+  }
+  const pending = !supabaseConfigured
+    ? demo.mobilePushDeliveries.filter((item) => item.provider === "expo" && item.status === "sent" && item.provider_message_id)
+    : await supabaseFetch("/rest/v1/mobile_push_deliveries?select=*&provider=eq.expo&status=eq.sent&provider_message_id=not.is.null&order=created_at.asc&limit=1000", { service: true }).catch(() => []);
+  if (!pending.length) return { checked: 0, delivered: 0, failed: 0, expired: 0 };
+  const receiptResult = await mobilePushService.getReceipts(pending.map((item) => item.provider_message_id));
+  const summary = { checked: 0, delivered: 0, failed: 0, expired: 0 };
+  for (const delivery of pending) {
+    const receipt = receiptResult.receipts?.[delivery.provider_message_id];
+    if (!receipt) continue;
+    summary.checked += 1;
+    const error = clean(receipt?.details?.error || "");
+    const expired = error === "DeviceNotRegistered";
+    const delivered = receipt.status === "ok";
+    const status = delivered ? "delivered" : expired ? "expired" : "failed";
+    summary[status] += 1;
+    const patch = {
+      status,
+      error_code: delivered ? null : expired ? "PUSH_DEVICE_NOT_REGISTERED" : clean(error || "EXPO_PUSH_RECEIPT_FAILED").slice(0, 80),
+      delivered_at: delivered ? nowIso() : null,
+      updated_at: nowIso()
+    };
+    if (!supabaseConfigured) {
+      Object.assign(delivery, patch);
+      if (expired) {
+        const device = demo.mobilePushDevices.find((item) => item.id === delivery.device_id);
+        if (device) await updateNativeMobilePushDevice(device, { sent: false, status: "expired", errorCode: patch.error_code });
+      }
+      continue;
+    }
+    await supabaseFetch(`/rest/v1/mobile_push_deliveries?id=eq.${encodeURIComponent(delivery.id)}`, {
+      method: "PATCH",
+      service: true,
+      headers: { Prefer: "return=minimal" },
+      body: patch
+    }).catch(() => null);
+    if (expired && delivery.device_id) {
+      const devices = await supabaseFetch(`/rest/v1/mobile_push_devices?select=*&id=eq.${encodeURIComponent(delivery.device_id)}&limit=1`, { service: true }).catch(() => []);
+      if (devices?.[0]) await updateNativeMobilePushDevice(devices[0], { sent: false, status: "expired", errorCode: patch.error_code });
+    }
+  }
+  return summary;
+}
+
 function notificationRows() {
   ensureDemo();
   return demo.adminNotifications.map((notification) => {
@@ -23685,7 +24533,88 @@ async function adminNotifications(method, body, headers) {
   return json(405, { error: "Method not allowed." });
 }
 
+const RESERVATION_REQUEST_FIELDS = new Set([
+  "__rawBody",
+  "offer_id",
+  "restaurant_id",
+  "restaurantId",
+  "reservation_type",
+  "type",
+  "party_size",
+  "guest_name",
+  "name",
+  "guest_email",
+  "email",
+  "guest_phone",
+  "phone",
+  "guest_language",
+  "language",
+  "lang",
+  "notes",
+  "reservation_date",
+  "reservation_time",
+  "profile_key"
+]);
+
+function reservationInputError(code, error) {
+  return { status: 400, code, error };
+}
+
+function validateReservationRequestBody(body = {}) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return reservationInputError("INVALID_REQUEST_BODY", "Reservation request must be a JSON object.");
+  }
+  const unexpected = Object.keys(body).filter((key) => !RESERVATION_REQUEST_FIELDS.has(key));
+  if (unexpected.length) {
+    return reservationInputError("UNEXPECTED_FIELD", "Reservation request contains an unsupported field.");
+  }
+  for (const [key, value] of Object.entries(body)) {
+    if (key === "__rawBody" || value === null || value === undefined) continue;
+    if (typeof value === "object" || typeof value === "function") {
+      return reservationInputError("INVALID_FIELD_TYPE", "Reservation request contains an invalid field type.");
+    }
+  }
+  for (const key of ["offer_id", "restaurant_id", "restaurantId"]) {
+    if (clean(body[key]) && !looksLikeUuid(body[key])) {
+      return reservationInputError("INVALID_UUID", "Reservation or restaurant identifier is invalid.");
+    }
+  }
+  const name = clean(body.guest_name || body.name);
+  const email = lower(body.guest_email || body.email);
+  const phone = clean(body.guest_phone || body.phone);
+  if (name.length > 120 || /[\u0000-\u001f\u007f]/.test(name)) {
+    return reservationInputError("INVALID_GUEST_NAME", "Guest name is invalid or too long.");
+  }
+  if (email && (email.length > 254 || !isValidSignupEmail(email))) {
+    return reservationInputError("INVALID_GUEST_EMAIL", "Enter a valid guest email address.");
+  }
+  if (phone && (phone.length > 40 || !/^[0-9+().\-\s]{7,40}$/.test(phone))) {
+    return reservationInputError("INVALID_GUEST_PHONE", "Enter a valid guest phone number.");
+  }
+  if (clean(body.notes).length > 1000) {
+    return reservationInputError("NOTES_TOO_LONG", "Reservation notes are too long.");
+  }
+  if (clean(body.profile_key).length > 200) {
+    return reservationInputError("PROFILE_KEY_TOO_LONG", "Reservation profile identifier is too long.");
+  }
+  if (body.party_size !== undefined) {
+    const partySize = Number(body.party_size);
+    if (!Number.isInteger(partySize) || partySize < 1 || partySize > 50) {
+      return reservationInputError("INVALID_PARTY_SIZE", "Party size must be a whole number between 1 and 50.");
+    }
+  }
+  if (clean(body.reservation_date) && !isIsoDate(body.reservation_date)) {
+    return reservationInputError("INVALID_RESERVATION_DATE", "Choose a valid reservation date.");
+  }
+  if (clean(body.reservation_time) && !normalizeReservationTime(body.reservation_time)) {
+    return reservationInputError("INVALID_RESERVATION_TIME", "Choose a valid reservation time.");
+  }
+  return null;
+}
+
 async function createReservation(body, headers) {
+  const requestError = validateReservationRequestBody(body);
+  if (requestError) return json(requestError.status, { code: requestError.code, error: requestError.error });
   const offerId = clean(body.offer_id);
   const reservationType = normalizeReservationType(body.reservation_type || body.type, offerId);
   const partySize = Number(body.party_size);
@@ -23852,6 +24781,7 @@ async function createReservation(body, headers) {
   }
   const reservationRow = decorateReservationRow({
     ...row,
+    restaurant_email: restaurantNotificationEmail(offer.restaurants) || row.restaurant_email,
     source: row.source || "smarttable",
     booking_source: row.booking_source || "SMARTTABLE",
     booking_status: row.booking_status || "pending"
@@ -27178,7 +28108,8 @@ async function systemReservationAlertProcessor(method, body = {}, headers = {}) 
     await requireProfile(headers, ["admin"]);
   }
   const result = await processDueReservationAlertEscalations(clean(body.restaurant_id));
-  return json(200, { ok: true, result });
+  const nativePushReceipts = await processMobilePushReceipts();
+  return json(200, { ok: true, result, native_push_receipts: nativePushReceipts });
 }
 
 async function partnerProfile(method, body, headers, query) {
@@ -28993,9 +29924,9 @@ export async function handleApiRequest(input) {
     if (csrfError) {
       return json(403, csrfError);
     }
-    const rateLimit = mutationRateLimit(method, pathname, headers);
+    const rateLimit = await mutationRateLimit(method, pathname, headers);
     if (rateLimit) {
-      return json(429, { error: rateLimit.error, code: rateLimit.code, retry_after: rateLimit.retryAfterSeconds }, {
+      return json(rateLimit.status || 429, { error: rateLimit.error, code: rateLimit.code, retry_after: rateLimit.retryAfterSeconds }, {
         "retry-after": String(rateLimit.retryAfterSeconds)
       });
     }
@@ -29027,7 +29958,7 @@ export async function handleApiRequest(input) {
     if (method === "POST" && pathname === "/auth/login") return await login(body);
     if (pathname === "/auth/logout") return await authLogout(method, body, headers);
     if (method === "POST" && pathname === "/auth/signup-guest") return await signupGuest(body, headers);
-    if (pathname === "/auth/forgot-password") return await forgotPassword(method, body);
+    if (pathname === "/auth/forgot-password") return await forgotPassword(method, body, headers);
     if (pathname === "/auth/reset-password") return await resetPassword(method, body, headers);
     if (pathname === "/auth/callback") return await authCallback(method, body);
     if (pathname === "/auth/resend-verification") return await publicResendVerification(method, body, headers);
@@ -29057,6 +29988,7 @@ export async function handleApiRequest(input) {
     if (pathname === "/guest/favorites") return await guestFavorites(method, body, headers, url.searchParams);
     if (pathname === "/guest/food-feed-favorites") return await guestFoodFeedFavorites(method, body, headers, url.searchParams);
     if (pathname === "/guest/notifications") return await guestNotifications(method, body, headers, url.searchParams);
+    if (pathname === "/mobile/push-devices") return await mobilePushDevices(method, body, headers, url.searchParams);
     if (pathname === "/guest/preferences") return await guestPreferences(method, body, headers);
     if (pathname === "/guest/communications") return await guestCommunications(method, body, headers);
     if (pathname === "/guest/privacy") return await guestPrivacy(method, body, headers);

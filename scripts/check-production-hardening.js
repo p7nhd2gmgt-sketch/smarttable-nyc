@@ -6,7 +6,7 @@ const originalFetch = globalThis.fetch;
 
 function resetEnv(overrides = {}) {
   for (const key of Object.keys(process.env)) {
-    if (key.startsWith("SUPABASE_") || key.startsWith("RESEND_") || key.startsWith("EMAIL_") || key === "PUBLIC_BASE_URL" || key === "PUBLIC_SITE_URL" || key === "SMARTTABLE_ENV" || key === "APP_ENV" || key === "VERCEL_ENV" || key === "NODE_ENV") {
+    if (key.startsWith("SUPABASE_") || key.startsWith("RESEND_") || key.startsWith("EMAIL_") || key === "IMPERSONATION_SECRET" || key === "PUBLIC_BASE_URL" || key === "PUBLIC_SITE_URL" || key === "SMARTTABLE_ENV" || key === "APP_ENV" || key === "VERCEL_ENV" || key === "NODE_ENV") {
       delete process.env[key];
     }
   }
@@ -44,6 +44,7 @@ assert(missingHealth.body.production_configuration_issues.includes("SUPABASE_CON
 assert(missingHealth.body.production_configuration_issues.includes("PUBLIC_BASE_URL_MISSING"));
 assert(missingHealth.body.production_configuration_issues.includes("EMAIL_FROM_MISSING"));
 assert(missingHealth.body.production_configuration_issues.includes("RESEND_API_KEY_MISSING"));
+assert(missingHealth.body.production_configuration_issues.includes("IMPERSONATION_SECRET_MISSING_OR_WEAK"));
 
 const blockedPublic = await rawApi(missingCore, "GET", "/public/offers");
 assert.equal(blockedPublic.status, 503, "Production API must not fall back to demo data when mandatory configuration is missing.");
@@ -126,7 +127,8 @@ resetEnv({
   SUPABASE_SERVICE_ROLE_KEY: "service-role-key",
   PUBLIC_BASE_URL: "https://smarttablenyc.com",
   EMAIL_FROM: "SmartTable <reservations@mail.smarttablenyc.com>",
-  RESEND_API_KEY: "test-resend-key"
+  RESEND_API_KEY: "test-resend-key",
+  IMPERSONATION_SECRET: "test-only-impersonation-secret-at-least-32"
 });
 const configuredCore = await importCore("configured");
 const configuredHealth = await rawApi(configuredCore, "GET", "/health");
@@ -171,7 +173,8 @@ resetEnv({
   SUPABASE_SERVICE_ROLE_KEY: "sb_secret_test_key",
   PUBLIC_BASE_URL: "https://smarttablenyc.com",
   EMAIL_FROM: "SmartTable <reservations@mail.smarttablenyc.com>",
-  RESEND_API_KEY: "test-resend-key"
+  RESEND_API_KEY: "test-resend-key",
+  IMPERSONATION_SECRET: "test-only-impersonation-secret-at-least-32"
 });
 let secretKeyRequestHeaders = null;
 globalThis.fetch = async (url, options = {}) => {

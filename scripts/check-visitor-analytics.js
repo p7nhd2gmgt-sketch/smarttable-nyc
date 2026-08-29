@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 
 const indexHtml = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
+const analyticsBootstrap = await readFile(new URL("../public/analytics-bootstrap.js", import.meta.url), "utf8");
 const appJs = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
 const appCore = await readFile(new URL("../src/app-core.js", import.meta.url), "utf8");
 const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
@@ -16,12 +17,13 @@ function includesAll(source, values, message) {
 
 assert(packageJson.dependencies?.["@vercel/analytics"], "Official @vercel/analytics package must be installed.");
 assert.equal(packageJson.scripts?.["check:visitor-analytics"], "node scripts/check-visitor-analytics.js", "Visitor analytics check script must be exposed.");
-assert.equal((indexHtml.match(/data-smarttable-analytics/g) || []).length, 1, "Vercel Web Analytics script marker must be configured once.");
-assert(indexHtml.includes('script.setAttribute("data-smarttable-analytics", "vercel-web-analytics")'), "Vercel Web Analytics script must be injected once.");
-assert(indexHtml.includes('/_vercel/insights/script.js'), "Vercel Web Analytics must use the Vercel insights script route.");
-assert(indexHtml.includes('window.va("beforeSend"'), "Vercel Web Analytics must use beforeSend for privacy filtering.");
-assert(indexHtml.includes("productionHosts"), "Analytics must be production-host gated.");
-includesAll(indexHtml, [
+assert(indexHtml.includes('src="/analytics-bootstrap.js'), "The CSP-safe analytics bootstrap must be loaded as an external script.");
+assert.equal((analyticsBootstrap.match(/data-smarttable-analytics/g) || []).length, 1, "Vercel Web Analytics script marker must be configured once.");
+assert(analyticsBootstrap.includes('script.setAttribute("data-smarttable-analytics", "vercel-web-analytics")'), "Vercel Web Analytics script must be injected once.");
+assert(analyticsBootstrap.includes('/_vercel/insights/script.js'), "Vercel Web Analytics must use the Vercel insights script route.");
+assert(analyticsBootstrap.includes('window.va("beforeSend"'), "Vercel Web Analytics must use beforeSend for privacy filtering.");
+assert(analyticsBootstrap.includes("productionHosts"), "Analytics must be production-host gated.");
+includesAll(analyticsBootstrap, [
   '"smarttablenyc.com"',
   '"www.smarttablenyc.com"',
   '"/admin"',

@@ -141,7 +141,9 @@ console.log(JSON.stringify({
     status: restaurant.status,
     email: maskEmail(restaurant.email),
     contact_email: maskEmail(restaurant.contact_email),
-    reservation_notification_email: maskEmail(restaurant.reservation_notification_email)
+    reservation_notification_email: maskEmail(
+      restaurant.reservation_notification_email || restaurant.reservation_email || restaurant.email || restaurant.contact_email
+    )
   } : null,
   email_logs: logs.map(safeLog),
   email_queue: queue.map(safeQueue)

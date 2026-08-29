@@ -11,7 +11,7 @@ console.error = (...args) => {
 
 function resetEnv(overrides = {}) {
   for (const key of Object.keys(process.env)) {
-    if (key.startsWith("SUPABASE_") || key.startsWith("RESEND_") || key.startsWith("EMAIL_") || key === "PUBLIC_BASE_URL" || key === "PUBLIC_SITE_URL" || key === "SMARTTABLE_ENV" || key === "APP_ENV" || key === "VERCEL_ENV" || key === "NODE_ENV" || key === "SMARTTABLE_ENABLE_LOGIN_DIAGNOSTICS") {
+    if (key.startsWith("SUPABASE_") || key.startsWith("RESEND_") || key.startsWith("EMAIL_") || key === "IMPERSONATION_SECRET" || key === "PUBLIC_BASE_URL" || key === "PUBLIC_SITE_URL" || key === "SMARTTABLE_ENV" || key === "APP_ENV" || key === "VERCEL_ENV" || key === "NODE_ENV" || key === "SMARTTABLE_ENABLE_LOGIN_DIAGNOSTICS") {
       delete process.env[key];
     }
   }
@@ -46,6 +46,7 @@ function productionEnv() {
     SUPABASE_URL: "https://example.supabase.co",
     SUPABASE_ANON_KEY: "anon-key",
     SUPABASE_SERVICE_ROLE_KEY: "service-role-key",
+    IMPERSONATION_SECRET: "production-auth-flow-test-secret-32-bytes-minimum",
     PUBLIC_BASE_URL: "https://www.smarttablenyc.com",
     EMAIL_FROM: "SmartTable <reservations@mail.smarttablenyc.com>",
     RESEND_API_KEY: "test-resend-key"
@@ -492,6 +493,7 @@ await withMockedProductionCore("analytics-production-metadata-schema", async (ur
   const body = options.body ? JSON.parse(options.body) : null;
   if (target.includes("/rest/v1/analytics_events?select=*")) {
     assert(body.metadata?.step_key === "account", "Production analytics must store whitelisted properties in the metadata column.");
+    assert(!("profile_key" in body), "Production analytics insert must not require a legacy profile_key column.");
     assert(!("properties" in body), "Production analytics insert must not require a properties column.");
     assert(!("entity_type" in body) && !("entity_id" in body), "Production analytics insert must not require optional legacy columns.");
     return jsonResponse(201, [{ id: "analytics-prod", event_type: body.event_type, profile_key: body.profile_key, metadata: body.metadata }]);

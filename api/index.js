@@ -10,6 +10,12 @@ function payloadTooLargeError() {
   return error;
 }
 
+function invalidJsonError() {
+  const error = new Error("Invalid JSON request body.");
+  error.status = 400;
+  return error;
+}
+
 async function readBody(req) {
   const contentType = String(req.headers["content-type"] || "").toLowerCase();
   if (req.body && typeof req.body === "object") return req.body;
@@ -23,7 +29,7 @@ async function readBody(req) {
       if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return { ...parsed, __rawBody: req.body };
       return { value: parsed, __rawBody: req.body };
     } catch {
-      return {};
+      throw invalidJsonError();
     }
   }
 
@@ -46,7 +52,7 @@ async function readBody(req) {
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return { ...parsed, __rawBody: rawBody };
     return { value: parsed, __rawBody: rawBody };
   } catch {
-    return {};
+    throw invalidJsonError();
   }
 }
 
@@ -64,7 +70,11 @@ export default async function handler(req, res) {
     result = {
       status: error.status || 500,
       headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
-      body: { error: error.status === 413 ? "Request body is too large." : "Server error." }
+      body: {
+        error: error.status === 413
+          ? "Request body is too large."
+          : (error.status === 400 ? "Invalid request body." : "Server error.")
+      }
     };
   }
 

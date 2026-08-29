@@ -453,7 +453,39 @@ async function runConfiguredProviderChecks() {
     assert.equal(missingGuestEmail.status, 400, "Reservation requests without a guest email must fail validation before email queueing.");
 
     const originalPartnerProfile = await apiConfigured("GET", "/partner/profile", {}, partnerHeaders);
-    await apiConfigured("PATCH", "/partner/profile", { email: "" }, partnerHeaders);
+    const originalReservationEmail = originalPartnerProfile.restaurant.reservation_email || "";
+    const reservationNotificationEmail = uniqueEmail("reservation-notification");
+    await apiConfigured("PATCH", "/partner/profile", {
+      reservation_email: reservationNotificationEmail
+    }, partnerHeaders);
+    const routedMessageStart = sentMessages.length;
+    await apiConfigured("POST", "/reservations", {
+      offer_id: configuredOffer.offer_id,
+      reservation_date: configuredOffer.reservation_date || configuredOffer.offer_date,
+      reservation_time: configuredOffer.start_time || configuredOffer.offer_time,
+      party_size: 2,
+      guest_name: "Reservation Notification Email Guest",
+      guest_email: uniqueEmail("reservation-notification-guest"),
+      guest_phone: "+1 212 555 0187",
+      guest_language: "en"
+    });
+    const routedMessages = sentMessages.slice(routedMessageStart);
+    assert(
+      routedMessages.some((message) => (
+        Array.isArray(message.to)
+          ? message.to.includes(reservationNotificationEmail)
+          : message.to === reservationNotificationEmail
+      )),
+      "Reservation requests must use the partner's dedicated reservation notification email."
+    );
+    await apiConfigured("PATCH", "/partner/profile", {
+      reservation_email: originalReservationEmail
+    }, partnerHeaders);
+
+    await apiConfigured("PATCH", "/partner/profile", {
+      email: "",
+      reservation_email: ""
+    }, partnerHeaders);
     const missingRestaurantEmailReservation = await apiConfigured("POST", "/reservations", {
       offer_id: configuredOffer.offer_id,
       reservation_date: configuredOffer.reservation_date || configuredOffer.offer_date,
@@ -469,7 +501,10 @@ async function runConfiguredProviderChecks() {
     const missingRestaurantEmailId = missingRestaurantEmailReservation.reservation?.reservation_id;
     const missingRestaurantDiagnostics = await apiConfigured("GET", `/admin/email-diagnostics?reservation=${missingRestaurantEmailId}&email_type=restaurant_request_notice&status=failed`, {}, adminHeaders);
     assert(missingRestaurantDiagnostics.recent_logs.some((row) => row.last_safe_error || row.last_error_code === "MISSING_RESTAURANT_NOTIFICATION_EMAIL"), "Super Admin diagnostics must show the missing partner email failure.");
-    await apiConfigured("PATCH", "/partner/profile", { email: originalPartnerProfile.restaurant.email }, partnerHeaders);
+    await apiConfigured("PATCH", "/partner/profile", {
+      email: originalPartnerProfile.restaurant.email,
+      reservation_email: originalReservationEmail
+    }, partnerHeaders);
 
     providerMode = "temporary";
     const reservationDuringOutage = await rawApiConfigured("POST", "/reservations", {

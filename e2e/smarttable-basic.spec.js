@@ -96,11 +96,15 @@ function authHeaders(session) {
 async function storeSession(page, session) {
   await page.goto("/");
   await page.evaluate((storedSession) => {
-    localStorage.setItem("smarttable.session", JSON.stringify({
+    const role = String(storedSession?.profile?.role || "").trim().toLowerCase();
+    const storage = ["admin", "super_admin", "superadmin"].includes(role)
+      ? sessionStorage
+      : localStorage;
+    storage.setItem("smarttable.session", JSON.stringify({
       ...storedSession,
       expires_at: Date.now() + 30 * 24 * 60 * 60 * 1000
     }));
-    sessionStorage.removeItem("smarttable.session");
+    (storage === sessionStorage ? localStorage : sessionStorage).removeItem("smarttable.session");
   }, session);
   await page.goto("/");
 }
@@ -110,7 +114,11 @@ async function replaceStoredSession(page, session, path = "/") {
   await page.evaluate((storedSession) => {
     localStorage.removeItem("smarttable.session");
     sessionStorage.removeItem("smarttable.session");
-    localStorage.setItem("smarttable.session", JSON.stringify({
+    const role = String(storedSession?.profile?.role || "").trim().toLowerCase();
+    const storage = ["admin", "super_admin", "superadmin"].includes(role)
+      ? sessionStorage
+      : localStorage;
+    storage.setItem("smarttable.session", JSON.stringify({
       ...storedSession,
       expires_at: Date.now() + 30 * 24 * 60 * 60 * 1000
     }));

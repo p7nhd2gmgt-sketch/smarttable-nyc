@@ -9,6 +9,7 @@ async function read(path) {
 }
 
 const appSource = await read("public/app.js");
+const vercelConfig = JSON.parse(await read("vercel.json"));
 
 for (const token of [
   "function currentPublicGuestRoute()",
@@ -57,6 +58,25 @@ for (const token of [
   '"/superadmin/settings"'
 ]) {
   assert(appSource.includes(token), `Route map is missing ${token}.`);
+}
+
+const vercelRewrites = new Map((vercelConfig.rewrites || []).map((rewrite) => [rewrite.source, rewrite.destination]));
+for (const route of [
+  "/restaurants",
+  "/restaurants/:path*",
+  "/offers",
+  "/food-feed",
+  "/terms",
+  "/privacy",
+  "/cookies",
+  "/reservation-policy",
+  "/review-policy",
+  "/partner-terms",
+  "/accessibility",
+  "/contact",
+  "/help"
+]) {
+  assert(vercelRewrites.get(route) === "/", `Vercel SPA rewrites are missing ${route}.`);
 }
 
 for (const token of [

@@ -319,7 +319,14 @@ async function parseJson(req) {
   if (contentType.includes("application/x-www-form-urlencoded")) {
     return { ...Object.fromEntries(new URLSearchParams(rawBody)), __rawBody: rawBody };
   }
-  const parsed = JSON.parse(rawBody);
+  let parsed;
+  try {
+    parsed = JSON.parse(rawBody);
+  } catch {
+    const error = new Error("Invalid request body.");
+    error.status = 400;
+    throw error;
+  }
   if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
     return { ...parsed, __rawBody: rawBody };
   }
@@ -389,7 +396,10 @@ const server = http.createServer(async (req, res) => {
       status
     }));
     res.writeHead(status, securityHeaders({ "content-type": "application/json; charset=utf-8" }));
-    res.end(JSON.stringify({ error: isProductionRuntime && status >= 500 ? "Server error." : error.message || "Server error." }));
+    const safeMessage = status === 400
+      ? "Invalid request body."
+      : (status === 413 ? "Request body is too large." : "Server error.");
+    res.end(JSON.stringify({ error: safeMessage }));
   }
 });
 
