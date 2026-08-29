@@ -1,17 +1,17 @@
 # SMARTTABLE SECURITY AUDIT
 
-**Date:** 2026-08-29  
-**Commit:** `39a8c87` (`feature/guest-website-view-counter`, audit közben módosított munkafa)  
-**Environment:** helyi izolált demo + `smarttable-staging` közvetlen RBAC/RLS és több-instance rate-limit QA  
-**Production write/deployment a security audit során:** NEM  
-**Adatbázis-migráció alkalmazva:** IGEN, kizárólag stagingen: `0069_security_hardening.sql`, `0070_distributed_api_rate_limits.sql`
+**Date:** 2026-08-29
+**Deployed runtime commit:** `4d6b1fa6bb0279217e640bbd1186ee01fde7db7f` (`feature/guest-website-view-counter`)
+**Environment:** helyi izolált demo + `smarttable-staging` + engedélyezett production security rollout
+**Production write/deployment a security audit során:** IGEN, a tulajdonos külön jóváhagyásával
+**Adatbázis-migráció alkalmazva:** IGEN, stagingen és productionben: `0069_security_hardening.sql`, `0070_distributed_api_rate_limits.sql`
 
 ## SUMMARY
 
 | Súlyosság | Talált | Kódban javított | Nyitott release blocker |
 |---|---:|---:|---:|
 | P0 CRITICAL | 0 | 0 | 0 |
-| P1 HIGH | 7 | 7 | 0 stagingen |
+| P1 HIGH | 7 | 7 | 0 |
 | P2 MEDIUM | 9 | 8 | 1 elfogadott upstream kockázat |
 | P3 LOW | 3 | 1 | 2 dokumentált |
 
@@ -20,12 +20,14 @@ error handling, CSP és session hardeningje elkészült. A teljes helyi webes
 regresszió, a 64 Playwright E2E teszt, a mobil tesztek és mind a négy mobil
 export sikeres.
 
-A staging security release gate teljesült. A `0069_security_hardening.sql` és
-`0070_distributed_api_rate_limits.sql` kizárólag az ellenőrzött staging
-projektre került alkalmazásra. Az anon/guest/partner/admin közvetlen API
-próbák, a cross-tenant tiltások és két külön alkalmazáspéldány közös tartós
-limitje sikeres. Production rollout továbbra is külön, explicit jóváhagyást és
-megismételt ellenőrzést igényel; productionhöz ez a munka nem nyúlt.
+A staging és production security release gate teljesült. A `0069` és `0070`
+migráció az előzetesen azonosított staging, majd a tulajdonos által külön
+engedélyezett production projektre került. A production tranzakció előtti és
+utáni alap üzleti rekordszámok és ID-ujjlenyomatok megegyeztek. Az élő
+production health endpoint a pontos commitot, elérhető adatbázist és üres
+production konfigurációs hibalistát igazolta. A staging HTTPS origin azonosított,
+a native push provider, titkosítás, séma és tokenfogadás readiness ellenőrzése
+sikeres.
 
 ## ISSUES
 
@@ -46,7 +48,7 @@ jogokat, csak `service_role` hozzáférést hagy, és az admin RPC törzsében i
 vissza lett vonva.  
 **Files changed:** `supabase/migrations/0069_security_hardening.sql`  
 **Test:** `npm run check:security-hardening-0069`  
-**Status:** STAGINGEN ALKALMAZVA ÉS KÖZVETLEN API PRÓBÁVAL IGAZOLVA; PRODUCTION DEPLOYMENT REQUIRED
+**Status:** FIXED; STAGINGEN ÉS PRODUCTIONBEN ALKALMAZVA, KÖZVETLEN API PRÓBÁVAL IGAZOLVA
 
 ### SEC-002
 
@@ -63,9 +65,9 @@ volna.
 **Fix:** A 0069 minden érzékeny táblát és view-t server-only kapcsolatra állít;
 csak explicit, nem PII-t tartalmazó public read modellek maradnak publikusak.  
 **Files changed:** `supabase/migrations/0069_security_hardening.sql`  
-**Test:** 102/102 migrációban létrehozott tábla RLS audit; érzékeny relation
+**Test:** 103/103 migrációban létrehozott tábla RLS audit; érzékeny relation
 grant regression.  
-**Status:** STAGINGEN ALKALMAZVA ÉS IGAZOLVA; PRODUCTION DEPLOYMENT REQUIRED
+**Status:** FIXED; STAGINGEN ÉS PRODUCTIONBEN ALKALMAZVA ÉS IGAZOLVA
 
 ### SEC-003
 
@@ -81,7 +83,7 @@ is a saját centralizált jogosultság- és audit-ellenőrzéseik után működn
 **Files changed:** `supabase/migrations/0069_security_hardening.sql`  
 **Test:** self-promotion statikus regression + staging szerepkör/tenant
 izolációs API próba.  
-**Status:** STAGINGEN ALKALMAZVA ÉS SELF-ESCALATION PRÓBÁVAL IGAZOLVA; PRODUCTION DEPLOYMENT REQUIRED
+**Status:** FIXED; STAGINGEN SELF-ESCALATION PRÓBÁVAL, PRODUCTIONBEN TRIGGER- ÉS GRANT-AUDITTAL IGAZOLVA
 
 ### SEC-004
 
@@ -100,7 +102,7 @@ konfigurálható AAL2/MFA kényszerítés. Demo token productionben fail-closed.
 `e2e/smarttable-basic.spec.js`  
 **Test:** production hardening/auth-flow checks, 64/64 E2E, négy szerepkörös
 staging login/refresh/logout E2E.  
-**Status:** FIXED; MFA éles bekapcsolása MANUAL ACTION REQUIRED
+**Status:** FIXED; külön production `IMPERSONATION_SECRET` beállítva; MFA éles bekapcsolása MANUAL ACTION REQUIRED
 
 ### SEC-005
 
@@ -126,7 +128,7 @@ megtartják az enumeration-safe, route-specifikus válaszaikat.
 sequence `404, 404, 429`; resend-verification több instance-on az első három
 kérést elfogadja, a negyediket `VERIFICATION_RESEND_RATE_LIMITED` 429-cel
 elutasítja; anon/guest direct table és RPC hozzáférés DENIED.  
-**Status:** STAGINGEN FIXED ÉS MULTI-INSTANCE PRÓBÁVAL IGAZOLVA; PRODUCTION ROLLOUT REQUIRED
+**Status:** FIXED; STAGINGEN MULTI-INSTANCE PRÓBÁVAL, PRODUCTIONBEN FAIL-CLOSED KONFIGURÁCIÓVAL ÉS SÉMA-AUDITTAL IGAZOLVA
 
 ### SEC-006
 
@@ -141,7 +143,7 @@ réteg megkerülését.
 modelleken csak SELECT marad.  
 **Files changed:** `supabase/migrations/0069_security_hardening.sql`  
 **Test:** grant list regression, staging tenant isolation read probe.  
-**Status:** STAGINGEN ALKALMAZVA ÉS CROSS-TENANT PRÓBÁVAL IGAZOLVA; PRODUCTION DEPLOYMENT REQUIRED
+**Status:** FIXED; STAGINGEN CROSS-TENANT PRÓBÁVAL, PRODUCTIONBEN GRANT-AUDITTAL IGAZOLVA
 
 ### SEC-007
 
@@ -281,20 +283,23 @@ account deletion/export és PII logging szabályok dokumentálva.
 **Severity:** P2 MEDIUM  
 **Component:** Staging security readiness  
 **Description:** A staging RBAC/RLS és több-instance abuse protection éles
-adatbázis-szintű bizonyítása szükséges volt; a böngészőből elérhető, teljesen
-izolált HTTPS staging app-origin továbbra sincs azonosítva.  
+adatbázis-szintű bizonyítása és egy böngészőből elérhető, productiontől izolált
+HTTPS staging app-origin azonosítása szükséges volt.
 **Exploit scenario:** DB-hardening nélkül közvetlen grant kockázatok, közös
 limiter nélkül serverless instance-szétosztásos limitmegkerülés maradhatott volna.  
-**Fix:** a 0069 és 0070 migrációk kizárólag stagingre kerültek, fail-closed
-beállítással. Az alkalmazás helyben a staging backend ellen, valamint közvetlen
-PostgREST/RPC próbákkal lett ellenőrizve.  
+**Fix:** a 0069 és 0070 migrációk először stagingre kerültek, fail-closed
+beállítással. A stabil HTTPS staging alias a friss, staging Supabase-ra mutató
+Preview buildre került; a readiness gate most az élő health contractot, a
+projektazonosságot, az Expo providert, a titkosítás meglétét, a sémát és a
+tokenfogadást is ellenőrzi.
 **Files changed:** `scripts/check-staging-native-push-readiness.mjs`,
 `supabase/migrations/0068_native_mobile_push.sql`,
 `supabase/migrations/0069_security_hardening.sql`  
 **Test:** anon profiles DENIED; guest partner/admin adatok DENIED; Partner A ->
 Restaurant B update és booking read DENIED; partner/admin privileged RPC DENIED;
-self role escalation DENIED; két app instance közös 429; raw IP storage nincs.  
-**Status:** STAGING SECURITY PASS; ISOLATED HTTPS APP ORIGIN MANUAL ACTION REQUIRED A TELJES TÁVOLI BÖNGÉSZŐS QA-HOZ
+self role escalation DENIED; két app instance közös 429; raw IP storage nincs;
+native push live readiness blocker nélkül PASS.
+**Status:** FIXED; STAGING SECURITY ÉS NATIVE PUSH READINESS PASS
 
 ### SEC-017
 
@@ -318,9 +323,12 @@ nem release-blocking feladatként dokumentálva.
 | Web syntax/check | PASS |
 | Web lint | PASS |
 | Web production build | PASS |
-| Security hardening 0069 | PASS, 102/102 RLS tábla audit |
+| Security hardening 0069 | PASS, 103/103 RLS tábla audit |
 | Staging 0069 live RBAC/RLS | PASS, minden tiltott cross-role/cross-tenant próba DENIED |
 | Distributed rate limiting 0070 | PASS, service-only + két app instance közös limit |
+| Production 0069/0070 tranzakció | PASS, séma/grant/trigger/limiter ellenőrizve, üzleti adatok változatlanok |
+| Production HTTPS health + headerek | PASS, pontos commit, DB elérhető, konfigurációs hibák: 0 |
+| Staging HTTPS native push readiness | PASS, Expo provider + titkosítás + séma + tokenfogadás |
 | Secret scan | PASS, credential-like találat nincs |
 | Playwright teljes E2E | PASS, 64/64 |
 | Staging test accounts + direct RBAC API | PASS, 4/4 szerepkör |
@@ -346,35 +354,35 @@ security kontrollt és buildet törhetne el.
 
 ## MANUAL ACTION REQUIRED
 
-1. **Izolált staging app-origin:** állíts be explicit HTTPS SmartTable staging
-   web/API origint a teljes távoli böngészős QA-hoz. Production nem használható
-   fallbackként. A staging adatbázis és a helyi app -> staging ellenőrzés kész.
-2. **Production DB rollout:** csak a staging bizonyítás után, külön explicit
-   production jóváhagyással alkalmazható. Jelen audit nem alkalmazta.
-3. **Production distributed limiter:** a 0070 migrációt és a fail-closed env
-   kapcsolókat csak külön production jóváhagyással lehet élesíteni.
-4. **Privileged secrets/MFA:** védett környezeti változóban külön legalább 32
-   karakteres `IMPERSONATION_SECRET`; admin és superadmin AAL2 enrollment után
+1. **Admin/superadmin MFA:** minden privileged felhasználót AAL2/MFA eszközre
+   kell beiratni, majd az ellenőrzött enrollment után
    `ADMIN_MFA_REQUIRED=true`.
-5. **Email domain:** Resend/SmartTable küldő domain SPF, DKIM és DMARC státusz
+2. **Email domain:** Resend/SmartTable küldő domain SPF, DKIM és DMARC státusz
    ellenőrzése; ez kódból nem bizonyítható teljesen.
-6. **Backup provider:** Supabase automated backup gyakoriság és retention
-   ellenőrzése, majd dokumentált staging restore drill.
-7. **Native push staging:** `MOBILE_PUSH_PROVIDER=expo`, külön 32+ karakteres
-   encryption key, explicit staging origin és a 0068 schema ellenőrzése. A
-   readiness checker addig helyesen fail-closed.
+3. **Backup provider:** a production Supabase projektben a folyamatos WAL
+   archiválás látszik, de PITR nincs engedélyezve. A csomag/költség jóváhagyása
+   után PITR/retention beállítás és dokumentált staging restore drill szükséges.
+4. **Native push fizikai QA:** a staging backend release-ready, de valódi iOS
+   és Android készüléken engedélykérés, tokenregisztráció, háttérértesítés és
+   deep-link megnyitás még manuális eszköztesztet igényel.
+5. **Production native push:** productionben a native provider szándékosan nincs
+   engedélyezve; csak a fizikai staging QA után, külön rollout döntéssel kapcsolható be.
 
 ## RELEASE GATE
 
 **P0 nyitott:** 0  
-**P1 nyitott stagingen:** 0
+**P1 nyitott:** 0
 
 # STAGING SECURITY RELEASE STATUS: PASS
 
 A 0069 RBAC/RLS hardening és a 0070 tartós, több példány között közös limiter
 stagingen alkalmazva és közvetlen negatív/pozitív próbákkal igazolva.
 
-# PRODUCTION SECURITY RELEASE STATUS: FAIL / MANUAL ACTION REQUIRED
+# PRODUCTION SECURITY RELEASE STATUS: PASS
 
-Ez nem production rollout. A production adatbázis és környezeti konfiguráció
-változatlan; ott a 0069/0070 csak külön explicit jóváhagyással alkalmazható.
+A tulajdonos által külön engedélyezett production rollout során a 0069/0070
+tranzakció, a fail-closed distributed limiter, a rövid privileged token policy,
+a külön impersonation secret és a pontos commitból készült Vercel deployment
+élesítésre került. A kontrollszámok és ID-ujjlenyomatok szerint meglévő étterem,
+profil, ajánlat, foglalás és review adat nem változott. A fennmaradó manuális
+tételek működtetési/assurance feladatok; nyitott P0 vagy P1 kódhiba nincs.

@@ -47,6 +47,40 @@ function linkedProjectRef() {
   return existsSync(target) ? clean(readFileSync(target, "utf8")) : "";
 }
 
+async function liveDeploymentStatus(origin, stagingRef) {
+  if (!origin || !stagingRef) return { checked: false, ready: false, reason: "not_configured" };
+  try {
+    const response = await fetch(`${origin}/api/health`, {
+      headers: { accept: "application/json" },
+      signal: AbortSignal.timeout(15_000)
+    });
+    if (!response.ok) return { checked: true, ready: false, reason: `http_${response.status}` };
+    const health = await response.json();
+    const environment = clean(health.environment || health.runtime_mode).toLowerCase();
+    const identitySafe = clean(health.supabase_project_ref) === stagingRef
+      && environment !== "production";
+    const ready = Boolean(
+      identitySafe
+      && health.database_reachable === true
+      && health.native_push_configured === true
+      && clean(health.native_push_provider).toLowerCase() === "expo"
+      && health.native_push_schema_ready === true
+      && health.native_push_accepts_tokens === true
+    );
+    return {
+      checked: true,
+      ready,
+      identity_safe: identitySafe,
+      provider_ready: clean(health.native_push_provider).toLowerCase() === "expo",
+      schema_ready: health.native_push_schema_ready === true,
+      accepts_tokens: health.native_push_accepts_tokens === true,
+      reason: ready ? "available" : "configuration_incomplete"
+    };
+  } catch {
+    return { checked: true, ready: false, reason: "unavailable" };
+  }
+}
+
 async function main() {
   assertEnvFileIgnored();
   const { values: env } = readStagingEnvFile();
@@ -75,8 +109,9 @@ async function main() {
     }
   }
 
-  const providerReady = clean(env.MOBILE_PUSH_PROVIDER).toLowerCase() === "expo";
-  const encryptionReady = encryptionKeyValid(env.MOBILE_PUSH_TOKEN_ENCRYPTION_KEY);
+  const live = originSafe ? await liveDeploymentStatus(origin, stagingRef) : { checked: false, ready: false };
+  const providerReady = live.ready || clean(env.MOBILE_PUSH_PROVIDER).toLowerCase() === "expo";
+  const encryptionReady = live.ready || encryptionKeyValid(env.MOBILE_PUSH_TOKEN_ENCRYPTION_KEY);
   let schemaReady = false;
   let schemaCheck = "not_checked";
   if (identitySafe) {
@@ -96,6 +131,7 @@ async function main() {
   if (!providerReady) blockers.push("MOBILE_PUSH_PROVIDER_NOT_EXPO");
   if (!encryptionReady) blockers.push("MOBILE_PUSH_ENCRYPTION_KEY_MISSING_OR_INVALID");
   if (!schemaReady) blockers.push(schemaCheck === "missing" ? "MOBILE_PUSH_SCHEMA_MISSING" : "MOBILE_PUSH_SCHEMA_NOT_VERIFIED");
+  if (originSafe && live.checked && !live.ready) blockers.push("STAGING_NATIVE_PUSH_DEPLOYMENT_NOT_READY");
 
   console.log(JSON.stringify({
     staging_identity_verified: identitySafe,
@@ -104,6 +140,9 @@ async function main() {
     encryption_key_configured: encryptionReady,
     schema_ready: schemaReady,
     schema_check: schemaCheck,
+    live_deployment_checked: live.checked,
+    live_deployment_ready: live.ready,
+    live_deployment_reason: live.reason || "not_checked",
     ready_for_physical_device_qa: blockers.length === 0,
     blockers
   }, null, 2));
