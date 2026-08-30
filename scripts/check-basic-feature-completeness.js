@@ -171,7 +171,7 @@ includesAll(appSource, [
   "function isFeedbackEligible(",
   "/review/verified?reservation_id=",
   "api(\"/partner/billing\").catch(() => ({ billing: null, plans: [], invoices: [], stripe: { configured: false } }))",
-  "api(\"/admin/billing\").catch(() => ({ plans: [], subscriptions: [], invoices: [], payment_events: [], billing_events: [] }))",
+  "adminDataApi(\"billing\", \"/admin/billing\", { plans: [], subscriptions: [], invoices: [], payment_events: [], billing_events: [] })",
   "basicMode ? Promise.resolve({ campaigns: [], templates: [] })",
   "basicMode ? Promise.resolve({ campaigns: [], provider: { configured: false } })",
   "basicMode ? Promise.resolve({ submissions: [], insights: null })"

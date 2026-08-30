@@ -27679,13 +27679,9 @@ async function adminStats(headers) {
       favorites_total: (followers || []).filter((item) => item.notification_enabled !== false).length
     };
   };
-  const [guestWebsiteViews, bookingOptionViewsTotal, restaurants, stats] = await Promise.all([
+  const [guestWebsiteViews, restaurants, stats] = await Promise.all([
     supabaseExactCount(
       "/rest/v1/analytics_events?select=id&event_type=eq.guest_website_view",
-      { service: true }
-    ).catch(() => 0),
-    supabaseExactCount(
-      "/rest/v1/analytics_events?select=id&event_type=eq.restaurant_booking_options_viewed",
       { service: true }
     ).catch(() => 0),
     supabaseFetch("/rest/v1/restaurants?select=id,name,status&order=name.asc", { service: true }).catch(() => []),
@@ -27697,14 +27693,27 @@ async function adminStats(headers) {
         throw error;
       })
   ]);
-  const bookingOptionViewsByRestaurant = await Promise.all((restaurants || []).map(async (restaurant) => ({
+  const bookingOptionCountByRestaurant = new Map();
+  let bookingOptionViewsTotal = 0;
+  const analyticsPageSize = 1000;
+  for (let offset = 0; ; offset += analyticsPageSize) {
+    const rows = await supabaseFetch(
+      `/rest/v1/analytics_events?select=restaurant_id&event_type=eq.restaurant_booking_options_viewed&restaurant_id=not.is.null&order=created_at.asc,id.asc&limit=${analyticsPageSize}&offset=${offset}`,
+      { service: true }
+    ).catch(() => []);
+    for (const row of rows || []) {
+      const restaurantId = clean(row.restaurant_id);
+      if (!restaurantId) continue;
+      bookingOptionCountByRestaurant.set(restaurantId, (bookingOptionCountByRestaurant.get(restaurantId) || 0) + 1);
+      bookingOptionViewsTotal += 1;
+    }
+    if (!Array.isArray(rows) || rows.length < analyticsPageSize) break;
+  }
+  const bookingOptionViewsByRestaurant = (restaurants || []).map((restaurant) => ({
     restaurant_id: restaurant.id,
     restaurant_name: restaurant.name || "Restaurant",
-    booking_option_views: await supabaseExactCount(
-      `/rest/v1/analytics_events?select=id&event_type=eq.restaurant_booking_options_viewed&restaurant_id=eq.${encodeURIComponent(restaurant.id)}`,
-      { service: true }
-    ).catch(() => 0)
-  })));
+    booking_option_views: bookingOptionCountByRestaurant.get(clean(restaurant.id)) || 0
+  }));
   bookingOptionViewsByRestaurant.sort((left, right) => right.booking_option_views - left.booking_option_views
     || clean(left.restaurant_name).localeCompare(clean(right.restaurant_name)));
   return json(200, {

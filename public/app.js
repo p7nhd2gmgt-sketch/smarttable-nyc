@@ -371,6 +371,7 @@ const state = {
   adminRestaurantDetailTab: "overview",
   adminAuditRestaurantId: "",
   adminAuditLogs: [],
+  adminLoadWarnings: [],
   adminBillingFilter: "all",
   guestPreferenceErrors: {},
   guestSecurity: {
@@ -10061,7 +10062,31 @@ function renderPartnerInvitation() {
   });
 }
 
+const ADMIN_DATA_REQUEST_TIMEOUT_MS = 12_000;
+
+async function adminDataWithFallback(label, loader, fallback) {
+  try {
+    return await loader();
+  } catch (error) {
+    if (isAuthError(error)) throw error;
+    state.adminLoadWarnings.push({
+      label,
+      code: error?.payload?.code || "ADMIN_DATA_UNAVAILABLE"
+    });
+    return typeof fallback === "function" ? fallback() : fallback;
+  }
+}
+
+function adminDataApi(label, path, fallback, options = {}) {
+  return adminDataWithFallback(
+    label,
+    () => api(path, { ...options, timeoutMs: ADMIN_DATA_REQUEST_TIMEOUT_MS }),
+    fallback
+  );
+}
+
 async function loadAdminData(options = {}) {
+  state.adminLoadWarnings = [];
   const adminAiEnabled = canShowFeature("ai.adminAIControls", { allowDemo: true });
   const basicMode = isBasicMode();
   const analyticsFilters = {
@@ -10069,27 +10094,27 @@ async function loadAdminData(options = {}) {
     scope: isSuperAdmin() ? "superadmin" : "admin"
   };
   const [stats, restaurants, reservations, contentRows, partners, offers, reviews, foodFeed, photoSubmissions, notifications, systemMessages, trends, integrations, featureFlags, errors, billing, analytics, checklists, privacy, legal, reservationAlerts] = await Promise.all([
-    api("/admin/stats"),
-    fetchAdminRestaurantList(options),
-    api(`/admin/reservations${queryStringFromFilters(state.adminReservationFilters)}`),
-    api("/admin/content"),
-    api("/admin/partners"),
-    api("/admin/offers"),
-    api(`/admin/reviews${queryStringFromFilters(state.adminReviewFilters)}`),
-    api("/admin/food-feed").catch(() => ({ videos: [] })),
-    basicMode ? Promise.resolve({ submissions: [] }) : api("/admin/photo-reward-submissions"),
-    api("/admin/notifications"),
-    basicMode ? Promise.resolve({ campaigns: [], sms_provider: { configured: false } }) : api("/admin/system-messages").catch(() => ({ campaigns: [], sms_provider: { configured: false } })),
-    adminAiEnabled ? api("/ai/trends").catch(() => ({ trends: null })) : Promise.resolve({ trends: null }),
-    adminAiEnabled ? api("/admin/integrations").catch(() => ({ providers: [], connections: [], sync_runs: [], errors: [] })) : Promise.resolve({ providers: [], connections: [], sync_runs: [], errors: [] }),
-    adminAiEnabled ? api("/admin/feature-flags").catch(() => ({ flags: [] })) : Promise.resolve({ flags: [] }),
-    adminAiEnabled ? api("/admin/errors").catch(() => ({ app_errors: [], integration_errors: [], failed_emails: [], failed_ai_actions: [], admin_alerts: [] })) : Promise.resolve({ app_errors: [], integration_errors: [], failed_emails: [], failed_ai_actions: [], admin_alerts: [] }),
-    api("/admin/billing").catch(() => ({ plans: [], subscriptions: [], invoices: [], payment_events: [], billing_events: [] })),
-    api(`/admin/analytics${queryStringFromFilters(analyticsFilters)}`).catch(() => ({ analytics: null })),
-    adminAiEnabled ? api("/system/checklists").catch(() => ({ checklists: null })) : Promise.resolve({ checklists: null }),
-    api("/privacy/requests").catch(() => ({ requests: [] })),
-    api("/admin/legal-documents").catch(() => ({ documents: [], counts: {} })),
-    api("/admin/reservation-alerts").catch(() => ({ preferences: [], devices: [], alerts: [], deliveries: [], restaurants_without_push_device: [], offline_devices_over_24h: [] }))
+    adminDataApi("stats", "/admin/stats", () => ({ stats: state.stats || {} })),
+    adminDataWithFallback("restaurants", () => fetchAdminRestaurantList({ ...options, requestTimeoutMs: ADMIN_DATA_REQUEST_TIMEOUT_MS }), () => ({ restaurants: state.restaurants || [] })),
+    adminDataApi("reservations", `/admin/reservations${queryStringFromFilters(state.adminReservationFilters)}`, () => ({ reservations: state.reservations || [] })),
+    adminDataApi("content", "/admin/content", () => ({ content: state.contentRows || [] })),
+    adminDataApi("partners", "/admin/partners", () => ({ partners: state.partners || [] })),
+    adminDataApi("offers", "/admin/offers", () => ({ offers: state.adminOffers || [] })),
+    adminDataApi("reviews", `/admin/reviews${queryStringFromFilters(state.adminReviewFilters)}`, () => ({ reviews: state.adminReviews || [], pagination: state.adminReviewPagination })),
+    adminDataApi("food-feed", "/admin/food-feed", { videos: [] }),
+    basicMode ? Promise.resolve({ submissions: [] }) : adminDataApi("photo-submissions", "/admin/photo-reward-submissions", { submissions: [] }),
+    adminDataApi("notifications", "/admin/notifications", { notifications: [], unread_count: 0 }),
+    basicMode ? Promise.resolve({ campaigns: [], sms_provider: { configured: false } }) : adminDataApi("system-messages", "/admin/system-messages", { campaigns: [], sms_provider: { configured: false } }),
+    adminAiEnabled ? adminDataApi("trends", "/ai/trends", { trends: null }) : Promise.resolve({ trends: null }),
+    adminAiEnabled ? adminDataApi("integrations", "/admin/integrations", { providers: [], connections: [], sync_runs: [], errors: [] }) : Promise.resolve({ providers: [], connections: [], sync_runs: [], errors: [] }),
+    adminAiEnabled ? adminDataApi("feature-flags", "/admin/feature-flags", { flags: [] }) : Promise.resolve({ flags: [] }),
+    adminAiEnabled ? adminDataApi("errors", "/admin/errors", { app_errors: [], integration_errors: [], failed_emails: [], failed_ai_actions: [], admin_alerts: [] }) : Promise.resolve({ app_errors: [], integration_errors: [], failed_emails: [], failed_ai_actions: [], admin_alerts: [] }),
+    adminDataApi("billing", "/admin/billing", { plans: [], subscriptions: [], invoices: [], payment_events: [], billing_events: [] }),
+    adminDataApi("analytics", `/admin/analytics${queryStringFromFilters(analyticsFilters)}`, { analytics: null }),
+    adminAiEnabled ? adminDataApi("checklists", "/system/checklists", { checklists: null }) : Promise.resolve({ checklists: null }),
+    adminDataApi("privacy", "/privacy/requests", { requests: [] }),
+    adminDataApi("legal", "/admin/legal-documents", { documents: [], counts: {} }),
+    adminDataApi("reservation-alerts", "/admin/reservation-alerts", { preferences: [], devices: [], alerts: [], deliveries: [], restaurants_without_push_device: [], offline_devices_over_24h: [] })
   ]);
   state.stats = stats.stats;
   state.restaurants = restaurants.restaurants || [];
@@ -10123,8 +10148,8 @@ async function fetchAdminRestaurantList(options = {}) {
     ? `/admin/restaurants?fresh=${encodeURIComponent(Date.now())}`
     : "/admin/restaurants";
   const fetchOptions = freshRestaurantList
-    ? { cache: "no-store", headers: { "cache-control": "no-store" } }
-    : {};
+    ? { cache: "no-store", headers: { "cache-control": "no-store" }, timeoutMs: options.requestTimeoutMs }
+    : { timeoutMs: options.requestTimeoutMs };
   return await api(restaurantListPath, fetchOptions);
 }
 
@@ -11483,6 +11508,23 @@ function adminBookingOptionViewsPanel(stats = {}) {
   `;
 }
 
+function adminLoadWarningPanel() {
+  const count = state.adminLoadWarnings?.length || 0;
+  if (!count) return "";
+  return `
+    <article class="panel wide-panel admin-load-warning" role="alert">
+      <div class="section-title-row compact">
+        <div>
+          <span class="section-kicker">${escapeHtml(t("admin_partial_load_kicker", "Connection notice"))}</span>
+          <h2>${escapeHtml(t("admin_partial_load_title", "Some admin data could not be loaded"))}</h2>
+          <p class="muted">${escapeHtml(t("admin_partial_load_body", "The available sections are shown below. Retry to load the missing data."))}</p>
+        </div>
+        <button class="primary-button" id="retryAdminData" type="button">${escapeHtml(t("retry_button", "Retry"))}</button>
+      </div>
+    </article>
+  `;
+}
+
 function renderAdmin() {
   if (!state.session || !isAdminRole(state.session.profile.role)) return renderLogin("admin");
   const stats = state.stats || {};
@@ -11703,9 +11745,15 @@ function renderAdmin() {
         <button class="primary-button" id="refreshAdmin" type="button">${escapeHtml(t("refresh_button", "Refresh"))}</button>
       </div>
     </section>
+    ${adminLoadWarningPanel()}
     ${dashboardTabbedInterface(adminArea, adminTabs, activeAdminTab, t("admin_dashboard_tabs_label", "Admin dashboard sections"))}
   `);
   bindDashboardTabs(renderAdmin);
+  document.querySelector("#retryAdminData")?.addEventListener("click", async (event) => {
+    setButtonPending(event.currentTarget, true, t("loading_button", "Loading..."));
+    await loadAdminData();
+    renderAdmin();
+  });
   document.querySelector("#refreshAdmin").addEventListener("click", async () => {
     await loadAdminData();
     renderAdmin();

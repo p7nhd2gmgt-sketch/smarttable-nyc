@@ -176,9 +176,9 @@ excludesAll(adminBaseNavigation, [
 ], "BASIC admin base navigation future-module hiding");
 
 includesAll(app, [
-  "basicMode ? Promise.resolve({ submissions: [] }) : api(\"/admin/photo-reward-submissions\")",
-  "basicMode ? Promise.resolve({ campaigns: [], sms_provider: { configured: false } }) : api(\"/admin/system-messages\")",
-  "api(\"/admin/billing\").catch(() => ({ plans: [], subscriptions: [], invoices: [], payment_events: [], billing_events: [] }))"
+  "basicMode ? Promise.resolve({ submissions: [] }) : adminDataApi(\"photo-submissions\", \"/admin/photo-reward-submissions\"",
+  "basicMode ? Promise.resolve({ campaigns: [], sms_provider: { configured: false } }) : adminDataApi(\"system-messages\", \"/admin/system-messages\"",
+  "adminDataApi(\"billing\", \"/admin/billing\", { plans: [], subscriptions: [], invoices: [], payment_events: [], billing_events: [] })"
 ], "BASIC admin loader skips future modules");
 
 includesAll(styles, [

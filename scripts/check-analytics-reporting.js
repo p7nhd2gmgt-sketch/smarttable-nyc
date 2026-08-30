@@ -207,7 +207,7 @@ async function assertStaticContracts() {
     "data-analytics-page",
     "sessionAuthHeaders(currentSession())",
     'api(`/partner/analytics${queryStringFromFilters(state.partnerAnalyticsFilters)}`)',
-    'api(`/admin/analytics${queryStringFromFilters(analyticsFilters)}`)',
+    'adminDataApi("analytics", `/admin/analytics${queryStringFromFilters(analyticsFilters)}`',
     "partner_nav_analytics",
     "admin_nav_analytics"
   ]) {

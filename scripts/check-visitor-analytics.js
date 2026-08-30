@@ -98,8 +98,11 @@ includesAll(appCore, [
   'public_restaurant_cards?select=restaurant_id',
   'restaurant_id: row.restaurant_id',
   'event_type=eq.restaurant_booking_options_viewed',
+  'const bookingOptionCountByRestaurant = new Map()',
+  'const analyticsPageSize = 1000',
   'booking_option_views_by_restaurant: bookingOptionViewsByRestaurant'
 ], "Secure restaurant booking-option aggregation");
+assert(!appCore.includes('event_type=eq.restaurant_booking_options_viewed&restaurant_id=eq.${encodeURIComponent(restaurant.id)}'), "Admin analytics must not issue one count request per restaurant.");
 
 assert(!appCore.includes('/rest/v1/rpc/track_restaurant_view'), "Loading an offer list must not count every restaurant as viewed.");
 assert(!appCore.includes('restaurant.views_count = numberOr(restaurant.views_count, 0) + 1'), "Demo offer-list loading must not inflate restaurant views.");
