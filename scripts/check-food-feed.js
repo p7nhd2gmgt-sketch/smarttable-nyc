@@ -80,7 +80,7 @@ for (const token of [
   "signedFoodFeedMediaUrl",
   "randomizeFoodFeedVideos",
   "query.get(\"fresh\")",
-  "Only Super Admin can upload What to Eat media.",
+  "Only Super Admin can upload Crave media.",
   "food_feed_media_uploaded_by_superadmin",
   "publish_immediately"
 ]) {
@@ -114,8 +114,8 @@ for (const token of [
 assert(!publicApp.includes("data-food-feed-sound"), "Public Food Feed must not render a sound control.");
 assert(!publicApp.includes("food-feed-sound"), "Public Food Feed must not include sound-control styling or handlers.");
 assert(publicApp.includes('class="food-feed-restaurant-link" type="button" data-food-feed-open='), "The visible restaurant name must open the restaurant profile.");
-assert(!publicApp.includes('class="ghost-button" type="button" data-food-feed-open='), "What to Eat must not duplicate the restaurant profile link with a second button.");
-assert(publicApp.includes('class="primary-button" type="button" data-food-feed-book='), "What to Eat must retain the Book a table action.");
+assert(!publicApp.includes('class="ghost-button" type="button" data-food-feed-open='), "Crave must not duplicate the restaurant profile link with a second button.");
+assert(publicApp.includes('class="primary-button" type="button" data-food-feed-book='), "Crave must retain the Book a table action.");
 assert(publicApp.includes('"/partner/food-feed": "#partner-food-feed"'), "Legacy Partner food-video links must target the embedded profile manager.");
 assert(publicApp.includes('"/partner/food-feed": "profile"'), "Legacy Partner food-video links must open the Restaurant Profile tab.");
 assert(!/key:\s*"food-feed",\s*label:\s*t\("partner_food_feed_tab"/.test(publicApp), "Food-video management must not occupy a primary Partner navigation tab.");
@@ -187,7 +187,7 @@ assert(styles.includes("column-count: 5"), "Wide desktop Food Feed must expand t
 assert(styles.includes("break-inside: avoid"), "Desktop Food Feed cards must not split between masonry columns.");
 assert(styles.includes("scroll-snap-type: none"), "Desktop Food Feed must disable mobile reel snapping.");
 assert(styles.includes("@media (max-width: 720px)"), "Food Feed must retain its dedicated mobile reel layout.");
-assert(styles.includes("-webkit-line-clamp: 2"), "What to Eat descriptions must stay compact across viewports.");
+assert(styles.includes("-webkit-line-clamp: 2"), "Crave descriptions must stay compact across viewports.");
 assert(appCore.includes("width < 720 || height < 1280"), "Food Feed backend must reject low-resolution media.");
 assert(publicApp.includes("metadata.width < 720 || metadata.height < 1280"), "Food Feed upload UI must reject low-resolution media before upload.");
 assert(styles.includes(".food-feed-management-grid"), "Partner/admin management layout is missing.");

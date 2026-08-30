@@ -202,7 +202,7 @@ const HEADER_SEARCH_SHORTCUTS = [
   { action: "tonight", icon: "moon", labelKey: "header_search_tonight", fallback: "Book tonight" },
   { action: "discounts", icon: "discount", labelKey: "header_search_discounts", fallback: "Top discounts" },
   { action: "newest", icon: "sparkles", labelKey: "header_search_newest", fallback: "Newest restaurants" },
-  { action: "food-feed", icon: "dish", labelKey: "header_search_food_feed", fallback: "What to Eat" },
+  { action: "food-feed", icon: "dish", labelKey: "header_search_food_feed", fallback: "Crave" },
   { action: "query", query: "Italian", icon: "fork", labelKey: "header_search_italian", fallback: "Italian" },
   { action: "query", query: "Caf\u00e9", icon: "cup", labelKey: "header_search_cafe", fallback: "Caf\u00e9s" },
   { action: "query", query: "West Village", icon: "pin", labelKey: "header_search_west_village", fallback: "West Village" },
@@ -1944,7 +1944,7 @@ function updateChromeText() {
   document.querySelector(".brand small").textContent = isBasicMode() ? t("basic_brand_subtitle", "Discounted restaurant reservations") : t("brand_subtitle", "The AI Revenue Operating System for Restaurants");
   document.querySelector("#guestNav").textContent = t("nav_offers", "Offers");
   document.querySelector("#restaurantsNav").textContent = t("nav_restaurants", "Restaurants");
-  document.querySelector("#foodFeedNav").textContent = t("nav_food_feed", "What to Eat");
+  document.querySelector("#foodFeedNav").textContent = t("nav_food_feed", "Crave");
   if (signupNav) {
     signupNav.textContent = t("signup_nav_button", "Sign Up");
     signupNav.hidden = Boolean(state.session);
@@ -1990,7 +1990,7 @@ function publicRouteMeta() {
   }
   if (path === "/food-feed") {
     return {
-      title: t("food_feed_seo_title", "What to Eat | Discover nearby dishes on SmartTable"),
+      title: t("food_feed_seo_title", "Crave | Discover nearby dishes on SmartTable"),
       description: t("food_feed_seo_description", "Swipe through short food videos, discover nearby restaurants, and book a table on SmartTable."),
       canonicalPath: "/food-feed",
       noindex
@@ -7036,7 +7036,7 @@ async function loadFoodFeed(options = {}) {
     state.foodFeed.loaded = true;
     return cycleVideos;
   } catch (error) {
-    state.foodFeed.error = error?.message || t("food_feed_load_error", "What to Eat could not be loaded.");
+    state.foodFeed.error = error?.message || t("food_feed_load_error", "Crave could not be loaded.");
     state.foodFeed.requestKey = foodFeedPreviewRequest().requestKey;
     state.foodFeed.loaded = true;
     return [];
@@ -7215,8 +7215,8 @@ function foodFeedPage() {
     <section class="food-feed-page" aria-labelledby="food-feed-page-title">
       <h1 class="visually-hidden" id="food-feed-page-title">${escapeHtml(t("food_feed_title", "What do you feel like eating?"))}</h1>
       <div class="food-feed-toolbar">
-        <button class="food-feed-toolbar-button food-feed-close" type="button" data-food-feed-close aria-label="${escapeAttr(t("food_feed_close", "Close What to Eat"))}" title="${escapeAttr(t("food_feed_close", "Close What to Eat"))}">&#10005;</button>
-        <strong class="food-feed-toolbar-title">${escapeHtml(isTestPreview ? t("food_feed_test_preview_title", "What to Eat test preview") : t("nav_food_feed", "What to Eat"))}</strong>
+        <button class="food-feed-toolbar-button food-feed-close" type="button" data-food-feed-close aria-label="${escapeAttr(t("food_feed_close", "Close Crave"))}" title="${escapeAttr(t("food_feed_close", "Close Crave"))}">&#10005;</button>
+        <strong class="food-feed-toolbar-title">${escapeHtml(isTestPreview ? t("food_feed_test_preview_title", "Crave test preview") : t("nav_food_feed", "Crave"))}</strong>
         ${isTestPreview ? `
           <span class="food-feed-preview-badge">${escapeHtml(t("food_feed_test_preview_badge", "Test preview"))}</span>
         ` : `<div class="food-feed-location-controls">
@@ -8790,7 +8790,7 @@ function savedFoodFeedDishesPanel() {
             `;
           }).join("")}
         </div>
-      ` : `<div class="empty-state">${escapeHtml(t("food_feed_saved_dishes_empty", "No saved dishes yet. Tap the star in What to Eat to save one."))}</div>`}
+      ` : `<div class="empty-state">${escapeHtml(t("food_feed_saved_dishes_empty", "No saved dishes yet. Tap the star in Crave to save one."))}</div>`}
     </section>
   `;
 }
@@ -11678,8 +11678,8 @@ function renderAdmin() {
     },
     {
       key: "food-feed",
-      label: t("admin_food_feed_tab", "What to Eat"),
-      compactLabel: t("admin_food_feed_tab", "What to Eat"),
+      label: t("admin_food_feed_tab", "Crave"),
+      compactLabel: t("admin_food_feed_tab", "Crave"),
       content: `<section class="dashboard-grid one-col">${adminFoodFeedPanel()}</section>`
     },
     {
@@ -16121,7 +16121,7 @@ function partnerFoodFeedPanel() {
               </div>
             </div>
           </article>
-        `).join("") || `<div class="empty-state compact-empty"><p>${escapeHtml(t("partner_food_feed_empty", "No What to Eat videos have been submitted yet."))}</p></div>`}
+        `).join("") || `<div class="empty-state compact-empty"><p>${escapeHtml(t("partner_food_feed_empty", "No Crave videos have been submitted yet."))}</p></div>`}
       </div>
     </article>
   `;
@@ -16138,8 +16138,8 @@ function adminFoodFeedPanel() {
     <article class="panel food-feed-manager" id="admin-food-feed">
       <div class="section-title-row compact">
         <div>
-          <span class="section-kicker">What to Eat</span>
-          <h2>${escapeHtml(t("admin_food_feed_title", "What to Eat moderation"))}</h2>
+          <span class="section-kicker">Crave</span>
+          <h2>${escapeHtml(t("admin_food_feed_title", "Crave moderation"))}</h2>
           <p class="muted">${escapeHtml(t("admin_food_feed_intro", "Review restaurant media before it becomes visible in the public feed."))}</p>
         </div>
       </div>
@@ -16291,9 +16291,9 @@ async function submitAdminFoodFeed(event) {
       method: "POST",
       body: JSON.stringify({ action: "sign_upload", restaurant_id: restaurantId, filename: file.name, content_type: file.type })
     });
-    if (!signed.upload_url || !signed.path) throw new Error(t("food_feed_load_error", "What to Eat could not be loaded right now."));
+    if (!signed.upload_url || !signed.path) throw new Error(t("food_feed_load_error", "Crave could not be loaded right now."));
     const uploadResponse = await fetch(signed.upload_url, { method: "PUT", headers: { "content-type": file.type }, body: file });
-    if (!uploadResponse.ok) throw new Error(t("food_feed_load_error", "What to Eat could not be loaded right now."));
+    if (!uploadResponse.ok) throw new Error(t("food_feed_load_error", "Crave could not be loaded right now."));
     await api("/admin/food-feed", {
       method: "POST",
       body: JSON.stringify({
@@ -16310,9 +16310,9 @@ async function submitAdminFoodFeed(event) {
     form.reset();
     await loadAdminData();
     renderAdmin();
-    showToast(t("admin_food_feed_uploaded", "What to Eat media uploaded."));
+    showToast(t("admin_food_feed_uploaded", "Crave media uploaded."));
   } catch (error) {
-    showToast(error.message || t("food_feed_load_error", "What to Eat could not be loaded right now."));
+    showToast(error.message || t("food_feed_load_error", "Crave could not be loaded right now."));
   } finally {
     setButtonPending(button, false);
   }
@@ -16333,13 +16333,13 @@ async function submitPartnerFoodFeed(event) {
       method: "POST",
       body: JSON.stringify({ action: "sign_upload", filename: file.name, content_type: file.type })
     });
-    if (!signed.upload_url || !signed.path) throw new Error(t("food_feed_load_error", "What to Eat could not be loaded right now."));
+    if (!signed.upload_url || !signed.path) throw new Error(t("food_feed_load_error", "Crave could not be loaded right now."));
     const uploadResponse = await fetch(signed.upload_url, {
       method: "PUT",
       headers: { "content-type": file.type },
       body: file
     });
-    if (!uploadResponse.ok) throw new Error(t("food_feed_load_error", "What to Eat could not be loaded right now."));
+    if (!uploadResponse.ok) throw new Error(t("food_feed_load_error", "Crave could not be loaded right now."));
     await api("/partner/food-feed", {
       method: "POST",
       body: JSON.stringify({
@@ -16357,7 +16357,7 @@ async function submitPartnerFoodFeed(event) {
     renderPartner();
     showToast(t("partner_food_feed_submitted", "Video submitted for moderation."));
   } catch (error) {
-    showToast(error.message || t("food_feed_load_error", "What to Eat could not be loaded right now."));
+    showToast(error.message || t("food_feed_load_error", "Crave could not be loaded right now."));
   } finally {
     setButtonPending(button, false);
   }
@@ -16384,7 +16384,7 @@ async function updateAdminFoodFeedStatus(button) {
     await api("/admin/food-feed", { method: "PATCH", body: JSON.stringify({ id, status: button.dataset.adminFoodFeedStatus, moderation_reason: reason }) });
     await loadAdminData();
     renderAdmin();
-    showToast(t("admin_food_feed_updated", "What to Eat media status updated."));
+    showToast(t("admin_food_feed_updated", "Crave media status updated."));
   } catch (error) {
     showToast(error.message);
   } finally {

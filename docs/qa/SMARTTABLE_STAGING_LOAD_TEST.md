@@ -19,7 +19,7 @@ It is a capacity signal, not a guarantee that 3,000 people can all submit reserv
 
 ## Traffic model
 
-Public traffic covers configuration, restaurant listing, offers, What to Eat, newest restaurants, and public content. Authenticated traffic covers the assigned staging partner's profile, statistics, reservations list, offers list, reviews, analytics, and notification preferences.
+Public traffic covers configuration, restaurant listing, offers, Crave, newest restaurants, and public content. Authenticated traffic covers the assigned staging partner's profile, statistics, reservations list, offers list, reviews, analytics, and notification preferences.
 
 The 1,000-user profile is intentionally partner-heavy. The 3,000-user profile models a mixed marketplace audience. A shared partner session is used, so the result measures API and database read capacity rather than 1,000 separate restaurant tenants.
 

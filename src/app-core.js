@@ -20884,7 +20884,7 @@ async function guestFoodFeedFavorites(method, body, headers, query) {
         favorites: demo.foodFeedFavorites.filter((item) => item.guest_user_id === profile.id)
       });
     }
-    if (!videoId) return json(400, { error: "What to Eat item is required." });
+    if (!videoId) return json(400, { error: "Crave item is required." });
     if (method === "POST") {
       let favorite = demo.foodFeedFavorites.find((item) => item.guest_user_id === profile.id && item.food_feed_video_id === videoId);
       if (!favorite) {
@@ -20940,11 +20940,11 @@ async function guestFoodFeedFavorites(method, body, headers, query) {
     return json(200, { mode: "supabase", favorites: result.filter(Boolean) });
   }
 
-  if (!videoId) return json(400, { error: "What to Eat item is required." });
+  if (!videoId) return json(400, { error: "Crave item is required." });
   if (method === "POST") {
     const videos = await supabaseFetch(`/rest/v1/food_feed_videos?select=id,restaurant_id,status,is_test_data&id=eq.${encodeURIComponent(videoId)}&limit=1`, { service: true });
     const video = videos?.[0];
-    if (!video || video.status !== "published" || video.is_test_data === true) return json(404, { error: "What to Eat item not found." });
+    if (!video || video.status !== "published" || video.is_test_data === true) return json(404, { error: "Crave item not found." });
     const restaurants = await supabaseFetch(`/rest/v1/restaurants?select=*&id=eq.${encodeURIComponent(video.restaurant_id)}&limit=1`, { service: true });
     const restaurant = restaurants?.[0];
     const restaurantStatus = lower(restaurant?.status);
@@ -20953,7 +20953,7 @@ async function guestFoodFeedFavorites(method, body, headers, query) {
       || lifecycleStatus !== "active"
       || restaurant.visible_on_guest_site === false
       || restaurant.is_test_data === true
-      || restaurant.is_test_restaurant === true) return json(404, { error: "What to Eat item not found." });
+      || restaurant.is_test_restaurant === true) return json(404, { error: "Crave item not found." });
     const rows = await supabaseFetch("/rest/v1/food_feed_favorites?on_conflict=guest_user_id,food_feed_video_id&select=*", {
       method: "POST",
       service: true,
@@ -22844,9 +22844,9 @@ function validFoodFeedMediaInput(body = {}, options = {}) {
   if (mediaType === "video" && !['video/mp4', 'video/webm'].includes(mimeType)) return "Only MP4 and WebM videos are allowed.";
   const maxSize = mediaType === "image" ? 10485760 : 20971520;
   if (!Number.isInteger(fileSize) || fileSize <= 0 || fileSize > maxSize) return mediaType === "image" ? "Image size must be 10 MB or less." : "Video size must be 20 MB or less.";
-  if (mediaType === "video" && (!Number.isInteger(durationMs) || durationMs < 2500 || durationMs > 3500)) return "What to Eat videos must be 3 seconds long.";
-  if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= width) return "What to Eat media must use a vertical format.";
-  if (width < 720 || height < 1280) return "What to Eat media must be at least 720 by 1280 pixels. 1080 by 1920 pixels is recommended.";
+  if (mediaType === "video" && (!Number.isInteger(durationMs) || durationMs < 2500 || durationMs > 3500)) return "Crave videos must be 3 seconds long.";
+  if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= width) return "Crave media must use a vertical format.";
+  if (width < 720 || height < 1280) return "Crave media must be at least 720 by 1280 pixels. 1080 by 1920 pixels is recommended.";
   if (!stripUnsafeHtml(body.title || "").trim()) return "Media title is required.";
   return "";
 }
@@ -22878,7 +22878,7 @@ async function partnerFoodFeed(method, body, headers, query = new URLSearchParam
     return await createFoodFeedUploadUrl(restaurant, body);
   }
   if (method === "POST") {
-    if (!supabaseConfigured) return json(503, { error: "What to Eat uploads require Supabase Storage." });
+    if (!supabaseConfigured) return json(503, { error: "Crave uploads require Supabase Storage." });
     const validationError = validFoodFeedMediaInput(body);
     if (validationError) return json(400, { error: validationError });
     const storagePath = clean(body.storage_path);
@@ -22939,7 +22939,7 @@ async function partnerFoodFeed(method, body, headers, query = new URLSearchParam
 async function adminFoodFeed(method, body, headers) {
   const { profile } = await requireProfile(headers, ["admin"]);
   if (!supabaseConfigured && method === "GET") return json(200, { videos: [] });
-  if (!supabaseConfigured) return json(503, { error: "What to Eat uploads require Supabase Storage." });
+  if (!supabaseConfigured) return json(503, { error: "Crave uploads require Supabase Storage." });
   if (method === "GET") {
     let rows;
     try {
@@ -22964,7 +22964,7 @@ async function adminFoodFeed(method, body, headers) {
     return json(200, { videos });
   }
   if (method === "POST") {
-    if (!isSuperAdminProfile(profile)) return json(403, { error: "Only Super Admin can upload What to Eat media." });
+    if (!isSuperAdminProfile(profile)) return json(403, { error: "Only Super Admin can upload Crave media." });
     const restaurantId = clean(body.restaurant_id);
     if (!restaurantId) return json(400, { error: "Restaurant is required." });
     const restaurantRows = await supabaseFetch(`/rest/v1/restaurants?select=*&id=eq.${encodeURIComponent(restaurantId)}&limit=1`, { service: true });
