@@ -7214,13 +7214,15 @@ function foodFeedPage() {
       ${!isTestPreview && state.foodFeed.locationStatus === "denied" ? `<p class="food-feed-notice warning">${escapeHtml(t("food_feed_location_denied", "Location was not shared. You can still browse all available videos."))}</p>` : ""}
       ${state.foodFeed.error ? `<p class="food-feed-notice error">${escapeHtml(state.foodFeed.error)}</p>` : ""}
       <div class="food-feed-stream" data-food-feed-stream aria-label="${escapeAttr(t("food_feed_stream_label", "Food video feed"))}">
-        ${state.foodFeed.loading && !videos.length ? `<div class="food-feed-empty"><div class="loading-skeleton"></div><p>${escapeHtml(t("loading_text", "Loading…"))}</p></div>` : videos.map(foodFeedCard).join("") || `
-          <div class="food-feed-empty">
-            <h2>${escapeHtml(t("food_feed_empty_title", "No food videos yet"))}</h2>
-            <p>${escapeHtml(t("food_feed_empty_body", "Restaurant videos will appear here after they are reviewed and published."))}</p>
-            <a class="primary-button" href="/restaurants">${escapeHtml(t("nav_restaurants", "Restaurants"))}</a>
-          </div>
-        `}
+        <div class="food-feed-grid" data-food-feed-grid>
+          ${state.foodFeed.loading && !videos.length ? `<div class="food-feed-empty"><div class="loading-skeleton"></div><p>${escapeHtml(t("loading_text", "Loading…"))}</p></div>` : videos.map(foodFeedCard).join("") || `
+            <div class="food-feed-empty">
+              <h2>${escapeHtml(t("food_feed_empty_title", "No food videos yet"))}</h2>
+              <p>${escapeHtml(t("food_feed_empty_body", "Restaurant videos will appear here after they are reviewed and published."))}</p>
+              <a class="primary-button" href="/restaurants">${escapeHtml(t("nav_restaurants", "Restaurants"))}</a>
+            </div>
+          `}
+        </div>
       </div>
     </section>
   `;
@@ -7286,11 +7288,12 @@ function bindFoodFeedCardEvents() {
 async function appendNextFoodFeedCycle() {
   if (foodFeedPreviewRequest().enabled) return;
   const stream = document.querySelector("[data-food-feed-stream]");
-  if (!stream || state.foodFeed.loading || !state.foodFeed.videos.length) return;
+  const grid = stream?.querySelector("[data-food-feed-grid]");
+  if (!stream || !grid || state.foodFeed.loading || !state.foodFeed.videos.length) return;
   const previousCount = state.foodFeed.videos.length;
   const appended = await loadFoodFeed({ append: true });
   if (!appended.length || !document.body.contains(stream)) return;
-  stream.insertAdjacentHTML("beforeend", appended.map((video, index) => foodFeedCard(video, previousCount + index)).join(""));
+  grid.insertAdjacentHTML("beforeend", appended.map((video, index) => foodFeedCard(video, previousCount + index)).join(""));
   bindFoodFeedCardEvents();
   initializeFoodFeedPlayback();
 }

@@ -179,6 +179,14 @@ assert(styles.includes("--food-feed-reel-width"), "Food Feed must constrain desk
 assert(styles.includes("min(450px, calc(100dvh * 0.5625), 100vw)"), "Food Feed desktop reel must avoid excessive source upscaling.");
 assert(styles.includes("@media (min-width: 721px)"), "Food Feed must define a dedicated tablet and desktop layout.");
 assert(styles.includes("object-fit: contain"), "Food Feed desktop media must remain fully visible without destructive cropping.");
+assert(publicApp.includes('class="food-feed-grid" data-food-feed-grid'), "Food Feed must render a dedicated responsive grid container.");
+assert(publicApp.includes('const grid = stream?.querySelector("[data-food-feed-grid]");'), "Infinite Food Feed loading must append into the responsive grid container.");
+assert(styles.includes("@media (min-width: 1024px)"), "Food Feed must define a desktop-only mosaic breakpoint.");
+assert(styles.includes("column-count: 4"), "Desktop Food Feed must start with a multi-column masonry layout.");
+assert(styles.includes("column-count: 5"), "Wide desktop Food Feed must expand the masonry layout.");
+assert(styles.includes("break-inside: avoid"), "Desktop Food Feed cards must not split between masonry columns.");
+assert(styles.includes("scroll-snap-type: none"), "Desktop Food Feed must disable mobile reel snapping.");
+assert(styles.includes("@media (max-width: 720px)"), "Food Feed must retain its dedicated mobile reel layout.");
 assert(styles.includes("-webkit-line-clamp: 2"), "What to Eat descriptions must stay compact across viewports.");
 assert(appCore.includes("width < 720 || height < 1280"), "Food Feed backend must reject low-resolution media.");
 assert(publicApp.includes("metadata.width < 720 || metadata.height < 1280"), "Food Feed upload UI must reject low-resolution media before upload.");
