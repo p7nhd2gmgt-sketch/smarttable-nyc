@@ -6707,6 +6707,55 @@ function sanitizeSignupAnalyticsProperties(value = {}) {
   return output;
 }
 
+export function isAnalyticsSchemaMismatch(error) {
+  return error?.code === "PGRST204" || error?.code === "42703";
+}
+
+export function analyticsEventInsertPayloads(row) {
+  return [
+    {
+      event_type: row.event_type,
+      user_id: null,
+      metadata: row.properties,
+      created_at: row.created_at
+    },
+    {
+      event_type: row.event_type,
+      user_id: null,
+      profile_key: row.profile_key,
+      metadata: row.properties,
+      created_at: row.created_at
+    },
+    {
+      event_type: row.event_type,
+      profile_key: row.profile_key,
+      restaurant_id: row.restaurant_id,
+      entity_type: row.entity_type,
+      entity_id: row.entity_id,
+      properties: row.properties,
+      created_at: row.created_at
+    }
+  ];
+}
+
+async function insertAnalyticsEvent(row) {
+  let lastSchemaError = null;
+  for (const body of analyticsEventInsertPayloads(row)) {
+    try {
+      return await supabaseFetch("/rest/v1/analytics_events?select=*", {
+        method: "POST",
+        service: true,
+        headers: { Prefer: "return=representation" },
+        body
+      });
+    } catch (error) {
+      if (!isAnalyticsSchemaMismatch(error)) throw error;
+      lastSchemaError = error;
+    }
+  }
+  throw lastSchemaError || new Error("Analytics storage is unavailable.");
+}
+
 async function analyticsEvent(method, body) {
   if (method !== "POST") return json(405, { error: "Method not allowed." });
   const eventType = clean(body.event_type || body.eventType);
@@ -6754,29 +6803,7 @@ async function analyticsEvent(method, body) {
     return json(201, { mode: "demo", event: row });
   }
 
-  let rows;
-  try {
-    rows = await supabaseFetch("/rest/v1/analytics_events?select=*", {
-      method: "POST",
-      service: true,
-      headers: { Prefer: "return=representation" },
-      body: {
-        event_type: row.event_type,
-        user_id: null,
-        restaurant_id: row.restaurant_id,
-        metadata: row.properties,
-        created_at: row.created_at
-      }
-    });
-  } catch (error) {
-    if (error.code !== "PGRST204") throw error;
-    rows = await supabaseFetch("/rest/v1/analytics_events?select=*", {
-      method: "POST",
-      service: true,
-      headers: { Prefer: "return=representation" },
-      body: (({ id, ...payload }) => payload)(row)
-    });
-  }
+  const rows = await insertAnalyticsEvent(row);
   const saved = rows?.[0] ? {
     ...rows[0],
     properties: rows[0].properties || rows[0].metadata || row.properties
@@ -27613,6 +27640,35 @@ async function adminReservations(method, body, headers, query) {
   return json(405, { error: "Method not allowed." });
 }
 
+export function analyticsRestaurantId(row = {}) {
+  return clean(row.restaurant_id || row.metadata?.restaurant_id || row.properties?.restaurant_id);
+}
+
+async function bookingOptionAnalyticsRows() {
+  const analyticsPageSize = 1000;
+  const schemaFields = ["metadata", "properties", "restaurant_id"];
+  let lastSchemaError = null;
+  for (const field of schemaFields) {
+    const collected = [];
+    try {
+      for (let offset = 0; ; offset += analyticsPageSize) {
+        const rows = await supabaseFetch(
+          `/rest/v1/analytics_events?select=${field}&event_type=eq.restaurant_booking_options_viewed&order=created_at.asc,id.asc&limit=${analyticsPageSize}&offset=${offset}`,
+          { service: true }
+        );
+        collected.push(...(rows || []));
+        if (!Array.isArray(rows) || rows.length < analyticsPageSize) break;
+      }
+      return collected;
+    } catch (error) {
+      if (!isAnalyticsSchemaMismatch(error)) throw error;
+      lastSchemaError = error;
+    }
+  }
+  if (lastSchemaError) return [];
+  return [];
+}
+
 async function adminStats(headers) {
   await requireProfile(headers, ["admin"]);
   if (!supabaseConfigured) {
@@ -27687,7 +27743,7 @@ async function adminStats(headers) {
     supabaseFetch("/rest/v1/restaurants?select=id,name,status&order=name.asc", { service: true }).catch(() => []),
     supabaseFetch("/rest/v1/rpc/admin_dashboard_stats", { method: "POST", service: true, body: {} })
       .catch((error) => {
-        if (String(error?.code || "").startsWith("PGRST") || /schema cache|function/i.test(error?.message || "")) {
+        if (isAnalyticsSchemaMismatch(error) || String(error?.code || "").startsWith("PGRST") || /schema cache|function|column .* does not exist/i.test(error?.message || "")) {
           return fallbackStats();
         }
         throw error;
@@ -27695,19 +27751,12 @@ async function adminStats(headers) {
   ]);
   const bookingOptionCountByRestaurant = new Map();
   let bookingOptionViewsTotal = 0;
-  const analyticsPageSize = 1000;
-  for (let offset = 0; ; offset += analyticsPageSize) {
-    const rows = await supabaseFetch(
-      `/rest/v1/analytics_events?select=restaurant_id&event_type=eq.restaurant_booking_options_viewed&restaurant_id=not.is.null&order=created_at.asc,id.asc&limit=${analyticsPageSize}&offset=${offset}`,
-      { service: true }
-    ).catch(() => []);
-    for (const row of rows || []) {
-      const restaurantId = clean(row.restaurant_id);
-      if (!restaurantId) continue;
-      bookingOptionCountByRestaurant.set(restaurantId, (bookingOptionCountByRestaurant.get(restaurantId) || 0) + 1);
-      bookingOptionViewsTotal += 1;
-    }
-    if (!Array.isArray(rows) || rows.length < analyticsPageSize) break;
+  const bookingOptionRows = await bookingOptionAnalyticsRows().catch(() => []);
+  for (const row of bookingOptionRows) {
+    const restaurantId = analyticsRestaurantId(row);
+    if (!restaurantId) continue;
+    bookingOptionCountByRestaurant.set(restaurantId, (bookingOptionCountByRestaurant.get(restaurantId) || 0) + 1);
+    bookingOptionViewsTotal += 1;
   }
   const bookingOptionViewsByRestaurant = (restaurants || []).map((restaurant) => ({
     restaurant_id: restaurant.id,

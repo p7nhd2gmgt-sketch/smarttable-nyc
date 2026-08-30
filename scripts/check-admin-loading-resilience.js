@@ -32,6 +32,8 @@ for (const required of [
 assert(appCore.includes("const bookingOptionCountByRestaurant = new Map()"), "Booking-option analytics must aggregate one paginated event stream.");
 assert(appCore.includes("const analyticsPageSize = 1000"), "Booking-option analytics must use bounded pages.");
 assert(!appCore.includes('event_type=eq.restaurant_booking_options_viewed&restaurant_id=eq.${encodeURIComponent(restaurant.id)}'), "Booking-option analytics must not issue an N+1 count request.");
+assert(appCore.includes('isAnalyticsSchemaMismatch(error)'), "Admin stats must recognize legacy analytics schema mismatches.");
+assert(appCore.includes('/schema cache|function|column .* does not exist/i'), "Admin stats must fall back when a legacy dashboard RPC references a removed column.");
 
 const originalFetch = globalThis.fetch;
 try {

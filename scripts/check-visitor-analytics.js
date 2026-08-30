@@ -97,6 +97,10 @@ includesAll(appCore, [
   'looksLikeUuid(bookingRestaurantId)',
   'public_restaurant_cards?select=restaurant_id',
   'restaurant_id: row.restaurant_id',
+  'metadata: row.properties',
+  'const schemaFields = ["metadata", "properties", "restaurant_id"]',
+  'analyticsRestaurantId(row)',
+  'isAnalyticsSchemaMismatch(error)',
   'event_type=eq.restaurant_booking_options_viewed',
   'const bookingOptionCountByRestaurant = new Map()',
   'const analyticsPageSize = 1000',
@@ -107,7 +111,35 @@ assert(!appCore.includes('event_type=eq.restaurant_booking_options_viewed&restau
 assert(!appCore.includes('/rest/v1/rpc/track_restaurant_view'), "Loading an offer list must not count every restaurant as viewed.");
 assert(!appCore.includes('restaurant.views_count = numberOr(restaurant.views_count, 0) + 1'), "Demo offer-list loading must not inflate restaurant views.");
 
-const { handleApiRequest } = await import(`../src/app-core.js?visitor-analytics=${Date.now()}`);
+const {
+  analyticsEventInsertPayloads,
+  analyticsRestaurantId,
+  handleApiRequest,
+  isAnalyticsSchemaMismatch
+} = await import(`../src/app-core.js?visitor-analytics=${Date.now()}`);
+
+const compatibilityRow = {
+  event_type: "restaurant_booking_options_viewed",
+  profile_key: null,
+  restaurant_id: "00000000-0000-4000-8000-000000000001",
+  entity_type: "restaurant",
+  entity_id: "00000000-0000-4000-8000-000000000001",
+  properties: {
+    restaurant_id: "00000000-0000-4000-8000-000000000001",
+    entry_point: "restaurant_detail"
+  },
+  created_at: "2026-08-30T00:00:00.000Z"
+};
+const compatibilityPayloads = analyticsEventInsertPayloads(compatibilityRow);
+assert.equal(compatibilityPayloads[0].metadata.restaurant_id, compatibilityRow.restaurant_id, "Production-compatible metadata must preserve the restaurant attribution.");
+assert.equal(compatibilityPayloads[0].user_id, null, "Anonymous visitor analytics must not attach a user identifier.");
+assert.equal(compatibilityPayloads[2].properties.restaurant_id, compatibilityRow.restaurant_id, "Legacy properties schemas must preserve the restaurant attribution.");
+assert.equal(analyticsRestaurantId({ metadata: compatibilityRow.properties }), compatibilityRow.restaurant_id, "Metadata-backed analytics must resolve the restaurant identifier.");
+assert.equal(analyticsRestaurantId({ properties: compatibilityRow.properties }), compatibilityRow.restaurant_id, "Properties-backed analytics must resolve the restaurant identifier.");
+assert.equal(analyticsRestaurantId({ restaurant_id: compatibilityRow.restaurant_id }), compatibilityRow.restaurant_id, "Column-backed analytics must resolve the restaurant identifier.");
+assert.equal(isAnalyticsSchemaMismatch({ code: "42703" }), true, "Missing-column errors must activate the compatibility path.");
+assert.equal(isAnalyticsSchemaMismatch({ code: "PGRST204" }), true, "PostgREST schema-cache errors must activate the compatibility path.");
+assert.equal(isAnalyticsSchemaMismatch({ code: "42501" }), false, "Authorization errors must never be hidden as schema compatibility issues.");
 const rawApi = (method, path, body = {}, headers = {}) => handleApiRequest({
   method,
   url: `/api${path}`,
