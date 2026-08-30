@@ -3896,6 +3896,22 @@ textarea {
   overflow-x: auto;
 }
 
+.booking-option-views-table {
+  min-width: 440px;
+}
+
+.booking-option-views-table th:last-child,
+.booking-option-views-table td:last-child {
+  text-align: right;
+}
+
+.booking-option-view-count {
+  color: var(--brand);
+  font-size: 1.05rem;
+  font-variant-numeric: tabular-nums;
+  font-weight: 800;
+}
+
 .partner-wide-shell .partner-table-wrap {
   max-width: 100%;
   overflow-x: auto;

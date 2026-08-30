@@ -3774,6 +3774,7 @@ function safeSignupAnalyticsMetadata(metadata = {}) {
     "auth_provider",
     "request_type",
     "restaurant_id",
+    "entry_point",
     "reservation_status",
     "notification_type",
     "settings_count",
@@ -3814,12 +3815,14 @@ function trackGuestAccountEvent(eventType, metadata = {}, options = {}) {
   }, options);
 }
 
+const anonymousPublicAnalyticsEvents = new Set(["guest_website_view", "restaurant_booking_options_viewed"]);
+
 function trackSafeAnalyticsEvent(eventType, metadata = {}, options = {}) {
   const payload = {
     event_type: eventType,
     metadata: safeSignupAnalyticsMetadata(metadata)
   };
-  if (eventType !== "guest_website_view") payload.profile_key = state.aiProfileKey;
+  if (!anonymousPublicAnalyticsEvents.has(eventType)) payload.profile_key = state.aiProfileKey;
   const body = JSON.stringify(payload);
   try {
     if (options.keepalive && navigator.sendBeacon) {
@@ -3862,6 +3865,20 @@ function trackGuestWebsiteView(route = currentPublicGuestRoute()) {
   if (lastTrackedGuestWebsitePath === analyticsRoute.path) return;
   lastTrackedGuestWebsitePath = analyticsRoute.path;
   trackSafeAnalyticsEvent("guest_website_view", {
+    path: analyticsRoute.path,
+    route_kind: analyticsRoute.routeKind,
+    language: state.lang,
+    market_code: state.config?.resolved_market_code || state.config?.default_market_code || "",
+    source: "guest_website"
+  });
+}
+
+function trackRestaurantBookingOptionsView(restaurantId, entryPoint) {
+  const analyticsRoute = guestWebsiteAnalyticsRoute();
+  if (!analyticsRoute || !restaurantId) return;
+  trackSafeAnalyticsEvent("restaurant_booking_options_viewed", {
+    restaurant_id: restaurantId,
+    entry_point: entryPoint,
     path: analyticsRoute.path,
     route_kind: analyticsRoute.routeKind,
     language: state.lang,
@@ -6754,6 +6771,7 @@ function bindGuestEvents(restaurants) {
     button.addEventListener("click", (event) => {
       event.stopPropagation();
       prepareGuestModalOpen(button);
+      trackRestaurantBookingOptionsView(button.dataset.restaurant, "offer_reservation");
       trackAiEvent(button.dataset.aiAction === "reserve" ? "ai_recommendation_reserve_clicked" : "reserve_clicked", {
         restaurant_id: button.dataset.restaurant,
         offer_id: button.dataset.openReserve
@@ -6770,6 +6788,7 @@ function bindGuestEvents(restaurants) {
     button.addEventListener("click", (event) => {
       event.stopPropagation();
       prepareGuestModalOpen(button);
+      trackRestaurantBookingOptionsView(button.dataset.restaurant || button.dataset.openStandardReserve, "standard_reservation");
       trackAiEvent("standard_reservation_clicked", {
         restaurant_id: button.dataset.restaurant || button.dataset.openStandardReserve
       });
@@ -6793,6 +6812,7 @@ function bindGuestEvents(restaurants) {
     state.reservationSuccess = null;
     state.aiWizardOpen = false;
     trackAiEvent("restaurant_detail_opened", { restaurant_id: trigger.dataset.openRestaurant });
+    trackRestaurantBookingOptionsView(trigger.dataset.openRestaurant, "restaurant_detail");
     if (trigger.dataset.restaurantSlug) history.pushState(null, "", `/restaurants/${trigger.dataset.restaurantSlug}`);
     renderGuest(currentPublicGuestRoute());
   };
@@ -6820,6 +6840,7 @@ function bindGuestEvents(restaurants) {
       prepareGuestModalOpen(button);
       const restaurantId = button.dataset.newestRestaurant;
       trackAiEvent("newest_restaurant_clicked", { restaurant_id: restaurantId, offer_id: button.dataset.newestOffer });
+      trackRestaurantBookingOptionsView(restaurantId, "newest_restaurant");
       state.restaurantDetail = restaurantId;
       state.reservationModal = null;
       state.followModal = null;
@@ -7163,7 +7184,7 @@ function foodFeedCard(video, index) {
           <h2>${escapeHtml(video.title || restaurant.name || t("restaurant_label", "Restaurant"))}</h2>
           ${isTestPreview
             ? `<strong class="food-feed-preview-restaurant">${escapeHtml(restaurant.name || t("restaurant_label", "Restaurant"))}</strong>`
-            : `<button class="food-feed-restaurant-link" type="button" data-food-feed-open="${escapeAttr(slug)}">${escapeHtml(restaurant.name || t("restaurant_label", "Restaurant"))}</button>`}
+            : `<button class="food-feed-restaurant-link" type="button" data-food-feed-open="${escapeAttr(slug)}" data-food-feed-restaurant="${escapeAttr(restaurant.id || restaurant.restaurant_id || "")}">${escapeHtml(restaurant.name || t("restaurant_label", "Restaurant"))}</button>`}
           ${video.caption ? `<p>${escapeHtml(video.caption)}</p>` : ""}
           <div class="food-feed-meta">
             ${restaurant.cuisine ? `<span>${escapeHtml(restaurant.cuisine)}</span>` : ""}
@@ -7178,7 +7199,7 @@ function foodFeedCard(video, index) {
               <strong>${escapeHtml(t("food_feed_test_preview_badge", "Test preview"))}</strong>
               <span>${escapeHtml(t("food_feed_test_preview_note", "Bookings and favorites are disabled."))}</span>
             </div>
-          ` : `<button class="primary-button" type="button" data-food-feed-book="${escapeAttr(slug)}">${escapeHtml(t("food_feed_book_table", "Book a table"))}</button>`}
+          ` : `<button class="primary-button" type="button" data-food-feed-book="${escapeAttr(slug)}" data-food-feed-restaurant="${escapeAttr(restaurant.id || restaurant.restaurant_id || "")}">${escapeHtml(t("food_feed_book_table", "Book a table"))}</button>`}
         </div>
       </div>
     </article>
@@ -7254,6 +7275,7 @@ function bindFoodFeedCardEvents() {
     button.addEventListener("click", async () => {
       stopFoodFeedPlayback();
       const slug = button.dataset.foodFeedOpen || button.dataset.foodFeedBook;
+      trackRestaurantBookingOptionsView(button.dataset.foodFeedRestaurant, "food_feed");
       history.pushState(null, "", `/restaurants/${encodeURIComponent(slug)}`);
       await renderCurrentMode();
     });
@@ -11421,6 +11443,46 @@ async function runAdminReservationAlertAction(button) {
   }
 }
 
+function adminBookingOptionViewsPanel(stats = {}) {
+  const rows = Array.isArray(stats.booking_option_views_by_restaurant)
+    ? stats.booking_option_views_by_restaurant
+    : [];
+  const table = rows.length
+    ? `
+      <div class="table-wrap">
+        <table class="partner-data-table booking-option-views-table">
+          <thead>
+            <tr>
+              <th>${escapeHtml(t("restaurant_label", "Restaurant"))}</th>
+              <th>${escapeHtml(t("admin_booking_option_views_count", "Booking option opens"))}</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rows.map((row) => `
+              <tr>
+                <td><strong>${escapeHtml(row.restaurant_name || t("restaurant_label", "Restaurant"))}</strong></td>
+                <td class="booking-option-view-count">${escapeHtml(formatNumber(row.booking_option_views || 0))}</td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
+      </div>
+    `
+    : `<p class="empty-state">${escapeHtml(t("admin_booking_option_views_empty", "No restaurant booking-option views have been recorded yet."))}</p>`;
+  return `
+    <article class="panel wide-panel booking-option-views-panel" id="admin-booking-option-views">
+      <div class="section-title-row compact">
+        <div>
+          <span class="section-kicker">${escapeHtml(t("admin_booking_option_views_kicker", "Guest interest"))}</span>
+          <h2>${escapeHtml(t("admin_booking_option_views_title", "Booking option views by restaurant"))}</h2>
+          <p class="muted">${escapeHtml(t("admin_booking_option_views_body", "Counts each deliberate guest click that opens a restaurant or its booking options."))}</p>
+        </div>
+      </div>
+      ${table}
+    </article>
+  `;
+}
+
 function renderAdmin() {
   if (!state.session || !isAdminRole(state.session.profile.role)) return renderLogin("admin");
   const stats = state.stats || {};
@@ -11539,12 +11601,13 @@ function renderAdmin() {
           ${kpiStatCard("admin_kpi_partner_accounts", "Partner accounts", stats.partners_total, "admin_kpi_partner_accounts_desc", "Users with restaurant partner access", { key: "partners_total" })}
           ${kpiStatCard("admin_kpi_active_offers", "Active offers", stats.offers_active, "admin_kpi_active_offers_desc", "Offers currently marked active", { key: "offers_active" })}
           ${kpiStatCard("admin_kpi_total_reservations", "Total reservations", stats.reservations_total, "admin_kpi_total_reservations_desc", "All reservation requests recorded by SmartTable", { key: "reservations_total" })}
-          ${kpiStatCard("admin_kpi_profile_views", "Profile views", stats.views_total, "admin_kpi_profile_views_desc", "Public restaurant profile views where available", { key: "views_total" })}
           ${kpiStatCard("admin_kpi_guest_website_views", "Guest website views", stats.guest_website_views ?? 0, "admin_kpi_guest_website_views_desc", "Public guest website page views recorded by SmartTable", { key: "guest_website_views" })}
+          ${kpiStatCard("admin_kpi_booking_option_views", "Booking option views", stats.booking_option_views_total ?? 0, "admin_kpi_booking_option_views_desc", "Guest clicks that opened restaurant booking options", { key: "booking_option_views_total" })}
           ${kpiStatCard("admin_kpi_favorites", "Favorites", stats.favorites_total, "admin_kpi_favorites_desc", "Active restaurant followers and favorites", { key: "favorites_total" })}
           ${kpiStatCard("admin_kpi_favorites_week", "New favorites this week", stats.favorites_this_week, "admin_kpi_favorites_week_desc", "Favorites created during the last 7 days", { key: "favorites_this_week" })}
           ${kpiStatCard("admin_kpi_favorites_month", "New favorites this month", stats.favorites_this_month, "admin_kpi_favorites_month_desc", "Favorites created during the current month", { key: "favorites_this_month" })}
         </section>
+        <section class="dashboard-grid one-col">${adminBookingOptionViewsPanel(stats)}</section>
       `
     },
     {

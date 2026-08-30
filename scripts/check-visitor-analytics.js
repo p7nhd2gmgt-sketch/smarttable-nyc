@@ -1,6 +1,12 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { TEST_ACCOUNTS } from "./test-account-credentials.mjs";
+
+process.env.SUPABASE_URL = "";
+process.env.SUPABASE_ANON_KEY = "";
+process.env.SUPABASE_SERVICE_ROLE_KEY = "";
+process.env.RESEND_API_KEY = "";
 
 const indexHtml = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
 const analyticsBootstrap = await readFile(new URL("../public/analytics-bootstrap.js", import.meta.url), "utf8");
@@ -59,19 +65,106 @@ includesAll(appJs, [
   'trackSafeAnalyticsEvent("guest_website_view"',
   'path: analyticsRoute.path',
   'route_kind: analyticsRoute.routeKind',
-  'if (eventType !== "guest_website_view") payload.profile_key = state.aiProfileKey',
+  'const anonymousPublicAnalyticsEvents = new Set(["guest_website_view", "restaurant_booking_options_viewed"])',
+  'if (!anonymousPublicAnalyticsEvents.has(eventType)) payload.profile_key = state.aiProfileKey',
   'fetch("/api/analytics/events"'
 ], "First-party guest website view tracking");
 assert(!appJs.includes('trackSafeAnalyticsEvent("guest_website_view", {\n    profile_key:'), "Guest website views must not include a profile key.");
 
 includesAll(appCore, [
   '"guest_website_view"',
-  'profile_key: eventType === "guest_website_view" ? null',
+  'anonymousPublicAnalyticsEvents.has(eventType) ? null',
   '? "guest_website"',
   'async function supabaseExactCount',
   'Prefer: "count=exact"',
   'event_type=eq.guest_website_view',
   'guest_website_views: guestWebsiteViews'
 ], "Guest website view aggregation");
+
+includesAll(appJs, [
+  'trackSafeAnalyticsEvent("restaurant_booking_options_viewed"',
+  'trackRestaurantBookingOptionsView(button.dataset.restaurant, "offer_reservation")',
+  'trackRestaurantBookingOptionsView(button.dataset.restaurant || button.dataset.openStandardReserve, "standard_reservation")',
+  'trackRestaurantBookingOptionsView(trigger.dataset.openRestaurant, "restaurant_detail")',
+  'trackRestaurantBookingOptionsView(restaurantId, "newest_restaurant")',
+  'trackRestaurantBookingOptionsView(button.dataset.foodFeedRestaurant, "food_feed")',
+  'adminBookingOptionViewsPanel(stats)',
+  'stats.booking_option_views_total ?? 0'
+], "Restaurant booking-option interaction tracking");
+
+includesAll(appCore, [
+  '"restaurant_booking_options_viewed"',
+  'looksLikeUuid(bookingRestaurantId)',
+  'public_restaurant_cards?select=restaurant_id',
+  'restaurant_id: row.restaurant_id',
+  'event_type=eq.restaurant_booking_options_viewed',
+  'booking_option_views_by_restaurant: bookingOptionViewsByRestaurant'
+], "Secure restaurant booking-option aggregation");
+
+assert(!appCore.includes('/rest/v1/rpc/track_restaurant_view'), "Loading an offer list must not count every restaurant as viewed.");
+assert(!appCore.includes('restaurant.views_count = numberOr(restaurant.views_count, 0) + 1'), "Demo offer-list loading must not inflate restaurant views.");
+
+const { handleApiRequest } = await import(`../src/app-core.js?visitor-analytics=${Date.now()}`);
+const rawApi = (method, path, body = {}, headers = {}) => handleApiRequest({
+  method,
+  url: `/api${path}`,
+  body,
+  headers: {
+    "x-forwarded-for": "203.0.113.90",
+    "user-agent": "SmartTable visitor analytics automated verification",
+    ...headers
+  }
+});
+const publicRestaurants = await rawApi("GET", "/public/restaurants");
+assert.equal(publicRestaurants.status, 200, "Public restaurants must be available for analytics verification.");
+const publicRestaurantId = publicRestaurants.body.restaurants?.[0]?.restaurant_id || publicRestaurants.body.restaurants?.[0]?.id;
+assert.match(publicRestaurantId || "", /^[0-9a-f-]{36}$/i, "A public restaurant UUID is required for analytics verification.");
+
+const invalidRestaurant = await rawApi("POST", "/analytics/events", {
+  event_type: "restaurant_booking_options_viewed",
+  metadata: { restaurant_id: "not-a-uuid", entry_point: "restaurant_detail", path: "/restaurants/test" }
+});
+assert.equal(invalidRestaurant.status, 400, "Invalid restaurant identifiers must be rejected.");
+
+const invalidEntryPoint = await rawApi("POST", "/analytics/events", {
+  event_type: "restaurant_booking_options_viewed",
+  metadata: { restaurant_id: publicRestaurantId, entry_point: "forged", path: "/restaurants/test" }
+});
+assert.equal(invalidEntryPoint.status, 400, "Unknown analytics entry points must be rejected.");
+
+const nonPublicRestaurant = await rawApi("POST", "/analytics/events", {
+  event_type: "restaurant_booking_options_viewed",
+  metadata: { restaurant_id: "00000000-0000-4000-8000-000000000000", entry_point: "restaurant_detail", path: "/restaurants/test" }
+});
+assert.equal(nonPublicRestaurant.status, 400, "Unknown or non-public restaurants must not receive analytics events.");
+
+const unsafePath = await rawApi("POST", "/analytics/events", {
+  event_type: "restaurant_booking_options_viewed",
+  metadata: { restaurant_id: publicRestaurantId, entry_point: "restaurant_detail", path: "/restaurants/test?token=secret" }
+});
+assert.equal(unsafePath.status, 400, "Analytics paths containing query data must be rejected.");
+
+const validInteraction = await rawApi("POST", "/analytics/events", {
+  event_type: "restaurant_booking_options_viewed",
+  metadata: { restaurant_id: publicRestaurantId, entry_point: "restaurant_detail", path: "/restaurants/test" }
+});
+assert.equal(validInteraction.status, 201, "A valid public booking-option interaction must be recorded.");
+assert.equal(validInteraction.body.event.profile_key, null, "Public restaurant interactions must remain anonymous.");
+
+const adminLogin = await rawApi("POST", "/auth/login", {
+  email: TEST_ACCOUNTS.admin.email,
+  password: TEST_ACCOUNTS.admin.password
+});
+assert.equal(adminLogin.status, 200, "Admin login must succeed for analytics aggregation verification.");
+const adminStats = await rawApi("GET", "/admin/stats", {}, {
+  authorization: `Bearer ${adminLogin.body.access_token}`
+});
+assert.equal(adminStats.status, 200, "Admin analytics aggregation must be authorized and available.");
+assert.equal(adminStats.body.stats.booking_option_views_total, 1, "The admin total must count every recorded booking-option interaction.");
+assert.equal(
+  adminStats.body.stats.booking_option_views_by_restaurant.find((row) => row.restaurant_id === publicRestaurantId)?.booking_option_views,
+  1,
+  "The admin restaurant breakdown must attribute the interaction to the exact restaurant."
+);
 
 console.log("Privacy-conscious visitor analytics checks passed.");

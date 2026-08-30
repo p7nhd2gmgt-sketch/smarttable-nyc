@@ -97,10 +97,10 @@ for (const expected of [
   "admin_kpi_active_offers_desc",
   "admin_kpi_total_reservations",
   "admin_kpi_total_reservations_desc",
-  "admin_kpi_profile_views",
-  "admin_kpi_profile_views_desc",
   "admin_kpi_guest_website_views",
   "admin_kpi_guest_website_views_desc",
+  "admin_kpi_booking_option_views",
+  "admin_kpi_booking_option_views_desc",
   "admin_kpi_favorites",
   "admin_kpi_favorites_desc",
   "admin_kpi_favorites_week",
@@ -111,6 +111,7 @@ for (const expected of [
   assert(adminStatsSource.includes(expected), `Admin KPI cards must include ${expected}.`);
 }
 assert(!adminStatsSource.includes('statCard("Restaurants"'), "Admin stats must not use hard-coded English labels.");
+assert(!adminStatsSource.includes("stats.views_total"), "The obsolete offer-list-inflated profile-view KPI must not remain visible.");
 
 const requiredLocaleKeys = [
   "partner_kpi_profile_views",
@@ -157,6 +158,13 @@ const requiredLocaleKeys = [
   "admin_kpi_profile_views_desc",
   "admin_kpi_guest_website_views",
   "admin_kpi_guest_website_views_desc",
+  "admin_kpi_booking_option_views",
+  "admin_kpi_booking_option_views_desc",
+  "admin_booking_option_views_kicker",
+  "admin_booking_option_views_title",
+  "admin_booking_option_views_body",
+  "admin_booking_option_views_count",
+  "admin_booking_option_views_empty",
   "admin_kpi_favorites",
   "admin_kpi_favorites_desc",
   "admin_kpi_favorites_week",

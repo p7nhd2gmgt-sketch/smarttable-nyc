@@ -499,6 +499,7 @@ const postVisitTokenTtlHours = {
 };
 const allowedSignupAnalyticsEvents = new Set([
   "guest_website_view",
+  "restaurant_booking_options_viewed",
   "signup_started",
   "signup_validation_failed",
   "signup_submitted",
@@ -532,6 +533,8 @@ const allowedSignupAnalyticsEvents = new Set([
   "account_deletion_requested",
   "account_deleted"
 ]);
+const anonymousPublicAnalyticsEvents = new Set(["guest_website_view", "restaurant_booking_options_viewed"]);
+const bookingOptionAnalyticsEntryPoints = new Set(["restaurant_detail", "offer_reservation", "standard_reservation", "newest_restaurant", "food_feed"]);
 const apiRateLimitBuckets = new Map();
 const reservationAlertRateLimitBuckets = new Map();
 const mobilePushDeviceRateLimitBuckets = new Map();
@@ -567,6 +570,7 @@ const allowedSignupAnalyticsProperties = new Set([
   "auth_provider",
   "request_type",
   "restaurant_id",
+  "entry_point",
   "reservation_status",
   "notification_type",
   "settings_count",
@@ -6708,19 +6712,38 @@ async function analyticsEvent(method, body) {
   const eventType = clean(body.event_type || body.eventType);
   if (!allowedSignupAnalyticsEvents.has(eventType)) return json(400, { error: "Unsupported analytics event." });
   const properties = sanitizeSignupAnalyticsProperties(body.metadata || body.properties || {});
-  if (eventType === "guest_website_view" && (!properties.path?.startsWith("/") || /[?#]/.test(properties.path))) {
+  if (anonymousPublicAnalyticsEvents.has(eventType) && (!properties.path?.startsWith("/") || /[?#]/.test(properties.path))) {
     return json(400, { error: "A safe public website path is required." });
+  }
+  const bookingRestaurantId = eventType === "restaurant_booking_options_viewed" ? clean(properties.restaurant_id) : "";
+  if (eventType === "restaurant_booking_options_viewed") {
+    if (!looksLikeUuid(bookingRestaurantId) || !bookingOptionAnalyticsEntryPoints.has(clean(properties.entry_point))) {
+      return json(400, { error: "A valid public restaurant interaction is required." });
+    }
+    if (!supabaseConfigured) {
+      ensureDemo();
+      const publicRestaurant = demo.restaurants.find((item) => clean(item.id) === bookingRestaurantId
+        && clean(item.status) === "approved"
+        && item.visible_on_guest_site !== false);
+      if (!publicRestaurant) return json(400, { error: "A valid public restaurant interaction is required." });
+    } else {
+      const publicRestaurants = await supabaseFetch(`/rest/v1/public_restaurant_cards?select=restaurant_id&restaurant_id=eq.${encodeURIComponent(bookingRestaurantId)}&limit=1`, { service: false });
+      if (!publicRestaurants?.length) return json(400, { error: "A valid public restaurant interaction is required." });
+    }
   }
   const row = {
     id: crypto.randomUUID(),
     event_type: eventType,
-    profile_key: eventType === "guest_website_view" ? null : aiProfileKey(body.profile_key),
+    profile_key: anonymousPublicAnalyticsEvents.has(eventType) ? null : aiProfileKey(body.profile_key),
+    restaurant_id: bookingRestaurantId || null,
     entity_type: eventType === "guest_website_view"
       ? "guest_website"
+      : eventType === "restaurant_booking_options_viewed"
+        ? "restaurant"
       : eventType.startsWith("signup_") || ["preference_selected", "terms_accepted", "privacy_accepted", "restaurant_followed_during_signup"].includes(eventType)
         ? "guest_signup"
         : "guest_account",
-    entity_id: null,
+    entity_id: bookingRestaurantId || null,
     properties,
     created_at: nowIso()
   };
@@ -6740,6 +6763,7 @@ async function analyticsEvent(method, body) {
       body: {
         event_type: row.event_type,
         user_id: null,
+        restaurant_id: row.restaurant_id,
         metadata: row.properties,
         created_at: row.created_at
       }
@@ -15524,22 +15548,10 @@ async function listPublicOffers(query) {
   const includeTestData = publicQueryIncludesTestData(query);
   if (!supabaseConfigured) {
     const rows = filterPublicTestDataRows(publicOfferRows(lang).map(sanitizePublicOfferRow), includeTestData);
-    const restaurantIds = new Set(rows.map((row) => row.restaurant_id));
-    for (const id of restaurantIds) {
-      const restaurant = demo.restaurants.find((item) => item.id === id);
-      if (restaurant) restaurant.views_count = numberOr(restaurant.views_count, 0) + 1;
-    }
     return json(200, { mode: "demo", offers: rows });
   }
 
   const rows = filterPublicTestDataRows(await supabaseFetch("/rest/v1/public_available_offers?select=*&order=sort_order.asc.nullslast,restaurant_name.asc,offer_date.asc,start_time.asc", { service: false }), includeTestData);
-  const restaurantIds = [...new Set((rows || []).map((row) => row.restaurant_id).filter(Boolean))];
-  await Promise.all(restaurantIds.map((restaurantId) => supabaseFetch("/rest/v1/rpc/track_restaurant_view", {
-    method: "POST",
-    service: false,
-    body: { p_restaurant_id: restaurantId }
-  }).catch(() => null)));
-
   const offers = (rows || []).map((row) => {
     const localizedRow = {
       ...row,
@@ -27606,6 +27618,13 @@ async function adminStats(headers) {
   if (!supabaseConfigured) {
     ensureDemo();
     const reservations = demo.reservations.map((item) => ({ ...item, status: normalizeReservationStatus(item.status) }));
+    const bookingOptionEvents = demo.analyticsEvents.filter((item) => clean(item.event_type) === "restaurant_booking_options_viewed");
+    const bookingOptionViewsByRestaurant = demo.restaurants.map((restaurant) => ({
+      restaurant_id: restaurant.id,
+      restaurant_name: restaurant.name || "Restaurant",
+      booking_option_views: bookingOptionEvents.filter((item) => clean(item.restaurant_id || item.properties?.restaurant_id) === clean(restaurant.id)).length
+    })).sort((left, right) => right.booking_option_views - left.booking_option_views
+      || clean(left.restaurant_name).localeCompare(clean(right.restaurant_name)));
     const now = new Date();
     const weekStart = dateStartOfWeek(now);
     const monthStart = dateStartOfMonth(now);
@@ -27623,6 +27642,8 @@ async function adminStats(headers) {
         seats_reserved: reservations.reduce((sum, item) => sum + item.party_size, 0),
         views_total: demo.restaurants.reduce((sum, item) => sum + numberOr(item.views_count, 0), 0),
         guest_website_views: demo.analyticsEvents.filter((item) => clean(item.event_type) === "guest_website_view").length,
+        booking_option_views_total: bookingOptionEvents.length,
+        booking_option_views_by_restaurant: bookingOptionViewsByRestaurant,
         favorites_total: activeFollowers.length,
         favorites_this_week: activeFollowers.filter((item) => new Date(item.created_at) >= weekStart).length,
         favorites_this_month: activeFollowers.filter((item) => new Date(item.created_at) >= monthStart).length
@@ -27653,24 +27674,45 @@ async function adminStats(headers) {
       seats_reserved: normalizedReservations.reduce((sum, item) => sum + numberOr(item.party_size, 0), 0),
       views_total: 0,
       guest_website_views: 0,
+      booking_option_views_total: 0,
+      booking_option_views_by_restaurant: [],
       favorites_total: (followers || []).filter((item) => item.notification_enabled !== false).length
     };
   };
-  const guestWebsiteViews = await supabaseExactCount(
-    "/rest/v1/analytics_events?select=id&event_type=eq.guest_website_view",
-    { service: true }
-  ).catch(() => 0);
-  const stats = await supabaseFetch("/rest/v1/rpc/admin_dashboard_stats", { method: "POST", service: true, body: {} })
-    .catch((error) => {
-      if (String(error?.code || "").startsWith("PGRST") || /schema cache|function/i.test(error?.message || "")) {
-        return fallbackStats();
-      }
-      throw error;
-    });
+  const [guestWebsiteViews, bookingOptionViewsTotal, restaurants, stats] = await Promise.all([
+    supabaseExactCount(
+      "/rest/v1/analytics_events?select=id&event_type=eq.guest_website_view",
+      { service: true }
+    ).catch(() => 0),
+    supabaseExactCount(
+      "/rest/v1/analytics_events?select=id&event_type=eq.restaurant_booking_options_viewed",
+      { service: true }
+    ).catch(() => 0),
+    supabaseFetch("/rest/v1/restaurants?select=id,name,status&order=name.asc", { service: true }).catch(() => []),
+    supabaseFetch("/rest/v1/rpc/admin_dashboard_stats", { method: "POST", service: true, body: {} })
+      .catch((error) => {
+        if (String(error?.code || "").startsWith("PGRST") || /schema cache|function/i.test(error?.message || "")) {
+          return fallbackStats();
+        }
+        throw error;
+      })
+  ]);
+  const bookingOptionViewsByRestaurant = await Promise.all((restaurants || []).map(async (restaurant) => ({
+    restaurant_id: restaurant.id,
+    restaurant_name: restaurant.name || "Restaurant",
+    booking_option_views: await supabaseExactCount(
+      `/rest/v1/analytics_events?select=id&event_type=eq.restaurant_booking_options_viewed&restaurant_id=eq.${encodeURIComponent(restaurant.id)}`,
+      { service: true }
+    ).catch(() => 0)
+  })));
+  bookingOptionViewsByRestaurant.sort((left, right) => right.booking_option_views - left.booking_option_views
+    || clean(left.restaurant_name).localeCompare(clean(right.restaurant_name)));
   return json(200, {
     stats: {
       ...(stats || {}),
-      guest_website_views: guestWebsiteViews
+      guest_website_views: guestWebsiteViews,
+      booking_option_views_total: bookingOptionViewsTotal,
+      booking_option_views_by_restaurant: bookingOptionViewsByRestaurant
     }
   });
 }

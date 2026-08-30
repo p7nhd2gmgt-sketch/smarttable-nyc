@@ -74,7 +74,10 @@ assert.equal((indexHtml.match(/<script>(?:.|\n)*?<\/script>/g) || []).length, 0,
 assert(apiHandler.includes("Invalid JSON request body."), "The Vercel adapter must reject malformed JSON instead of treating it as an empty object.");
 assert(server.includes('error.status = 400'), "The local server adapter must classify malformed JSON as a safe client error.");
 assert(!server.includes('error.message || "Server error."'), "HTTP error responses must not echo internal exception messages.");
-assert(appCore.includes('if (IS_PRODUCTION_RUNTIME) {\n    throw Object.assign(new Error("Demo authentication is disabled.")'), "Production must reject demo-token issuance.");
+assert(
+  /if \(IS_PRODUCTION_RUNTIME\) \{\r?\n\s+throw Object\.assign\(new Error\("Demo authentication is disabled\."\)/.test(appCore),
+  "Production must reject demo-token issuance."
+);
 assert(appCore.includes("if (IS_PRODUCTION_RUNTIME) return null;"), "Production must reject demo-token restoration.");
 assert(!appCore.includes("SUPABASE_SERVICE_ROLE_KEY || IMPERSONATION_SECRET"), "Impersonation signing must not reuse the Supabase service-role key.");
 assert(!appCore.includes('"smarttable-impersonation-secret"'), "Impersonation signing must not use a hardcoded fallback secret.");
