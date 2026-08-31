@@ -232,10 +232,11 @@ await api("PATCH", "/superadmin/field-representatives", {
 }, superadmin.headers);
 await expectStatus("GET", "/admin/access-context", 403, {}, representativeHeaders, "Suspended field representative access must stop immediately.");
 
-const [migration, appSource, coreSource] = await Promise.all([
+const [migration, appSource, coreSource, indexSource] = await Promise.all([
   readFile(new URL("../supabase/migrations/0071_field_representative_access.sql", import.meta.url), "utf8"),
   readFile(new URL("../public/app.js", import.meta.url), "utf8"),
-  readFile(new URL("../src/app-core.js", import.meta.url), "utf8")
+  readFile(new URL("../src/app-core.js", import.meta.url), "utf8"),
+  readFile(new URL("../public/index.html", import.meta.url), "utf8")
 ]);
 for (const token of [
   "field_representative_assignments",
@@ -261,5 +262,9 @@ for (const token of [
   "/superadmin/field-representatives",
   "/auth/field-representative-invitation"
 ]) assert.ok(coreSource.includes(token), `Field representative backend is missing ${token}.`);
+assert.ok(
+  indexSource.includes('/app.js?v=field-team-20260831-1'),
+  "The Field Team release must use a cache-busting application bundle URL."
+);
 
 console.log("Field representative administration checks passed.");
