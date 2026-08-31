@@ -19,7 +19,10 @@ create table if not exists public.field_representative_assignments (
 
 create table if not exists public.field_representative_markets (
   user_id uuid not null references auth.users(id) on delete cascade,
-  market_id uuid not null references public.markets(id) on delete cascade,
+  -- BASIC deployments use the canonical market UUIDs from application config.
+  -- Do not require the optional multi-market foundation table here: some
+  -- production installations predate public.markets and restaurants.market_id.
+  market_id uuid not null,
   status text not null default 'active' check (status in ('active', 'revoked')),
   created_by uuid references auth.users(id) on delete set null,
   created_at timestamptz not null default now(),

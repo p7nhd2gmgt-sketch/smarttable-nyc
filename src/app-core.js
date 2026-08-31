@@ -3473,6 +3473,36 @@ function restaurantMarketId(restaurant = {}) {
   return clean(restaurant.market_id || defaultMarket().id);
 }
 
+async function scopedRestaurantRows(access = {}, fields = "id", filters = "") {
+  const schema = await supabaseOpenApiSchema();
+  if (!schema) {
+    const error = new Error("Restaurant scope could not be verified.");
+    error.status = 503;
+    error.code = "RESTAURANT_SCOPE_UNAVAILABLE";
+    throw error;
+  }
+  const definition = openApiTableDefinition(openApiDefinitions(schema), "restaurants");
+  const columns = new Set(Object.keys(definition?.properties || {}));
+  if (!columns.size) {
+    const error = new Error("Restaurant scope could not be verified.");
+    error.status = 503;
+    error.code = "RESTAURANT_SCOPE_UNAVAILABLE";
+    throw error;
+  }
+  const hasMarketId = columns.has("market_id");
+  if (!access.unrestricted && !hasMarketId && !access.market_ids.includes(defaultMarket().id)) return [];
+  const selectedFields = fields
+    .split(",")
+    .map((field) => clean(field))
+    .filter((field, index, values) => field && columns.has(field) && values.indexOf(field) === index);
+  if (hasMarketId && !selectedFields.includes("market_id")) selectedFields.push("market_id");
+  if (!selectedFields.length) selectedFields.push("id");
+  const marketFilter = !access.unrestricted && hasMarketId
+    ? `&market_id=in.(${access.market_ids.map((id) => encodeURIComponent(id)).join(",")})`
+    : "";
+  return supabaseFetch(`/rest/v1/restaurants?select=${selectedFields.join(",")}${marketFilter}${filters}`, { service: true });
+}
+
 function fieldRepresentativeCanAccessRestaurant(access = {}, restaurant = {}) {
   return access.unrestricted === true || access.market_ids.includes(restaurantMarketId(restaurant));
 }
@@ -27070,7 +27100,7 @@ async function adminPartners(method, body, headers) {
     if (method === "GET") {
       const rows = await supabaseFetch("/rest/v1/profiles?select=*&role=in.(partner,restaurant)&order=created_at.desc", { service: true });
       const invitations = await supabaseFetch("/rest/v1/partner_invitations?select=id,email,full_name,restaurant_id,restaurant_role,status,invited_at,expires_at,is_test_data&order=invited_at.desc", { service: true }).catch(() => []);
-      const restaurantRows = await supabaseFetch("/rest/v1/restaurants?select=id,market_id", { service: true }).catch(() => []);
+      const restaurantRows = await scopedRestaurantRows(access, "id").catch(() => []);
       const accessibleIds = new Set((restaurantRows || []).filter((restaurant) => fieldRepresentativeCanAccessRestaurant(access, restaurant)).map((restaurant) => clean(restaurant.id)));
       return json(200, {
         partners: partnerAdminListRows(
@@ -27085,7 +27115,7 @@ async function adminPartners(method, body, headers) {
       const restaurantId = nullableClean(body.restaurant_id);
       const restaurantRole = normalizeRestaurantUserRole(body.restaurant_role || body.role);
       if (!email || !restaurantId) return json(400, { error: "Email and restaurant are required." });
-      const targetRestaurants = await supabaseFetch(`/rest/v1/restaurants?select=id,market_id&id=eq.${encodeURIComponent(restaurantId)}&limit=1`, { service: true }).catch(() => []);
+      const targetRestaurants = await scopedRestaurantRows(access, "id", `&id=eq.${encodeURIComponent(restaurantId)}&limit=1`).catch(() => []);
       if (!targetRestaurants?.[0]) return json(404, { error: "Restaurant not found." });
       assertFieldRepresentativeRestaurant(access, targetRestaurants[0]);
       const invitationToken = generatePartnerInvitationToken();
@@ -27245,7 +27275,7 @@ async function adminPartners(method, body, headers) {
         const invitations = await supabaseFetch(`/rest/v1/partner_invitations?select=*&id=eq.${encodeURIComponent(id)}&limit=1`, { service: true }).catch(() => []);
         const invitation = invitations?.[0];
         if (!invitation) return json(404, { error: "Partner invitation not found." });
-        const invitationRestaurants = await supabaseFetch(`/rest/v1/restaurants?select=id,market_id&id=eq.${encodeURIComponent(invitation.restaurant_id)}&limit=1`, { service: true }).catch(() => []);
+        const invitationRestaurants = await scopedRestaurantRows(access, "id", `&id=eq.${encodeURIComponent(invitation.restaurant_id)}&limit=1`).catch(() => []);
         if (!invitationRestaurants?.[0]) return json(404, { error: "Restaurant not found." });
         assertFieldRepresentativeRestaurant(access, invitationRestaurants[0]);
         if (action === "revoke_invitation") {
@@ -27340,7 +27370,7 @@ async function adminPartners(method, body, headers) {
         const assignments = await supabaseFetch(`/rest/v1/restaurant_users?select=*&${assignmentFilters}&limit=1`, { service: true }).catch(() => []);
         const assignment = assignments?.[0];
         if (!assignment) return json(404, { error: "Restaurant access assignment not found." });
-        const assignmentRestaurants = await supabaseFetch(`/rest/v1/restaurants?select=id,market_id&id=eq.${encodeURIComponent(assignment.restaurant_id)}&limit=1`, { service: true }).catch(() => []);
+        const assignmentRestaurants = await scopedRestaurantRows(access, "id", `&id=eq.${encodeURIComponent(assignment.restaurant_id)}&limit=1`).catch(() => []);
         if (!assignmentRestaurants?.[0]) return json(404, { error: "Restaurant not found." });
         assertFieldRepresentativeRestaurant(access, assignmentRestaurants[0]);
         const patch = await filterSupabaseTablePayload("restaurant_users", restaurantAccessPatch);
@@ -28189,8 +28219,7 @@ async function adminStats(headers) {
         favorites_total: followers.length
       } });
     }
-    const marketFilter = access.market_ids.map((id) => encodeURIComponent(id)).join(",");
-    const restaurants = await supabaseFetch(`/rest/v1/restaurants?select=id,name,status,views_count,market_id&market_id=in.(${marketFilter})&order=name.asc`, { service: true }).catch(() => []);
+    const restaurants = await scopedRestaurantRows(access, "id,name,status,views_count", "&order=name.asc").catch(() => []);
     const restaurantIds = new Set((restaurants || []).map((item) => clean(item.id)));
     const [profiles, offers, reservations, followers, bookingOptionRows] = await Promise.all([
       supabaseFetch("/rest/v1/profiles?select=id,role,restaurant_id", { service: true }).catch(() => []),

@@ -245,6 +245,7 @@ for (const token of [
   "field_rep_assignments_self_read",
   "field_rep_markets_self_read"
 ]) assert.ok(migration.includes(token), `Migration is missing ${token}.`);
+assert.ok(!migration.includes("references public.markets"), "Field representative migration must remain compatible with BASIC deployments that predate public.markets.");
 for (const token of [
   "fieldRepresentativeTeamPanel",
   "renderFieldRepresentativeInvitation",
@@ -253,6 +254,8 @@ for (const token of [
 ]) assert.ok(appSource.includes(token), `Field representative UI is missing ${token}.`);
 for (const token of [
   "restrictedRestaurantMutation",
+  "scopedRestaurantRows",
+  "RESTAURANT_SCOPE_UNAVAILABLE",
   "assertFieldRepresentativeRestaurant",
   "FIELD_REPRESENTATIVE_RESTRICTED_FIELD",
   "/superadmin/field-representatives",
