@@ -96,8 +96,8 @@ create policy field_rep_invitations_superadmin_all on public.field_representativ
 for all using (auth.role() = 'service_role' or public.is_super_admin())
 with check (auth.role() = 'service_role' or public.is_super_admin());
 
-revoke insert, update, delete on public.field_representative_assignments from anon, authenticated;
-revoke insert, update, delete on public.field_representative_markets from anon, authenticated;
+revoke all on public.field_representative_assignments from anon, authenticated;
+revoke all on public.field_representative_markets from anon, authenticated;
 revoke all on public.field_representative_invitations from anon, authenticated;
 grant select on public.field_representative_assignments, public.field_representative_markets to authenticated;
 
