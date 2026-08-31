@@ -160,7 +160,7 @@ function isSessionExpired(session) {
 }
 
 function isPrivilegedWebSession(session = {}) {
-  return ["admin", "super_admin"].includes(normalizeRole(session?.profile?.role));
+  return ["admin", "super_admin", "field_representative"].includes(normalizeRole(session?.profile?.role));
 }
 
 function withSessionExpiry(session, remember = true) {
@@ -461,6 +461,10 @@ const state = {
   restaurants: [],
   reservations: [],
   partners: [],
+  adminAccessContext: null,
+  fieldRepresentatives: [],
+  fieldRepresentativeInvitations: [],
+  fieldRepresentativeMarkets: [],
   adminOffers: [],
   adminReviews: [],
   adminFoodFeedVideos: [],
@@ -1086,7 +1090,8 @@ function currentProtectedAreaRoute() {
     "/admin/audit": "#admin-tab-panel-audit",
     "/admin/content": "#admin-tab-panel-settings",
     "/admin/platform-settings": "#admin-tab-panel-settings",
-    "/admin/analytics": "#admin-tab-panel-reports"
+    "/admin/analytics": "#admin-tab-panel-reports",
+    "/admin/field-team": "#admin-tab-panel-field-team"
   };
   const superAdminTargets = {
     "/superadmin": "#superadmin-tab-panel-overview",
@@ -1102,7 +1107,8 @@ function currentProtectedAreaRoute() {
     "/superadmin/reviews": "#superadmin-tab-panel-reviews",
     "/superadmin/settings": "#superadmin-tab-panel-settings",
     "/superadmin/audit": "#superadmin-tab-panel-audit",
-    "/superadmin/analytics": "#superadmin-tab-panel-reports"
+    "/superadmin/analytics": "#superadmin-tab-panel-reports",
+    "/superadmin/field-team": "#superadmin-tab-panel-field-team"
   };
   if (path === "/account" || path.startsWith("/account/") || hash === "#guest-account") {
     return { area: "guest", mode: "guest", loginRole: "guest" };
@@ -1336,12 +1342,29 @@ function normalizeRole(role) {
   const value = String(role || "guest").trim().toLowerCase();
   if (["owner", "restaurant_owner", "restaurant", "restaurant_partner"].includes(value)) return "partner";
   if (["superadmin", "super-admin"].includes(value)) return "super_admin";
+  if (["field-representative", "field_rep", "representative", "territory_admin"].includes(value)) return "field_representative";
   return value;
 }
 
 function isAdminRole(role) {
   const normalized = normalizeRole(role);
-  return normalized === "admin" || normalized === "super_admin";
+  return normalized === "admin" || normalized === "super_admin" || normalized === "field_representative";
+}
+
+function isFieldRepresentativeSession() {
+  return normalizeRole(currentSession()?.profile?.role) === "field_representative";
+}
+
+function currentFieldRepresentativeAccess() {
+  return state.adminAccessContext?.access || {};
+}
+
+function assignedFieldRepresentativeMarkets() {
+  return Array.isArray(state.adminAccessContext?.markets) ? state.adminAccessContext.markets : [];
+}
+
+function fieldRepresentativeMarketLabel(market = {}) {
+  return market.label || market.name || [market.city, market.region, market.country].filter(Boolean).join(", ") || market.id || "Market";
 }
 
 function appModeForRole(role) {
@@ -1354,7 +1377,7 @@ function appModeForRole(role) {
 function defaultDashboardRouteForRole(role) {
   const normalized = normalizeRole(role);
   if (normalized === "super_admin") return "/superadmin";
-  if (normalized === "admin") return "/admin";
+  if (normalized === "admin" || normalized === "field_representative") return "/admin";
   if (normalized === "partner") return "/partner";
   return "/account";
 }
@@ -1368,7 +1391,7 @@ function adminDashboardRouteForRole(role) {
 function updateAdminDashboardNav(session = currentSession()) {
   if (!adminDashboardNav) return;
   const role = normalizeRole(session?.profile?.role || "");
-  const visible = role === "admin" || role === "super_admin";
+  const visible = role === "admin" || role === "super_admin" || role === "field_representative";
   adminDashboardNav.hidden = !visible;
   adminDashboardNav.toggleAttribute("data-authenticated-admin-nav", visible);
   if (!visible) {
@@ -2342,6 +2365,7 @@ function currentGuestAccountRoute() {
   if (path === "/post-visit/action") return "post-visit-action";
   if (path === "/review/verified") return "verified-review";
   if (path === "/partner/invite") return "partner-invite";
+  if (path === "/admin/invite") return "field-representative-invite";
   if (path === "/signup/check-email") return "signup-check-email";
   if (path === "/signup/welcome") return "signup-welcome";
   if (path === "/signup" || hash === "#guest-signup") return "signup";
@@ -3253,7 +3277,8 @@ function dashboardTabRoute(area, key) {
     reports: "reports",
     reviews: "reviews",
     settings: "settings",
-    audit: "audit"
+    audit: "audit",
+    "field-team": "field-team"
   };
   const partnerSegments = {
     overview: "",
@@ -10077,6 +10102,75 @@ async function adminDataWithFallback(label, loader, fallback) {
   }
 }
 
+function renderFieldRepresentativeInvitation() {
+  const params = new URLSearchParams(window.location.search);
+  const token = params.get("token") || "";
+  app.innerHTML = `
+    <section class="login-card">
+      <span class="section-kicker">${escapeHtml(t("field_representative_invite_kicker", "SmartTable field operations"))}</span>
+      <h1>${escapeHtml(t("field_representative_invite_title", "Create your field representative access"))}</h1>
+      <p class="muted">${escapeHtml(t("field_representative_invite_body", "Use your secure invitation to manage restaurant onboarding and partner access in your assigned territory."))}</p>
+      ${!token ? `<p class="form-error" role="alert">${escapeHtml(t("field_representative_invite_missing_token", "This invitation link is missing its token."))}</p>` : ""}
+      <form class="auth-form" id="fieldRepresentativeInviteForm">
+        <input type="hidden" name="token" value="${escapeAttr(token)}">
+        ${renderPasswordField("password", t("signup_password", "Password"), "", "showPassword", "new-password")}
+        ${renderPasswordField("confirm_password", t("signup_confirm_password", "Confirm password"), "", "showConfirmPassword", "new-password")}
+        <div id="resetPasswordStrength">${resetPasswordStrengthMeter("")}</div>
+        <div class="signup-consent-list">
+          ${signupConsentCheckbox("terms_consent", partnerLegalConsentLabelHtml(), false)}
+        </div>
+        <button class="primary-button wide" type="submit" ${!token ? "disabled" : ""}>${escapeHtml(t("field_representative_invite_accept_button", "Activate access"))}</button>
+      </form>
+      <button class="link-button" type="button" data-field-representative-login>${escapeHtml(t("field_representative_invite_login_link", "Back to admin login"))}</button>
+    </section>
+  `;
+  document.querySelector("[data-field-representative-login]")?.addEventListener("click", async () => {
+    history.pushState(null, "", "/admin");
+    state.mode = "admin";
+    await renderCurrentMode();
+  });
+  const form = document.querySelector("#fieldRepresentativeInviteForm");
+  form?.addEventListener("input", () => {
+    const meter = document.querySelector("#resetPasswordStrength");
+    if (meter) meter.innerHTML = resetPasswordStrengthMeter(form.elements.password?.value || "");
+  });
+  document.querySelectorAll("[data-toggle-auth-password]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const key = button.dataset.toggleAuthPassword;
+      state[key] = !state[key];
+      renderFieldRepresentativeInvitation();
+    });
+  });
+  form?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const data = formObject(form);
+    if (passwordStrength(data.password).score < 5) {
+      showToast(t("signup_error_password", "Use at least 8 characters with uppercase, lowercase, number, and symbol."));
+      return;
+    }
+    if (data.password !== data.confirm_password) {
+      showToast(t("signup_error_password_match", "Passwords must match."));
+      return;
+    }
+    if (!boolValue(data.terms_consent)) {
+      showToast(t("field_representative_invite_terms_required", "Accept the Terms and Privacy Policy to activate access."));
+      return;
+    }
+    const submitButton = form.querySelector('[type="submit"]');
+    try {
+      setButtonPending(submitButton, true, t("activating_button", "Activating..."));
+      await api("/auth/field-representative-invitation", { method: "POST", body: JSON.stringify(data) });
+      showToast(t("field_representative_invite_success", "Field representative access is ready. You can now sign in."));
+      history.pushState(null, "", "/admin");
+      state.mode = "admin";
+      await renderCurrentMode();
+    } catch (error) {
+      setButtonPending(submitButton, false);
+      showToast(error.message || t("field_representative_invite_failed", "This invitation could not be accepted."));
+    }
+  });
+}
+
 function adminDataApi(label, path, fallback, options = {}) {
   return adminDataWithFallback(
     label,
@@ -10087,6 +10181,24 @@ function adminDataApi(label, path, fallback, options = {}) {
 
 async function loadAdminData(options = {}) {
   state.adminLoadWarnings = [];
+  if (normalizeRole(currentSession()?.profile?.role) === "field_representative") {
+    const [accessContext, stats, restaurants, partners] = await Promise.all([
+      adminDataApi("access-context", "/admin/access-context", { access: { market_ids: [] }, markets: [] }),
+      adminDataApi("stats", "/admin/stats", () => ({ stats: state.stats || {} })),
+      adminDataWithFallback("restaurants", () => fetchAdminRestaurantList({ ...options, requestTimeoutMs: ADMIN_DATA_REQUEST_TIMEOUT_MS }), () => ({ restaurants: state.restaurants || [] })),
+      adminDataApi("partners", "/admin/partners", () => ({ partners: state.partners || [] }))
+    ]);
+    state.adminAccessContext = accessContext;
+    state.stats = stats.stats || {};
+    state.restaurants = restaurants.restaurants || [];
+    state.partners = partners.partners || [];
+    state.adminOffers = [];
+    state.reservations = [];
+    state.notifications = [];
+    state.unreadNotifications = 0;
+    return;
+  }
+  state.adminAccessContext = null;
   const adminAiEnabled = canShowFeature("ai.adminAIControls", { allowDemo: true });
   const basicMode = isBasicMode();
   const analyticsFilters = {
@@ -10140,6 +10252,16 @@ async function loadAdminData(options = {}) {
   state.adminLegalDocuments = legal.documents || [];
   state.adminLegalCounts = legal.counts || {};
   state.adminReservationAlerts = reservationAlerts || null;
+  if (isSuperAdmin()) {
+    const fieldTeam = await adminDataApi("field-team", "/superadmin/field-representatives", { representatives: [], invitations: [], markets: [] });
+    state.fieldRepresentatives = fieldTeam.representatives || [];
+    state.fieldRepresentativeInvitations = fieldTeam.invitations || [];
+    state.fieldRepresentativeMarkets = fieldTeam.markets || [];
+  } else {
+    state.fieldRepresentatives = [];
+    state.fieldRepresentativeInvitations = [];
+    state.fieldRepresentativeMarkets = [];
+  }
 }
 
 async function fetchAdminRestaurantList(options = {}) {
@@ -11525,10 +11647,215 @@ function adminLoadWarningPanel() {
   `;
 }
 
+const fieldRepresentativePermissionOptions = [
+  ["can_manage_restaurants", "Restaurant onboarding and settings"],
+  ["can_invite_partners", "Send partner invitations"],
+  ["can_manage_partner_access", "Manage partner access"],
+  ["can_manage_capacity", "Manage tables and capacity"]
+];
+
+function fieldRepresentativePermissionFields(values = {}, prefix = "") {
+  return `
+    <fieldset class="field-representative-permissions">
+      <legend>${escapeHtml(t("field_rep_permissions_label", "Allowed work"))}</legend>
+      ${fieldRepresentativePermissionOptions.map(([name, label]) => `
+        <label class="check">
+          <input type="checkbox" name="${escapeAttr(name)}" ${values[name] !== false ? "checked" : ""}>
+          <span>${escapeHtml(t(`field_rep_permission_${name}`, label))}</span>
+        </label>
+      `).join("")}
+      ${prefix ? `<p class="form-note">${escapeHtml(prefix)}</p>` : ""}
+    </fieldset>
+  `;
+}
+
+function fieldRepresentativeMarketFields(selectedMarketIds = [], scope = "invite") {
+  const selected = new Set((selectedMarketIds || []).map(String));
+  const markets = state.fieldRepresentativeMarkets || [];
+  if (!markets.length) {
+    return `<div class="empty-state">${escapeHtml(t("field_rep_markets_empty", "No active markets are available. Create or activate a market before inviting a representative."))}</div>`;
+  }
+  return `
+    <fieldset class="field-representative-markets">
+      <legend>${escapeHtml(t("field_rep_markets_label", "Assigned territories"))}</legend>
+      ${markets.map((market) => `
+        <label class="check">
+          <input type="checkbox" name="market_ids" value="${escapeAttr(market.id)}" ${selected.has(String(market.id)) ? "checked" : ""} data-field-representative-market="${escapeAttr(scope)}">
+          <span>${escapeHtml(fieldRepresentativeMarketLabel(market))}</span>
+        </label>
+      `).join("")}
+    </fieldset>
+  `;
+}
+
+function fieldRepresentativeAccessFormPayload(form) {
+  const payload = formObject(form);
+  payload.market_ids = Array.from(form.querySelectorAll('[name="market_ids"]:checked')).map((input) => input.value);
+  fieldRepresentativePermissionOptions.forEach(([name]) => {
+    payload[name] = Boolean(form.elements[name]?.checked);
+  });
+  return payload;
+}
+
+function fieldRepresentativeTeamPanel() {
+  if (!isSuperAdmin()) return "";
+  const representatives = state.fieldRepresentatives || [];
+  const pendingInvitations = (state.fieldRepresentativeInvitations || []).filter((invitation) => invitation.status === "pending");
+  return `
+    <section class="dashboard-grid one-col field-representative-admin" id="field-representative-admin">
+      <article class="panel wide-panel">
+        <div class="section-title-row compact">
+          <div>
+            <span class="section-kicker">${escapeHtml(t("field_rep_team_kicker", "FIELD OPERATIONS"))}</span>
+            <h2>${escapeHtml(t("field_rep_team_title", "Territory representatives"))}</h2>
+            <p class="muted">${escapeHtml(t("field_rep_team_body", "Invite representatives and limit every account to its assigned markets and operational responsibilities."))}</p>
+          </div>
+        </div>
+        <div class="admin-safety-note">
+          <strong>${escapeHtml(t("field_rep_safety_title", "Restricted by design"))}</strong>
+          <p>${escapeHtml(t("field_rep_safety_body", "Representatives can prepare restaurant data and partner access, but only Super Admin can activate, publish, suspend, archive, delete, bill, or change global access."))}</p>
+        </div>
+        <form class="mini-form admin-form" id="fieldRepresentativeInviteAdminForm">
+          <h3>${escapeHtml(t("field_rep_invite_title", "Invite a territory representative"))}</h3>
+          <div class="restaurant-detail-grid">
+            <label>${escapeHtml(t("full_name_label", "Full name"))}<input name="full_name" autocomplete="name" required></label>
+            <label>${escapeHtml(t("email_label", "Email"))}<input name="email" type="email" autocomplete="email" required></label>
+          </div>
+          ${fieldRepresentativeMarketFields([], "new")}
+          ${fieldRepresentativePermissionFields({}, t("field_rep_permissions_help", "All permissions remain limited to the selected territories."))}
+          <button class="primary-button" type="submit" ${state.fieldRepresentativeMarkets?.length ? "" : "disabled"}>${escapeHtml(t("field_rep_send_invite", "Send secure invitation"))}</button>
+        </form>
+      </article>
+      <article class="panel wide-panel">
+        <h3>${escapeHtml(t("field_rep_active_accounts", "Representative accounts"))}</h3>
+        ${representatives.length ? representatives.map((representative) => `
+          <form class="mini-form admin-form field-representative-access-card" data-field-representative-access-form="${escapeAttr(representative.id)}">
+            <input type="hidden" name="id" value="${escapeAttr(representative.id)}">
+            <div class="section-title-row compact">
+              <div>
+                <strong>${escapeHtml(representative.full_name || representative.email || "Representative")}</strong>
+                <p class="muted">${escapeHtml(representative.email || "")}</p>
+              </div>
+              ${statusBadge(representative.assignment_status || representative.status || "active")}
+            </div>
+            ${fieldRepresentativeMarketFields(representative.market_ids || [], representative.id)}
+            ${fieldRepresentativePermissionFields(representative)}
+            <div class="button-row">
+              <button class="primary-button" type="submit">${escapeHtml(t("save_access_button", "Save access"))}</button>
+              <button class="ghost-button ${representative.assignment_status === "suspended" ? "" : "danger"}" type="button" data-field-representative-status="${escapeAttr(representative.id)}" data-next-field-representative-status="${representative.assignment_status === "suspended" ? "reactivate" : "suspend"}">${escapeHtml(representative.assignment_status === "suspended" ? t("reactivate_button", "Reactivate") : t("suspend_button", "Suspend"))}</button>
+            </div>
+          </form>
+        `).join("") : `<div class="empty-state">${escapeHtml(t("field_rep_accounts_empty", "No territory representative accounts yet."))}</div>`}
+      </article>
+      <article class="panel wide-panel">
+        <h3>${escapeHtml(t("field_rep_pending_invitations", "Pending invitations"))}</h3>
+        ${pendingInvitations.length ? `<div class="status-list">${pendingInvitations.map((invitation) => `
+          <span>
+            <span><strong>${escapeHtml(invitation.full_name || invitation.email)}</strong><br><small>${escapeHtml(invitation.email)} · ${escapeHtml(formatDate(invitation.expires_at))}</small></span>
+            <button class="ghost-button danger" type="button" data-revoke-field-representative-invitation="${escapeAttr(invitation.id)}">${escapeHtml(t("partner_invitation_revoke_button", "Revoke invitation"))}</button>
+          </span>
+        `).join("")}</div>` : `<div class="empty-state">${escapeHtml(t("field_rep_invitations_empty", "No pending representative invitations."))}</div>`}
+      </article>
+    </section>
+  `;
+}
+
+function fieldRepresentativeOverviewPanel(stats = {}) {
+  const access = currentFieldRepresentativeAccess();
+  const markets = assignedFieldRepresentativeMarkets();
+  return `
+    <section class="dashboard-grid one-col field-representative-overview">
+      <article class="panel wide-panel">
+        <span class="section-kicker">${escapeHtml(t("field_rep_scope_kicker", "YOUR TERRITORY"))}</span>
+        <h2>${escapeHtml(t("field_rep_scope_title", "Assigned markets"))}</h2>
+        <div class="status-list">${markets.map((market) => `<span>${escapeHtml(fieldRepresentativeMarketLabel(market))}</span>`).join("")}</div>
+        <p class="form-note">${escapeHtml(t("field_rep_scope_notice", "You only see and edit restaurants and partner access in these territories. Publication and lifecycle decisions remain with Super Admin."))}</p>
+      </article>
+      <section class="stats-grid">
+        ${kpiStatCard("field_rep_restaurants", "Assigned restaurants", stats.restaurants_total, "field_rep_restaurants_desc", "Restaurants visible in your assigned markets", { key: "restaurants_total" })}
+        ${kpiStatCard("field_rep_partners", "Partner accounts", stats.partners_total, "field_rep_partners_desc", "Partner access in your assigned markets", { key: "partners_total" })}
+      </section>
+      <article class="panel wide-panel">
+        <h3>${escapeHtml(t("field_rep_allowed_work", "Your allowed work"))}</h3>
+        <ul class="restaurant-readiness-list">
+          ${fieldRepresentativePermissionOptions.map(([name, label]) => `<li class="${access[name] ? "pass" : "warn"}"><span>${access[name] ? "ON" : "OFF"}</span>${escapeHtml(t(`field_rep_permission_${name}`, label))}</li>`).join("")}
+        </ul>
+      </article>
+    </section>
+  `;
+}
+
+async function submitFieldRepresentativeInvitation(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const button = form.querySelector('[type="submit"]');
+  const payload = fieldRepresentativeAccessFormPayload(form);
+  if (!payload.market_ids.length) return showToast(t("field_rep_market_required", "Select at least one territory."));
+  try {
+    setButtonPending(button, true);
+    await api("/superadmin/field-representatives", { method: "POST", body: JSON.stringify(payload) });
+    await loadAdminData();
+    renderAdmin();
+    showToast(t("field_rep_invitation_sent", "Territory representative invitation sent."));
+  } catch (error) {
+    setButtonPending(button, false);
+    showToast(error.message);
+  }
+}
+
+async function updateFieldRepresentativeAccess(form) {
+  const button = form.querySelector('[type="submit"]');
+  const payload = fieldRepresentativeAccessFormPayload(form);
+  if (!payload.market_ids.length) return showToast(t("field_rep_market_required", "Select at least one territory."));
+  try {
+    setButtonPending(button, true);
+    await api("/superadmin/field-representatives", { method: "PATCH", body: JSON.stringify({ ...payload, action: "update_access" }) });
+    await loadAdminData();
+    renderAdmin();
+    showToast(t("field_rep_access_saved", "Territory representative access saved."));
+  } catch (error) {
+    setButtonPending(button, false);
+    showToast(error.message);
+  }
+}
+
+async function setFieldRepresentativeStatus(button) {
+  const action = button.dataset.nextFieldRepresentativeStatus;
+  const id = button.dataset.fieldRepresentativeStatus;
+  if (action === "suspend" && !window.confirm(t("field_rep_suspend_confirm", "Suspend this territory representative?"))) return;
+  const form = button.closest("form");
+  const payload = form ? fieldRepresentativeAccessFormPayload(form) : { id };
+  try {
+    setButtonPending(button, true);
+    await api("/superadmin/field-representatives", { method: "PATCH", body: JSON.stringify({ ...payload, id, action }) });
+    await loadAdminData();
+    renderAdmin();
+    showToast(action === "suspend" ? t("field_rep_suspended", "Territory representative suspended.") : t("field_rep_reactivated", "Territory representative reactivated."));
+  } catch (error) {
+    setButtonPending(button, false);
+    showToast(error.message);
+  }
+}
+
+async function revokeFieldRepresentativeInvitation(button) {
+  if (!window.confirm(t("field_rep_revoke_confirm", "Revoke this territory representative invitation?"))) return;
+  try {
+    setButtonPending(button, true);
+    await api("/superadmin/field-representatives", { method: "PATCH", body: JSON.stringify({ id: button.dataset.revokeFieldRepresentativeInvitation, action: "revoke_invitation" }) });
+    await loadAdminData();
+    renderAdmin();
+    showToast(t("field_rep_invitation_revoked", "Territory representative invitation revoked."));
+  } catch (error) {
+    setButtonPending(button, false);
+    showToast(error.message);
+  }
+}
+
 function renderAdmin() {
   if (!state.session || !isAdminRole(state.session.profile.role)) return renderLogin("admin");
   const stats = state.stats || {};
-  const aiAdminPanels = canShowFeature("ai.adminAIControls", { allowDemo: true }) ? `
+  const representativeMode = isFieldRepresentativeSession();
+  const aiAdminPanels = !representativeMode && canShowFeature("ai.adminAIControls", { allowDemo: true }) ? `
     ${aiAdminControlsPanel()}
     ${aiExperiencePreviewPanel()}
     ${platformTrendPanel()}
@@ -11539,12 +11866,12 @@ function renderAdmin() {
     ${marketplaceInsightsPanel()}
     ${consumerIntelligencePanel()}
   ` : "";
-  let futureAdminPanels = `
+  let futureAdminPanels = representativeMode ? "" : `
       ${billingFoundationPanel()}
     `;
   let futureAdminGridPanels = "";
   if (!isBasicMode()) {
-    futureAdminGridPanels = `
+    if (!representativeMode) futureAdminGridPanels = `
       <article class="panel" id="admin-photo-submissions">
         <div class="section-title-row compact">
           <div><span class="section-kicker">Rewards moderation</span><h2>${escapeHtml(t("admin_photo_submissions_title", "Guest Photo & Review Submissions"))}</h2></div>
@@ -11560,7 +11887,7 @@ function renderAdmin() {
       <div class="section-title-row compact">
         <div><span class="section-kicker">${escapeHtml(t("admin_nav_partners", "Partners"))}</span><h2>${escapeHtml(t("partner_accounts_title", "Restaurant accounts"))}</h2></div>
       </div>
-      <form class="mini-form admin-form" id="partnerForm">
+      ${!representativeMode || currentFieldRepresentativeAccess().can_invite_partners ? `<form class="mini-form admin-form" id="partnerForm">
         <input name="full_name" placeholder="${escapeAttr(t("partner_owner_name_placeholder", "Owner name"))}" required>
         <input name="email" type="email" placeholder="${escapeAttr(t("partner_owner_email_placeholder", "Owner email"))}" required>
         <select name="restaurant_id" required>
@@ -11576,7 +11903,7 @@ function renderAdmin() {
         </select>
         <p class="form-note">${escapeHtml(t("partner_invitation_password_note", "SmartTable sends a secure invitation. Partners create their own password; temporary plaintext passwords are never emailed."))}</p>
         <button class="primary-button" type="submit">${escapeHtml(t("send_partner_invitation_button", "Send partner invitation"))}</button>
-      </form>
+      </form>` : `<p class="form-note">${escapeHtml(t("field_rep_partner_invite_disabled", "Partner invitations are not enabled for this account."))}</p>`}
       ${partnerTable()}
     </article>
   `;
@@ -11635,7 +11962,7 @@ function renderAdmin() {
       key: "overview",
       label: t("dashboard_tab_overview", "Overview"),
       compactLabel: t("dashboard_tab_overview_compact", "Overview"),
-      content: `
+      content: representativeMode ? fieldRepresentativeOverviewPanel(stats) : `
         ${platformModeQuickPanel()}
         <section class="stats-grid" id="admin-stats">
           ${kpiStatCard("admin_kpi_total_restaurants", "Total restaurants", stats.restaurants_total, "admin_kpi_total_restaurants_desc", "Restaurants in the management database", { key: "restaurants_total" })}
@@ -11664,6 +11991,12 @@ function renderAdmin() {
       compactLabel: t("dashboard_tab_partners_compact", "Partners"),
       content: `<section class="dashboard-grid one-col">${partnerAccountsPanel}</section>`
     },
+    ...(isSuperAdmin() ? [{
+      key: "field-team",
+      label: t("dashboard_tab_field_team", "Territory representatives"),
+      compactLabel: t("dashboard_tab_field_team_compact", "Field team"),
+      content: fieldRepresentativeTeamPanel()
+    }] : []),
     {
       key: "reservations",
       label: t("dashboard_tab_reservations", "Reservations"),
@@ -11723,7 +12056,7 @@ function renderAdmin() {
       compactLabel: t("dashboard_tab_audit_compact", "Audit"),
       content: auditPanel
     }
-  ].map((tab) => ({
+  ].filter((tab) => !representativeMode || ["overview", "restaurants", "partners"].includes(tab.key)).map((tab) => ({
     ...tab,
     tabId: `${adminArea}-tab-${tab.key}`,
     panelId: `${adminArea}-tab-panel-${tab.key}`
@@ -11732,16 +12065,18 @@ function renderAdmin() {
   app.innerHTML = dashboardShellTabbed(`
     <section class="dashboard-head compact-dashboard-head">
       <div>
-        <span class="section-kicker">${escapeHtml(adminArea === "superadmin" ? t("superadmin_dashboard_kicker", "Super Admin dashboard") : t("admin_dashboard_kicker", "Admin dashboard"))}</span>
-        <h1>${escapeHtml(t("admin_dashboard_title", "Smart Table operations"))}</h1>
+        <span class="section-kicker">${escapeHtml(representativeMode ? t("field_rep_dashboard_kicker", "Field operations") : adminArea === "superadmin" ? t("superadmin_dashboard_kicker", "Super Admin dashboard") : t("admin_dashboard_kicker", "Admin dashboard"))}</span>
+        <h1>${escapeHtml(representativeMode ? t("field_rep_dashboard_title", "Restaurant onboarding") : t("admin_dashboard_title", "Smart Table operations"))}</h1>
       </div>
       <div class="admin-head-actions">
-        ${platformHeaderModeControl()}
-        <span class="status ${escapeAttr(currentPlatformMode())}">${escapeHtml(t("platformMode.currentMode", "Current mode"))}: ${escapeHtml(platformModeLabel())}</span>
-        <div class="notification-wrap">
-          <button class="ghost-button notification-button" id="toggleNotifications" type="button">${escapeHtml(t("notifications_title", "Notifications"))} <span>${escapeHtml(state.unreadNotifications)}</span></button>
-          ${state.showNotifications ? notificationDropdown() : ""}
-        </div>
+        ${representativeMode ? "" : `
+          ${platformHeaderModeControl()}
+          <span class="status ${escapeAttr(currentPlatformMode())}">${escapeHtml(t("platformMode.currentMode", "Current mode"))}: ${escapeHtml(platformModeLabel())}</span>
+          <div class="notification-wrap">
+            <button class="ghost-button notification-button" id="toggleNotifications" type="button">${escapeHtml(t("notifications_title", "Notifications"))} <span>${escapeHtml(state.unreadNotifications)}</span></button>
+            ${state.showNotifications ? notificationDropdown() : ""}
+          </div>
+        `}
         <button class="primary-button" id="refreshAdmin" type="button">${escapeHtml(t("refresh_button", "Refresh"))}</button>
       </div>
     </section>
@@ -11754,7 +12089,7 @@ function renderAdmin() {
     await loadAdminData();
     renderAdmin();
   });
-  document.querySelector("#refreshAdmin").addEventListener("click", async () => {
+  document.querySelector("#refreshAdmin")?.addEventListener("click", async () => {
     await loadAdminData();
     renderAdmin();
   });
@@ -11848,7 +12183,20 @@ function renderAdmin() {
   document.querySelectorAll("[data-photo-submission-status]").forEach((button) => {
     button.addEventListener("click", () => updatePhotoSubmissionStatus(button.dataset.photoSubmissionId, button.dataset.photoSubmissionStatus));
   });
-  document.querySelector("#restaurantForm").addEventListener("submit", submitRestaurant);
+  document.querySelector("#fieldRepresentativeInviteAdminForm")?.addEventListener("submit", submitFieldRepresentativeInvitation);
+  document.querySelectorAll("[data-field-representative-access-form]").forEach((form) => {
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      updateFieldRepresentativeAccess(event.currentTarget);
+    });
+  });
+  document.querySelectorAll("[data-field-representative-status]").forEach((button) => {
+    button.addEventListener("click", () => setFieldRepresentativeStatus(button));
+  });
+  document.querySelectorAll("[data-revoke-field-representative-invitation]").forEach((button) => {
+    button.addEventListener("click", () => revokeFieldRepresentativeInvitation(button));
+  });
+  document.querySelector("#restaurantForm")?.addEventListener("submit", submitRestaurant);
   const restaurantPartnerMode = document.querySelector("[data-restaurant-partner-mode]");
   const syncRestaurantPartnerCreateFields = () => {
     const fields = document.querySelector("[data-restaurant-partner-fields]");
@@ -11889,7 +12237,7 @@ function renderAdmin() {
       renderAdmin();
     });
   });
-  document.querySelector("#partnerForm").addEventListener("submit", submitPartner);
+  document.querySelector("#partnerForm")?.addEventListener("submit", submitPartner);
   document.querySelector("#contentSearch")?.addEventListener("input", (event) => {
     const value = event.target.value;
     state.contentSearch = value;
@@ -12154,6 +12502,62 @@ function restaurantWizardTextarea(name, label, value = "", attrs = "") {
 }
 
 function restaurantOnboardingWizard() {
+  if (isFieldRepresentativeSession()) {
+    const markets = assignedFieldRepresentativeMarkets();
+    return `
+      <form class="mini-form admin-form restaurant-onboarding-wizard" id="restaurantForm">
+        <div class="restaurant-draft-intro">
+          <span class="section-kicker">${escapeHtml(t("field_rep_restaurant_kicker", "FIELD OPERATIONS"))}</span>
+          <h3>${escapeHtml(t("field_rep_restaurant_title", "Add a restaurant draft"))}</h3>
+          <p>${escapeHtml(t("field_rep_restaurant_body", "Add the essential restaurant information for an assigned market. A Super Admin reviews and publishes the draft."))}</p>
+        </div>
+        <fieldset class="restaurant-draft-fields">
+          <legend>${escapeHtml(t("restaurant_quick_create_essentials", "Essential details"))}</legend>
+          <label>${escapeHtml(t("field_rep_market_label", "Assigned market"))}
+            <select name="market_id" required>
+              <option value="">${escapeHtml(t("field_rep_market_choose", "Choose market"))}</option>
+              ${markets.map((market) => `<option value="${escapeAttr(market.id)}">${escapeHtml(fieldRepresentativeMarketLabel(market))}</option>`).join("")}
+            </select>
+          </label>
+          ${restaurantWizardField("name", t("restaurant_name_label", "Restaurant name"), "", "required autocomplete=\"organization\"")}
+          ${restaurantWizardField("email", t("restaurant_primary_email_label", "Primary email"), "", "type=\"email\" required autocomplete=\"email\"")}
+          ${restaurantWizardField("address", t("street_address_label", "Street address"), "", "required autocomplete=\"street-address\"")}
+          ${restaurantWizardField("cuisine_type", t("filter_cuisine_label", "Cuisine"), "", "required autocomplete=\"off\"")}
+        </fieldset>
+        <details class="restaurant-create-options">
+          <summary>${escapeHtml(t("restaurant_quick_create_optional", "Optional details"))}</summary>
+          <div class="restaurant-create-options-grid">
+            ${restaurantWizardField("legal_name", t("restaurant_legal_name_label", "Legal business name"))}
+            ${restaurantWizardField("reservation_email", t("restaurant_reservation_email_label", "Reservation email"), "", "type=\"email\"")}
+            ${restaurantWizardField("phone", t("phone_label", "Phone"), "", "type=\"tel\" autocomplete=\"tel\"")}
+            ${restaurantWizardField("country", t("country_label", "Country"), "US", "autocomplete=\"country\"")}
+            ${restaurantWizardField("city", t("city_label", "City"), "", "autocomplete=\"address-level2\"")}
+            ${restaurantWizardField("district", t("filter_neighborhood_label", "Neighborhood"))}
+            ${restaurantWizardTextarea("short_description", t("restaurant_short_description_label", "Short description"))}
+            ${restaurantWizardTextarea("full_description", t("restaurant_full_description_label", "Full description"))}
+            <label>${escapeHtml(t("restaurant_partner_access_mode_label", "Partner access setup"))}
+              <select name="partner_access_mode" data-restaurant-partner-mode>
+                <option value="none_later">${escapeHtml(t("restaurant_partner_access_none", "Create without a partner and invite one later"))}</option>
+                <option value="invite_new">${escapeHtml(t("restaurant_partner_access_invite_new", "Invite a new partner"))}</option>
+                <option value="assign_existing">${escapeHtml(t("restaurant_partner_access_assign_existing", "Assign an existing partner"))}</option>
+              </select>
+            </label>
+            <div class="restaurant-partner-create-fields" data-restaurant-partner-fields hidden>
+              ${restaurantWizardField("partner_full_name", t("restaurant_partner_contact_name_placeholder", "Partner contact name"))}
+              ${restaurantWizardField("partner_email", t("restaurant_partner_email_placeholder", "Partner email"), "", "type=\"email\"")}
+              <label>${escapeHtml(t("restaurant_role_label", "Restaurant-level role"))}
+                <select name="restaurant_role">
+                  ${["owner", "manager", "reservation_staff", "marketing_staff", "read_only"].map((role) => `<option value="${escapeAttr(role)}">${escapeHtml(t(`restaurant_role_${role}`, role.replaceAll("_", " ")))}</option>`).join("")}
+                </select>
+              </label>
+            </div>
+          </div>
+        </details>
+        <p class="form-note restaurant-draft-safety-note">${escapeHtml(t("field_rep_draft_safety", "This always creates a hidden draft. Only a Super Admin can publish, suspend, archive or delete it."))}</p>
+        <button class="primary-button restaurant-create-draft-button" type="submit" ${markets.length ? "" : "disabled"}>${escapeHtml(t("restaurant_create_draft_button", "Create draft"))}</button>
+      </form>
+    `;
+  }
   return `
     <form class="mini-form admin-form restaurant-onboarding-wizard" id="restaurantForm">
       <div class="restaurant-draft-intro">
@@ -12331,6 +12735,7 @@ function restaurantDetailOverview(detail) {
 
 function restaurantDetailProfile(detail) {
   const restaurant = detail.restaurant || {};
+  const representativeMode = isFieldRepresentativeSession();
   return `
     <form class="mini-form admin-form restaurant-setup-form" id="restaurantProfileSetupForm" data-restaurant-setup="profile">
       <input type="hidden" name="id" value="${escapeAttr(restaurant.id || "")}">
@@ -12354,7 +12759,7 @@ function restaurantDetailProfile(detail) {
         ${restaurantWizardField("currency_code", t("currency_label", "Currency"), restaurant.currency_code || "USD")}
         ${restaurantWizardTextarea("short_description", t("restaurant_short_description_label", "Short description"), restaurant.short_description || restaurant.description_en || restaurant.description || "")}
         ${restaurantWizardTextarea("full_description", t("restaurant_full_description_label", "Full description"), restaurant.full_description || restaurant.description_en || restaurant.description || "")}
-        ${restaurantBooleanSetupField("visible_on_guest_site", t("restaurant_visible_label", "Visible on guest site"), restaurant.visible_on_guest_site === true)}
+        ${representativeMode ? "" : restaurantBooleanSetupField("visible_on_guest_site", t("restaurant_visible_label", "Visible on guest site"), restaurant.visible_on_guest_site === true)}
       </div>
       <details class="restaurant-setup-advanced">
         <summary>${escapeHtml(t("advanced_settings_label", "Advanced settings"))}</summary>
@@ -12378,9 +12783,9 @@ function restaurantDetailProfile(detail) {
           ${restaurantWizardTextarea("seo_description", t("seo_description_label", "SEO description"), restaurant.seo_description || "")}
           ${restaurantWizardTextarea("accessibility_info", t("restaurant_accessibility_info_label", "Accessibility information"), restaurant.accessibility_info || "")}
           ${restaurantWizardTextarea("parking_info", t("restaurant_parking_info_label", "Parking information"), restaurant.parking_info || "")}
-          ${restaurantBooleanSetupField("is_featured", t("restaurant_featured_label", "Featured restaurant"), restaurant.is_featured === true)}
+          ${representativeMode ? "" : restaurantBooleanSetupField("is_featured", t("restaurant_featured_label", "Featured restaurant"), restaurant.is_featured === true)}
           ${restaurantBooleanSetupField("is_new_restaurant", t("restaurant_new_label", "New restaurant label"), restaurant.is_new_restaurant === true)}
-          ${restaurantBooleanSetupField("is_test_data", t("restaurant_test_data_label", "Test data"), restaurant.is_test_data === true || restaurant.is_test_restaurant === true)}
+          ${representativeMode ? "" : restaurantBooleanSetupField("is_test_data", t("restaurant_test_data_label", "Test data"), restaurant.is_test_data === true || restaurant.is_test_restaurant === true)}
         </div>
       </details>
       <button class="primary-button" type="submit">${escapeHtml(t("save_profile_button", "Save profile"))}</button>
@@ -12501,6 +12906,7 @@ function restaurantCapacityDetailPanel(detail) {
 function restaurantPartnerAccessDetailPanel(detail) {
   const access = detail.partner_access || [];
   const invitations = detail.invitations || [];
+  const canManageAccess = !isFieldRepresentativeSession() || currentFieldRepresentativeAccess().can_manage_partner_access === true;
   return `
     ${access.length ? `
       <div class="table-wrap">
@@ -12511,17 +12917,17 @@ function restaurantPartnerAccessDetailPanel(detail) {
               <tr>
                 <td>${escapeHtml(row.full_name || row.email || row.user_id || "")}<br><span class="muted">${escapeHtml(row.email || row.user_id || "")}</span></td>
                 <td>
-                  <select data-restaurant-access-role="${escapeAttr(row.id)}" aria-label="${escapeAttr(t("restaurant_role_label", "Restaurant-level role"))}">
+                  <select data-restaurant-access-role="${escapeAttr(row.id)}" aria-label="${escapeAttr(t("restaurant_role_label", "Restaurant-level role"))}" ${canManageAccess ? "" : "disabled"}>
                     ${["owner", "manager", "reservation_staff", "marketing_staff", "read_only"].map((role) => `<option value="${escapeAttr(role)}" ${role === row.role ? "selected" : ""}>${escapeHtml(t(`restaurant_role_${role}`, role.replace("_", " ")))}</option>`).join("")}
                   </select>
                 </td>
                 <td>${statusBadge(row.status || "active")}</td>
                 <td>
-                  <div class="button-row">
+                  ${canManageAccess ? `<div class="button-row">
                     <button class="ghost-button" type="button" data-restaurant-access-action="change_restaurant_role" data-restaurant-access-id="${escapeAttr(row.id)}">${escapeHtml(t("change_role_button", "Change role"))}</button>
                     ${row.status === "active" ? `<button class="ghost-button warning" type="button" data-restaurant-access-action="deactivate_restaurant_access" data-restaurant-access-id="${escapeAttr(row.id)}">${escapeHtml(t("deactivate_access_button", "Deactivate access"))}</button>` : `<button class="ghost-button" type="button" data-restaurant-access-action="reactivate_restaurant_access" data-restaurant-access-id="${escapeAttr(row.id)}">${escapeHtml(t("reactivate_access_button", "Reactivate access"))}</button>`}
                     <button class="ghost-button danger" type="button" data-restaurant-access-action="remove_restaurant_access" data-restaurant-access-id="${escapeAttr(row.id)}">${escapeHtml(t("remove_access_button", "Remove access"))}</button>
-                  </div>
+                  </div>` : `<span class="muted">${escapeHtml(t("field_rep_partner_access_read_only", "Read only"))}</span>`}
                 </td>
               </tr>
             `).join("")}
@@ -12553,6 +12959,8 @@ function restaurantDetailPanel() {
   const detail = state.adminRestaurantDetail;
   if (!detail?.restaurant) return "";
   const restaurant = detail.restaurant;
+  const representativeMode = isFieldRepresentativeSession();
+  const access = currentFieldRepresentativeAccess();
   const tabs = [
     ["overview", t("restaurant_tab_overview", "Overview")],
     ["profile", t("restaurant_tab_public_profile", "Public Profile")],
@@ -12564,8 +12972,17 @@ function restaurantDetailPanel() {
     ["reservation_rows", t("restaurant_tab_reservations", "Reservations")],
     ["audit", t("restaurant_tab_audit", "Audit History")],
     ["system", t("restaurant_tab_system", "System Status")]
-  ];
-  const tab = state.adminRestaurantDetailTab;
+  ].filter(([key]) => !representativeMode || [
+    "overview",
+    "profile",
+    "hours",
+    "reservations",
+    ...(access.can_manage_capacity ? ["capacity"] : []),
+    ...(access.can_manage_partner_access || access.can_invite_partners ? ["access"] : [])
+  ].includes(key));
+  const allowedTabs = new Set(tabs.map(([key]) => key));
+  const tab = allowedTabs.has(state.adminRestaurantDetailTab) ? state.adminRestaurantDetailTab : "overview";
+  if (state.adminRestaurantDetailTab !== tab) state.adminRestaurantDetailTab = tab;
   const body = tab === "profile" ? restaurantDetailProfile(detail)
     : tab === "hours" ? restaurantDetailHours(detail)
       : tab === "reservations" ? restaurantDetailReservationSettings(detail)
@@ -12594,6 +13011,7 @@ function restaurantDetailPanel() {
 }
 
 function restaurantAdminPanel(includeAudit = true) {
+  const representativeMode = isFieldRepresentativeSession();
   return `
     <article class="panel wide-panel" id="admin-restaurants">
       <div class="section-title-row compact">
@@ -12603,7 +13021,9 @@ function restaurantAdminPanel(includeAudit = true) {
         </div>
         <button class="primary-button" type="button" data-focus-restaurant-form>${escapeHtml(t("add_restaurant_button", "Add Restaurant"))}</button>
       </div>
-      <p class="form-note">${escapeHtml(t("restaurant_admin_scope_note", "Admins can create restaurants in Draft, invite partners, manage lifecycle status, and review audit history without manual SQL editing."))}</p>
+      <p class="form-note">${escapeHtml(representativeMode
+        ? t("field_rep_restaurant_scope_note", "Create and configure restaurant drafts only in your assigned territories. Super Admin controls activation, publication, suspension, archiving, and deletion.")
+        : t("restaurant_admin_scope_note", "Admins can create restaurants in Draft, invite partners, manage lifecycle status, and review audit history without manual SQL editing."))}</p>
       ${restaurantOnboardingWizard()}
       ${restaurantAdminFilters()}
       ${restaurantTable()}
@@ -12615,6 +13035,7 @@ function restaurantAdminPanel(includeAudit = true) {
 
 function restaurantTable() {
   if (!state.restaurants.length) return `<div class="empty-state">${escapeHtml(t("restaurants_empty_admin", "No restaurants yet."))}</div>`;
+  const representativeMode = isFieldRepresentativeSession();
   const filtered = filteredAdminRestaurants();
   const totalPages = Math.max(1, Math.ceil(filtered.length / state.adminRestaurantPageSize));
   state.adminRestaurantPage = Math.min(Math.max(1, state.adminRestaurantPage), totalPages);
@@ -12659,25 +13080,27 @@ function restaurantTable() {
               </td>
               <td>
                 ${restaurantLifecycleBadge(restaurant)}
-                <select data-field="status" aria-label="${escapeAttr(t("restaurant_status_label", "Restaurant status"))}">
+                ${representativeMode ? `<span class="form-note">${escapeHtml(t("field_rep_status_read_only", "Lifecycle status is controlled by Super Admin."))}</span>` : `<select data-field="status" aria-label="${escapeAttr(t("restaurant_status_label", "Restaurant status"))}">
                   <option value="draft" ${lifecycle === "draft" ? "selected" : ""}>${escapeHtml(t("restaurant_status_draft", "Draft"))}</option>
                   <option value="pending_review" ${lifecycle === "pending_review" ? "selected" : ""}>${escapeHtml(t("restaurant_status_pending_review", "Pending review"))}</option>
                   <option value="active" ${lifecycle === "active" ? "selected" : ""}>${escapeHtml(t("restaurant_status_active", "Active"))}</option>
                   <option value="suspended" ${lifecycle === "suspended" ? "selected" : ""}>${escapeHtml(t("restaurant_status_suspended", "Suspended"))}</option>
                   <option value="archived" ${lifecycle === "archived" ? "selected" : ""}>${escapeHtml(t("restaurant_status_archived", "Archived"))}</option>
-                </select>
+                </select>`}
               </td>
               <td>
                 <div class="button-row">
                   <button class="ghost-button" data-view-restaurant="${escapeAttr(restaurant.id)}" type="button">${escapeHtml(t("view_button", "View"))}</button>
                   <button class="ghost-button" data-save-restaurant="${escapeAttr(restaurant.id)}" type="button">${escapeHtml(t("save_button", "Save"))}</button>
-                  <button class="ghost-button" data-invite-restaurant="${escapeAttr(restaurant.id)}" type="button">${escapeHtml(t("invite_partner_button", "Invite Partner"))}</button>
-                  <button class="ghost-button" data-manage-restaurant-access="${escapeAttr(restaurant.id)}" type="button">${escapeHtml(t("manage_access_button", "Manage Access"))}</button>
-                  ${lifecycle !== "active" ? `<button class="ghost-button" data-restaurant-status-action="${escapeAttr(restaurant.id)}" data-next-status="active" type="button">${escapeHtml(t("activate_button", "Activate"))}</button>` : ""}
-                  ${lifecycle !== "suspended" ? `<button class="ghost-button danger" data-restaurant-status-action="${escapeAttr(restaurant.id)}" data-next-status="suspended" type="button">${escapeHtml(t("suspend_button", "Suspend"))}</button>` : ""}
-                  ${lifecycle !== "archived" ? `<button class="ghost-button danger" data-restaurant-status-action="${escapeAttr(restaurant.id)}" data-next-status="archived" type="button">${escapeHtml(t("archive_button", "Archive"))}</button>` : ""}
-                  ${["suspended", "archived"].includes(lifecycle) ? `<button class="ghost-button" data-restaurant-status-action="${escapeAttr(restaurant.id)}" data-next-status="active" type="button">${escapeHtml(t("reactivate_button", "Reactivate"))}</button>` : ""}
-                  <button class="ghost-button" data-restaurant-audit="${escapeAttr(restaurant.id)}" type="button">${escapeHtml(t("view_audit_history_button", "View Audit History"))}</button>
+                  ${!representativeMode || currentFieldRepresentativeAccess().can_invite_partners ? `<button class="ghost-button" data-invite-restaurant="${escapeAttr(restaurant.id)}" type="button">${escapeHtml(t("invite_partner_button", "Invite Partner"))}</button>` : ""}
+                  ${!representativeMode || currentFieldRepresentativeAccess().can_manage_partner_access ? `<button class="ghost-button" data-manage-restaurant-access="${escapeAttr(restaurant.id)}" type="button">${escapeHtml(t("manage_access_button", "Manage Access"))}</button>` : ""}
+                  ${representativeMode ? "" : `
+                    ${lifecycle !== "active" ? `<button class="ghost-button" data-restaurant-status-action="${escapeAttr(restaurant.id)}" data-next-status="active" type="button">${escapeHtml(t("activate_button", "Activate"))}</button>` : ""}
+                    ${lifecycle !== "suspended" ? `<button class="ghost-button danger" data-restaurant-status-action="${escapeAttr(restaurant.id)}" data-next-status="suspended" type="button">${escapeHtml(t("suspend_button", "Suspend"))}</button>` : ""}
+                    ${lifecycle !== "archived" ? `<button class="ghost-button danger" data-restaurant-status-action="${escapeAttr(restaurant.id)}" data-next-status="archived" type="button">${escapeHtml(t("archive_button", "Archive"))}</button>` : ""}
+                    ${["suspended", "archived"].includes(lifecycle) ? `<button class="ghost-button" data-restaurant-status-action="${escapeAttr(restaurant.id)}" data-next-status="active" type="button">${escapeHtml(t("reactivate_button", "Reactivate"))}</button>` : ""}
+                    <button class="ghost-button" data-restaurant-audit="${escapeAttr(restaurant.id)}" type="button">${escapeHtml(t("view_audit_history_button", "View Audit History"))}</button>
+                  `}
                 </div>
               </td>
             </tr>
@@ -12709,8 +13132,8 @@ function partnerTable() {
               <td>${escapeHtml(partner.restaurant_id || "Not linked")}</td>
               <td>
                 <div class="button-row">
-                  ${partnerInvitationActions(partner)}
-                  <button class="ghost-button" data-view-as-partner="${escapeAttr(partner.id)}" type="button">${escapeHtml(t("view_as_partner_button", "View as partner"))}</button>
+                  ${!isFieldRepresentativeSession() || currentFieldRepresentativeAccess().can_manage_partner_access === true ? partnerInvitationActions(partner) : ""}
+                  ${isFieldRepresentativeSession() ? "" : `<button class="ghost-button" data-view-as-partner="${escapeAttr(partner.id)}" type="button">${escapeHtml(t("view_as_partner_button", "View as partner"))}</button>`}
                 </div>
               </td>
             </tr>
@@ -13391,6 +13814,10 @@ async function submitRestaurant(event) {
     }
   } catch (error) {
     if (error.payload?.code === "DUPLICATE_RESTAURANT_POSSIBLE") {
+      if (isFieldRepresentativeSession()) {
+        showToast(t("field_rep_duplicate_requires_super_admin", "A possible duplicate was found. Super Admin approval is required before it can be created."));
+        return;
+      }
       const duplicates = (error.payload.duplicates || [])
         .map((item) => `${item.name || item.id}: ${(item.matched_fields || []).join(", ")}`)
         .join("\n");
@@ -19326,6 +19753,11 @@ async function renderCurrentMode() {
     if (accountRoute === "partner-invite") {
       state.mode = "guest";
       renderPartnerInvitation();
+      return;
+    }
+    if (accountRoute === "field-representative-invite") {
+      state.mode = "guest";
+      renderFieldRepresentativeInvitation();
       return;
     }
     if (accountRoute === "forgot-password") {

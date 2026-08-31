@@ -741,6 +741,9 @@ const demo = {
   notifications: [],
   restaurantUsers: [],
   partnerInvitations: [],
+  fieldRepresentativeAssignments: [],
+  fieldRepresentativeMarkets: [],
+  fieldRepresentativeInvitations: [],
   restaurantDiningAreas: [],
   restaurantTables: [],
   restaurantCapacityOverrides: [],
@@ -3377,6 +3380,7 @@ function normalizeRole(role) {
   const value = clean(role || "guest");
   if (value === "restaurant" || value === "restaurant_partner") return "partner";
   if (value === "superadmin") return "super_admin";
+  if (["field-representative", "field_rep", "representative", "territory_admin"].includes(value)) return "field_representative";
   return value;
 }
 
@@ -3396,6 +3400,141 @@ function isSuperAdminProfile(profile = {}) {
 
 function isAdminProfile(profile = {}) {
   return roleMatches(profile.role, ["admin"]);
+}
+
+function isFieldRepresentativeProfile(profile = {}) {
+  return normalizeRole(profile.role) === "field_representative";
+}
+
+async function fieldRepresentativeAccess(profile = {}) {
+  if (isAdminProfile(profile)) {
+    return {
+      kind: "platform_admin",
+      status: "active",
+      unrestricted: true,
+      market_ids: publicMarketConfig({ includeInactive: true }).map((market) => market.id),
+      can_manage_restaurants: true,
+      can_manage_capacity: true,
+      can_invite_partners: true,
+      can_manage_partner_access: true
+    };
+  }
+  if (!isFieldRepresentativeProfile(profile)) {
+    const error = new Error("Administrator access is required.");
+    error.status = 403;
+    error.code = "FIELD_REPRESENTATIVE_ACCESS_REQUIRED";
+    throw error;
+  }
+  let assignment;
+  let markets;
+  if (!supabaseConfigured) {
+    ensureDemo();
+    assignment = demo.fieldRepresentativeAssignments.find((item) => clean(item.user_id) === clean(profile.id));
+    markets = demo.fieldRepresentativeMarkets.filter((item) => clean(item.user_id) === clean(profile.id) && clean(item.status || "active") === "active");
+  } else {
+    const [assignments, marketRows] = await Promise.all([
+      supabaseFetch(`/rest/v1/field_representative_assignments?user_id=eq.${encodeURIComponent(profile.id)}&select=*&limit=1`, { service: true }).catch(() => []),
+      supabaseFetch(`/rest/v1/field_representative_markets?user_id=eq.${encodeURIComponent(profile.id)}&status=eq.active&select=market_id`, { service: true }).catch(() => [])
+    ]);
+    assignment = assignments?.[0];
+    markets = marketRows || [];
+  }
+  if (!assignment || clean(assignment.status) !== "active" || !markets.length) {
+    const error = new Error("Your field representative access is not active or has no assigned territory.");
+    error.status = 403;
+    error.code = "FIELD_REPRESENTATIVE_SCOPE_INACTIVE";
+    throw error;
+  }
+  return {
+    kind: "field_representative",
+    status: assignment.status,
+    unrestricted: false,
+    market_ids: markets.map((item) => clean(item.market_id)).filter(Boolean),
+    can_manage_restaurants: assignment.can_manage_restaurants === true,
+    can_manage_capacity: assignment.can_manage_capacity === true,
+    can_invite_partners: assignment.can_invite_partners === true,
+    can_manage_partner_access: assignment.can_manage_partner_access === true
+  };
+}
+
+async function requireAdminAccess(headers, permission = "") {
+  const { profile } = await requireProfile(headers, ["admin", "field_representative"]);
+  const access = await fieldRepresentativeAccess(profile);
+  if (permission && access[permission] !== true) {
+    const error = new Error("This action is not enabled for your field representative account.");
+    error.status = 403;
+    error.code = "FIELD_REPRESENTATIVE_PERMISSION_DENIED";
+    throw error;
+  }
+  return { profile, access };
+}
+
+function restaurantMarketId(restaurant = {}) {
+  return clean(restaurant.market_id || defaultMarket().id);
+}
+
+function fieldRepresentativeCanAccessRestaurant(access = {}, restaurant = {}) {
+  return access.unrestricted === true || access.market_ids.includes(restaurantMarketId(restaurant));
+}
+
+function assertFieldRepresentativeRestaurant(access = {}, restaurant = {}) {
+  if (fieldRepresentativeCanAccessRestaurant(access, restaurant)) return;
+  const error = new Error("This restaurant is outside your assigned territory.");
+  error.status = 403;
+  error.code = "FIELD_REPRESENTATIVE_TERRITORY_DENIED";
+  throw error;
+}
+
+function restrictedRestaurantMutation(body = {}, access = {}) {
+  if (access.unrestricted) return { ...body };
+  const forbidden = [
+    "status", "onboarding_status", "visible_on_guest_site", "is_featured", "is_test_data", "is_test_restaurant",
+    "owner_user_id", "billing_plan", "billing_status", "monthly_fee", "fee_per_booking", "sort_order",
+    "duplicate_override", "duplicate_override_reason"
+  ];
+  if (forbidden.some((field) => body[field] !== undefined)) {
+    const error = new Error("Publishing, lifecycle, ownership, billing and platform flags require a platform administrator.");
+    error.status = 403;
+    error.code = "FIELD_REPRESENTATIVE_RESTRICTED_FIELD";
+    throw error;
+  }
+  const requestedMarket = clean(body.market_id || (access.market_ids.length === 1 ? access.market_ids[0] : ""));
+  if (!requestedMarket || !access.market_ids.includes(requestedMarket)) {
+    const error = new Error("Choose one of your assigned territories.");
+    error.status = 403;
+    error.code = "FIELD_REPRESENTATIVE_TERRITORY_DENIED";
+    throw error;
+  }
+  return {
+    ...body,
+    market_id: requestedMarket,
+    status: "pending",
+    onboarding_status: "draft",
+    visible_on_guest_site: false,
+    is_featured: false
+  };
+}
+
+function restrictedRestaurantPatch(body = {}, access = {}) {
+  if (access.unrestricted) return { ...body };
+  const forbidden = [
+    "status", "onboarding_status", "visible_on_guest_site", "is_featured", "is_test_data", "is_test_restaurant",
+    "owner_user_id", "billing_plan", "billing_status", "monthly_fee", "fee_per_booking", "sort_order",
+    "duplicate_override", "duplicate_override_reason"
+  ];
+  if (forbidden.some((field) => body[field] !== undefined)) {
+    const error = new Error("Publishing, lifecycle, ownership, billing and platform flags require a platform administrator.");
+    error.status = 403;
+    error.code = "FIELD_REPRESENTATIVE_RESTRICTED_FIELD";
+    throw error;
+  }
+  if (body.market_id !== undefined && !access.market_ids.includes(clean(body.market_id))) {
+    const error = new Error("This restaurant cannot be moved outside your assigned territories.");
+    error.status = 403;
+    error.code = "FIELD_REPRESENTATIVE_TERRITORY_DENIED";
+    throw error;
+  }
+  return { ...body };
 }
 
 function normalizeRestaurantUserRole(role) {
@@ -4065,6 +4204,7 @@ function ensureDemo() {
   const regularAdminId = "00000000-0000-4000-8000-000000000004";
   const partnerUserId = "00000000-0000-4000-8000-000000000002";
   const guestId = "00000000-0000-4000-8000-000000000003";
+  const marketId = defaultMarket().id;
   const restaurantId = "10000000-0000-4000-8000-000000000001";
   const secondRestaurantId = "10000000-0000-4000-8000-000000000002";
   const testRestaurantId = "10000000-0000-4000-8000-000000000123";
@@ -4217,6 +4357,7 @@ function ensureDemo() {
   demo.restaurants = [
     {
       id: restaurantId,
+      market_id: marketId,
       owner_user_id: partnerUserId,
       name: "Hudson Hearth",
       legal_name: "Hudson Hearth LLC",
@@ -4278,6 +4419,7 @@ function ensureDemo() {
     },
     {
       id: secondRestaurantId,
+      market_id: marketId,
       owner_user_id: null,
       name: "Casa Luna Trattoria",
       legal_name: "Casa Luna Hospitality Inc.",
@@ -4339,6 +4481,7 @@ function ensureDemo() {
     },
     {
       id: testRestaurantId,
+      market_id: marketId,
       owner_user_id: partnerUserId,
       slug: "smarttable-test-bistro",
       name: "SmartTable Test Bistro",
@@ -25032,6 +25175,16 @@ function restaurantPayload(body, options = {}) {
   for (const field of fields) {
     if (body[field] !== undefined || options.full) payload[field] = stripUnsafeHtml(body[field]);
   }
+  if (body.market_id !== undefined || options.full) {
+    const marketId = clean(body.market_id || defaultMarket().id);
+    if (!looksLikeUuid(marketId)) {
+      const error = new Error("Restaurant market must be a valid identifier.");
+      error.status = 400;
+      error.code = "RESTAURANT_MARKET_INVALID";
+      throw error;
+    }
+    payload.market_id = marketId;
+  }
   if (payload.primary_timezone && !isValidTimeZone(payload.primary_timezone)) {
     const error = new Error("Restaurant timezone must be a valid IANA timezone.");
     error.status = 400;
@@ -26177,12 +26330,12 @@ async function adminLegalDocuments(method, body, headers, query) {
 }
 
 async function adminRestaurants(method, body, headers, query) {
-  const { profile } = await requireProfile(headers, ["admin"]);
+  const { profile, access } = await requireAdminAccess(headers, "can_manage_restaurants");
 
   if (!supabaseConfigured) {
     ensureDemo();
     if (method === "GET") {
-      const restaurants = [...demo.restaurants].sort((a, b) => {
+      const restaurants = demo.restaurants.filter((restaurant) => fieldRepresentativeCanAccessRestaurant(access, restaurant)).sort((a, b) => {
         const order = numberOr(a.sort_order, 999999) - numberOr(b.sort_order, 999999);
         if (order) return order;
         return clean(a.name).localeCompare(clean(b.name)) || clean(a.created_at).localeCompare(clean(b.created_at));
@@ -26200,9 +26353,10 @@ async function adminRestaurants(method, body, headers, query) {
       });
     }
     if (method === "POST") {
-      const duplicateCandidates = await findRestaurantDuplicateCandidates(body);
-      const overrideReason = duplicateOverrideReason(body);
-      if (duplicateCandidates.length && !body.duplicate_override) {
+      const mutationBody = restrictedRestaurantMutation(body, access);
+      const duplicateCandidates = await findRestaurantDuplicateCandidates(mutationBody);
+      const overrideReason = duplicateOverrideReason(mutationBody);
+      if (duplicateCandidates.length && !mutationBody.duplicate_override) {
         await createAuditLog({
           profile,
           action: "restaurant_duplicate_warning",
@@ -26220,7 +26374,7 @@ async function adminRestaurants(method, body, headers, query) {
         });
       }
       if (duplicateCandidates.length && !overrideReason) return json(400, { error: "An override reason is required to create a possible duplicate restaurant.", code: "DUPLICATE_OVERRIDE_REASON_REQUIRED" });
-      const rawPayload = restaurantPayload(body, { full: true });
+      const rawPayload = restaurantPayload(mutationBody, { full: true });
       const slugConflict = await restaurantSlugConflict(rawPayload.slug);
       if (slugConflict) return json(409, { error: "Restaurant slug is already in use.", code: "RESTAURANT_SLUG_EXISTS", conflict: { id: slugConflict.id, name: slugConflict.name } });
       const item = {
@@ -26233,7 +26387,7 @@ async function adminRestaurants(method, body, headers, query) {
       demo.restaurants.unshift(item);
       return await finalizeCreatedRestaurant({
         profile,
-        body,
+        body: mutationBody,
         headers,
         createdRestaurant: item,
         duplicateCandidates,
@@ -26243,12 +26397,14 @@ async function adminRestaurants(method, body, headers, query) {
     if (method === "PATCH") {
       const item = demo.restaurants.find((restaurant) => restaurant.id === clean(body.id || query.get("id")));
       if (!item) return json(404, { error: "Restaurant not found." });
+      assertFieldRepresentativeRestaurant(access, item);
+      const mutationBody = restrictedRestaurantPatch(body, access);
       const relatedTables = (demo.restaurantTables || []).filter((table) => clean(table.restaurant_id) === clean(item.id));
       const assignedPartnerCount = (demo.restaurantUsers || []).filter((user) => clean(user.restaurant_id) === clean(item.id) && clean(user.status) === "active").length;
-      const lifecycle = body.status !== undefined || body.onboarding_status !== undefined
-        ? validateRestaurantLifecycleTransition(item, body, { actorId: profile.id, tables: relatedTables, assigned_partner_count: assignedPartnerCount })
+      const lifecycle = mutationBody.status !== undefined || mutationBody.onboarding_status !== undefined
+        ? validateRestaurantLifecycleTransition(item, mutationBody, { actorId: profile.id, tables: relatedTables, assigned_partner_count: assignedPartnerCount })
         : null;
-      const patch = { ...restaurantPayload(body), ...(lifecycle?.patch || {}) };
+      const patch = { ...restaurantPayload(mutationBody), ...(lifecycle?.patch || {}) };
       const slugConflict = patch.slug ? await restaurantSlugConflict(patch.slug, item.id) : null;
       if (slugConflict) return json(409, { error: "Restaurant slug is already in use.", code: "RESTAURANT_SLUG_EXISTS", conflict: { id: slugConflict.id, name: slugConflict.name } });
       const previous = { ...item };
@@ -26261,7 +26417,7 @@ async function adminRestaurants(method, body, headers, query) {
         headers,
         previousValue: previous,
         newValue: item,
-        metadata: { restaurant_id: item.id, previous_status: restaurantLifecycleStatus(previous), next_status: restaurantLifecycleStatus(item), reason: clean(body.status_reason || body.reason || "") }
+        metadata: { restaurant_id: item.id, previous_status: restaurantLifecycleStatus(previous), next_status: restaurantLifecycleStatus(item), reason: clean(mutationBody.status_reason || mutationBody.reason || "") }
       });
       if (lifecycle) {
         await createRestaurantStatusHistory({
@@ -26269,7 +26425,7 @@ async function adminRestaurants(method, body, headers, query) {
           restaurantId: item.id,
           previousStatus: restaurantLifecycleStatus(previous),
           newStatus: restaurantLifecycleStatus(item),
-          reason: clean(body.status_reason || body.reason || ""),
+          reason: clean(mutationBody.status_reason || mutationBody.reason || ""),
           changedFields: Object.keys(patch),
           headers,
           metadata: { action: "restaurant_status_transition" },
@@ -26290,12 +26446,14 @@ async function adminRestaurants(method, body, headers, query) {
         supabaseFetch("/rest/v1/restaurant_tables?select=restaurant_id,status,max_capacity,is_accessible,seating_type", { service: true }).catch(() => []),
         supabaseFetch("/rest/v1/restaurant_service_capacity_overrides?select=restaurant_id,status", { service: true }).catch(() => [])
       ]);
-      return json(200, { restaurants: buildRestaurantAdminRows(rows || [], { offers, reservations, restaurantUsers, invitations, diningAreas, tables, capacityOverrides }) });
+      const scopedRows = (rows || []).filter((restaurant) => fieldRepresentativeCanAccessRestaurant(access, restaurant));
+      return json(200, { restaurants: buildRestaurantAdminRows(scopedRows, { offers, reservations, restaurantUsers, invitations, diningAreas, tables, capacityOverrides }) });
     }
     if (method === "POST") {
-      const duplicateCandidates = await findRestaurantDuplicateCandidates(body);
-      const overrideReason = duplicateOverrideReason(body);
-      if (duplicateCandidates.length && !body.duplicate_override) {
+      const mutationBody = restrictedRestaurantMutation(body, access);
+      const duplicateCandidates = await findRestaurantDuplicateCandidates(mutationBody);
+      const overrideReason = duplicateOverrideReason(mutationBody);
+      if (duplicateCandidates.length && !mutationBody.duplicate_override) {
         await createAuditLog({
           profile,
           action: "restaurant_duplicate_warning",
@@ -26313,7 +26471,7 @@ async function adminRestaurants(method, body, headers, query) {
         });
       }
       if (duplicateCandidates.length && !overrideReason) return json(400, { error: "An override reason is required to create a possible duplicate restaurant.", code: "DUPLICATE_OVERRIDE_REASON_REQUIRED" });
-      const payload = await preparedRestaurantPayload(body, { full: true });
+      const payload = await preparedRestaurantPayload(mutationBody, { full: true });
       const slugConflict = payload.slug ? await restaurantSlugConflict(payload.slug) : null;
       if (slugConflict) return json(409, { error: "Restaurant slug is already in use.", code: "RESTAURANT_SLUG_EXISTS", conflict: { id: slugConflict.id, name: slugConflict.name } });
       const rows = await supabaseFetch("/rest/v1/restaurants?select=*", {
@@ -26329,7 +26487,7 @@ async function adminRestaurants(method, body, headers, query) {
       if (!createdRestaurant?.id) return json(502, { error: "Restaurant was created but is not queryable by the admin list endpoint yet.", code: "RESTAURANT_CREATE_READBACK_FAILED" });
       return await finalizeCreatedRestaurant({
         profile,
-        body,
+        body: mutationBody,
         headers,
         createdRestaurant,
         duplicateCandidates,
@@ -26341,19 +26499,21 @@ async function adminRestaurants(method, body, headers, query) {
       const previousRows = await supabaseFetch(`/rest/v1/restaurants?id=eq.${encodeURIComponent(id)}&select=*&limit=1`, { service: true }).catch(() => []);
       const previous = previousRows?.[0];
       if (!previous) return json(404, { error: "Restaurant not found." });
+      assertFieldRepresentativeRestaurant(access, previous);
+      const mutationBody = restrictedRestaurantPatch(body, access);
       const [relatedTables, restaurantUsers] = await Promise.all([
         supabaseFetch(`/rest/v1/restaurant_tables?select=*&restaurant_id=eq.${encodeURIComponent(id)}`, { service: true }).catch(() => []),
         supabaseFetch(`/rest/v1/restaurant_users?select=restaurant_id,status&restaurant_id=eq.${encodeURIComponent(id)}`, { service: true }).catch(() => [])
       ]);
-      const lifecycle = body.status !== undefined || body.onboarding_status !== undefined
-        ? validateRestaurantLifecycleTransition(previous, body, {
+      const lifecycle = mutationBody.status !== undefined || mutationBody.onboarding_status !== undefined
+        ? validateRestaurantLifecycleTransition(previous, mutationBody, {
           actorId: profile.id,
           tables: relatedTables || [],
           assigned_partner_count: (restaurantUsers || []).filter((user) => clean(user.status) === "active").length
         })
         : null;
       const payload = await filterSupabaseTablePayload("restaurants", {
-        ...restaurantPayload(body),
+        ...restaurantPayload(mutationBody),
         ...(lifecycle?.patch || {})
       });
       const slugConflict = payload.slug ? await restaurantSlugConflict(payload.slug, id) : null;
@@ -26372,7 +26532,7 @@ async function adminRestaurants(method, body, headers, query) {
         headers,
         previousValue: previous || null,
         newValue: rows?.[0],
-        metadata: { restaurant_id: rows?.[0]?.id || id, previous_status: restaurantLifecycleStatus(previous), next_status: restaurantLifecycleStatus(rows?.[0] || payload), reason: clean(body.status_reason || body.reason || "") }
+        metadata: { restaurant_id: rows?.[0]?.id || id, previous_status: restaurantLifecycleStatus(previous), next_status: restaurantLifecycleStatus(rows?.[0] || payload), reason: clean(mutationBody.status_reason || mutationBody.reason || "") }
       });
       if (lifecycle) {
         await createRestaurantStatusHistory({
@@ -26380,7 +26540,7 @@ async function adminRestaurants(method, body, headers, query) {
           restaurantId: rows?.[0]?.id || id,
           previousStatus: restaurantLifecycleStatus(previous),
           newStatus: restaurantLifecycleStatus(rows?.[0] || payload),
-          reason: clean(body.status_reason || body.reason || ""),
+          reason: clean(mutationBody.status_reason || mutationBody.reason || ""),
           changedFields: Object.keys(payload),
           headers,
           metadata: { action: "restaurant_status_transition" },
@@ -26428,7 +26588,7 @@ function restaurantDetailView(restaurant = {}, context = {}) {
 }
 
 async function adminRestaurantDetail(method, body, headers, query) {
-  await requireProfile(headers, ["admin"]);
+  const { access } = await requireAdminAccess(headers, "can_manage_restaurants");
   if (method !== "GET") return json(405, { error: "Method not allowed." });
   const id = clean(query.get("id") || body.id);
   if (!id) return json(400, { error: "Restaurant id is required." });
@@ -26436,6 +26596,7 @@ async function adminRestaurantDetail(method, body, headers, query) {
     ensureDemo();
     const restaurant = demo.restaurants.find((item) => clean(item.id) === id);
     if (!restaurant) return json(404, { error: "Restaurant not found." });
+    assertFieldRepresentativeRestaurant(access, restaurant);
     return json(200, restaurantDetailView(restaurant, {
       diningAreas: (demo.restaurantDiningAreas || []).filter((item) => clean(item.restaurant_id) === id),
       tables: (demo.restaurantTables || []).filter((item) => clean(item.restaurant_id) === id),
@@ -26464,6 +26625,7 @@ async function adminRestaurantDetail(method, body, headers, query) {
   ]);
   const restaurant = restaurants?.[0];
   if (!restaurant) return json(404, { error: "Restaurant not found." });
+  assertFieldRepresentativeRestaurant(access, restaurant);
   return json(200, restaurantDetailView(restaurant, { diningAreas, tables, capacityOverrides, partnerAccess, invitations, offers, reservations, auditLogs, statusHistory }));
 }
 
@@ -26475,7 +26637,7 @@ function compactSupabaseRow(row = {}) {
 }
 
 async function adminRestaurantCapacity(method, body, headers, query) {
-  const { profile } = await requireProfile(headers, ["admin"]);
+  const { profile, access } = await requireAdminAccess(headers, "can_manage_capacity");
   if (!["POST", "PATCH"].includes(method)) return json(405, { error: "Method not allowed." });
   const restaurantId = clean(body.restaurant_id || body.id || query.get("restaurant_id"));
   if (!restaurantId) return json(400, { error: "Restaurant id is required." });
@@ -26483,6 +26645,7 @@ async function adminRestaurantCapacity(method, body, headers, query) {
     ensureDemo();
     const restaurant = demo.restaurants.find((item) => clean(item.id) === restaurantId);
     if (!restaurant) return json(404, { error: "Restaurant not found." });
+    assertFieldRepresentativeRestaurant(access, restaurant);
     const areas = sanitizedDiningAreas(body.dining_areas, restaurantId, restaurant);
     const tables = sanitizedRestaurantTables(body.tables, restaurantId, restaurant);
     const overrides = sanitizedCapacityOverrides(body.capacity_overrides, restaurantId, restaurant);
@@ -26525,6 +26688,7 @@ async function adminRestaurantCapacity(method, body, headers, query) {
   const restaurantRows = await supabaseFetch(`/rest/v1/restaurants?select=*&id=eq.${encodeURIComponent(restaurantId)}&limit=1`, { service: true });
   const restaurant = restaurantRows?.[0];
   if (!restaurant) return json(404, { error: "Restaurant not found." });
+  assertFieldRepresentativeRestaurant(access, restaurant);
   const [areaColumns, tableColumns, overrideColumns] = await Promise.all([
     supabaseTableColumns("restaurant_dining_areas"),
     supabaseTableColumns("restaurant_tables"),
@@ -26683,11 +26847,23 @@ function restaurantAccessPatchForAction(action = "", body = {}) {
 }
 
 async function adminPartners(method, body, headers) {
-  const { profile: actorProfile } = await requireProfile(headers, ["admin"]);
+  const { profile: actorProfile, access } = await requireAdminAccess(headers);
+  if (method === "POST" && access.can_invite_partners !== true) {
+    return json(403, { error: "Partner invitations are not enabled for this account.", code: "FIELD_REPRESENTATIVE_PERMISSION_DENIED" });
+  }
+  if (method === "GET" && access.can_manage_partner_access !== true && access.can_invite_partners !== true) {
+    return json(403, { error: "Partner access is not enabled for this account.", code: "FIELD_REPRESENTATIVE_PERMISSION_DENIED" });
+  }
+  if (method === "PATCH" && access.can_manage_partner_access !== true) {
+    return json(403, { error: "Partner access management is not enabled for this account.", code: "FIELD_REPRESENTATIVE_PERMISSION_DENIED" });
+  }
   if (!supabaseConfigured) {
     ensureDemo();
     if (method === "GET") {
-      return json(200, { partners: partnerAdminListRows(demo.profiles.filter((profile) => roleMatches(profile.role, ["partner"])), demo.partnerInvitations) });
+      const accessibleIds = new Set(demo.restaurants.filter((restaurant) => fieldRepresentativeCanAccessRestaurant(access, restaurant)).map((restaurant) => clean(restaurant.id)));
+      const profiles = demo.profiles.filter((profile) => roleMatches(profile.role, ["partner"]) && accessibleIds.has(clean(profile.restaurant_id)));
+      const invitations = demo.partnerInvitations.filter((invitation) => accessibleIds.has(clean(invitation.restaurant_id)));
+      return json(200, { partners: partnerAdminListRows(profiles, invitations) });
     }
     if (method === "POST") {
       const email = lower(body.email);
@@ -26695,6 +26871,9 @@ async function adminPartners(method, body, headers) {
       const restaurantId = nullableClean(body.restaurant_id);
       const restaurantRole = normalizeRestaurantUserRole(body.restaurant_role || body.role);
       if (!email || !restaurantId) return json(400, { error: "Email and restaurant are required." });
+      const restaurant = demo.restaurants.find((item) => clean(item.id) === restaurantId);
+      if (!restaurant) return json(404, { error: "Restaurant not found." });
+      assertFieldRepresentativeRestaurant(access, restaurant);
       const invitationToken = generatePartnerInvitationToken();
       const tokenHash = partnerInvitationTokenHash(invitationToken);
       const existingProfile = demo.profiles.find((item) => lower(item.email) === email);
@@ -26734,7 +26913,6 @@ async function adminPartners(method, body, headers) {
         created_at: nowIso(),
         updated_at: nowIso()
       });
-      const restaurant = demo.restaurants.find((item) => item.id === restaurantId);
       if (restaurant && restaurantRole === "owner" && existingProfile) restaurant.owner_user_id = id;
       const invitationEmail = await sendRestaurantPartnerInvitationEmail({
         email,
@@ -26768,6 +26946,9 @@ async function adminPartners(method, body, headers) {
       if (action === "revoke_invitation" || action === "resend_invitation") {
         const invitation = demo.partnerInvitations.find((item) => item.id === clean(body.id));
         if (!invitation) return json(404, { error: "Partner invitation not found." });
+        const invitationRestaurant = demo.restaurants.find((item) => clean(item.id) === clean(invitation.restaurant_id));
+        if (!invitationRestaurant) return json(404, { error: "Restaurant not found." });
+        assertFieldRepresentativeRestaurant(access, invitationRestaurant);
         if (action === "revoke_invitation") {
           if (invitation.status !== "pending") return json(409, { error: "Only pending invitations can be revoked." });
           invitation.status = "revoked";
@@ -26839,6 +27020,9 @@ async function adminPartners(method, body, headers) {
           )
         );
         if (!assignment) return json(404, { error: "Restaurant access assignment not found." });
+        const assignmentRestaurant = demo.restaurants.find((item) => clean(item.id) === clean(assignment.restaurant_id));
+        if (!assignmentRestaurant) return json(404, { error: "Restaurant not found." });
+        assertFieldRepresentativeRestaurant(access, assignmentRestaurant);
         const previous = { ...assignment };
         Object.assign(assignment, restaurantAccessPatch, { updated_at: nowIso() });
         const profile = demo.profiles.find((item) => clean(item.id) === clean(assignment.user_id) || lower(item.email) === lower(assignment.email));
@@ -26858,6 +27042,7 @@ async function adminPartners(method, body, headers) {
         });
         return json(200, { restaurant_access: assignment, partner: profile ? clientProfile(profile) : null });
       }
+      if (!access.unrestricted) return json(403, { error: "Field representatives cannot change account roles or global profile assignments.", code: "FIELD_REPRESENTATIVE_ROLE_CHANGE_DENIED" });
       const profile = demo.profiles.find((item) => item.id === clean(body.id));
       if (!profile) return json(404, { error: "Partner profile not found." });
       if (clean(body.id) === clean(actorProfile.id) && body.role !== undefined) return json(403, { error: "You cannot change your own role." });
@@ -26885,7 +27070,14 @@ async function adminPartners(method, body, headers) {
     if (method === "GET") {
       const rows = await supabaseFetch("/rest/v1/profiles?select=*&role=in.(partner,restaurant)&order=created_at.desc", { service: true });
       const invitations = await supabaseFetch("/rest/v1/partner_invitations?select=id,email,full_name,restaurant_id,restaurant_role,status,invited_at,expires_at,is_test_data&order=invited_at.desc", { service: true }).catch(() => []);
-      return json(200, { partners: partnerAdminListRows(rows || [], invitations || []) });
+      const restaurantRows = await supabaseFetch("/rest/v1/restaurants?select=id,market_id", { service: true }).catch(() => []);
+      const accessibleIds = new Set((restaurantRows || []).filter((restaurant) => fieldRepresentativeCanAccessRestaurant(access, restaurant)).map((restaurant) => clean(restaurant.id)));
+      return json(200, {
+        partners: partnerAdminListRows(
+          (rows || []).filter((profile) => accessibleIds.has(clean(profile.restaurant_id))),
+          (invitations || []).filter((invitation) => accessibleIds.has(clean(invitation.restaurant_id)))
+        )
+      });
     }
     if (method === "POST") {
       const email = lower(body.email);
@@ -26893,6 +27085,9 @@ async function adminPartners(method, body, headers) {
       const restaurantId = nullableClean(body.restaurant_id);
       const restaurantRole = normalizeRestaurantUserRole(body.restaurant_role || body.role);
       if (!email || !restaurantId) return json(400, { error: "Email and restaurant are required." });
+      const targetRestaurants = await supabaseFetch(`/rest/v1/restaurants?select=id,market_id&id=eq.${encodeURIComponent(restaurantId)}&limit=1`, { service: true }).catch(() => []);
+      if (!targetRestaurants?.[0]) return json(404, { error: "Restaurant not found." });
+      assertFieldRepresentativeRestaurant(access, targetRestaurants[0]);
       const invitationToken = generatePartnerInvitationToken();
       const tokenHash = partnerInvitationTokenHash(invitationToken);
       const existingProfiles = await supabaseFetch(`/rest/v1/profiles?select=*&email=eq.${encodeURIComponent(email)}&limit=1`, { service: true }).catch(() => []);
@@ -27050,6 +27245,9 @@ async function adminPartners(method, body, headers) {
         const invitations = await supabaseFetch(`/rest/v1/partner_invitations?select=*&id=eq.${encodeURIComponent(id)}&limit=1`, { service: true }).catch(() => []);
         const invitation = invitations?.[0];
         if (!invitation) return json(404, { error: "Partner invitation not found." });
+        const invitationRestaurants = await supabaseFetch(`/rest/v1/restaurants?select=id,market_id&id=eq.${encodeURIComponent(invitation.restaurant_id)}&limit=1`, { service: true }).catch(() => []);
+        if (!invitationRestaurants?.[0]) return json(404, { error: "Restaurant not found." });
+        assertFieldRepresentativeRestaurant(access, invitationRestaurants[0]);
         if (action === "revoke_invitation") {
           if (clean(invitation.status) !== "pending") return json(409, { error: "Only pending invitations can be revoked." });
           await supabaseFetch(`/rest/v1/partner_invitations?id=eq.${encodeURIComponent(id)}`, {
@@ -27142,6 +27340,9 @@ async function adminPartners(method, body, headers) {
         const assignments = await supabaseFetch(`/rest/v1/restaurant_users?select=*&${assignmentFilters}&limit=1`, { service: true }).catch(() => []);
         const assignment = assignments?.[0];
         if (!assignment) return json(404, { error: "Restaurant access assignment not found." });
+        const assignmentRestaurants = await supabaseFetch(`/rest/v1/restaurants?select=id,market_id&id=eq.${encodeURIComponent(assignment.restaurant_id)}&limit=1`, { service: true }).catch(() => []);
+        if (!assignmentRestaurants?.[0]) return json(404, { error: "Restaurant not found." });
+        assertFieldRepresentativeRestaurant(access, assignmentRestaurants[0]);
         const patch = await filterSupabaseTablePayload("restaurant_users", restaurantAccessPatch);
         const rows = await supabaseFetch(`/rest/v1/restaurant_users?id=eq.${encodeURIComponent(assignment.id)}&select=*`, {
           method: "PATCH",
@@ -27171,6 +27372,7 @@ async function adminPartners(method, body, headers) {
         });
         return json(200, { restaurant_access: rows?.[0] || { ...assignment, ...patch } });
       }
+      if (!access.unrestricted) return json(403, { error: "Field representatives cannot change account roles or global profile assignments.", code: "FIELD_REPRESENTATIVE_ROLE_CHANGE_DENIED" });
       const id = clean(body.id);
       if (id === clean(actorProfile.id) && body.role !== undefined) return json(403, { error: "You cannot change your own role." });
       const update = {};
@@ -27350,6 +27552,291 @@ async function partnerInvitationAuth(method, body, query = new URLSearchParams()
     metadata: { restaurant_id: invitation.restaurant_id, email_hash: hashEmailValue(invitation.email), restaurant_role: invitation.restaurant_role, partner_terms_accepted: true, terms_version: TERMS_VERSION, privacy_policy_version: PRIVACY_POLICY_VERSION }
   });
   return json(200, { profile: clientProfile(profiles?.[0]), invitation: normalizeInvitation({ ...invitation, status: "accepted" }) });
+}
+
+function fieldRepresentativeInvitationUrl(token = "") {
+  return `${PUBLIC_BASE_URL}/admin/invite?token=${encodeURIComponent(token)}`;
+}
+
+function normalizedFieldRepresentativeMarkets(value) {
+  const requested = Array.isArray(value) ? value : arrayFrom(value);
+  const allowed = new Set(publicMarketConfig({ includeInactive: true }).map((market) => market.id));
+  return [...new Set(requested.map((item) => clean(item)).filter((item) => allowed.has(item)))];
+}
+
+function fieldRepresentativePermissions(value = {}) {
+  return {
+    can_manage_restaurants: value.can_manage_restaurants !== false && value.can_manage_restaurants !== "false",
+    can_manage_capacity: value.can_manage_capacity !== false && value.can_manage_capacity !== "false",
+    can_invite_partners: value.can_invite_partners !== false && value.can_invite_partners !== "false",
+    can_manage_partner_access: value.can_manage_partner_access !== false && value.can_manage_partner_access !== "false"
+  };
+}
+
+function clientFieldRepresentativeInvitation(invitation = {}) {
+  return {
+    id: invitation.id,
+    email: invitation.email,
+    full_name: invitation.full_name,
+    status: clean(invitation.status || "pending"),
+    market_ids: Array.isArray(invitation.market_ids) ? invitation.market_ids : [],
+    ...fieldRepresentativePermissions(invitation),
+    invited_at: invitation.invited_at,
+    expires_at: invitation.expires_at,
+    accepted_at: invitation.accepted_at,
+    revoked_at: invitation.revoked_at
+  };
+}
+
+async function sendFieldRepresentativeInvitationEmail({ email, fullName, invitationToken }) {
+  const subject = "SmartTable field operations access";
+  const invitationUrl = fieldRepresentativeInvitationUrl(invitationToken);
+  const body = `Hi ${clean(fullName) || clean(email)}, you have been invited to SmartTable Field Operations. Use the secure invitation link to create your password. Access is limited to assigned territories and restaurant onboarding tasks.`;
+  return sendEmail({
+    to: email,
+    subject,
+    text: `${body}\n\n${invitationUrl}`,
+    html: appEmailHtml(subject, body, { label: "Activate field access", url: invitationUrl })
+  }, {
+    event_type: "field_representative_invitation",
+    email_type: "field_representative_invitation",
+    locale: "en",
+    template_version: EMAIL_TEMPLATE_VERSION,
+    idempotency_key: hashEmailValue(`field-representative-invitation:${lower(email)}:${partnerInvitationTokenHash(invitationToken).slice(0, 24)}`)
+  });
+}
+
+async function superAdminFieldRepresentatives(method, body, headers) {
+  const { profile: actorProfile } = await requireProfile(headers, ["super_admin"]);
+  const markets = publicMarketConfig({ includeInactive: true });
+  if (method === "GET") {
+    if (!supabaseConfigured) {
+      ensureDemo();
+      const representatives = demo.profiles
+        .filter((profile) => isFieldRepresentativeProfile(profile))
+        .map((profile) => {
+          const assignment = demo.fieldRepresentativeAssignments.find((item) => clean(item.user_id) === clean(profile.id)) || {};
+          const marketIds = demo.fieldRepresentativeMarkets
+            .filter((item) => clean(item.user_id) === clean(profile.id) && clean(item.status || "active") === "active")
+            .map((item) => item.market_id);
+          return { ...clientProfile(profile), ...fieldRepresentativePermissions(assignment), assignment_status: assignment.status || "active", market_ids: marketIds };
+        });
+      return json(200, {
+        representatives,
+        invitations: demo.fieldRepresentativeInvitations.map(clientFieldRepresentativeInvitation),
+        markets
+      });
+    }
+    const [profiles, assignments, marketRows, invitations] = await Promise.all([
+      supabaseFetch("/rest/v1/profiles?select=id,email,full_name,role,status,created_at,updated_at&role=eq.field_representative&order=created_at.desc", { service: true }).catch(() => []),
+      supabaseFetch("/rest/v1/field_representative_assignments?select=*&order=created_at.desc", { service: true }).catch(() => []),
+      supabaseFetch("/rest/v1/field_representative_markets?select=*&order=created_at.desc", { service: true }).catch(() => []),
+      supabaseFetch("/rest/v1/field_representative_invitations?select=*&order=created_at.desc", { service: true }).catch(() => [])
+    ]);
+    const representatives = (profiles || []).map((profile) => {
+      const assignment = (assignments || []).find((item) => clean(item.user_id) === clean(profile.id)) || {};
+      const marketIds = (marketRows || []).filter((item) => clean(item.user_id) === clean(profile.id) && clean(item.status) === "active").map((item) => item.market_id);
+      return { ...clientProfile(profile), ...fieldRepresentativePermissions(assignment), assignment_status: assignment.status || "active", market_ids: marketIds };
+    });
+    return json(200, { representatives, invitations: (invitations || []).map(clientFieldRepresentativeInvitation), markets });
+  }
+
+  if (method === "POST") {
+    const email = lower(body.email);
+    const fullName = clean(body.full_name || body.name || email);
+    const marketIds = normalizedFieldRepresentativeMarkets(body.market_ids || body.markets);
+    const permissions = fieldRepresentativePermissions(body);
+    if (!isValidSignupEmail(email)) return json(400, { error: "Enter a valid email address." });
+    if (!marketIds.length) return json(400, { error: "Select at least one territory.", code: "FIELD_REPRESENTATIVE_MARKET_REQUIRED" });
+    const invitationToken = !supabaseConfigured && clean(body.test_invitation_token)
+      ? clean(body.test_invitation_token)
+      : generatePartnerInvitationToken();
+    const invitation = {
+      id: crypto.randomUUID(),
+      email,
+      full_name: fullName,
+      token_hash: partnerInvitationTokenHash(invitationToken),
+      status: "pending",
+      market_ids: marketIds,
+      ...permissions,
+      invited_by: actorProfile.id,
+      invited_at: nowIso(),
+      expires_at: new Date(Date.now() + 7 * 86400000).toISOString(),
+      created_at: nowIso(),
+      updated_at: nowIso()
+    };
+    if (!supabaseConfigured) {
+      ensureDemo();
+      const existingProfile = demo.profiles.find((item) => lower(item.email) === email);
+      if (existingProfile && !isFieldRepresentativeProfile(existingProfile)) {
+        return json(409, { error: "This email already belongs to another SmartTable account.", code: "FIELD_REPRESENTATIVE_EMAIL_IN_USE" });
+      }
+      demo.fieldRepresentativeInvitations.forEach((item) => {
+        if (lower(item.email) === email && clean(item.status) === "pending") Object.assign(item, { status: "revoked", revoked_at: nowIso(), updated_at: nowIso() });
+      });
+      demo.fieldRepresentativeInvitations.unshift(invitation);
+    } else {
+      const existing = await supabaseFetch(`/rest/v1/profiles?select=id,role&email=eq.${encodeURIComponent(email)}&limit=1`, { service: true }).catch(() => []);
+      if (existing?.[0] && !isFieldRepresentativeProfile(existing[0])) {
+        return json(409, { error: "This email already belongs to another SmartTable account.", code: "FIELD_REPRESENTATIVE_EMAIL_IN_USE" });
+      }
+      await supabaseFetch(`/rest/v1/field_representative_invitations?email=eq.${encodeURIComponent(email)}&status=eq.pending`, {
+        method: "PATCH", service: true, headers: { Prefer: "return=minimal" }, body: { status: "revoked", revoked_at: nowIso(), updated_at: nowIso() }
+      }).catch(() => null);
+      const rows = await supabaseFetch("/rest/v1/field_representative_invitations?select=*", {
+        method: "POST", service: true, headers: { Prefer: "return=representation" }, body: invitation
+      });
+      Object.assign(invitation, rows?.[0] || {});
+    }
+    const emailResult = await sendFieldRepresentativeInvitationEmail({ email, fullName, invitationToken });
+    await createAuditLog({
+      profile: actorProfile,
+      action: "field_representative_invited",
+      entityType: "field_representative_invitation",
+      entityId: invitation.id,
+      targetRole: "field_representative",
+      headers,
+      newValue: { email_hash: hashEmailValue(email), market_ids: marketIds, ...permissions },
+      metadata: { market_ids: marketIds }
+    });
+    return json(201, { invitation: clientFieldRepresentativeInvitation(invitation), email_delivery: emailDeliverySummary([emailResult]) });
+  }
+
+  if (method === "PATCH") {
+    const action = clean(body.action);
+    const id = clean(body.id || body.user_id || body.invitation_id);
+    if (!id) return json(400, { error: "Representative or invitation is required." });
+    if (["suspend", "reactivate", "update_access"].includes(action)) {
+      const status = action === "suspend" ? "suspended" : "active";
+      const marketIds = normalizedFieldRepresentativeMarkets(body.market_ids || body.markets);
+      let permissions = fieldRepresentativePermissions(body);
+      if (action !== "suspend" && !marketIds.length) return json(400, { error: "Select at least one territory." });
+      if (!supabaseConfigured) {
+        ensureDemo();
+        const representative = demo.profiles.find((item) => clean(item.id) === id && isFieldRepresentativeProfile(item));
+        if (!representative) return json(404, { error: "Field representative not found." });
+        let assignment = demo.fieldRepresentativeAssignments.find((item) => clean(item.user_id) === id);
+        if (action === "suspend" && assignment) permissions = fieldRepresentativePermissions(assignment);
+        if (!assignment) {
+          assignment = { user_id: id, created_by: actorProfile.id, created_at: nowIso() };
+          demo.fieldRepresentativeAssignments.push(assignment);
+        }
+        Object.assign(assignment, { status, ...permissions, updated_at: nowIso() });
+        if (action !== "suspend") {
+          demo.fieldRepresentativeMarkets = demo.fieldRepresentativeMarkets.filter((item) => clean(item.user_id) !== id);
+          marketIds.forEach((marketId) => demo.fieldRepresentativeMarkets.push({ user_id: id, market_id: marketId, status: "active", created_by: actorProfile.id, created_at: nowIso(), updated_at: nowIso() }));
+        }
+      } else {
+        const representativeProfiles = await supabaseFetch(
+          `/rest/v1/profiles?select=id,role,status&id=eq.${encodeURIComponent(id)}&limit=1`,
+          { service: true }
+        ).catch(() => []);
+        const representative = representativeProfiles?.[0];
+        if (!representative || !isFieldRepresentativeProfile(representative)) {
+          return json(404, { error: "Field representative not found." });
+        }
+        if (action === "suspend") {
+          const currentAssignments = await supabaseFetch(`/rest/v1/field_representative_assignments?select=*&user_id=eq.${encodeURIComponent(id)}&limit=1`, { service: true }).catch(() => []);
+          if (currentAssignments?.[0]) permissions = fieldRepresentativePermissions(currentAssignments[0]);
+        }
+        await supabaseFetch("/rest/v1/field_representative_assignments?on_conflict=user_id", {
+          method: "POST", service: true, headers: { Prefer: "resolution=merge-duplicates,return=minimal" }, body: { user_id: id, status, ...permissions, created_by: actorProfile.id, updated_at: nowIso() }
+        });
+        if (action !== "suspend") {
+          await supabaseFetch(`/rest/v1/field_representative_markets?user_id=eq.${encodeURIComponent(id)}`, { method: "DELETE", service: true, headers: { Prefer: "return=minimal" } });
+          await supabaseFetch("/rest/v1/field_representative_markets", {
+            method: "POST", service: true, headers: { Prefer: "return=minimal" }, body: marketIds.map((marketId) => ({ user_id: id, market_id: marketId, status: "active", created_by: actorProfile.id }))
+          });
+        }
+      }
+      await createAuditLog({ profile: actorProfile, action: `field_representative_${action}`, entityType: "profile", entityId: id, targetUserId: id, targetRole: "field_representative", headers, newValue: { status, market_ids: marketIds, ...permissions } });
+      return json(200, { ok: true, id, status, market_ids: marketIds, permissions });
+    }
+    if (action === "revoke_invitation") {
+      if (!supabaseConfigured) {
+        ensureDemo();
+        const invitation = demo.fieldRepresentativeInvitations.find((item) => clean(item.id) === id);
+        if (!invitation) return json(404, { error: "Invitation not found." });
+        Object.assign(invitation, { status: "revoked", revoked_at: nowIso(), updated_at: nowIso() });
+      } else {
+        await supabaseFetch(`/rest/v1/field_representative_invitations?id=eq.${encodeURIComponent(id)}&status=eq.pending`, { method: "PATCH", service: true, headers: { Prefer: "return=minimal" }, body: { status: "revoked", revoked_at: nowIso(), updated_at: nowIso() } });
+      }
+      await createAuditLog({ profile: actorProfile, action: "field_representative_invitation_revoked", entityType: "field_representative_invitation", entityId: id, targetRole: "field_representative", headers });
+      return json(200, { ok: true, id, status: "revoked" });
+    }
+    return json(400, { error: "Unsupported field representative action." });
+  }
+  return json(405, { error: "Method not allowed." });
+}
+
+async function fieldRepresentativeInvitationAuth(method, body, query = new URLSearchParams()) {
+  if (!["GET", "POST"].includes(method)) return json(405, { error: "Method not allowed." });
+  const token = clean(body.token || body.invitation_token || query.get("token"));
+  if (!token) return json(400, { error: "Invitation token is required." });
+  const tokenHash = partnerInvitationTokenHash(token);
+  const rateLimit = rateLimitEmailRequest(`field-representative-invitation:${tokenHash.slice(0, 24)}`, { limit: 8, windowMs: 15 * 60 * 1000 });
+  if (rateLimit.limited) return json(429, { error: "Too many invitation attempts. Please try again later.", code: "INVITATION_RATE_LIMITED" });
+  const invitations = !supabaseConfigured
+    ? (ensureDemo(), demo.fieldRepresentativeInvitations)
+    : await supabaseFetch(`/rest/v1/field_representative_invitations?select=*&token_hash=eq.${encodeURIComponent(tokenHash)}&limit=1`, { service: true }).catch(() => []);
+  const invitation = (invitations || []).find((item) => clean(item.token_hash) === tokenHash) || invitations?.[0];
+  if (!invitation || clean(invitation.status) !== "pending" || new Date(invitation.expires_at) <= new Date()) {
+    return json(410, { error: "This invitation is invalid or expired.", code: "INVITATION_INVALID_OR_EXPIRED" });
+  }
+  if (method === "GET") return json(200, { invitation: clientFieldRepresentativeInvitation(invitation), markets: publicMarketConfig({ includeInactive: true }) });
+  const password = String(body.password || "");
+  const confirmPassword = String(body.confirm_password || body.confirmPassword || "");
+  if (!isStrongSignupPassword(password)) return json(400, { error: "Use a stronger password." });
+  if (password !== confirmPassword) return json(400, { error: "Passwords must match." });
+  if (!boolValue(body.terms_consent || body.admin_terms_consent)) return json(400, { error: "Terms and Privacy Policy acceptance is required." });
+  let userId = "";
+  let profile = null;
+  if (!supabaseConfigured) {
+    let user = demo.users.find((item) => lower(item.email) === lower(invitation.email));
+    profile = demo.profiles.find((item) => lower(item.email) === lower(invitation.email));
+    if (!user) {
+      user = { id: profile?.id || crypto.randomUUID(), email: lower(invitation.email), password, is_test_data: true };
+      demo.users.push(user);
+    } else user.password = password;
+    userId = user.id;
+    if (!profile) {
+      profile = { id: userId, email: user.email, full_name: invitation.full_name || user.email, role: "field_representative", status: "active", preferred_language: "en", created_at: nowIso() };
+      demo.profiles.push(profile);
+    }
+    Object.assign(profile, { role: "field_representative", status: "active", updated_at: nowIso() });
+    demo.fieldRepresentativeAssignments.push({ user_id: userId, status: "active", ...fieldRepresentativePermissions(invitation), created_by: invitation.invited_by, created_at: nowIso(), updated_at: nowIso() });
+    invitation.market_ids.forEach((marketId) => demo.fieldRepresentativeMarkets.push({ user_id: userId, market_id: marketId, status: "active", created_by: invitation.invited_by, created_at: nowIso(), updated_at: nowIso() }));
+    Object.assign(invitation, { status: "accepted", accepted_by: userId, accepted_at: nowIso(), updated_at: nowIso() });
+  } else {
+    let authUser;
+    try {
+      authUser = await supabaseFetch("/auth/v1/admin/users", { method: "POST", service: true, body: { email: lower(invitation.email), password, email_confirm: true, user_metadata: { full_name: invitation.full_name || invitation.email } } });
+    } catch (error) {
+      const profiles = await supabaseFetch(`/rest/v1/profiles?select=id,role&email=eq.${encodeURIComponent(lower(invitation.email))}&limit=1`, { service: true }).catch(() => []);
+      if (!profiles?.[0]?.id || !isFieldRepresentativeProfile(profiles[0])) throw error;
+      authUser = { id: profiles[0].id };
+      await supabaseFetch(`/auth/v1/admin/users/${encodeURIComponent(authUser.id)}`, { method: "PUT", service: true, body: { password, email_confirm: true } });
+    }
+    userId = authUser?.id || authUser?.user?.id;
+    if (!userId) return json(500, { error: "Could not create field representative account." });
+    const rows = await supabaseFetch("/rest/v1/profiles?on_conflict=id&select=*", { method: "POST", service: true, headers: { Prefer: "resolution=merge-duplicates,return=representation" }, body: await filterSupabaseTablePayload("profiles", { id: userId, email: lower(invitation.email), full_name: invitation.full_name || invitation.email, role: "field_representative", status: "active" }) });
+    profile = rows?.[0];
+    await supabaseFetch("/rest/v1/field_representative_assignments?on_conflict=user_id", { method: "POST", service: true, headers: { Prefer: "resolution=merge-duplicates,return=minimal" }, body: { user_id: userId, status: "active", ...fieldRepresentativePermissions(invitation), created_by: invitation.invited_by } });
+    await supabaseFetch("/rest/v1/field_representative_markets", { method: "POST", service: true, headers: { Prefer: "return=minimal" }, body: invitation.market_ids.map((marketId) => ({ user_id: userId, market_id: marketId, status: "active", created_by: invitation.invited_by })) });
+    await supabaseFetch(`/rest/v1/field_representative_invitations?id=eq.${encodeURIComponent(invitation.id)}`, { method: "PATCH", service: true, headers: { Prefer: "return=minimal" }, body: { status: "accepted", accepted_by: userId, accepted_at: nowIso(), updated_at: nowIso() } });
+  }
+  await createAuditLog({ profile, action: "field_representative_invitation_accepted", entityType: "field_representative_invitation", entityId: invitation.id, targetUserId: userId, targetRole: "field_representative", newValue: { status: "accepted", market_ids: invitation.market_ids } });
+  return json(200, { profile: clientProfile(profile), invitation: clientFieldRepresentativeInvitation({ ...invitation, status: "accepted" }) });
+}
+
+async function adminAccessContext(headers) {
+  const { profile, access } = await requireAdminAccess(headers, "can_manage_restaurants");
+  const marketMap = new Map(publicMarketConfig({ includeInactive: true }).map((market) => [market.id, market]));
+  return json(200, {
+    profile: clientProfile(profile),
+    access,
+    markets: access.market_ids.map((id) => marketMap.get(id)).filter(Boolean)
+  });
 }
 
 function canAdminViewAsTarget(actorProfile = {}, targetProfile = {}) {
@@ -27670,7 +28157,77 @@ async function bookingOptionAnalyticsRows() {
 }
 
 async function adminStats(headers) {
-  await requireProfile(headers, ["admin"]);
+  const { access } = await requireAdminAccess(headers, "can_manage_restaurants");
+  if (!access.unrestricted) {
+    if (!supabaseConfigured) {
+      ensureDemo();
+      const restaurants = demo.restaurants.filter((restaurant) => fieldRepresentativeCanAccessRestaurant(access, restaurant));
+      const restaurantIds = new Set(restaurants.map((restaurant) => clean(restaurant.id)));
+      const reservations = demo.reservations
+        .filter((item) => restaurantIds.has(clean(item.restaurant_id)))
+        .map((item) => ({ ...item, status: normalizeReservationStatus(item.status) }));
+      const offers = demo.offers.filter((item) => restaurantIds.has(clean(item.restaurant_id)));
+      const followers = demo.restaurantFollowers.filter((item) => restaurantIds.has(clean(item.restaurant_id)) && item.notification_enabled !== false);
+      const bookingOptionEvents = demo.analyticsEvents.filter((item) => clean(item.event_type) === "restaurant_booking_options_viewed" && restaurantIds.has(clean(item.restaurant_id || item.properties?.restaurant_id)));
+      return json(200, { stats: {
+        restaurants_total: restaurants.length,
+        restaurants_pending: restaurants.filter((item) => clean(item.status) === "pending").length,
+        partners_total: demo.profiles.filter((item) => roleMatches(item.role, ["partner"]) && restaurantIds.has(clean(item.restaurant_id))).length,
+        offers_active: offers.filter((item) => clean(item.status) === "active").length,
+        reservations_total: reservations.length,
+        reservations_pending: reservations.filter((item) => item.status === "pending").length,
+        reservations_accepted: reservations.filter((item) => item.status === "accepted").length,
+        reservations_rejected: reservations.filter((item) => item.status === "rejected").length,
+        seats_reserved: reservations.reduce((sum, item) => sum + numberOr(item.party_size, 0), 0),
+        views_total: restaurants.reduce((sum, item) => sum + numberOr(item.views_count, 0), 0),
+        booking_option_views_total: bookingOptionEvents.length,
+        booking_option_views_by_restaurant: restaurants.map((restaurant) => ({
+          restaurant_id: restaurant.id,
+          restaurant_name: restaurant.name || "Restaurant",
+          booking_option_views: bookingOptionEvents.filter((item) => clean(item.restaurant_id || item.properties?.restaurant_id) === clean(restaurant.id)).length
+        })).sort((left, right) => right.booking_option_views - left.booking_option_views),
+        favorites_total: followers.length
+      } });
+    }
+    const marketFilter = access.market_ids.map((id) => encodeURIComponent(id)).join(",");
+    const restaurants = await supabaseFetch(`/rest/v1/restaurants?select=id,name,status,views_count,market_id&market_id=in.(${marketFilter})&order=name.asc`, { service: true }).catch(() => []);
+    const restaurantIds = new Set((restaurants || []).map((item) => clean(item.id)));
+    const [profiles, offers, reservations, followers, bookingOptionRows] = await Promise.all([
+      supabaseFetch("/rest/v1/profiles?select=id,role,restaurant_id", { service: true }).catch(() => []),
+      supabaseFetch("/rest/v1/offers?select=id,status,restaurant_id", { service: true }).catch(() => []),
+      supabaseFetch("/rest/v1/reservations?select=id,status,party_size,restaurant_id", { service: true }).catch(() => []),
+      supabaseFetch("/rest/v1/restaurant_followers?select=id,notification_enabled,restaurant_id", { service: true }).catch(() => []),
+      bookingOptionAnalyticsRows().catch(() => [])
+    ]);
+    const scopedOffers = (offers || []).filter((item) => restaurantIds.has(clean(item.restaurant_id)));
+    const scopedReservations = (reservations || []).filter((item) => restaurantIds.has(clean(item.restaurant_id))).map((item) => ({ ...item, status: normalizeReservationStatus(item.status) }));
+    const scopedFollowers = (followers || []).filter((item) => restaurantIds.has(clean(item.restaurant_id)) && item.notification_enabled !== false);
+    const scopedBookingRows = (bookingOptionRows || []).filter((item) => restaurantIds.has(analyticsRestaurantId(item)));
+    const viewCountByRestaurant = new Map();
+    scopedBookingRows.forEach((item) => {
+      const restaurantId = analyticsRestaurantId(item);
+      viewCountByRestaurant.set(restaurantId, (viewCountByRestaurant.get(restaurantId) || 0) + 1);
+    });
+    return json(200, { stats: {
+      restaurants_total: restaurants.length,
+      restaurants_pending: restaurants.filter((item) => clean(item.status) === "pending").length,
+      partners_total: (profiles || []).filter((item) => roleMatches(item.role, ["partner"]) && restaurantIds.has(clean(item.restaurant_id))).length,
+      offers_active: scopedOffers.filter((item) => clean(item.status) === "active").length,
+      reservations_total: scopedReservations.length,
+      reservations_pending: scopedReservations.filter((item) => item.status === "pending").length,
+      reservations_accepted: scopedReservations.filter((item) => item.status === "accepted").length,
+      reservations_rejected: scopedReservations.filter((item) => item.status === "rejected").length,
+      seats_reserved: scopedReservations.reduce((sum, item) => sum + numberOr(item.party_size, 0), 0),
+      views_total: restaurants.reduce((sum, item) => sum + numberOr(item.views_count, 0), 0),
+      booking_option_views_total: scopedBookingRows.length,
+      booking_option_views_by_restaurant: restaurants.map((restaurant) => ({
+        restaurant_id: restaurant.id,
+        restaurant_name: restaurant.name || "Restaurant",
+        booking_option_views: viewCountByRestaurant.get(clean(restaurant.id)) || 0
+      })).sort((left, right) => right.booking_option_views - left.booking_option_views),
+      favorites_total: scopedFollowers.length
+    } });
+  }
   if (!supabaseConfigured) {
     ensureDemo();
     const reservations = demo.reservations.map((item) => ({ ...item, status: normalizeReservationStatus(item.status) }));
@@ -30064,6 +30621,7 @@ export async function handleApiRequest(input) {
     if (pathname === "/auth/resend-verification") return await publicResendVerification(method, body, headers);
     if (pathname === "/auth/verification") return await authVerification(method, body, headers);
     if (pathname === "/auth/partner-invitation") return await partnerInvitationAuth(method, body, url.searchParams);
+    if (pathname === "/auth/field-representative-invitation") return await fieldRepresentativeInvitationAuth(method, body, url.searchParams);
     if (pathname === "/auth/language") return await updateLanguagePreference(method, body, headers);
     if (pathname === "/auth/security") return await guestSecurity(method, body, headers);
     if (method === "GET" && pathname === "/auth/me") {
@@ -30114,6 +30672,8 @@ export async function handleApiRequest(input) {
     if (pathname === "/admin/restaurant-capacity") return await adminRestaurantCapacity(method, body, headers, url.searchParams);
     if (pathname === "/admin/audit-logs") return await adminAuditLogs(method, body, headers, url.searchParams);
     if (pathname === "/admin/partners") return await adminPartners(method, body, headers);
+    if (method === "GET" && pathname === "/admin/access-context") return await adminAccessContext(headers);
+    if (pathname === "/superadmin/field-representatives") return await superAdminFieldRepresentatives(method, body, headers);
     if (pathname === "/admin/impersonate-partner") return await adminImpersonatePartner(method, body, headers);
     if (pathname === "/admin/impersonate-account") return await adminImpersonateAccount(method, body, headers, url.searchParams);
     if (pathname === "/admin/impersonation/end") return await adminImpersonationEnd(method, body, headers);
