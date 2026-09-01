@@ -14,6 +14,9 @@
   --gold: #c28a2f;
   --blue: #315f82;
   --charcoal: #202522;
+  --toast-bg: #202522;
+  --toast-text: #ffffff;
+  --toast-border: rgba(255, 255, 255, 0.16);
   --shadow: 0 20px 55px rgba(23, 33, 29, 0.14);
   --shadow-soft: 0 12px 34px rgba(23, 33, 29, 0.09);
 }
@@ -32,6 +35,9 @@ html[data-theme="dark"] {
   --gold: #efc46c;
   --blue: #8cc7ef;
   --charcoal: #eef5f0;
+  --toast-bg: #eef5f0;
+  --toast-text: #101713;
+  --toast-border: #506156;
   --shadow: 0 20px 55px rgba(0, 0, 0, 0.36);
   --shadow-soft: 0 12px 34px rgba(0, 0, 0, 0.26);
   --guest-bg: #101713;
@@ -2387,17 +2393,20 @@ textarea {
 }
 
 .toast {
-  background: var(--charcoal);
+  background: var(--toast-bg);
+  border: 1px solid var(--toast-border);
   border-radius: 8px;
   bottom: 20px;
   box-shadow: var(--shadow);
-  color: white;
+  color: var(--toast-text);
+  font-weight: 700;
   left: 50%;
   max-width: min(92vw, 620px);
   opacity: 0;
   padding: 12px 16px;
   pointer-events: none;
   position: fixed;
+  text-align: center;
   transform: translate(-50%, 12px);
   transition: opacity 0.2s ease, transform 0.2s ease;
   z-index: 40;

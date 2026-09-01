@@ -232,11 +232,12 @@ await api("PATCH", "/superadmin/field-representatives", {
 }, superadmin.headers);
 await expectStatus("GET", "/admin/access-context", 403, {}, representativeHeaders, "Suspended field representative access must stop immediately.");
 
-const [migration, appSource, coreSource, indexSource] = await Promise.all([
+const [migration, appSource, coreSource, indexSource, stylesSource] = await Promise.all([
   readFile(new URL("../supabase/migrations/0071_field_representative_access.sql", import.meta.url), "utf8"),
   readFile(new URL("../public/app.js", import.meta.url), "utf8"),
   readFile(new URL("../src/app-core.js", import.meta.url), "utf8"),
-  readFile(new URL("../public/index.html", import.meta.url), "utf8")
+  readFile(new URL("../public/index.html", import.meta.url), "utf8"),
+  readFile(new URL("../public/styles.css", import.meta.url), "utf8")
 ]);
 for (const token of [
   "field_representative_assignments",
@@ -266,5 +267,17 @@ assert.ok(
   indexSource.includes('/app.js?v=field-team-20260831-1'),
   "The Field Team release must use a cache-busting application bundle URL."
 );
+assert.ok(
+  indexSource.includes('/styles.css?v=toast-contrast-20260831-1'),
+  "The toast contrast fix must use a cache-busting stylesheet URL."
+);
+for (const token of [
+  "--toast-bg: #202522;",
+  "--toast-text: #ffffff;",
+  "--toast-bg: #eef5f0;",
+  "--toast-text: #101713;",
+  "background: var(--toast-bg);",
+  "color: var(--toast-text);"
+]) assert.ok(stylesSource.includes(token), `Toast contrast styling is missing ${token}.`);
 
 console.log("Field representative administration checks passed.");
