@@ -1328,6 +1328,44 @@ test.describe.serial("SmartTable BASIC production E2E", () => {
     const partnerInvitation = await (await partnerInvited).json();
     expect(partnerInvitation.invitation?.status).toBe("pending");
 
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect(page.locator(".admin-partner-accounts-table")).toBeVisible();
+    const partnerPageOverflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
+    expect(partnerPageOverflow).toBeLessThanOrEqual(1);
+    const emailCell = page.locator(".admin-partner-email-cell").filter({ hasText: partnerEmail }).first();
+    await expect(emailCell).toBeVisible();
+    const emailLayout = await emailCell.evaluate((element) => {
+      const bounds = element.getBoundingClientRect();
+      return {
+        left: bounds.left,
+        right: bounds.right,
+        viewportWidth: window.innerWidth,
+        wordBreak: window.getComputedStyle(element).wordBreak
+      };
+    });
+    expect(emailLayout.left).toBeGreaterThanOrEqual(0);
+    expect(emailLayout.right).toBeLessThanOrEqual(emailLayout.viewportWidth + 1);
+    expect(["break-word", "normal"]).toContain(emailLayout.wordBreak);
+
+    await replaceStoredSession(page, representative, "/admin/restaurants");
+    const addRestaurantButton = page.locator(".admin-add-restaurant-button");
+    await expect(addRestaurantButton).toBeVisible();
+    const addRestaurantLayout = await addRestaurantButton.evaluate((element) => {
+      const bounds = element.getBoundingClientRect();
+      return {
+        height: bounds.height,
+        right: bounds.right,
+        viewportWidth: window.innerWidth,
+        whiteSpace: window.getComputedStyle(element).whiteSpace
+      };
+    });
+    expect(addRestaurantLayout.whiteSpace).toBe("nowrap");
+    expect(addRestaurantLayout.height).toBeLessThanOrEqual(56);
+    expect(addRestaurantLayout.right).toBeLessThanOrEqual(addRestaurantLayout.viewportWidth + 1);
+    const restaurantPageOverflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
+    expect(restaurantPageOverflow).toBeLessThanOrEqual(1);
+    await page.setViewportSize({ width: 1280, height: 900 });
+
     const accessRestricted = await json(await request.patch("/api/superadmin/field-representatives", {
       headers: authHeaders(superAdmin),
       data: {

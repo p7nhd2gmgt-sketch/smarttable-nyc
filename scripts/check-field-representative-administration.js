@@ -264,11 +264,11 @@ for (const token of [
   "/auth/field-representative-invitation"
 ]) assert.ok(coreSource.includes(token), `Field representative backend is missing ${token}.`);
 assert.ok(
-  indexSource.includes('/app.js?v=field-team-20260831-2'),
+  indexSource.includes('/app.js?v=field-team-mobile-20260831-1'),
   "The Field Team release must use a cache-busting application bundle URL."
 );
 assert.ok(
-  indexSource.includes('/styles.css?v=feedback-toast-20260831-3'),
+  indexSource.includes('/styles.css?v=field-team-mobile-20260831-1'),
   "The toast contrast fix must use a cache-busting stylesheet URL."
 );
 assert.ok(
@@ -284,6 +284,20 @@ for (const token of [
   "color: #ffffff !important;",
   "-webkit-text-fill-color: #ffffff !important;"
 ]) assert.ok(stylesSource.includes(token), `Toast contrast styling is missing ${token}.`);
+for (const token of [
+  "admin-partner-accounts-table",
+  "admin-partner-email-cell",
+  "admin-restaurants-heading",
+  "admin-add-restaurant-button"
+]) assert.ok(appSource.includes(token), `Field representative mobile markup is missing ${token}.`);
+for (const token of [
+  ".admin-partner-accounts-table td::before",
+  "content: attr(data-label);",
+  ".admin-partner-email-cell",
+  "overflow-wrap: anywhere;",
+  ".admin-add-restaurant-button",
+  "white-space: nowrap;"
+]) assert.ok(stylesSource.includes(token), `Field representative mobile styling is missing ${token}.`);
 for (const token of [
   'toast.style.setProperty("background", "#111814", "important")',
   'toast.style.setProperty("background-image", "linear-gradient(#111814, #111814)", "important")',

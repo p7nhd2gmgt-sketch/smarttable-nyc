@@ -13030,12 +13030,12 @@ function restaurantAdminPanel(includeAudit = true) {
   const representativeMode = isFieldRepresentativeSession();
   return `
     <article class="panel wide-panel" id="admin-restaurants">
-      <div class="section-title-row compact">
+      <div class="section-title-row compact admin-restaurants-heading">
         <div>
           <span class="section-kicker">${escapeHtml(t("admin_nav_restaurants", "Restaurants"))}</span>
           <h2>${escapeHtml(t("admin_restaurants_title", "Manage restaurants"))}</h2>
         </div>
-        <button class="primary-button" type="button" data-focus-restaurant-form>${escapeHtml(t("add_restaurant_button", "Add Restaurant"))}</button>
+        <button class="primary-button admin-add-restaurant-button" type="button" data-focus-restaurant-form>${escapeHtml(t("add_restaurant_button", "Add Restaurant"))}</button>
       </div>
       <p class="form-note">${escapeHtml(representativeMode
         ? t("field_rep_restaurant_scope_note", "Create and configure restaurant drafts only in your assigned territories. Super Admin controls activation, publication, suspension, archiving, and deletion.")
@@ -13135,18 +13135,18 @@ function restaurantTable() {
 function partnerTable() {
   if (!state.partners.length) return '<div class="empty-state">No partner accounts yet.</div>';
   return `
-    <div class="table-wrap">
-      <table>
+    <div class="table-wrap admin-partner-accounts-wrap">
+      <table class="admin-partner-accounts-table">
         <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Invitation</th><th>Restaurant</th><th>${escapeHtml(t("actions_label", "Actions"))}</th></tr></thead>
         <tbody>
           ${state.partners.map((partner) => `
-            <tr>
-              <td>${escapeHtml(partner.full_name || "Partner")}</td>
-              <td>${escapeHtml(partner.email)}</td>
-              <td>${statusBadge(normalizeRole(partner.role))}<br><span class="muted">${escapeHtml(partner.restaurant_role || "")}</span></td>
-              <td>${statusBadge(partner.invitation_status || partner.status || "active")}</td>
-              <td>${escapeHtml(partner.restaurant_id || "Not linked")}</td>
-              <td>
+            <tr class="admin-partner-account-row">
+              <td data-label="${escapeAttr(t("name_label", "Name"))}">${escapeHtml(partner.full_name || "Partner")}</td>
+              <td class="admin-partner-email-cell" data-label="${escapeAttr(t("email_label", "Email"))}">${escapeHtml(partner.email)}</td>
+              <td data-label="${escapeAttr(t("role_label", "Role"))}">${statusBadge(normalizeRole(partner.role))}<br><span class="muted">${escapeHtml(partner.restaurant_role || "")}</span></td>
+              <td data-label="${escapeAttr(t("invitation_label", "Invitation"))}">${statusBadge(partner.invitation_status || partner.status || "active")}</td>
+              <td data-label="${escapeAttr(t("restaurant_label", "Restaurant"))}">${escapeHtml(partner.restaurant_id || "Not linked")}</td>
+              <td data-label="${escapeAttr(t("actions_label", "Actions"))}">
                 <div class="button-row">
                   ${!isFieldRepresentativeSession() || currentFieldRepresentativeAccess().can_manage_partner_access === true ? partnerInvitationActions(partner) : ""}
                   ${isFieldRepresentativeSession() ? "" : `<button class="ghost-button" data-view-as-partner="${escapeAttr(partner.id)}" type="button">${escapeHtml(t("view_as_partner_button", "View as partner"))}</button>`}

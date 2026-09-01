@@ -7118,6 +7118,127 @@ th {
   }
 }
 
+/* Field operations keeps dense desktop data tables, but on phones each
+   partner account becomes a readable card instead of forcing page overflow. */
+@media (max-width: 760px) {
+  .admin-partner-accounts-wrap {
+    overflow-x: visible;
+  }
+
+  .admin-partner-accounts-table,
+  .admin-partner-accounts-table thead,
+  .admin-partner-accounts-table tbody,
+  .admin-partner-accounts-table tr,
+  .admin-partner-accounts-table th,
+  .admin-partner-accounts-table td {
+    display: block;
+    min-width: 0;
+    width: 100%;
+  }
+
+  .admin-partner-accounts-table {
+    border-collapse: separate;
+    border-spacing: 0;
+    min-width: 0;
+  }
+
+  .admin-partner-accounts-table thead {
+    clip: rect(0 0 0 0);
+    clip-path: inset(50%);
+    height: 1px;
+    overflow: hidden;
+    position: absolute;
+    white-space: nowrap;
+    width: 1px;
+  }
+
+  .admin-partner-accounts-table tbody {
+    display: grid;
+    gap: 12px;
+  }
+
+  .admin-partner-accounts-table tr {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    overflow: hidden;
+  }
+
+  .admin-partner-accounts-table td {
+    align-items: start;
+    border-bottom: 1px solid var(--line);
+    display: grid;
+    gap: 8px;
+    grid-template-columns: minmax(82px, 0.34fr) minmax(0, 1fr);
+    overflow-wrap: anywhere;
+    padding: 10px 12px;
+  }
+
+  .admin-partner-accounts-table td:last-child {
+    border-bottom: 0;
+  }
+
+  .admin-partner-accounts-table td::before {
+    color: var(--muted);
+    content: attr(data-label);
+    font-size: 0.72rem;
+    font-weight: 800;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+
+  .admin-partner-email-cell {
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+
+  .admin-partner-accounts-table td > * {
+    min-width: 0;
+  }
+
+  .admin-partner-accounts-table .button-row {
+    display: grid;
+    gap: 8px;
+    grid-column: 2;
+    grid-template-columns: 1fr;
+    width: 100%;
+  }
+
+  .admin-partner-accounts-table .button-row button {
+    min-height: 44px;
+    width: 100%;
+  }
+
+  .admin-restaurants-heading {
+    align-items: start;
+    display: grid;
+    gap: 12px;
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .admin-restaurants-heading > div {
+    min-width: 0;
+  }
+
+  .admin-add-restaurant-button {
+    max-width: none;
+    min-height: 44px;
+    padding: 10px 12px;
+    white-space: nowrap;
+    width: auto;
+  }
+}
+
+@media (max-width: 380px) {
+  .admin-restaurants-heading {
+    grid-template-columns: 1fr;
+  }
+
+  .admin-add-restaurant-button {
+    width: 100%;
+  }
+}
+
 @media (max-width: 1100px) {
   .reservation-filter-form,
   .mini-form.horizontal.reservation-filter-form {
