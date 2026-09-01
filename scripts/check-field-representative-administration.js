@@ -268,16 +268,18 @@ assert.ok(
   "The Field Team release must use a cache-busting application bundle URL."
 );
 assert.ok(
-  indexSource.includes('/styles.css?v=toast-contrast-20260831-1'),
+  indexSource.includes('/styles.css?v=toast-contrast-20260831-2'),
   "The toast contrast fix must use a cache-busting stylesheet URL."
 );
 for (const token of [
-  "--toast-bg: #202522;",
-  "--toast-text: #ffffff;",
-  "--toast-bg: #eef5f0;",
-  "--toast-text: #101713;",
-  "background: var(--toast-bg);",
-  "color: var(--toast-text);"
+  "background: #111814 !important;",
+  "color: #ffffff !important;",
+  "-webkit-text-fill-color: #ffffff !important;"
 ]) assert.ok(stylesSource.includes(token), `Toast contrast styling is missing ${token}.`);
+for (const token of [
+  'toast.style.setProperty("background-color", "#111814", "important")',
+  'toast.style.setProperty("color", "#ffffff", "important")',
+  'toast.style.setProperty("-webkit-text-fill-color", "#ffffff", "important")'
+]) assert.ok(appSource.includes(token), `Browser-forced toast contrast behavior is missing ${token}.`);
 
 console.log("Field representative administration checks passed.");

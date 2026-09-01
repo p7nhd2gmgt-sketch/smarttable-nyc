@@ -905,6 +905,11 @@ function safeInternalNavigationUrl(value = "") {
 
 function showToast(message) {
   toast.textContent = translateInlineText(message);
+  // Keep operational feedback readable even when a browser/extension applies
+  // automatic dark-mode color rewriting to form and status elements.
+  toast.style.setProperty("background-color", "#111814", "important");
+  toast.style.setProperty("color", "#ffffff", "important");
+  toast.style.setProperty("-webkit-text-fill-color", "#ffffff", "important");
   toast.classList.add("show");
   window.setTimeout(() => toast.classList.remove("show"), 3200);
 }

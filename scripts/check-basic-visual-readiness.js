@@ -14,6 +14,18 @@ function includesAll(source, tokens, label) {
   }
 }
 
+function relativeLuminance(hex) {
+  const channels = hex.match(/[a-f\d]{2}/gi)?.map((value) => Number.parseInt(value, 16) / 255) || [];
+  assert(channels.length === 3, `Invalid contrast color ${hex}.`);
+  const linear = channels.map((value) => value <= 0.03928 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4);
+  return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2];
+}
+
+function contrastRatio(foreground, background) {
+  const values = [relativeLuminance(foreground), relativeLuminance(background)].sort((a, b) => b - a);
+  return (values[0] + 0.05) / (values[1] + 0.05);
+}
+
 function parseLocale(source, label) {
   try {
     return JSON.parse(source);
@@ -233,6 +245,22 @@ includesAll(styles, [
   ".app-error-state",
   ".empty-state"
 ], "Phase 19 accessibility and state CSS");
+
+includesAll(styles, [
+  ".toast",
+  "background: #111814 !important",
+  "color: #ffffff !important",
+  "-webkit-text-fill-color: #ffffff !important"
+], "Theme-independent toast contrast CSS");
+includesAll(app, [
+  'toast.style.setProperty("background-color", "#111814", "important")',
+  'toast.style.setProperty("color", "#ffffff", "important")',
+  'toast.style.setProperty("-webkit-text-fill-color", "#ffffff", "important")'
+], "Browser-forced toast contrast behavior");
+assert(
+  contrastRatio("#ffffff", "#111814") >= 7,
+  "Toast feedback must meet WCAG AAA contrast for normal text."
+);
 
 includesAll(guestDesign, [
   "--guest-container: min(1180px, calc(100vw - 32px))",

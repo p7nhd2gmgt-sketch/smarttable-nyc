@@ -2393,12 +2393,13 @@ textarea {
 }
 
 .toast {
-  background: var(--toast-bg);
-  border: 1px solid var(--toast-border);
+  background: #111814 !important;
+  background-color: #111814 !important;
+  border: 1px solid rgba(255, 255, 255, 0.32);
   border-radius: 8px;
   bottom: 20px;
   box-shadow: var(--shadow);
-  color: var(--toast-text);
+  color: #ffffff !important;
   font-weight: 700;
   left: 50%;
   max-width: min(92vw, 620px);
@@ -2407,8 +2408,10 @@ textarea {
   pointer-events: none;
   position: fixed;
   text-align: center;
+  text-shadow: none;
   transform: translate(-50%, 12px);
   transition: opacity 0.2s ease, transform 0.2s ease;
+  -webkit-text-fill-color: #ffffff !important;
   z-index: 40;
 }
 
