@@ -247,15 +247,26 @@ includesAll(styles, [
 ], "Phase 19 accessibility and state CSS");
 
 includesAll(styles, [
-  ".toast",
+  ".smarttable-feedback-toast",
+  ".smarttable-feedback-toast::before",
+  ".smarttable-feedback-toast__message",
   "background: #111814 !important",
+  "background-image: linear-gradient(#111814, #111814) !important",
+  "forced-color-adjust: none",
   "color: #ffffff !important",
   "-webkit-text-fill-color: #ffffff !important"
 ], "Theme-independent toast contrast CSS");
+assert(
+  indexHtml.includes('class="toast smarttable-feedback-toast"'),
+  "Toast feedback must preserve the legacy .toast integration contract."
+);
 includesAll(app, [
+  'toast.style.setProperty("background", "#111814", "important")',
+  'toast.style.setProperty("background-image", "linear-gradient(#111814, #111814)", "important")',
   'toast.style.setProperty("background-color", "#111814", "important")',
   'toast.style.setProperty("color", "#ffffff", "important")',
-  'toast.style.setProperty("-webkit-text-fill-color", "#ffffff", "important")'
+  'toast.style.setProperty("-webkit-text-fill-color", "#ffffff", "important")',
+  'toastMessage.style.setProperty("color", "#ffffff", "important")'
 ], "Browser-forced toast contrast behavior");
 assert(
   contrastRatio("#ffffff", "#111814") >= 7,

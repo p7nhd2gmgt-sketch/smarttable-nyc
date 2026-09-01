@@ -75,6 +75,43 @@ function signupPayload(overrides = {}) {
   };
 }
 
+function fieldRepresentativeRestaurantPayload({ name, slug, email, marketId }) {
+  return {
+    name,
+    legal_name: `${name} LLC`,
+    slug,
+    email,
+    primary_email: email,
+    reservation_email: email,
+    address: `100 ${name} Avenue`,
+    street_address: `100 ${name} Avenue`,
+    city: "New York",
+    country: "US",
+    district: "New York",
+    state_region: "NY",
+    postal_code: "10001",
+    cuisine_type: "Modern European",
+    price_level: "$$",
+    short_description: "Field operations browser verification restaurant.",
+    full_description: "Field operations browser verification restaurant profile.",
+    primary_timezone: "America/New_York",
+    currency_code: "USD",
+    default_language: "en",
+    supported_languages: ["en"],
+    market_id: marketId,
+    service_periods: [{ day: "mon", period: "dinner", opens: "17:00", closes: "22:00" }],
+    reservation_acceptance_mode: "manual",
+    reservation_interval_minutes: 30,
+    minimum_booking_notice_minutes: 30,
+    booking_horizon_days: 30,
+    default_table_duration_minutes: 90,
+    min_party_size: 2,
+    max_party_size: 8,
+    available_party_sizes: [2, 3, 4, 5, 6, 7, 8],
+    accepts_reservation_requests: true
+  };
+}
+
 async function json(response) {
   const payload = await response.json().catch(() => ({}));
   return { response, payload };
@@ -97,7 +134,7 @@ async function storeSession(page, session) {
   await page.goto("/");
   await page.evaluate((storedSession) => {
     const role = String(storedSession?.profile?.role || "").trim().toLowerCase();
-    const storage = ["admin", "super_admin", "superadmin"].includes(role)
+    const storage = ["admin", "super_admin", "superadmin", "field_representative"].includes(role)
       ? sessionStorage
       : localStorage;
     storage.setItem("smarttable.session", JSON.stringify({
@@ -115,7 +152,7 @@ async function replaceStoredSession(page, session, path = "/") {
     localStorage.removeItem("smarttable.session");
     sessionStorage.removeItem("smarttable.session");
     const role = String(storedSession?.profile?.role || "").trim().toLowerCase();
-    const storage = ["admin", "super_admin", "superadmin"].includes(role)
+    const storage = ["admin", "super_admin", "superadmin", "field_representative"].includes(role)
       ? sessionStorage
       : localStorage;
     storage.setItem("smarttable.session", JSON.stringify({
@@ -1123,6 +1160,216 @@ test.describe.serial("SmartTable BASIC production E2E", () => {
 
     const superFeatureFlags = await request.get("/api/admin/feature-flags", { headers: authHeaders(superAdmin) });
     expect(superFeatureFlags.status()).toBe(200);
+  });
+
+  test("field representative browser lifecycle enforces territory and permission boundaries", async ({ page, request }) => {
+    const superAdmin = await login(request, TEST_ACCOUNTS.superadmin.email, TEST_ACCOUNTS.superadmin.password);
+    const team = await json(await request.get("/api/superadmin/field-representatives", {
+      headers: authHeaders(superAdmin)
+    }));
+    expect(team.response.status(), JSON.stringify(team.payload)).toBe(200);
+    const nyc = (team.payload.markets || []).find((market) => market.code === "nyc");
+    const budapest = (team.payload.markets || []).find((market) => market.code === "budapest");
+    expect(nyc?.id).toBeTruthy();
+    expect(budapest?.id).toBeTruthy();
+
+    const revokedEmail = uniqueEmail("field-rep-revoked-browser");
+    await replaceStoredSession(page, superAdmin, "/superadmin/field-team");
+    const inviteForm = page.locator("#fieldRepresentativeInviteAdminForm");
+    await expect(inviteForm).toBeVisible();
+    await inviteForm.locator('[name="full_name"]').fill("Revoked Browser Representative");
+    await inviteForm.locator('[name="email"]').fill(revokedEmail);
+    await inviteForm.locator(`[name="market_ids"][value="${nyc.id}"]`).check();
+    for (const permission of [
+      "can_manage_restaurants",
+      "can_manage_capacity",
+      "can_invite_partners",
+      "can_manage_partner_access"
+    ]) {
+      await inviteForm.locator(`[name="${permission}"]`).check();
+    }
+    const invitationCreated = page.waitForResponse((response) =>
+      response.request().method() === "POST"
+      && response.status() === 201
+      && response.url().includes("/api/superadmin/field-representatives")
+      && (response.request().postData() || "").includes(revokedEmail)
+    );
+    await inviteForm.locator('button[type="submit"]').click();
+    const revokedInvitationPayload = await (await invitationCreated).json();
+    const revokedInvitationId = revokedInvitationPayload.invitation?.id;
+    expect(revokedInvitationId).toBeTruthy();
+    const revokeButton = page.locator(`[data-revoke-field-representative-invitation="${revokedInvitationId}"]`);
+    await expect(revokeButton).toBeVisible();
+    page.once("dialog", (dialog) => dialog.accept());
+    const invitationRevoked = page.waitForResponse((response) =>
+      response.request().method() === "PATCH"
+      && response.status() === 200
+      && response.url().includes("/api/superadmin/field-representatives")
+      && (response.request().postData() || "").includes(revokedInvitationId)
+    );
+    await revokeButton.click();
+    await invitationRevoked;
+    await expect(page.locator(`[data-revoke-field-representative-invitation="${revokedInvitationId}"]`)).toHaveCount(0);
+
+    const representativeEmail = uniqueEmail("field-rep-browser");
+    const invitationToken = `field-representative-browser-${stamp()}`;
+    const representativePassword = "Field-Representative-2026!";
+    const invited = await json(await request.post("/api/superadmin/field-representatives", {
+      headers: authHeaders(superAdmin),
+      data: {
+        email: representativeEmail,
+        full_name: "NYC Browser Representative",
+        market_ids: [nyc.id],
+        can_manage_restaurants: true,
+        can_manage_capacity: true,
+        can_invite_partners: true,
+        can_manage_partner_access: true,
+        test_invitation_token: invitationToken
+      }
+    }));
+    expect(invited.response.status(), JSON.stringify(invited.payload)).toBe(201);
+
+    await page.evaluate(() => {
+      localStorage.removeItem("smarttable.session");
+      sessionStorage.removeItem("smarttable.session");
+    });
+    await page.goto(`/admin/invite?token=${encodeURIComponent(invitationToken)}`);
+    const activationForm = page.locator("#fieldRepresentativeInviteForm");
+    await expect(activationForm).toBeVisible();
+    await activationForm.locator('[name="password"]').fill(representativePassword);
+    await activationForm.locator('[name="confirm_password"]').fill(representativePassword);
+    await activationForm.locator('input[type="checkbox"][name="terms_consent"]').check();
+    const activatedResponse = page.waitForResponse((response) =>
+      response.request().method() === "POST"
+      && response.status() === 200
+      && response.url().includes("/api/auth/field-representative-invitation")
+    );
+    await activationForm.locator('button[type="submit"]').click();
+    await activatedResponse;
+    await expect(page).toHaveURL(/\/admin(?:$|[?#])/);
+
+    await signInThroughVisibleForm(page, "/admin", representativeEmail, representativePassword);
+    await expectAuthenticatedRoute(page, "/admin");
+    const representativeSession = await page.evaluate(() => ({
+      session: JSON.parse(sessionStorage.getItem("smarttable.session") || "null"),
+      persistent: localStorage.getItem("smarttable.session")
+    }));
+    expect(representativeSession.session?.profile?.role).toBe("field_representative");
+    expect(representativeSession.persistent).toBeNull();
+    await expect(page.getByText("Assigned markets", { exact: true })).toBeVisible();
+      await expect(
+        page
+          .getByRole("tabpanel", { name: "Overview" })
+          .getByText("New York City", { exact: true }),
+      ).toBeVisible();
+    await expect(page.locator("[data-dashboard-tab]")).toHaveCount(3);
+    await expect(page.locator('[data-dashboard-tab="overview"]')).toBeVisible();
+    await expect(page.locator('[data-dashboard-tab="restaurants"]')).toBeVisible();
+    await expect(page.locator('[data-dashboard-tab="partners"]')).toBeVisible();
+    await expect(page.locator('[data-dashboard-tab="offers"]')).toHaveCount(0);
+
+    const representative = await login(request, representativeEmail, representativePassword);
+    const outsideTerritory = await request.post("/api/admin/restaurants", {
+      headers: authHeaders(representative),
+      data: {
+        ...fieldRepresentativeRestaurantPayload({
+          name: `Outside Territory Browser ${stamp()}`,
+          slug: `outside-territory-browser-${stamp()}`,
+          email: uniqueEmail("outside-territory-browser"),
+          marketId: budapest.id
+        }),
+        city: "Budapest",
+        country: "HU",
+        state_region: "Budapest",
+        postal_code: "1051",
+        primary_timezone: "Europe/Budapest",
+        currency_code: "HUF"
+      }
+    });
+    expect(outsideTerritory.status()).toBe(403);
+
+    await replaceStoredSession(page, representative, "/admin/restaurants");
+    const restaurantForm = page.locator("#restaurantForm");
+    await expect(restaurantForm).toBeVisible();
+    await restaurantForm.locator('[name="market_id"]').selectOption(nyc.id);
+    const restaurantName = `NYC Field Browser ${stamp()}`;
+    await restaurantForm.locator('[name="name"]').fill(restaurantName);
+    await restaurantForm.locator('[name="email"]').fill(uniqueEmail("field-browser-restaurant"));
+    await restaurantForm.locator('[name="address"]').fill(`${stamp()} Broadway, New York, NY 10001`);
+    await restaurantForm.locator('[name="cuisine_type"]').fill("Modern European");
+    const restaurantCreated = page.waitForResponse((response) =>
+      response.request().method() === "POST"
+      && response.status() === 201
+      && response.url().includes("/api/admin/restaurants")
+      && (response.request().postData() || "").includes(restaurantName)
+    );
+    await restaurantForm.locator('button[type="submit"]').click();
+    const restaurantResult = await (await restaurantCreated).json();
+    const restaurantId = restaurantResult.restaurant?.id;
+    expect(restaurantId).toBeTruthy();
+    expect(restaurantResult.restaurant?.visible_on_guest_site).toBe(false);
+    expect(restaurantResult.restaurant?.onboarding_status).toBe("draft");
+
+    await replaceStoredSession(page, representative, "/admin/partners");
+    const partnerForm = page.locator("#partnerForm");
+    await expect(partnerForm).toBeVisible();
+    const partnerEmail = uniqueEmail("field-browser-partner");
+    await partnerForm.locator('[name="full_name"]').fill("Field Browser Restaurant Owner");
+    await partnerForm.locator('[name="email"]').fill(partnerEmail);
+    await partnerForm.locator('[name="restaurant_id"]').selectOption(restaurantId);
+    await partnerForm.locator('[name="restaurant_role"]').selectOption("owner");
+    const partnerInvited = page.waitForResponse((response) =>
+      response.request().method() === "POST"
+      && response.status() === 201
+      && response.url().includes("/api/admin/partners")
+      && (response.request().postData() || "").includes(partnerEmail)
+    );
+    await partnerForm.locator('button[type="submit"]').click();
+    const partnerInvitation = await (await partnerInvited).json();
+    expect(partnerInvitation.invitation?.status).toBe("pending");
+
+    const accessRestricted = await json(await request.patch("/api/superadmin/field-representatives", {
+      headers: authHeaders(superAdmin),
+      data: {
+        action: "update_access",
+        id: representative.profile.id,
+        market_ids: [nyc.id],
+        can_manage_restaurants: true,
+        can_manage_capacity: true,
+        can_invite_partners: false,
+        can_manage_partner_access: false
+      }
+    }));
+    expect(accessRestricted.response.status(), JSON.stringify(accessRestricted.payload)).toBe(200);
+    await replaceStoredSession(page, representative, "/admin/partners");
+    await expect(page.locator("#partnerForm")).toHaveCount(0);
+    await expect(page.getByText("Partner invitations are not enabled for this account.", { exact: true })).toBeVisible();
+    const directPartnerInvite = await request.post("/api/admin/partners", {
+      headers: authHeaders(representative),
+      data: {
+        email: uniqueEmail("field-browser-denied-partner"),
+        full_name: "Denied Field Browser Owner",
+        restaurant_id: restaurantId,
+        restaurant_role: "owner"
+      }
+    });
+    expect(directPartnerInvite.status()).toBe(403);
+
+    await replaceStoredSession(page, superAdmin, "/superadmin/field-team");
+    const suspendButton = page.locator(`[data-field-representative-status="${representative.profile.id}"]`);
+    await expect(suspendButton).toBeVisible();
+    await expect(suspendButton).toHaveAttribute("data-next-field-representative-status", "suspend");
+    page.once("dialog", (dialog) => dialog.accept());
+    const suspended = page.waitForResponse((response) =>
+      response.request().method() === "PATCH"
+      && response.status() === 200
+      && response.url().includes("/api/superadmin/field-representatives")
+      && (response.request().postData() || "").includes('"action":"suspend"')
+    );
+    await suspendButton.click();
+    await suspended;
+    const suspendedContext = await request.get("/api/admin/access-context", { headers: authHeaders(representative) });
+    expect(suspendedContext.status()).toBe(403);
   });
 
   test("guest, partner, admin, and super-admin browser routes render", async ({ page, request }) => {

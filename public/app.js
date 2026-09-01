@@ -545,6 +545,7 @@ const state = {
 
 const app = document.querySelector("#app");
 const toast = document.querySelector("#toast");
+const toastMessage = document.querySelector("#toastMessage");
 const sessionButton = document.querySelector("#sessionButton");
 const adminDashboardNav = document.querySelector("#adminDashboardNav");
 const signupNav = document.querySelector("#signupNav");
@@ -904,12 +905,22 @@ function safeInternalNavigationUrl(value = "") {
 }
 
 function showToast(message) {
-  toast.textContent = translateInlineText(message);
+  if (!toast) return;
+  const translatedMessage = translateInlineText(message);
+  if (toastMessage) toastMessage.textContent = translatedMessage;
+  else toast.textContent = translatedMessage;
   // Keep operational feedback readable even when a browser/extension applies
   // automatic dark-mode color rewriting to form and status elements.
+  toast.style.setProperty("background", "#111814", "important");
+  toast.style.setProperty("background-image", "linear-gradient(#111814, #111814)", "important");
   toast.style.setProperty("background-color", "#111814", "important");
   toast.style.setProperty("color", "#ffffff", "important");
   toast.style.setProperty("-webkit-text-fill-color", "#ffffff", "important");
+  toast.style.setProperty("forced-color-adjust", "none");
+  if (toastMessage) {
+    toastMessage.style.setProperty("color", "#ffffff", "important");
+    toastMessage.style.setProperty("-webkit-text-fill-color", "#ffffff", "important");
+  }
   toast.classList.add("show");
   window.setTimeout(() => toast.classList.remove("show"), 3200);
 }

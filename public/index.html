@@ -18,7 +18,7 @@
     <link rel="canonical" href="https://www.smarttablenyc.com/">
     <link rel="icon" type="image/svg+xml" href="/favicon.svg">
     <link rel="manifest" href="/site.webmanifest">
-    <link rel="stylesheet" href="/styles.css?v=toast-contrast-20260831-2">
+    <link rel="stylesheet" href="/styles.css?v=feedback-toast-20260831-3">
     <script type="application/ld+json">
       {
         "@context": "https://schema.org",
@@ -148,8 +148,16 @@
       <main id="app" class="app-shell" aria-live="polite" tabindex="-1"></main>
     </div>
 
-    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <div
+      class="toast smarttable-feedback-toast"
+      id="toast"
+      role="status"
+      aria-live="polite"
+      aria-atomic="true"
+    >
+      <span class="smarttable-feedback-toast__message" id="toastMessage"></span>
+    </div>
     <script src="/analytics-bootstrap.js?v=security-20260829-1"></script>
-    <script src="/app.js?v=field-team-20260831-1" type="module"></script>
+    <script src="/app.js?v=field-team-20260831-2" type="module"></script>
   </body>
 </html>
