@@ -169,6 +169,23 @@ const created = await api("POST", "/admin/restaurants", nycPayload, representati
 assert.ok(created.restaurant?.id, "Field representatives must create assigned-territory restaurant drafts.");
 assert.equal(created.restaurant.visible_on_guest_site, false, "Field representative restaurants must remain hidden until approval.");
 assert.equal(created.restaurant.onboarding_status, "draft", "Field representative restaurants must remain in onboarding draft.");
+const sharedContactStamp = Date.now();
+const sharedContactRestaurant = await api("POST", "/admin/restaurants", {
+  ...restaurantPayload({
+    name: `Field Operations Shared Contact ${sharedContactStamp}`,
+    slug: `field-operations-shared-contact-${sharedContactStamp}`,
+    email: nycPayload.email,
+    marketId: nyc.id
+  }),
+  address: `${sharedContactStamp} Shared Contact Avenue`,
+  street_address: `${sharedContactStamp} Shared Contact Avenue`,
+  phone: `+1 917 555 ${String(sharedContactStamp).slice(-4)}`,
+  website: `https://field-shared-contact-${sharedContactStamp}.example.test`
+}, representativeHeaders);
+assert.ok(
+  sharedContactRestaurant.restaurant?.id,
+  "Field representatives must be able to reuse one contact email for distinct restaurants."
+);
 await expectStatus("PATCH", "/admin/restaurants", 403, {
   id: created.restaurant.id,
   status: "active",

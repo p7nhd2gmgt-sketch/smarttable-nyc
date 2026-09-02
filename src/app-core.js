@@ -25497,8 +25497,16 @@ function restaurantDuplicateMatches(body = {}, rows = []) {
   const input = duplicateRestaurantInput(body);
   return (rows || []).map((row) => {
     const candidate = restaurantDuplicateCandidate(row);
-    const matched_fields = ["name", "address", "phone", "website", "partner_email"]
+    const matched_fields = ["name", "address", "phone", "website"]
       .filter((field) => input[field] && candidate.normalized[field] && input[field] === candidate.normalized[field]);
+    if (
+      matched_fields.length &&
+      input.partner_email &&
+      candidate.normalized.partner_email &&
+      input.partner_email === candidate.normalized.partner_email
+    ) {
+      matched_fields.push("partner_email");
+    }
     return matched_fields.length
       ? { id: candidate.id, name: candidate.name, status: candidate.status, matched_fields }
       : null;
