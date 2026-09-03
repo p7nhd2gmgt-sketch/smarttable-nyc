@@ -7118,6 +7118,166 @@ th {
   }
 }
 
+/* Guest offer filters stay compact on phones and only rerender after submit. */
+.guest-offer-filter-shell {
+  margin: 0 0 22px;
+}
+
+.guest-offer-filter-toolbar {
+  display: none;
+}
+
+.guest-offer-filter-actions {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+  grid-column: 1 / -1;
+  justify-content: flex-end;
+}
+
+.guest-offer-filter-actions .primary-button,
+.guest-offer-filter-actions .ghost-button {
+  min-height: 44px;
+  min-width: 150px;
+}
+
+.guest-offer-filters input,
+.guest-offer-filters select {
+  font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 720px) {
+  .guest-offer-filter-shell {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 18px;
+    box-shadow: var(--shadow-soft);
+    margin-bottom: 18px;
+    overflow: hidden;
+  }
+
+  .guest-offer-filter-toolbar {
+    align-items: center;
+    display: flex;
+    justify-content: space-between;
+    min-height: 76px;
+    padding: 14px;
+  }
+
+  .guest-offer-filter-toolbar-copy {
+    display: grid;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .guest-offer-filter-toolbar-copy strong {
+    color: var(--ink);
+    font-size: 1rem;
+  }
+
+  .guest-offer-filter-toolbar-copy span {
+    color: var(--muted);
+    font-size: 0.78rem;
+  }
+
+  .guest-offer-filter-toggle {
+    align-items: center;
+    display: inline-flex;
+    flex-shrink: 0;
+    gap: 8px;
+    min-height: 42px;
+    padding: 8px 12px;
+  }
+
+  .guest-offer-filters {
+    display: none !important;
+    gap: 12px !important;
+    grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+    margin: 0 !important;
+    padding: 0 14px 14px !important;
+  }
+
+  .guest-offer-filter-shell.is-open .guest-offer-filters {
+    display: grid !important;
+  }
+
+  .guest-offer-filters .guest-filter-wide,
+  .guest-offer-filter-actions {
+    grid-column: 1 / -1;
+  }
+
+  .guest-offer-filters label {
+    font-size: 0.75rem;
+    gap: 5px;
+    min-width: 0;
+  }
+
+  .guest-offer-filters input,
+  .guest-offer-filters select {
+    font-size: 1rem;
+    min-height: 48px;
+    padding: 10px 12px;
+  }
+
+  .guest-offer-filters input[type="date"],
+  .guest-offer-filters input[type="time"] {
+    appearance: auto;
+    min-width: 0;
+  }
+
+  .guest-offer-filters .filter-check input {
+    min-height: 22px;
+    width: 22px;
+  }
+
+  .guest-offer-filter-actions {
+    display: grid;
+    grid-template-columns: 1fr auto;
+  }
+
+  .guest-offer-filter-actions .primary-button,
+  .guest-offer-filter-actions .ghost-button {
+    min-width: 0;
+    width: 100%;
+  }
+}
+
+@media (max-width: 360px) {
+  .guest-offer-filters {
+    grid-template-columns: 1fr !important;
+  }
+
+  .guest-offer-filters > * {
+    grid-column: 1 !important;
+  }
+}
+
+html[data-theme="dark"] .guest-offer-filter-shell {
+  background: var(--surface);
+  border-color: var(--line-strong);
+}
+
+html[data-theme="dark"] .guest-offer-filters input,
+html[data-theme="dark"] .guest-offer-filters select {
+  -webkit-text-fill-color: #f4f2e9;
+  background: #17251f;
+  border-color: #496456;
+  color: #f4f2e9;
+  color-scheme: dark;
+  opacity: 1;
+}
+
+html[data-theme="dark"] .guest-offer-filters input::placeholder {
+  -webkit-text-fill-color: #a8b5ad;
+  color: #a8b5ad;
+  opacity: 1;
+}
+
+html[data-theme="dark"] .guest-offer-filters input::-webkit-calendar-picker-indicator {
+  filter: none;
+  opacity: 0.9;
+}
+
 /* Field operations keeps dense desktop data tables, but on phones each
    partner account becomes a readable card instead of forcing page overflow. */
 @media (max-width: 760px) {

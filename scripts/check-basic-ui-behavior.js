@@ -88,6 +88,25 @@ includesAll(app, [
 ], "Homepage and BASIC guest listing rendering");
 
 includesAll(app, [
+  "function activeGuestFilterCount(",
+  "guest-offer-filter-shell",
+  "data-toggle-offer-filters",
+  "aria-controls=\"guestOfferFilters\"",
+  "id=\"guestOfferFilters\"",
+  "guest-offer-filter-actions",
+  "apply_filters_button",
+  "state.offerFiltersExpanded = false"
+], "Compact guest offer filter behavior");
+
+includesAll(styles, [
+  ".guest-offer-filter-toolbar",
+  ".guest-offer-filter-shell.is-open .guest-offer-filters",
+  "grid-template-columns: repeat(2, minmax(0, 1fr))",
+  "input[type=\"date\"]",
+  "-webkit-text-fill-color: #f4f2e9"
+], "Responsive, high-contrast guest offer filters");
+
+includesAll(app, [
   "function canShowFeature(",
   "function isBasicMode()",
   "function guestAiConciergeHomepageEntry()",
@@ -336,7 +355,14 @@ for (const [locale, messages] of Object.entries(locales)) {
     "not_found_title",
     "app_error_title",
     "retry_button",
-    "skip_to_content"
+    "skip_to_content",
+    "filters_title",
+    "filter_summary_default",
+    "active_filters_label",
+    "show_filters_button",
+    "hide_filters_button",
+    "apply_filters_button",
+    "clear_filters_button"
   ]) {
     assert(String(messages[key] || "").trim(), `${locale}.json must define ${key}.`);
   }

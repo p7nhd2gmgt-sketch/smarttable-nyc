@@ -424,6 +424,7 @@ const state = {
   partnerPortfolioFilter: "all",
   partnerMarketingMessage: localStorage.getItem("smarttable.partnerMarketingMessage") || "Tonight only: enjoy 20% off your early dinner reservation at our restaurant. Limited tables available.",
   viewMode: "list",
+  offerFiltersExpanded: false,
   filters: {
     neighborhood: "",
     cuisine: "",
@@ -4282,29 +4283,58 @@ function optionSelect(name, label, value, options, placeholder) {
   `;
 }
 
+function activeGuestFilterCount(filters = {}) {
+  const valueCount = ["restaurantName", "neighborhood", "cuisine", "discount", "date", "time", "partySize"]
+    .filter((key) => String(filters[key] ?? "").trim()).length;
+  const availabilityCount = filters.availableOnly ? 1 : 0;
+  const sortCount = filters.sort && filters.sort !== "recommended" ? 1 : 0;
+  return valueCount + availabilityCount + sortCount;
+}
+
 function filterBar() {
   const filters = state.filters;
+  const activeCount = activeGuestFilterCount(filters);
+  const expanded = Boolean(state.offerFiltersExpanded);
+  const summary = activeCount
+    ? `${activeCount} ${t("active_filters_label", "active")}`
+    : t("filter_summary_default", "Refine restaurant offers");
   return `
-    <section class="filters offers-filters">
-      <label>${escapeHtml(t("filter_restaurant_name_label", "Restaurant name"))}<input name="restaurantName" value="${escapeAttr(filters.restaurantName)}" placeholder="${escapeAttr(t("filter_restaurant_placeholder", "Hudson Hearth"))}"></label>
-      <label>${escapeHtml(t("filter_neighborhood_label", "Neighborhood"))}<input name="neighborhood" value="${escapeAttr(filters.neighborhood)}" placeholder="${escapeAttr(t("filter_neighborhood_placeholder", "West Village"))}"></label>
-      <label>${escapeHtml(t("filter_cuisine_label", "Cuisine"))}<input name="cuisine" value="${escapeAttr(filters.cuisine)}" placeholder="${escapeAttr(t("filter_cuisine_placeholder", "Italian"))}"></label>
-      <label>${escapeHtml(t("filter_discount_label", "Minimum discount"))}<input name="discount" type="number" min="0" max="90" value="${escapeAttr(filters.discount)}" placeholder="${escapeAttr(t("filter_discount_placeholder", "20"))}"></label>
-      <label>${escapeHtml(t("filter_date_label", "Date"))}<input name="date" type="date" value="${escapeAttr(filters.date)}"></label>
-      <label>${escapeHtml(t("filter_time_label", "Time"))}<input name="time" type="time" value="${escapeAttr(filters.time)}"></label>
-      <label>${escapeHtml(t("filter_party_size_label", "Party size"))}<input name="partySize" type="number" min="1" value="${escapeAttr(filters.partySize)}" placeholder="2"></label>
-      <label>${escapeHtml(t("sort_label", "Sort"))}
-        <select name="sort">
-          <option value="recommended" ${filters.sort === "recommended" ? "selected" : ""}>${escapeHtml(t("sort_recommended_label", "Recommended"))}</option>
-          <option value="newest" ${filters.sort === "newest" ? "selected" : ""}>${escapeHtml(t("sort_newest_label", "Newest"))}</option>
-          <option value="highest_discount" ${filters.sort === "highest_discount" ? "selected" : ""}>${escapeHtml(t("sort_highest_discount_label", "Highest discount"))}</option>
-          <option value="soonest" ${filters.sort === "soonest" ? "selected" : ""}>${escapeHtml(t("sort_soonest_label", "Soonest available"))}</option>
-          <option value="name" ${filters.sort === "name" ? "selected" : ""}>${escapeHtml(t("sort_name_label", "Restaurant name A-Z"))}</option>
-          <option value="admin_order" ${filters.sort === "admin_order" ? "selected" : ""}>${escapeHtml(t("sort_admin_order_label", "Admin custom order"))}</option>
-        </select>
-      </label>
-      <label class="check filter-check"><input name="availableOnly" type="checkbox" ${filters.availableOnly ? "checked" : ""}> ${escapeHtml(t("filter_available_only_label", "Only available offers"))}</label>
-    </section>
+    <div class="guest-offer-filter-shell ${expanded ? "is-open" : ""}">
+      <div class="guest-offer-filter-toolbar">
+        <div class="guest-offer-filter-toolbar-copy">
+          <strong>${escapeHtml(t("filters_title", "Filters"))}</strong>
+          <span>${escapeHtml(summary)}</span>
+        </div>
+        <button class="ghost-button guest-offer-filter-toggle" data-toggle-offer-filters type="button" aria-controls="guestOfferFilters" aria-expanded="${expanded}">
+          ${escapeHtml(t(expanded ? "hide_filters_button" : "show_filters_button", expanded ? "Hide" : "Show"))}
+          <span aria-hidden="true">${expanded ? "−" : "+"}</span>
+        </button>
+      </div>
+      <form id="guestOfferFilters" class="filters offers-filters guest-offer-filters">
+        <label class="guest-filter-wide">${escapeHtml(t("filter_restaurant_name_label", "Restaurant name"))}<input name="restaurantName" value="${escapeAttr(filters.restaurantName)}" placeholder="${escapeAttr(t("filter_restaurant_placeholder", "Hudson Hearth"))}"></label>
+        <label>${escapeHtml(t("filter_neighborhood_label", "Neighborhood"))}<input name="neighborhood" value="${escapeAttr(filters.neighborhood)}" placeholder="${escapeAttr(t("filter_neighborhood_placeholder", "West Village"))}"></label>
+        <label>${escapeHtml(t("filter_cuisine_label", "Cuisine"))}<input name="cuisine" value="${escapeAttr(filters.cuisine)}" placeholder="${escapeAttr(t("filter_cuisine_placeholder", "Italian"))}"></label>
+        <label>${escapeHtml(t("filter_discount_label", "Minimum discount"))}<input name="discount" type="number" min="0" max="90" value="${escapeAttr(filters.discount)}" placeholder="${escapeAttr(t("filter_discount_placeholder", "20"))}"></label>
+        <label>${escapeHtml(t("filter_date_label", "Date"))}<input name="date" type="date" value="${escapeAttr(filters.date)}"></label>
+        <label>${escapeHtml(t("filter_time_label", "Time"))}<input name="time" type="time" value="${escapeAttr(filters.time)}"></label>
+        <label>${escapeHtml(t("filter_party_size_label", "Party size"))}<input name="partySize" type="number" min="1" value="${escapeAttr(filters.partySize)}" placeholder="2"></label>
+        <label class="guest-filter-wide">${escapeHtml(t("sort_label", "Sort"))}
+          <select name="sort">
+            <option value="recommended" ${filters.sort === "recommended" ? "selected" : ""}>${escapeHtml(t("sort_recommended_label", "Recommended"))}</option>
+            <option value="newest" ${filters.sort === "newest" ? "selected" : ""}>${escapeHtml(t("sort_newest_label", "Newest"))}</option>
+            <option value="highest_discount" ${filters.sort === "highest_discount" ? "selected" : ""}>${escapeHtml(t("sort_highest_discount_label", "Highest discount"))}</option>
+            <option value="soonest" ${filters.sort === "soonest" ? "selected" : ""}>${escapeHtml(t("sort_soonest_label", "Soonest available"))}</option>
+            <option value="name" ${filters.sort === "name" ? "selected" : ""}>${escapeHtml(t("sort_name_label", "Restaurant name A-Z"))}</option>
+            <option value="admin_order" ${filters.sort === "admin_order" ? "selected" : ""}>${escapeHtml(t("sort_admin_order_label", "Admin custom order"))}</option>
+          </select>
+        </label>
+        <label class="check filter-check guest-filter-wide"><input name="availableOnly" type="checkbox" ${filters.availableOnly ? "checked" : ""}> ${escapeHtml(t("filter_available_only_label", "Only available offers"))}</label>
+        <div class="guest-offer-filter-actions">
+          <button class="primary-button" type="submit">${escapeHtml(t("apply_filters_button", "Apply filters"))}</button>
+          <button class="ghost-button" data-clear-guest-filters type="button">${escapeHtml(t("clear_filters_button", "Clear"))}</button>
+        </div>
+      </form>
+    </div>
   `;
 }
 
@@ -6770,20 +6800,32 @@ function bindGuestEvents(restaurants) {
   document.querySelector("#routePlanForm")?.addEventListener("submit", submitRoutePlan);
   document.querySelector("#consumptionForm")?.addEventListener("submit", submitConsumptionUpload);
   document.querySelectorAll(".offers-filters input, .offers-filters select").forEach((control) => {
+    const liveFilter = !control.closest(".guest-offer-filters");
     control.addEventListener("input", () => {
       if (control.type === "checkbox") state.filters[control.name] = control.checked;
       else state.filters[control.name] = control.value;
-      renderGuest();
+      if (liveFilter) renderGuest();
     });
     control.addEventListener("change", () => {
       if (control.type === "checkbox") state.filters[control.name] = control.checked;
       else state.filters[control.name] = control.value;
+      if (liveFilter) renderGuest();
+    });
+  });
+  document.querySelectorAll("[data-toggle-offer-filters]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.offerFiltersExpanded = !state.offerFiltersExpanded;
       renderGuest();
+      if (state.offerFiltersExpanded) document.querySelector("#guestOfferFilters")?.querySelector("input, select")?.focus();
     });
   });
   document.querySelectorAll("form.offers-filters").forEach((form) => {
     form.addEventListener("submit", (event) => {
       event.preventDefault();
+      if (form.classList.contains("guest-offer-filters")) {
+        state.offerFiltersExpanded = false;
+        renderGuest();
+      }
       document.querySelector("#guest-offers")?.scrollIntoView({ behavior: "smooth", block: "start" });
     });
   });
@@ -6800,6 +6842,7 @@ function bindGuestEvents(restaurants) {
         availableOnly: false,
         sort: "recommended"
       };
+      state.offerFiltersExpanded = false;
       renderGuest();
     });
   });
