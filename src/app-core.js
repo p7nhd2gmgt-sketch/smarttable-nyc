@@ -25606,9 +25606,25 @@ function restaurantReadinessChecks(restaurant = {}, context = {}) {
     : jsonValueFrom(restaurant.service_periods, []);
   const tables = context.tables || [];
   const activeTables = tables.filter((item) => clean(item.status || "active") === "active");
+  const latitudeRaw = restaurant.latitude;
+  const longitudeRaw = restaurant.longitude;
+  const latitude = latitudeRaw === null || latitudeRaw === undefined || clean(latitudeRaw) === "" ? null : Number(latitudeRaw);
+  const longitude = longitudeRaw === null || longitudeRaw === undefined || clean(longitudeRaw) === "" ? null : Number(longitudeRaw);
+  const hasValidCoordinates = Number.isFinite(latitude)
+    && Number.isFinite(longitude)
+    && latitude >= -90
+    && latitude <= 90
+    && longitude >= -180
+    && longitude <= 180
+    && !(latitude === 0 && longitude === 0);
   const checks = [
     { key: "name", label: "Restaurant name", pass: Boolean(clean(restaurant.name)) },
     { key: "slug", label: "Public slug", pass: Boolean(clean(restaurant.slug)) || !("slug" in restaurant) },
+    { key: "address", label: "Street address", pass: Boolean(clean(restaurant.address || restaurant.street_address)) },
+    { key: "city", label: "City", pass: Boolean(clean(restaurant.city)) },
+    { key: "country", label: "Country", pass: Boolean(clean(restaurant.country)) },
+    { key: "coordinates", label: "Map coordinates", pass: hasValidCoordinates },
+    { key: "cuisine", label: "Cuisine", pass: Boolean(clean(restaurant.cuisine_type || restaurant.cuisine)) },
     { key: "timezone", label: "Timezone", pass: Boolean(clean(restaurant.primary_timezone || restaurant.timezone)) },
     { key: "reservation_email", label: "Reservation contact email", pass: Boolean(lower(restaurant.reservation_email || restaurant.primary_email || restaurant.contact_email || restaurant.email)) },
     { key: "service_periods", label: "Service periods", pass: servicePeriods.length > 0 || Boolean(clean(restaurant.opening_hours)) },
@@ -25667,7 +25683,7 @@ function validateRestaurantLifecycleTransition(restaurant = {}, body = {}, conte
       error.readiness = readiness;
       throw error;
     }
-    if (!readiness.can_activate) {
+    if (current !== "active" && !readiness.can_activate) {
       const error = new Error("Restaurant is not ready for activation.");
       error.status = 409;
       error.code = "RESTAURANT_ACTIVATION_READINESS_FAILED";
@@ -30780,6 +30796,7 @@ export async function handleApiRequest(input) {
         : error.message || "Server error."
     };
     if (error.code) payload.code = error.code;
+    if (error.readiness && typeof error.readiness === "object") payload.readiness = error.readiness;
     if (error.details?.send_after) payload.send_after = error.details.send_after;
     return json(status, payload);
   }

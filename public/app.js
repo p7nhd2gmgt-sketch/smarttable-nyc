@@ -547,6 +547,7 @@ const state = {
 const app = document.querySelector("#app");
 const toast = document.querySelector("#toast");
 const toastMessage = document.querySelector("#toastMessage");
+let toastHideTimer = null;
 const sessionButton = document.querySelector("#sessionButton");
 const adminDashboardNav = document.querySelector("#adminDashboardNav");
 const signupNav = document.querySelector("#signupNav");
@@ -905,7 +906,7 @@ function safeInternalNavigationUrl(value = "") {
   }
 }
 
-function showToast(message) {
+function showToast(message, durationMs = 3200) {
   if (!toast) return;
   const translatedMessage = translateInlineText(message);
   if (toastMessage) toastMessage.textContent = translatedMessage;
@@ -923,7 +924,11 @@ function showToast(message) {
     toastMessage.style.setProperty("-webkit-text-fill-color", "#ffffff", "important");
   }
   toast.classList.add("show");
-  window.setTimeout(() => toast.classList.remove("show"), 3200);
+  if (toastHideTimer !== null) window.clearTimeout(toastHideTimer);
+  toastHideTimer = window.setTimeout(() => {
+    toast.classList.remove("show");
+    toastHideTimer = null;
+  }, Math.max(1200, Number(durationMs) || 3200));
 }
 
 function setButtonPending(button, pending, label = t("saving_button", "Saving...")) {
@@ -12765,11 +12770,51 @@ function jsonForTextarea(value, fallback = []) {
 function restaurantReadinessPanel(readiness = {}) {
   const checks = [...(readiness.checks || []), ...(readiness.warnings || [])];
   if (!checks.length) return `<div class="empty-state">${escapeHtml(t("restaurant_readiness_empty", "Readiness checks are not available."))}</div>`;
+  const blockingKeys = new Set((readiness.blocking || []).map((item) => item.key));
   return `
     <ul class="restaurant-readiness-list">
-      ${checks.map((item) => `<li class="${item.pass ? "pass" : "warn"}"><span>${item.pass ? "PASS" : "CHECK"}</span>${escapeHtml(item.label || item.key)}</li>`).join("")}
+      ${checks.map((item) => {
+        const blocking = !item.pass && blockingKeys.has(item.key);
+        const status = item.pass
+          ? t("restaurant_readiness_pass", "PASS")
+          : blocking
+            ? t("restaurant_readiness_required", "REQUIRED")
+            : t("restaurant_readiness_recommended", "RECOMMENDED");
+        return `<li class="${item.pass ? "pass" : blocking ? "blocked" : "warn"}"><span>${escapeHtml(status)}</span>${escapeHtml(restaurantReadinessItemLabel(item))}</li>`;
+      }).join("")}
     </ul>
   `;
+}
+
+function restaurantReadinessItemLabel(item = {}) {
+  const keys = {
+    name: ["restaurant_name_label", "Restaurant name"],
+    slug: ["restaurant_slug_label", "Public slug"],
+    address: ["street_address_label", "Street address"],
+    city: ["city_label", "City"],
+    country: ["country_label", "Country"],
+    coordinates: ["restaurant_coordinates_label", "Map coordinates"],
+    cuisine: ["filter_cuisine_label", "Cuisine"],
+    timezone: ["timezone_label", "Timezone"],
+    reservation_email: ["restaurant_reservation_email_label", "Reservation email"],
+    service_periods: ["restaurant_service_periods_title", "Service periods"],
+    duplicate_warning: ["restaurant_duplicate_check_label", "Blocking duplicate warning"],
+    partner_access: ["restaurant_partner_access_label", "Partner access"],
+    public_profile: ["restaurant_public_profile_label", "Public profile"],
+    table_capacity: ["restaurant_table_config_status_label", "Table/capacity configuration"]
+  };
+  const definition = keys[item.key];
+  return definition ? t(definition[0], definition[1]) : (item.label || item.key || "");
+}
+
+function restaurantActivationBlockedMessage(readiness = {}) {
+  const missing = (readiness.blocking || []).map(restaurantReadinessItemLabel).filter(Boolean);
+  if (!missing.length) return t("restaurant_activation_not_ready", "Restaurant is not ready for activation. Open the restaurant overview to review the checklist.");
+  return contentTemplate(
+    "restaurant_activation_missing_fields",
+    "Cannot activate yet. Complete these required items: {{fields}}.",
+    { fields: missing.join(", ") }
+  );
 }
 
 function restaurantDetailTabButton(tab, label) {
@@ -13157,13 +13202,12 @@ function restaurantTable() {
               </td>
               <td>
                 ${restaurantLifecycleBadge(restaurant)}
-                ${representativeMode ? `<span class="form-note">${escapeHtml(t("field_rep_status_read_only", "Lifecycle status is controlled by Super Admin."))}</span>` : `<select data-field="status" aria-label="${escapeAttr(t("restaurant_status_label", "Restaurant status"))}">
-                  <option value="draft" ${lifecycle === "draft" ? "selected" : ""}>${escapeHtml(t("restaurant_status_draft", "Draft"))}</option>
-                  <option value="pending_review" ${lifecycle === "pending_review" ? "selected" : ""}>${escapeHtml(t("restaurant_status_pending_review", "Pending review"))}</option>
-                  <option value="active" ${lifecycle === "active" ? "selected" : ""}>${escapeHtml(t("restaurant_status_active", "Active"))}</option>
-                  <option value="suspended" ${lifecycle === "suspended" ? "selected" : ""}>${escapeHtml(t("restaurant_status_suspended", "Suspended"))}</option>
-                  <option value="archived" ${lifecycle === "archived" ? "selected" : ""}>${escapeHtml(t("restaurant_status_archived", "Archived"))}</option>
-                </select>`}
+                <span class="form-note">${escapeHtml(representativeMode
+                  ? t("field_rep_status_read_only", "Lifecycle status is controlled by Super Admin.")
+                  : t("restaurant_lifecycle_actions_hint", "Use the lifecycle action buttons to change status."))}</span>
+                ${!representativeMode && lifecycle !== "active" && restaurant.activation_readiness?.can_activate === false
+                  ? `<span class="form-note restaurant-activation-blocked-note">${escapeHtml(contentTemplate("restaurant_activation_missing_count", "{{count}} required items missing", { count: restaurant.activation_readiness?.blocking?.length || 0 }))}</span>`
+                  : ""}
               </td>
               <td>
                 <div class="button-row">
@@ -14151,6 +14195,15 @@ async function updateRestaurantStatus(id, status, button = null) {
   const activating = status === "active" || status === "approved";
   if (status === "suspended" && !confirm(t("restaurant_suspend_confirm", "Suspend this restaurant? It will no longer appear publicly."))) return;
   if (status === "archived" && !confirm(t("restaurant_archive_confirm", "Archive this restaurant? It will stay hidden until reactivated."))) return;
+  if (activating) {
+    const restaurant = state.restaurants.find((item) => String(item.id || "") === String(id || ""));
+    const readiness = restaurant?.activation_readiness;
+    if (readiness && readiness.can_activate === false) {
+      await viewRestaurantInAdmin(id);
+      showToast(restaurantActivationBlockedMessage(state.adminRestaurantDetail?.readiness || readiness), 9000);
+      return;
+    }
+  }
   if (activating && !confirm(t("restaurant_activate_confirm", "Activate this restaurant for the guest site if visibility is enabled?"))) return;
   const reason = ["suspended", "archived"].includes(status)
     ? (window.prompt(t("restaurant_status_reason_prompt", "Enter a reason for this status change.")) || "")
@@ -14173,6 +14226,11 @@ async function updateRestaurantStatus(id, status, button = null) {
     showToast(contentTemplate("restaurant_status_changed_toast", "Restaurant {{status}}.", { status }));
   } catch (error) {
     setButtonPending(button, false);
+    if (error.payload?.code === "RESTAURANT_ACTIVATION_READINESS_FAILED") {
+      await viewRestaurantInAdmin(id);
+      showToast(restaurantActivationBlockedMessage(error.payload?.readiness || state.adminRestaurantDetail?.readiness), 9000);
+      return;
+    }
     showToast(error.message);
   }
 }

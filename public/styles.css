@@ -9188,6 +9188,26 @@ html[data-theme="dark"] .guest-offer-filters input::-webkit-calendar-picker-indi
   color: #92400e;
 }
 
+.restaurant-readiness-list .blocked {
+  border-color: rgba(220, 38, 38, 0.34);
+}
+
+.restaurant-readiness-list .blocked span {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.restaurant-activation-blocked-note {
+  color: #b91c1c;
+  display: block;
+  font-weight: 800;
+  margin-top: 6px;
+}
+
+[data-theme="dark"] .restaurant-activation-blocked-note {
+  color: #fca5a5;
+}
+
 .admin-restaurant-detail {
   border: 1px solid var(--line);
   border-radius: 12px;

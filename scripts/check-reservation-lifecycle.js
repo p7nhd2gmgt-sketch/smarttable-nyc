@@ -141,6 +141,8 @@ assert(otherOfferSeed, "Demo data must include another restaurant offer for owne
 await api("PATCH", "/admin/restaurants", {
   id: otherOfferSeed.restaurant_id,
   status: "active",
+  city: "New York",
+  country: "US",
   primary_timezone: "America/New_York",
   activate_confirmed: true
 }, admin.headers);

@@ -87,6 +87,8 @@ function restaurantPayload(prefix = "restaurant-admin") {
     district: "Manhattan",
     state_region: "NY",
     postal_code: "10001",
+    latitude: 40.7505,
+    longitude: -73.9934,
     phone: uniquePhone(),
     website: `https://${prefix}-${stamp}.example.test`,
     cuisine_type: "Modern American",
@@ -160,6 +162,51 @@ async function assertRestaurantAdministrationRuntime() {
   assert.equal(restaurant.reservation_acceptance_mode, "manual", "Reservation settings must be saved.");
   assert.equal(restaurant.primary_timezone, "America/New_York", "Structured timezone must be saved.");
   assert.ok(Array.isArray(restaurant.service_periods) && restaurant.service_periods.length === 2, "Structured service periods must be saved.");
+
+  const incompletePayload = restaurantPayload("activation-readiness");
+  const incomplete = await api("POST", "/admin/restaurants", {
+    ...incompletePayload,
+    name: `Activation Readiness ${Date.now()}`,
+    slug: `activation-readiness-${Date.now()}`,
+    address: "",
+    street_address: "",
+    city: "",
+    country: "",
+    latitude: null,
+    longitude: null,
+    cuisine_type: "",
+    cuisine: "",
+    primary_timezone: "",
+    reservation_email: "",
+    opening_hours: "",
+    service_periods: []
+  }, adminHeaders);
+  await api("PATCH", "/admin/restaurants", {
+    id: incomplete.restaurant.id,
+    address: "",
+    street_address: "",
+    city: "",
+    country: "",
+    latitude: null,
+    longitude: null,
+    cuisine_type: "",
+    cuisine: "",
+    primary_timezone: "",
+    reservation_email: "",
+    opening_hours: "",
+    service_periods: []
+  }, adminHeaders);
+  const readinessFailure = await expectStatus("PATCH", "/admin/restaurants", 409, {
+    id: incomplete.restaurant.id,
+    status: "active",
+    activate_confirmed: true
+  }, adminHeaders, "Incomplete restaurants must not activate.");
+  assert.equal(readinessFailure.body?.code, "RESTAURANT_ACTIVATION_READINESS_FAILED", "Activation failure must expose a stable error code.");
+  assert.equal(readinessFailure.body?.readiness?.can_activate, false, "Activation failure must expose safe readiness details.");
+  const missingReadinessKeys = new Set((readinessFailure.body?.readiness?.blocking || []).map((item) => item.key));
+  for (const requiredKey of ["address", "city", "country", "coordinates", "cuisine", "timezone", "service_periods"]) {
+    assert.ok(missingReadinessKeys.has(requiredKey), `Activation readiness must identify missing ${requiredKey}.`);
+  }
 
   await expectStatus("POST", "/admin/restaurants", 409, {
     ...basePayload,
@@ -378,6 +425,8 @@ async function assertRestaurantAdministrationStaticContracts() {
     "restaurantCapacityForm",
     "restaurantDetailPanel",
     "restaurantSystemStatusPanel",
+    "restaurantActivationBlockedMessage",
+    "RESTAURANT_ACTIVATION_READINESS_FAILED",
     "data-restaurant-access-action",
     "api(\"/admin/restaurants\"",
     "api(\"/admin/restaurant-capacity\"",
@@ -402,7 +451,10 @@ async function assertRestaurantAdministrationStaticContracts() {
       "restaurant_status_history_title",
       "restaurant_system_status_title",
       "restaurant_access_reason_prompt",
-      "restaurant_activation_confirm_label"
+      "restaurant_activation_confirm_label",
+      "restaurant_activation_missing_fields",
+      "restaurant_activation_missing_count",
+      "restaurant_lifecycle_actions_hint"
     ]) {
       assert.ok(locale.includes(`"${key}"`), `${label} locale missing ${key}.`);
     }
