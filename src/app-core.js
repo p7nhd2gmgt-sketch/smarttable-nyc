@@ -25635,14 +25635,20 @@ function restaurantReadinessChecks(restaurant = {}, context = {}) {
     { key: "public_profile", label: "Public profile", pass: Boolean(clean(restaurant.description || restaurant.description_en || restaurant.short_description)) },
     { key: "table_capacity", label: "Table/capacity configuration", pass: activeTables.length > 0 || Number(restaurant.table_capacity || restaurant.capacity || 0) > 0 }
   ];
-  const blocking = checks.filter((item) => !item.pass);
+  const missing = [...checks, ...warnings].filter((item) => !item.pass);
   const completedCount = checks.filter((item) => item.pass).length + warnings.filter((item) => item.pass).length;
   const totalCount = checks.length + warnings.length;
   return {
     checks,
     warnings,
-    blocking,
-    can_activate: blocking.length === 0,
+    // Profile completeness is advisory. A Super Admin's explicit
+    // confirmation is sufficient for activation, while the checklist remains
+    // available so missing details can be completed later.
+    blocking: [],
+    missing,
+    can_activate: true,
+    activation_confirmation_required: true,
+    activation_approver_role: "super_admin",
     completeness_percent: totalCount ? Math.round((completedCount / totalCount) * 100) : 0
   };
 }
@@ -25668,6 +25674,13 @@ function validateRestaurantLifecycleTransition(restaurant = {}, body = {}, conte
   const next = { ...restaurant, ...restaurantStoragePatchForLifecycle(requested), ...restaurantPayload(body) };
   const readiness = restaurantReadinessChecks(next, context);
   if (requested === "active") {
+    if (context.actorIsSuperAdmin !== true) {
+      const error = new Error("Super Admin approval is required to activate a restaurant.");
+      error.status = 403;
+      error.code = "RESTAURANT_ACTIVATION_SUPER_ADMIN_REQUIRED";
+      error.readiness = readiness;
+      throw error;
+    }
     const confirmed = boolValue(body.activate_confirmed ?? body.activation_confirmed ?? body.confirm_activation);
     if (!confirmed) {
       const error = new Error("Activation requires explicit confirmation.");
@@ -25680,13 +25693,6 @@ function validateRestaurantLifecycleTransition(restaurant = {}, body = {}, conte
       const error = new Error("Test restaurants cannot become publicly visible without explicit test visibility confirmation.");
       error.status = 409;
       error.code = "TEST_RESTAURANT_PUBLIC_VISIBILITY_BLOCKED";
-      error.readiness = readiness;
-      throw error;
-    }
-    if (current !== "active" && !readiness.can_activate) {
-      const error = new Error("Restaurant is not ready for activation.");
-      error.status = 409;
-      error.code = "RESTAURANT_ACTIVATION_READINESS_FAILED";
       error.readiness = readiness;
       throw error;
     }
@@ -26456,7 +26462,7 @@ async function adminRestaurants(method, body, headers, query) {
       const relatedTables = (demo.restaurantTables || []).filter((table) => clean(table.restaurant_id) === clean(item.id));
       const assignedPartnerCount = (demo.restaurantUsers || []).filter((user) => clean(user.restaurant_id) === clean(item.id) && clean(user.status) === "active").length;
       const lifecycle = mutationBody.status !== undefined || mutationBody.onboarding_status !== undefined
-        ? validateRestaurantLifecycleTransition(item, mutationBody, { actorId: profile.id, tables: relatedTables, assigned_partner_count: assignedPartnerCount })
+        ? validateRestaurantLifecycleTransition(item, mutationBody, { actorId: profile.id, actorIsSuperAdmin: isSuperAdminProfile(profile), tables: relatedTables, assigned_partner_count: assignedPartnerCount })
         : null;
       const patch = { ...restaurantPayload(mutationBody), ...(lifecycle?.patch || {}) };
       const slugConflict = patch.slug ? await restaurantSlugConflict(patch.slug, item.id) : null;
@@ -26562,6 +26568,7 @@ async function adminRestaurants(method, body, headers, query) {
       const lifecycle = mutationBody.status !== undefined || mutationBody.onboarding_status !== undefined
         ? validateRestaurantLifecycleTransition(previous, mutationBody, {
           actorId: profile.id,
+          actorIsSuperAdmin: isSuperAdminProfile(profile),
           tables: relatedTables || [],
           assigned_partner_count: (restaurantUsers || []).filter((user) => clean(user.status) === "active").length
         })

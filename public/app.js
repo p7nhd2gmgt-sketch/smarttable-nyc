@@ -12807,13 +12807,17 @@ function restaurantReadinessItemLabel(item = {}) {
   return definition ? t(definition[0], definition[1]) : (item.label || item.key || "");
 }
 
-function restaurantActivationBlockedMessage(readiness = {}) {
-  const missing = (readiness.blocking || []).map(restaurantReadinessItemLabel).filter(Boolean);
-  if (!missing.length) return t("restaurant_activation_not_ready", "Restaurant is not ready for activation. Open the restaurant overview to review the checklist.");
+function restaurantActivationConfirmationMessage(readiness = {}) {
+  const missingItems = readiness.missing || [
+    ...(readiness.checks || []),
+    ...(readiness.warnings || [])
+  ].filter((item) => !item.pass);
+  const missing = missingItems.map(restaurantReadinessItemLabel).filter(Boolean);
+  if (!missing.length) return t("restaurant_activate_confirm", "Activate this restaurant for the guest site if visibility is enabled?");
   return contentTemplate(
-    "restaurant_activation_missing_fields",
-    "Cannot activate yet. Complete these required items: {{fields}}.",
-    { fields: missing.join(", ") }
+    "restaurant_activate_incomplete_confirm",
+    "This profile has {{count}} incomplete recommended details: {{fields}}. Super Admin approval is sufficient. Activate anyway?",
+    { count: missing.length, fields: missing.join(", ") }
   );
 }
 
@@ -13158,6 +13162,7 @@ function restaurantAdminPanel(includeAudit = true) {
 function restaurantTable() {
   if (!state.restaurants.length) return `<div class="empty-state">${escapeHtml(t("restaurants_empty_admin", "No restaurants yet."))}</div>`;
   const representativeMode = isFieldRepresentativeSession();
+  const superAdminMode = isSuperAdmin();
   const filtered = filteredAdminRestaurants();
   const totalPages = Math.max(1, Math.ceil(filtered.length / state.adminRestaurantPageSize));
   state.adminRestaurantPage = Math.min(Math.max(1, state.adminRestaurantPage), totalPages);
@@ -13204,9 +13209,11 @@ function restaurantTable() {
                 ${restaurantLifecycleBadge(restaurant)}
                 <span class="form-note">${escapeHtml(representativeMode
                   ? t("field_rep_status_read_only", "Lifecycle status is controlled by Super Admin.")
-                  : t("restaurant_lifecycle_actions_hint", "Use the lifecycle action buttons to change status."))}</span>
-                ${!representativeMode && lifecycle !== "active" && restaurant.activation_readiness?.can_activate === false
-                  ? `<span class="form-note restaurant-activation-blocked-note">${escapeHtml(contentTemplate("restaurant_activation_missing_count", "{{count}} required items missing", { count: restaurant.activation_readiness?.blocking?.length || 0 }))}</span>`
+                  : superAdminMode
+                    ? t("restaurant_lifecycle_actions_hint", "Use the lifecycle action buttons to change status.")
+                    : t("restaurant_activation_super_admin_only", "Activation requires Super Admin approval."))}</span>
+                ${superAdminMode && lifecycle !== "active" && (restaurant.activation_readiness?.missing?.length || 0) > 0
+                  ? `<span class="form-note restaurant-activation-advisory-note">${escapeHtml(contentTemplate("restaurant_activation_advisory_count", "{{count}} recommended details can be added later", { count: restaurant.activation_readiness.missing.length }))}</span>`
                   : ""}
               </td>
               <td>
@@ -13216,10 +13223,10 @@ function restaurantTable() {
                   ${!representativeMode || currentFieldRepresentativeAccess().can_invite_partners ? `<button class="ghost-button" data-invite-restaurant="${escapeAttr(restaurant.id)}" type="button">${escapeHtml(t("invite_partner_button", "Invite Partner"))}</button>` : ""}
                   ${!representativeMode || currentFieldRepresentativeAccess().can_manage_partner_access ? `<button class="ghost-button" data-manage-restaurant-access="${escapeAttr(restaurant.id)}" type="button">${escapeHtml(t("manage_access_button", "Manage Access"))}</button>` : ""}
                   ${representativeMode ? "" : `
-                    ${lifecycle !== "active" ? `<button class="ghost-button" data-restaurant-status-action="${escapeAttr(restaurant.id)}" data-next-status="active" type="button">${escapeHtml(t("activate_button", "Activate"))}</button>` : ""}
+                    ${superAdminMode && lifecycle !== "active" ? `<button class="ghost-button" data-restaurant-status-action="${escapeAttr(restaurant.id)}" data-next-status="active" type="button">${escapeHtml(t("activate_button", "Activate"))}</button>` : ""}
                     ${lifecycle !== "suspended" ? `<button class="ghost-button danger" data-restaurant-status-action="${escapeAttr(restaurant.id)}" data-next-status="suspended" type="button">${escapeHtml(t("suspend_button", "Suspend"))}</button>` : ""}
                     ${lifecycle !== "archived" ? `<button class="ghost-button danger" data-restaurant-status-action="${escapeAttr(restaurant.id)}" data-next-status="archived" type="button">${escapeHtml(t("archive_button", "Archive"))}</button>` : ""}
-                    ${["suspended", "archived"].includes(lifecycle) ? `<button class="ghost-button" data-restaurant-status-action="${escapeAttr(restaurant.id)}" data-next-status="active" type="button">${escapeHtml(t("reactivate_button", "Reactivate"))}</button>` : ""}
+                    ${superAdminMode && ["suspended", "archived"].includes(lifecycle) ? `<button class="ghost-button" data-restaurant-status-action="${escapeAttr(restaurant.id)}" data-next-status="active" type="button">${escapeHtml(t("reactivate_button", "Reactivate"))}</button>` : ""}
                     <button class="ghost-button" data-restaurant-audit="${escapeAttr(restaurant.id)}" type="button">${escapeHtml(t("view_audit_history_button", "View Audit History"))}</button>
                   `}
                 </div>
@@ -14193,18 +14200,17 @@ async function approveRestaurant(id, button) {
 
 async function updateRestaurantStatus(id, status, button = null) {
   const activating = status === "active" || status === "approved";
+  if (activating && !isSuperAdmin()) {
+    showToast(t("restaurant_activation_super_admin_only", "Activation requires Super Admin approval."));
+    return;
+  }
   if (status === "suspended" && !confirm(t("restaurant_suspend_confirm", "Suspend this restaurant? It will no longer appear publicly."))) return;
   if (status === "archived" && !confirm(t("restaurant_archive_confirm", "Archive this restaurant? It will stay hidden until reactivated."))) return;
   if (activating) {
     const restaurant = state.restaurants.find((item) => String(item.id || "") === String(id || ""));
     const readiness = restaurant?.activation_readiness;
-    if (readiness && readiness.can_activate === false) {
-      await viewRestaurantInAdmin(id);
-      showToast(restaurantActivationBlockedMessage(state.adminRestaurantDetail?.readiness || readiness), 9000);
-      return;
-    }
+    if (!confirm(restaurantActivationConfirmationMessage(readiness))) return;
   }
-  if (activating && !confirm(t("restaurant_activate_confirm", "Activate this restaurant for the guest site if visibility is enabled?"))) return;
   const reason = ["suspended", "archived"].includes(status)
     ? (window.prompt(t("restaurant_status_reason_prompt", "Enter a reason for this status change.")) || "")
     : "";
@@ -14226,11 +14232,6 @@ async function updateRestaurantStatus(id, status, button = null) {
     showToast(contentTemplate("restaurant_status_changed_toast", "Restaurant {{status}}.", { status }));
   } catch (error) {
     setButtonPending(button, false);
-    if (error.payload?.code === "RESTAURANT_ACTIVATION_READINESS_FAILED") {
-      await viewRestaurantInAdmin(id);
-      showToast(restaurantActivationBlockedMessage(error.payload?.readiness || state.adminRestaurantDetail?.readiness), 9000);
-      return;
-    }
     showToast(error.message);
   }
 }

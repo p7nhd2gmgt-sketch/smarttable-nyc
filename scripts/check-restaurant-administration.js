@@ -124,6 +124,7 @@ async function assertRestaurantAdministrationRuntime() {
   const admin = await loginAs("admin");
   const superadmin = await loginAs("superadmin");
   const adminHeaders = requestHeaders(admin.headers, "admin");
+  const superadminHeaders = requestHeaders(superadmin.headers, "superadmin");
 
   await expectStatus("GET", "/admin/restaurants", 401, {}, {}, "Anonymous users must not access restaurant administration.");
   await expectStatus("GET", "/admin/restaurants", 403, {}, guest.headers, "Guests must not access restaurant administration.");
@@ -196,16 +197,17 @@ async function assertRestaurantAdministrationRuntime() {
     opening_hours: "",
     service_periods: []
   }, adminHeaders);
-  const readinessFailure = await expectStatus("PATCH", "/admin/restaurants", 409, {
+  const incompleteActivation = await api("PATCH", "/admin/restaurants", {
     id: incomplete.restaurant.id,
     status: "active",
     activate_confirmed: true
-  }, adminHeaders, "Incomplete restaurants must not activate.");
-  assert.equal(readinessFailure.body?.code, "RESTAURANT_ACTIVATION_READINESS_FAILED", "Activation failure must expose a stable error code.");
-  assert.equal(readinessFailure.body?.readiness?.can_activate, false, "Activation failure must expose safe readiness details.");
-  const missingReadinessKeys = new Set((readinessFailure.body?.readiness?.blocking || []).map((item) => item.key));
-  for (const requiredKey of ["address", "city", "country", "coordinates", "cuisine", "timezone", "service_periods"]) {
-    assert.ok(missingReadinessKeys.has(requiredKey), `Activation readiness must identify missing ${requiredKey}.`);
+  }, superadminHeaders);
+  assert.equal(incompleteActivation.restaurant?.onboarding_status, "active", "Super Admin confirmation must activate an incomplete restaurant profile.");
+  assert.equal(incompleteActivation.activation_readiness?.can_activate, true, "Profile completeness must remain advisory for activation.");
+  assert.equal(incompleteActivation.activation_readiness?.blocking?.length, 0, "Incomplete profile details must not block activation.");
+  const missingReadinessKeys = new Set((incompleteActivation.activation_readiness?.missing || []).map((item) => item.key));
+  for (const recommendedKey of ["address", "city", "country", "coordinates", "cuisine", "timezone", "service_periods"]) {
+    assert.ok(missingReadinessKeys.has(recommendedKey), `The advisory checklist must identify missing ${recommendedKey}.`);
   }
 
   await expectStatus("POST", "/admin/restaurants", 409, {
@@ -233,13 +235,19 @@ async function assertRestaurantAdministrationRuntime() {
     id: restaurant.id,
     status: "active",
     visible_on_guest_site: true
-  }, adminHeaders, "Activation must require explicit confirmation.");
+  }, superadminHeaders, "Activation must require explicit confirmation.");
+  await expectStatus("PATCH", "/admin/restaurants", 403, {
+    id: restaurant.id,
+    status: "active",
+    visible_on_guest_site: true,
+    activate_confirmed: true
+  }, adminHeaders, "Regular admins must not approve restaurant activation.");
   const activated = await api("PATCH", "/admin/restaurants", {
     id: restaurant.id,
     status: "active",
     visible_on_guest_site: true,
     activate_confirmed: true
-  }, adminHeaders);
+  }, superadminHeaders);
   assert.equal(activated.restaurant.status, "approved", "Activation must map to approved public status.");
   await expectStatus("PATCH", "/admin/restaurants", 400, { id: restaurant.id, status: "suspended" }, adminHeaders, "Suspension must require a reason.");
   const suspended = await api("PATCH", "/admin/restaurants", {
@@ -259,7 +267,7 @@ async function assertRestaurantAdministrationRuntime() {
     id: restaurant.id,
     status: "active",
     activate_confirmed: true
-  }, adminHeaders);
+  }, superadminHeaders);
   assert.equal(reactivated.restaurant.onboarding_status, "active", "Authorized reactivation must work.");
 
   const testRestaurant = await api("POST", "/admin/restaurants", {
@@ -273,7 +281,7 @@ async function assertRestaurantAdministrationRuntime() {
     status: "active",
     visible_on_guest_site: true,
     activate_confirmed: true
-  }, adminHeaders, "Test restaurants must not accidentally become public.");
+  }, superadminHeaders, "Test restaurants must not accidentally become public.");
 
   await expectStatus("POST", "/admin/restaurant-capacity", 400, {
     restaurant_id: restaurant.id,
@@ -405,6 +413,7 @@ async function assertRestaurantAdministrationStaticContracts() {
     "function validateServicePeriods(",
     "SERVICE_PERIOD_OVERLAP",
     "TEST_RESTAURANT_PUBLIC_VISIBILITY_BLOCKED",
+    "RESTAURANT_ACTIVATION_SUPER_ADMIN_REQUIRED",
     "RESTAURANT_URL_INVALID",
     "RESTAURANT_TIMEZONE_INVALID"
   ]) {
@@ -425,8 +434,8 @@ async function assertRestaurantAdministrationStaticContracts() {
     "restaurantCapacityForm",
     "restaurantDetailPanel",
     "restaurantSystemStatusPanel",
-    "restaurantActivationBlockedMessage",
-    "RESTAURANT_ACTIVATION_READINESS_FAILED",
+    "restaurantActivationConfirmationMessage",
+    "restaurant_activate_incomplete_confirm",
     "data-restaurant-access-action",
     "api(\"/admin/restaurants\"",
     "api(\"/admin/restaurant-capacity\"",
@@ -452,8 +461,9 @@ async function assertRestaurantAdministrationStaticContracts() {
       "restaurant_system_status_title",
       "restaurant_access_reason_prompt",
       "restaurant_activation_confirm_label",
-      "restaurant_activation_missing_fields",
-      "restaurant_activation_missing_count",
+      "restaurant_activate_incomplete_confirm",
+      "restaurant_activation_advisory_count",
+      "restaurant_activation_super_admin_only",
       "restaurant_lifecycle_actions_hint"
     ]) {
       assert.ok(locale.includes(`"${key}"`), `${label} locale missing ${key}.`);

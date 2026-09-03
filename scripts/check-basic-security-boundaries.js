@@ -89,6 +89,7 @@ async function assertProtectedApiBoundaries() {
   const admin = await loginAs(TEST_ACCOUNTS.admin.email, TEST_ACCOUNTS.admin.password, "admin");
   const superAdmin = await loginAs(TEST_ACCOUNTS.superadmin.email, TEST_ACCOUNTS.superadmin.password, "super_admin");
   const adminAuditHeaders = requestHeaders(admin.headers, "admin");
+  const superAdminAuditHeaders = requestHeaders(superAdmin.headers, "superadmin");
 
   await expectStatus("GET", "/guest/account", 401, {}, {}, "Logged-out users must not access guest account routes.");
   await expectStatus("GET", "/partner/profile", 401, {}, {}, "Logged-out users must not access partner routes.");
@@ -169,8 +170,9 @@ async function assertProtectedApiBoundaries() {
   assert.equal(typeof listedUnique?.assigned_partner_count, "number", "Admin restaurant list must expose assigned partner count.");
   assert.equal(typeof listedUnique?.active_offer_count, "number", "Admin restaurant list must expose active offer count.");
   assert.equal(typeof listedUnique?.upcoming_reservation_count, "number", "Admin restaurant list must expose upcoming reservation count.");
-  await expectStatus("PATCH", "/admin/restaurants", 400, { id: uniqueDraft.restaurant.id, status: "active", visible_on_guest_site: true }, adminAuditHeaders, "Restaurant activation must require explicit confirmation.");
-  const activated = await api("PATCH", "/admin/restaurants", { id: uniqueDraft.restaurant.id, status: "active", visible_on_guest_site: true, activate_confirmed: true }, adminAuditHeaders);
+  await expectStatus("PATCH", "/admin/restaurants", 400, { id: uniqueDraft.restaurant.id, status: "active", visible_on_guest_site: true }, superAdminAuditHeaders, "Restaurant activation must require explicit confirmation.");
+  await expectStatus("PATCH", "/admin/restaurants", 403, { id: uniqueDraft.restaurant.id, status: "active", visible_on_guest_site: true, activate_confirmed: true }, adminAuditHeaders, "Regular admins must not approve restaurant activation.");
+  const activated = await api("PATCH", "/admin/restaurants", { id: uniqueDraft.restaurant.id, status: "active", visible_on_guest_site: true, activate_confirmed: true }, superAdminAuditHeaders);
   assert.equal(activated.restaurant?.status, "approved", "Activating a restaurant must map to the existing approved public status.");
   assert.equal(activated.restaurant?.onboarding_status, "active", "Activating a restaurant must store active onboarding status.");
   await expectStatus("PATCH", "/admin/restaurants", 400, { id: uniqueDraft.restaurant.id, status: "suspended" }, adminAuditHeaders, "Suspending a restaurant must require an audit reason.");
@@ -179,8 +181,8 @@ async function assertProtectedApiBoundaries() {
   await expectStatus("PATCH", "/admin/restaurants", 400, { id: uniqueDraft.restaurant.id, status: "archived" }, adminAuditHeaders, "Archiving a restaurant must require an audit reason.");
   const archived = await api("PATCH", "/admin/restaurants", { id: uniqueDraft.restaurant.id, status: "archived", status_reason: "Security regression archive." }, adminAuditHeaders);
   assert.equal(archived.restaurant?.onboarding_status, "archived", "Archiving a restaurant must persist archived lifecycle status.");
-  const reactivated = await api("PATCH", "/admin/restaurants", { id: uniqueDraft.restaurant.id, status: "active", activate_confirmed: true }, adminAuditHeaders);
-  assert.equal(reactivated.restaurant?.onboarding_status, "active", "Archived restaurants must be safely reactivatable by admin.");
+  const reactivated = await api("PATCH", "/admin/restaurants", { id: uniqueDraft.restaurant.id, status: "active", activate_confirmed: true }, superAdminAuditHeaders);
+  assert.equal(reactivated.restaurant?.onboarding_status, "active", "Archived restaurants must be safely reactivatable by Super Admin.");
   const detail = await api("GET", `/admin/restaurant-detail?id=${encodeURIComponent(uniqueDraft.restaurant.id)}`, {}, admin.headers);
   assert.equal(detail.restaurant?.id, uniqueDraft.restaurant.id, "Admin restaurant detail endpoint must return the selected restaurant.");
   assert.equal(detail.system_status?.automatic_table_allocation_enabled, false, "BASIC must not claim automatic exact table assignment.");
@@ -203,7 +205,7 @@ async function assertProtectedApiBoundaries() {
     status: "active",
     visible_on_guest_site: true,
     activate_confirmed: true
-  }, adminAuditHeaders, "Test restaurants must not accidentally become public.");
+  }, superAdminAuditHeaders, "Test restaurants must not accidentally become public.");
   await expectStatus("POST", "/admin/restaurant-capacity", 400, {
     restaurant_id: uniqueDraft.restaurant.id,
     dining_areas: [{ name: "Main", code: "main", capacity: 20, status: "active" }],

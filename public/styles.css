@@ -9197,15 +9197,15 @@ html[data-theme="dark"] .guest-offer-filters input::-webkit-calendar-picker-indi
   color: #991b1b;
 }
 
-.restaurant-activation-blocked-note {
-  color: #b91c1c;
+.restaurant-activation-advisory-note {
+  color: #92400e;
   display: block;
   font-weight: 800;
   margin-top: 6px;
 }
 
-[data-theme="dark"] .restaurant-activation-blocked-note {
-  color: #fca5a5;
+[data-theme="dark"] .restaurant-activation-advisory-note {
+  color: #fcd34d;
 }
 
 .admin-restaurant-detail {
