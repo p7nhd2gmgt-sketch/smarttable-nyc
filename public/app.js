@@ -4291,6 +4291,12 @@ function activeGuestFilterCount(filters = {}) {
   return valueCount + availabilityCount + sortCount;
 }
 
+function syncGuestNativeFilterControl(control) {
+  const wrapper = control?.closest?.(".guest-native-filter-control");
+  if (!wrapper) return;
+  wrapper.classList.toggle("has-value", Boolean(String(control.value || "").trim()));
+}
+
 function filterBar() {
   const filters = state.filters;
   const activeCount = activeGuestFilterCount(filters);
@@ -4315,8 +4321,18 @@ function filterBar() {
         <label>${escapeHtml(t("filter_neighborhood_label", "Neighborhood"))}<input name="neighborhood" value="${escapeAttr(filters.neighborhood)}" placeholder="${escapeAttr(t("filter_neighborhood_placeholder", "West Village"))}"></label>
         <label>${escapeHtml(t("filter_cuisine_label", "Cuisine"))}<input name="cuisine" value="${escapeAttr(filters.cuisine)}" placeholder="${escapeAttr(t("filter_cuisine_placeholder", "Italian"))}"></label>
         <label>${escapeHtml(t("filter_discount_label", "Minimum discount"))}<input name="discount" type="number" min="0" max="90" value="${escapeAttr(filters.discount)}" placeholder="${escapeAttr(t("filter_discount_placeholder", "20"))}"></label>
-        <label>${escapeHtml(t("filter_date_label", "Date"))}<input name="date" type="date" value="${escapeAttr(filters.date)}"></label>
-        <label>${escapeHtml(t("filter_time_label", "Time"))}<input name="time" type="time" value="${escapeAttr(filters.time)}"></label>
+        <label>${escapeHtml(t("filter_date_label", "Date"))}
+          <span class="guest-native-filter-control ${String(filters.date || "").trim() ? "has-value" : ""}">
+            <input name="date" type="date" value="${escapeAttr(filters.date)}" aria-label="${escapeAttr(t("filter_date_label", "Date"))}">
+            <span class="guest-native-filter-placeholder" aria-hidden="true">${escapeHtml(t("filter_any_date_placeholder", "Any date"))}</span>
+          </span>
+        </label>
+        <label>${escapeHtml(t("filter_time_label", "Time"))}
+          <span class="guest-native-filter-control ${String(filters.time || "").trim() ? "has-value" : ""}">
+            <input name="time" type="time" value="${escapeAttr(filters.time)}" aria-label="${escapeAttr(t("filter_time_label", "Time"))}">
+            <span class="guest-native-filter-placeholder" aria-hidden="true">${escapeHtml(t("filter_any_time_placeholder", "Any time"))}</span>
+          </span>
+        </label>
         <label>${escapeHtml(t("filter_party_size_label", "Party size"))}<input name="partySize" type="number" min="1" value="${escapeAttr(filters.partySize)}" placeholder="2"></label>
         <label class="guest-filter-wide">${escapeHtml(t("sort_label", "Sort"))}
           <select name="sort">
@@ -6804,11 +6820,13 @@ function bindGuestEvents(restaurants) {
     control.addEventListener("input", () => {
       if (control.type === "checkbox") state.filters[control.name] = control.checked;
       else state.filters[control.name] = control.value;
+      syncGuestNativeFilterControl(control);
       if (liveFilter) renderGuest();
     });
     control.addEventListener("change", () => {
       if (control.type === "checkbox") state.filters[control.name] = control.checked;
       else state.filters[control.name] = control.value;
+      syncGuestNativeFilterControl(control);
       if (liveFilter) renderGuest();
     });
   });

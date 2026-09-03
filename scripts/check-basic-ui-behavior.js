@@ -89,10 +89,14 @@ includesAll(app, [
 
 includesAll(app, [
   "function activeGuestFilterCount(",
+  "function syncGuestNativeFilterControl(",
   "guest-offer-filter-shell",
   "data-toggle-offer-filters",
   "aria-controls=\"guestOfferFilters\"",
   "id=\"guestOfferFilters\"",
+  "guest-native-filter-control",
+  "filter_any_date_placeholder",
+  "filter_any_time_placeholder",
   "guest-offer-filter-actions",
   "apply_filters_button",
   "state.offerFiltersExpanded = false"
@@ -103,6 +107,9 @@ includesAll(styles, [
   ".guest-offer-filter-shell.is-open .guest-offer-filters",
   "grid-template-columns: repeat(2, minmax(0, 1fr))",
   "input[type=\"date\"]",
+  ".guest-native-filter-placeholder",
+  ".guest-native-filter-control.has-value",
+  "::-webkit-date-and-time-value",
   "-webkit-text-fill-color: #f4f2e9"
 ], "Responsive, high-contrast guest offer filters");
 
