@@ -8670,6 +8670,92 @@ html[data-theme="dark"] .guest-offer-filters input::-webkit-calendar-picker-indi
   margin-top: 6px;
 }
 
+.field-warning {
+  color: #8a4b00;
+  display: block;
+  font-size: 0.84rem;
+  font-weight: 800;
+  margin-top: 6px;
+}
+
+.inline-field-feedback {
+  line-height: 1.35;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  width: 100%;
+}
+
+.inline-field-feedback::before {
+  content: "\26A0\00A0";
+}
+
+input.is-field-invalid,
+select.is-field-invalid,
+textarea.is-field-invalid {
+  background: rgba(180, 35, 24, 0.1) !important;
+  border-color: #d92d20 !important;
+  box-shadow: 0 0 0 2px rgba(217, 45, 32, 0.18) !important;
+}
+
+input.is-field-warning,
+select.is-field-warning,
+textarea.is-field-warning {
+  background: rgba(245, 158, 11, 0.11) !important;
+  border-color: #d97706 !important;
+  box-shadow: 0 0 0 2px rgba(217, 119, 6, 0.16) !important;
+}
+
+.has-field-error > legend,
+.has-field-error > span:first-child {
+  color: #b42318;
+}
+
+.has-field-warning > legend,
+.has-field-warning > span:first-child {
+  color: #8a4b00;
+}
+
+.has-readiness-warning {
+  box-shadow: inset 4px 0 0 #d97706;
+}
+
+[data-theme="dark"] .field-error,
+[data-theme="dark"] .form-error {
+  color: #ff9b91;
+}
+
+[data-theme="dark"] .field-warning {
+  color: #ffd27a;
+}
+
+[data-theme="dark"] input.is-field-invalid,
+[data-theme="dark"] select.is-field-invalid,
+[data-theme="dark"] textarea.is-field-invalid {
+  background: rgba(127, 29, 29, 0.34) !important;
+  border-color: #ff746b !important;
+  box-shadow: 0 0 0 2px rgba(255, 116, 107, 0.2) !important;
+}
+
+[data-theme="dark"] input.is-field-warning,
+[data-theme="dark"] select.is-field-warning,
+[data-theme="dark"] textarea.is-field-warning {
+  background: rgba(120, 53, 15, 0.34) !important;
+  border-color: #fbbf24 !important;
+  box-shadow: 0 0 0 2px rgba(251, 191, 36, 0.18) !important;
+}
+
+@media (forced-colors: active) {
+  input.is-field-invalid,
+  select.is-field-invalid,
+  textarea.is-field-invalid,
+  input.is-field-warning,
+  select.is-field-warning,
+  textarea.is-field-warning {
+    outline: 3px solid CanvasText;
+    outline-offset: 2px;
+  }
+}
+
 .has-error input,
 .has-error select,
 .has-error textarea,

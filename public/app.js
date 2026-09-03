@@ -931,6 +931,238 @@ function showToast(message, durationMs = 3200) {
   }, Math.max(1200, Number(durationMs) || 3200));
 }
 
+let inlineValidationCounter = 0;
+let inlineFormValidationInstalled = false;
+
+function isInlineValidationControl(control) {
+  return Boolean(control?.matches?.("input:not([type='hidden']):not([type='submit']):not([type='button']):not([type='reset']), select, textarea"));
+}
+
+function relatedValidationControls(control) {
+  if (!isInlineValidationControl(control)) return [];
+  const form = control.form;
+  const type = String(control.type || "").toLowerCase();
+  if (!form || !control.name || !["checkbox", "radio"].includes(type)) return [control];
+  return Array.from(form.elements).filter((candidate) => isInlineValidationControl(candidate) && candidate.name === control.name);
+}
+
+function validationFeedbackKey(control) {
+  const controls = relatedValidationControls(control);
+  const primary = controls[0] || control;
+  if (!primary.dataset.inlineValidationKey) {
+    inlineValidationCounter += 1;
+    primary.dataset.inlineValidationKey = `field-${inlineValidationCounter}`;
+  }
+  controls.forEach((candidate) => {
+    candidate.dataset.inlineValidationKey = primary.dataset.inlineValidationKey;
+  });
+  return primary.dataset.inlineValidationKey;
+}
+
+function validationFeedbackHost(control) {
+  const type = String(control?.type || "").toLowerCase();
+  if (["checkbox", "radio"].includes(type)) {
+    return control.closest("fieldset, .signup-chip-grid, .signup-consent-list, .checkbox-row, .check-row, .check, label") || control.parentElement;
+  }
+  return control.closest("label, .guest-field, .form-field, .field, td") || control.parentElement;
+}
+
+function inlineValidationMessage(control) {
+  const validity = control?.validity;
+  if (!validity) return t("form_validation_invalid", "Check this field.");
+  if (validity.valueMissing) return t("form_validation_required", "This field is required.");
+  if (validity.typeMismatch && control.type === "email") return t("form_validation_email", "Enter a valid email address.");
+  if (validity.typeMismatch && control.type === "url") return t("form_validation_url", "Enter a valid web address.");
+  if (validity.tooShort) return contentTemplate("form_validation_too_short", "Use at least {{count}} characters.", { count: control.minLength });
+  if (validity.tooLong) return contentTemplate("form_validation_too_long", "Use no more than {{count}} characters.", { count: control.maxLength });
+  if (validity.rangeUnderflow) return contentTemplate("form_validation_minimum", "Enter a value of at least {{value}}.", { value: control.min });
+  if (validity.rangeOverflow) return contentTemplate("form_validation_maximum", "Enter a value no greater than {{value}}.", { value: control.max });
+  if (validity.stepMismatch || validity.badInput) return t("form_validation_number", "Enter a valid number.");
+  if (validity.patternMismatch) return t("form_validation_format", "Use the requested format.");
+  return cleanString(control.validationMessage) || t("form_validation_invalid", "Check this field.");
+}
+
+function clearInlineFieldFeedback(control) {
+  if (!isInlineValidationControl(control)) return;
+  const controls = relatedValidationControls(control);
+  const key = controls[0]?.dataset.inlineValidationKey || control.dataset.inlineValidationKey;
+  controls.forEach((candidate) => {
+    candidate.classList.remove("is-field-invalid", "is-field-warning");
+    candidate.removeAttribute("aria-invalid");
+    candidate.removeAttribute("data-field-warning");
+    if (key) {
+      const describedBy = String(candidate.getAttribute("aria-describedby") || "")
+        .split(/\s+/)
+        .filter((value) => value && value !== `${key}-feedback`)
+        .join(" ");
+      if (describedBy) candidate.setAttribute("aria-describedby", describedBy);
+      else candidate.removeAttribute("aria-describedby");
+    }
+  });
+  if (!key) return;
+  document.querySelectorAll(`[data-inline-validation-for="${key}"]`).forEach((feedback) => {
+    const host = feedback.parentElement;
+    feedback.remove();
+    if (host && !host.querySelector(".inline-field-feedback")) {
+      host.classList.remove("has-field-error", "has-field-warning");
+    }
+  });
+}
+
+function markInlineFieldFeedback(control, message, { severity = "error" } = {}) {
+  if (!isInlineValidationControl(control)) return null;
+  clearInlineFieldFeedback(control);
+  const controls = relatedValidationControls(control);
+  const primary = controls[0] || control;
+  const key = validationFeedbackKey(primary);
+  const host = validationFeedbackHost(primary);
+  if (!host) return null;
+  const warning = severity === "warning";
+  controls.forEach((candidate) => {
+    candidate.classList.add(warning ? "is-field-warning" : "is-field-invalid");
+    if (warning) candidate.setAttribute("data-field-warning", "true");
+    else candidate.setAttribute("aria-invalid", "true");
+    const describedBy = new Set(String(candidate.getAttribute("aria-describedby") || "").split(/\s+/).filter(Boolean));
+    describedBy.add(`${key}-feedback`);
+    candidate.setAttribute("aria-describedby", [...describedBy].join(" "));
+  });
+  host.classList.add(warning ? "has-field-warning" : "has-field-error");
+  const feedback = document.createElement("small");
+  feedback.id = `${key}-feedback`;
+  feedback.className = `${warning ? "field-warning" : "field-error"} inline-field-feedback`;
+  feedback.dataset.inlineValidationFor = key;
+  feedback.setAttribute("role", warning ? "status" : "alert");
+  feedback.textContent = message || inlineValidationMessage(primary);
+  host.append(feedback);
+  return primary;
+}
+
+function formControlsNamed(form, name) {
+  if (!form || !name) return [];
+  return Array.from(form.querySelectorAll("input, select, textarea"))
+    .filter((control) => control.name === name || control.dataset.field === name);
+}
+
+function markFormFieldFeedback(form, name, message, options = {}) {
+  const controls = formControlsNamed(form, name);
+  if (!controls.length) return null;
+  return markInlineFieldFeedback(controls.find((control) => control.type !== "hidden") || controls[0], message, options);
+}
+
+function focusValidationControl(control) {
+  if (!control) return;
+  window.setTimeout(() => {
+    control.scrollIntoView?.({ behavior: "smooth", block: "center" });
+    control.focus?.({ preventScroll: true });
+  }, 0);
+}
+
+function notifyHighlightedFormErrors() {
+  showToast(t("form_validation_review_highlighted", "Review the highlighted fields and correct the indicated errors."), 4600);
+}
+
+function customFormValidationErrors(form) {
+  const errors = [];
+  const value = (name) => cleanString(formControlsNamed(form, name).find((control) => control.type !== "hidden")?.value);
+  const add = (name, message) => {
+    if (formControlsNamed(form, name).length) errors.push({ name, message });
+  };
+  const password = value("password");
+  const confirmation = value("confirm_password");
+  if (confirmation || formControlsNamed(form, "confirm_password").length) {
+    if (password && passwordStrength(password).score < 5) {
+      add("password", t("signup_error_password", "Use at least 8 characters with uppercase, lowercase, number, and symbol."));
+    }
+    if (password && confirmation && password !== confirmation) {
+      add("confirm_password", t("signup_error_password_match", "Passwords must match."));
+    }
+  }
+  const startTime = value("start_time");
+  const endTime = value("end_time");
+  if (startTime && endTime && endTime <= startTime) {
+    add("end_time", t("form_validation_time_order", "End time must be later than start time."));
+  }
+  const eventStart = value("event_start_time");
+  const eventEnd = value("event_end_time");
+  if (eventStart && eventEnd && eventEnd <= eventStart) {
+    add("event_end_time", t("form_validation_time_order", "End time must be later than start time."));
+  }
+  const fromDate = value("from");
+  const toDate = value("to");
+  if (fromDate && toDate && toDate < fromDate) {
+    add("to", t("form_validation_date_order", "End date must be on or after start date."));
+  }
+  for (const name of ["holiday_exceptions", "temporary_closures", "dining_areas", "tables", "capacity_overrides"]) {
+    const json = value(name);
+    if (!json) continue;
+    try {
+      JSON.parse(json);
+    } catch {
+      add(name, t("form_validation_json", "Enter valid JSON data."));
+    }
+  }
+  const latitude = value("latitude");
+  if (latitude && (!Number.isFinite(Number(latitude)) || Number(latitude) < -90 || Number(latitude) > 90)) {
+    add("latitude", t("form_validation_latitude", "Latitude must be between -90 and 90."));
+  }
+  const longitude = value("longitude");
+  if (longitude && (!Number.isFinite(Number(longitude)) || Number(longitude) < -180 || Number(longitude) > 180)) {
+    add("longitude", t("form_validation_longitude", "Longitude must be between -180 and 180."));
+  }
+  return errors;
+}
+
+function installInlineFormValidation() {
+  if (inlineFormValidationInstalled) return;
+  inlineFormValidationInstalled = true;
+  document.addEventListener("invalid", (event) => {
+    const control = event.target;
+    if (!isInlineValidationControl(control)) return;
+    event.preventDefault();
+    const form = control.form;
+    form?.classList.add("form-validation-attempted");
+    const firstInvalid = !form?.querySelector(".is-field-invalid");
+    markInlineFieldFeedback(control, inlineValidationMessage(control));
+    if (firstInvalid) {
+      focusValidationControl(control);
+      notifyHighlightedFormErrors();
+    }
+  }, true);
+  document.addEventListener("submit", (event) => {
+    const form = event.target;
+    if (!(form instanceof HTMLFormElement)) return;
+    form.classList.add("form-validation-attempted");
+    const invalidControls = Array.from(form.elements)
+      .filter((control) => isInlineValidationControl(control) && control.willValidate && !control.validity.valid);
+    const customErrors = invalidControls.length ? [] : customFormValidationErrors(form);
+    if (!invalidControls.length && !customErrors.length) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    invalidControls.forEach((control) => markInlineFieldFeedback(control, inlineValidationMessage(control)));
+    customErrors.forEach(({ name, message }) => markFormFieldFeedback(form, name, message));
+    const firstCustomControl = customErrors.length ? formControlsNamed(form, customErrors[0].name)[0] : null;
+    focusValidationControl(invalidControls[0] || firstCustomControl);
+    notifyHighlightedFormErrors();
+  }, true);
+  const refreshFeedback = (event) => {
+    const control = event.target;
+    if (!isInlineValidationControl(control)) return;
+    const form = control.form;
+    if (form?.classList.contains("form-validation-attempted") && control.willValidate && !control.validity.valid) {
+      markInlineFieldFeedback(control, inlineValidationMessage(control));
+      return;
+    }
+    clearInlineFieldFeedback(control);
+  };
+  document.addEventListener("input", refreshFeedback, true);
+  document.addEventListener("change", refreshFeedback, true);
+  document.addEventListener("focusout", (event) => {
+    const control = event.target;
+    if (!isInlineValidationControl(control) || !control.willValidate || control.validity.valid || !cleanString(control.value)) return;
+    markInlineFieldFeedback(control, inlineValidationMessage(control));
+  }, true);
+}
+
 function setButtonPending(button, pending, label = t("saving_button", "Saving...")) {
   if (!button) return;
   if (pending) {
@@ -9660,11 +9892,16 @@ function bindGuestAccountEvents() {
     const wantsMarketingMessages = preferences.has("SmartTable news and marketing");
     const marketingConsent = Boolean(data.marketing_email_enabled);
     if (wantsMarketingMessages && !marketingConsent) {
-      showToast(t("marketing_consent_required_for_messages", "Enable marketing consent to receive marketing messages."));
+      const message = t("marketing_consent_required_for_messages", "Enable marketing consent to receive marketing messages.");
+      focusValidationControl(markFormFieldFeedback(event.currentTarget, "marketing_email_enabled", message));
+      showToast(message);
       return;
     }
     if (smsSelected && (!data.sms_consent || !isValidInternationalPhone(data.sms_country_code, data.sms_phone_number))) {
-      showToast(t("signup_error_sms_phone", "Enter a valid SMS number and separate SMS consent."));
+      const message = t("signup_error_sms_phone", "Enter a valid SMS number and separate SMS consent.");
+      const field = !data.sms_consent ? "sms_consent" : "sms_phone_number";
+      focusValidationControl(markFormFieldFeedback(event.currentTarget, field, message));
+      showToast(message);
       return;
     }
     try {
@@ -9990,7 +10227,9 @@ function bindGuestAccountEvents() {
     event.preventDefault();
     const data = formObject(event.currentTarget);
     if (data.confirmation_phrase !== "DELETE MY ACCOUNT") {
-      showToast(t("delete_phrase_required_toast", "Type DELETE MY ACCOUNT to confirm."));
+      const message = t("delete_phrase_required_toast", "Type DELETE MY ACCOUNT to confirm.");
+      focusValidationControl(markFormFieldFeedback(event.currentTarget, "confirmation_phrase", message));
+      showToast(message);
       return;
     }
     if (!confirm(t("delete_account_confirm_dialog", "Delete and anonymize this account? This cannot be undone."))) return;
@@ -10143,15 +10382,21 @@ function renderPartnerInvitation() {
     event.preventDefault();
     const data = formObject(form);
     if (passwordStrength(data.password).score < 5) {
-      showToast(t("signup_error_password", "Use at least 8 characters with uppercase, lowercase, number, and symbol."));
+      const message = t("signup_error_password", "Use at least 8 characters with uppercase, lowercase, number, and symbol.");
+      focusValidationControl(markFormFieldFeedback(form, "password", message));
+      showToast(message);
       return;
     }
     if (data.password !== data.confirm_password) {
-      showToast(t("signup_error_password_match", "Passwords must match."));
+      const message = t("signup_error_password_match", "Passwords must match.");
+      focusValidationControl(markFormFieldFeedback(form, "confirm_password", message));
+      showToast(message);
       return;
     }
     if (!boolValue(data.partner_terms_consent)) {
-      showToast(t("partner_invite_terms_required", "Accept the Partner Terms and Privacy Policy to create partner access."));
+      const message = t("partner_invite_terms_required", "Accept the Partner Terms and Privacy Policy to create partner access.");
+      focusValidationControl(markFormFieldFeedback(form, "partner_terms_consent", message));
+      showToast(message);
       return;
     }
     try {
@@ -10227,15 +10472,21 @@ function renderFieldRepresentativeInvitation() {
     event.preventDefault();
     const data = formObject(form);
     if (passwordStrength(data.password).score < 5) {
-      showToast(t("signup_error_password", "Use at least 8 characters with uppercase, lowercase, number, and symbol."));
+      const message = t("signup_error_password", "Use at least 8 characters with uppercase, lowercase, number, and symbol.");
+      focusValidationControl(markFormFieldFeedback(form, "password", message));
+      showToast(message);
       return;
     }
     if (data.password !== data.confirm_password) {
-      showToast(t("signup_error_password_match", "Passwords must match."));
+      const message = t("signup_error_password_match", "Passwords must match.");
+      focusValidationControl(markFormFieldFeedback(form, "confirm_password", message));
+      showToast(message);
       return;
     }
     if (!boolValue(data.terms_consent)) {
-      showToast(t("field_representative_invite_terms_required", "Accept the Terms and Privacy Policy to activate access."));
+      const message = t("field_representative_invite_terms_required", "Accept the Terms and Privacy Policy to activate access.");
+      focusValidationControl(markFormFieldFeedback(form, "terms_consent", message));
+      showToast(message);
       return;
     }
     const submitButton = form.querySelector('[type="submit"]');
@@ -11872,7 +12123,12 @@ async function submitFieldRepresentativeInvitation(event) {
   const form = event.currentTarget;
   const button = form.querySelector('[type="submit"]');
   const payload = fieldRepresentativeAccessFormPayload(form);
-  if (!payload.market_ids.length) return showToast(t("field_rep_market_required", "Select at least one territory."));
+  if (!payload.market_ids.length) {
+    const message = t("field_rep_market_required", "Select at least one territory.");
+    focusValidationControl(markFormFieldFeedback(form, "market_ids", message));
+    showToast(message);
+    return;
+  }
   try {
     setButtonPending(button, true);
     await api("/superadmin/field-representatives", { method: "POST", body: JSON.stringify(payload) });
@@ -11888,7 +12144,12 @@ async function submitFieldRepresentativeInvitation(event) {
 async function updateFieldRepresentativeAccess(form) {
   const button = form.querySelector('[type="submit"]');
   const payload = fieldRepresentativeAccessFormPayload(form);
-  if (!payload.market_ids.length) return showToast(t("field_rep_market_required", "Select at least one territory."));
+  if (!payload.market_ids.length) {
+    const message = t("field_rep_market_required", "Select at least one territory.");
+    focusValidationControl(markFormFieldFeedback(form, "market_ids", message));
+    showToast(message);
+    return;
+  }
   try {
     setButtonPending(button, true);
     await api("/superadmin/field-representatives", { method: "PATCH", body: JSON.stringify({ ...payload, action: "update_access" }) });
@@ -12489,6 +12750,9 @@ function renderAdmin() {
   bindReservationStatusButtons("/admin/reservations", loadAdminData, renderAdmin);
   bindReservationFilterForms();
   bindAnalyticsControls();
+  if (state.adminRestaurantDetailId && state.adminRestaurantDetail?.readiness) {
+    highlightRestaurantReadinessFields(state.adminRestaurantDetailId, state.adminRestaurantDetail.readiness);
+  }
   finalizeRenderedLanguage();
 }
 
@@ -12819,6 +13083,63 @@ function restaurantActivationConfirmationMessage(readiness = {}) {
     "This profile has {{count}} incomplete recommended details: {{fields}}. Super Admin approval is sufficient. Activate anyway?",
     { count: missing.length, fields: missing.join(", ") }
   );
+}
+
+const restaurantReadinessFieldMap = Object.freeze({
+  name: ["name"],
+  slug: ["slug"],
+  address: ["address", "street_address"],
+  city: ["city"],
+  country: ["country"],
+  coordinates: ["latitude", "longitude"],
+  cuisine: ["cuisine_type", "cuisine"],
+  timezone: ["primary_timezone", "timezone"],
+  reservation_email: ["reservation_email", "email"],
+  service_periods: ["opens_at", "closes_at", "opening_hours"],
+  public_profile: ["short_description", "full_description", "description_primary"],
+  table_capacity: ["guest_capacity", "table_capacity", "tables", "dining_areas"]
+});
+
+function highlightRestaurantReadinessFields(restaurantId, readiness = {}) {
+  const missing = readiness.missing || [
+    ...(readiness.checks || []),
+    ...(readiness.warnings || [])
+  ].filter((item) => !item.pass);
+  if (!missing.length) return null;
+  const row = document.querySelector(`[data-restaurant-row="${CSS.escape(String(restaurantId || ""))}"]`);
+  const detailMatches = String(state.adminRestaurantDetailId || "") === String(restaurantId || "");
+  const scopes = [
+    row,
+    ...(detailMatches ? [
+      document.querySelector("#restaurantProfileSetupForm"),
+      document.querySelector("#restaurantHoursSetupForm"),
+      document.querySelector("#restaurantReservationSetupForm"),
+      document.querySelector("#restaurantCapacityForm")
+    ] : [])
+  ].filter(Boolean);
+  let firstControl = null;
+  for (const item of missing) {
+    const names = restaurantReadinessFieldMap[item.key] || [];
+    const message = contentTemplate(
+      "restaurant_readiness_field_warning",
+      "Recommended detail is incomplete: {{field}}.",
+      { field: restaurantReadinessItemLabel(item) }
+    );
+    let markedForItem = false;
+    for (const scope of scopes) {
+      for (const name of names) {
+        const controls = formControlsNamed(scope, name);
+        for (const control of controls) {
+          if (!isInlineValidationControl(control)) continue;
+          const marked = markInlineFieldFeedback(control, message, { severity: "warning" });
+          firstControl ||= marked;
+          markedForItem = true;
+        }
+      }
+    }
+    if (!markedForItem) row?.classList.add("has-readiness-warning");
+  }
+  return firstControl;
 }
 
 function restaurantDetailTabButton(tab, label) {
@@ -14209,6 +14530,7 @@ async function updateRestaurantStatus(id, status, button = null) {
   if (activating) {
     const restaurant = state.restaurants.find((item) => String(item.id || "") === String(id || ""));
     const readiness = restaurant?.activation_readiness;
+    highlightRestaurantReadinessFields(id, readiness);
     if (!confirm(restaurantActivationConfirmationMessage(readiness))) return;
   }
   const reason = ["suspended", "archived"].includes(status)
@@ -14327,7 +14649,9 @@ async function submitPartnerReviewResponse(event) {
     return;
   }
   if (responseText.length < 2) {
-    showToast(t("partner_review_response_required", "Write a response before sending it for approval."));
+    const message = t("partner_review_response_required", "Write a response before sending it for approval.");
+    focusValidationControl(markFormFieldFeedback(form, "response_text", message));
+    showToast(message);
     return;
   }
   try {
@@ -20235,6 +20559,7 @@ window.addEventListener("beforeunload", () => {
 
 async function boot() {
   await clearAuthBrowserStateForEntryRoute();
+  installInlineFormValidation();
   bindNav();
   attachPartnerServiceWorkerListener();
   updateSessionButton();

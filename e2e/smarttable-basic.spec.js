@@ -464,7 +464,8 @@ test.describe.serial("SmartTable BASIC production E2E", () => {
     expect(mobileBox?.height || 0).toBeLessThanOrEqual(320);
     await expect(page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1)).resolves.toBe(true);
 
-    await page.locator("section.filters input[name='restaurantName']").fill(firstName);
+    await page.getByRole("button", { name: /^Show/i }).click();
+    await page.locator("#guestOfferFilters input[name='restaurantName']").fill(firstName);
     await expect(page.locator(".compact-restaurant-card").filter({ hasText: firstName }).first()).toBeVisible();
   });
 
