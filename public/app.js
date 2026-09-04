@@ -4578,7 +4578,6 @@ function filterBar() {
             <option value="highest_discount" ${filters.sort === "highest_discount" ? "selected" : ""}>${escapeHtml(t("sort_highest_discount_label", "Highest discount"))}</option>
             <option value="soonest" ${filters.sort === "soonest" ? "selected" : ""}>${escapeHtml(t("sort_soonest_label", "Soonest available"))}</option>
             <option value="name" ${filters.sort === "name" ? "selected" : ""}>${escapeHtml(t("sort_name_label", "Restaurant name A-Z"))}</option>
-            <option value="admin_order" ${filters.sort === "admin_order" ? "selected" : ""}>${escapeHtml(t("sort_admin_order_label", "Admin custom order"))}</option>
           </select>
         </label>
         <label class="check filter-check guest-filter-wide"><input name="availableOnly" type="checkbox" ${filters.availableOnly ? "checked" : ""}> ${escapeHtml(t("filter_available_only_label", "Only available offers"))}</label>

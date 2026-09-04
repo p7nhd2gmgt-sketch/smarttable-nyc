@@ -102,6 +102,11 @@ includesAll(app, [
   "state.offerFiltersExpanded = false"
 ], "Compact guest offer filter behavior");
 
+assert(
+  !app.includes('<option value="admin_order"'),
+  "Guest offer sorting must not expose the internal admin custom-order option."
+);
+
 includesAll(styles, [
   ".guest-offer-filter-toolbar",
   ".guest-offer-filter-shell.is-open .guest-offer-filters",
