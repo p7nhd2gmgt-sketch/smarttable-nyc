@@ -5645,8 +5645,17 @@ function reservationRpcErrorResponse(error) {
     || (/closed|cutoff/i.test(raw) ? "BOOKING_CUTOFF_PASSED" : "")
     || (/sold|capacity|party/i.test(raw) ? "OFFER_SOLD_OUT" : "")
     || (/outside|time/i.test(raw) ? "INVALID_OFFER_TIME" : "")
-    || (/date/i.test(raw) ? "OFFER_DATE_MISMATCH" : "")
-    || "OFFER_UNAVAILABLE";
+    || (/date/i.test(raw) ? "OFFER_DATE_MISMATCH" : "");
+  if (!code) {
+    logSafeServerEvent("reservation_rpc_failed", {
+      status: error?.status || 500,
+      code: error?.code || "RESERVATION_RPC_FAILED"
+    });
+    return json(503, {
+      code: "RESERVATION_SERVICE_UNAVAILABLE",
+      error: "Reservation could not be submitted right now. Please try again."
+    });
+  }
   return json(code === "OFFER_NOT_FOUND" ? 404 : 409, {
     code,
     error: OFFER_ERROR_MESSAGES[code] || OFFER_ERROR_MESSAGES.OFFER_UNAVAILABLE,
@@ -24931,6 +24940,10 @@ async function createReservation(body, headers) {
   }
 
   const token = authToken(headers);
+  let guestProfile = null;
+  if (token) {
+    guestProfile = await getSupabaseProfile(token).catch(() => null);
+  }
   const offerRows = await supabaseFetch(`/rest/v1/offers?select=*,restaurants(*)&id=eq.${encodeURIComponent(offerId)}&limit=1`, { service: true }).catch(() => []);
   const offer = offerRows?.[0];
   if (!offer) return json(404, { code: "OFFER_NOT_FOUND", error: "Offer not found.", offer_status: "unavailable" });
@@ -24958,14 +24971,14 @@ async function createReservation(body, headers) {
   try {
     row = await supabaseFetch("/rest/v1/rpc/create_reservation", {
       method: "POST",
-      service: false,
-      token: token || undefined,
+      service: true,
       body: {
         p_offer_id: offerId,
         p_guest_name: guest.name,
         p_guest_email: guest.email,
         p_guest_phone: guest.phone,
         p_party_size: partySize,
+        p_guest_id: guestProfile?.id || null,
         p_reservation_date: reservationDate,
         p_reservation_time: reservationTime,
         p_notes: notes

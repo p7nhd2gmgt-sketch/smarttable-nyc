@@ -7916,7 +7916,8 @@ function reservationErrorMessage(error) {
     STANDARD_RESERVATION_SCHEMA_MISSING: "reservation_error_standard_schema",
     INVALID_RESERVATION_DATE: "reservation_error_invalid_date",
     INVALID_RESERVATION_TIME: "reservation_error_invalid_time",
-    DUPLICATE_RESERVATION: "reservation_error_duplicate"
+    DUPLICATE_RESERVATION: "reservation_error_duplicate",
+    RESERVATION_SERVICE_UNAVAILABLE: "reservation_error_generic"
   };
   if (keys[code]) return t(keys[code], error?.message || "This offer is not available.");
   return error?.message || t("reservation_error_generic", "Reservation could not be submitted. Please try again.");
