@@ -13528,7 +13528,6 @@ function restaurantDetailPanel() {
     ["profile", t("restaurant_tab_public_profile", "Public Profile")],
     ["hours", t("restaurant_tab_hours", "Hours")],
     ["reservations", t("restaurant_tab_reservation_settings", "Reservation Settings")],
-    ["capacity", t("restaurant_tab_tables_capacity", "Tables and Capacity")],
     ["access", t("restaurant_tab_partner_access", "Partner Access")],
     ["offers", t("restaurant_tab_offers", "Offers")],
     ["reservation_rows", t("restaurant_tab_reservations", "Reservations")],
@@ -13539,7 +13538,6 @@ function restaurantDetailPanel() {
     "profile",
     "hours",
     "reservations",
-    ...(access.can_manage_capacity ? ["capacity"] : []),
     ...(access.can_manage_partner_access || access.can_invite_partners ? ["access"] : [])
   ].includes(key));
   const allowedTabs = new Set(tabs.map(([key]) => key));
@@ -13548,13 +13546,12 @@ function restaurantDetailPanel() {
   const body = tab === "profile" ? restaurantDetailProfile(detail)
     : tab === "hours" ? restaurantDetailHours(detail)
       : tab === "reservations" ? restaurantDetailReservationSettings(detail)
-        : tab === "capacity" ? restaurantCapacityDetailPanel(detail)
-          : tab === "access" ? restaurantPartnerAccessDetailPanel(detail)
-            : tab === "offers" ? restaurantRowsTable(detail.offers || [], t("no_offers_yet", "No offers yet."))
-              : tab === "reservation_rows" ? restaurantRowsTable(detail.reservations || [], t("reservations_empty", "No reservations yet."))
-                : tab === "audit" ? restaurantRowsTable(detail.audit_logs || [], t("restaurant_audit_empty", "No audit events loaded for this restaurant yet."))
-                  : tab === "system" ? restaurantSystemStatusPanel(detail)
-                    : restaurantDetailOverview(detail);
+        : tab === "access" ? restaurantPartnerAccessDetailPanel(detail)
+          : tab === "offers" ? restaurantRowsTable(detail.offers || [], t("no_offers_yet", "No offers yet."))
+            : tab === "reservation_rows" ? restaurantRowsTable(detail.reservations || [], t("reservations_empty", "No reservations yet."))
+              : tab === "audit" ? restaurantRowsTable(detail.audit_logs || [], t("restaurant_audit_empty", "No audit events loaded for this restaurant yet."))
+                : tab === "system" ? restaurantSystemStatusPanel(detail)
+                  : restaurantDetailOverview(detail);
   return `
     <div class="admin-restaurant-detail" id="admin-restaurant-detail">
       <div class="section-title-row compact">

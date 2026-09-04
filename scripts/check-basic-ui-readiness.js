@@ -345,6 +345,10 @@ excludesAll(functionBody(app, "restaurantOnboardingWizard"), [
   "restaurant_subscription_no_stripe_note"
 ], "BASIC restaurant onboarding placeholder hiding");
 
+excludesAll(functionBody(app, "restaurantDetailPanel"), [
+  '["capacity", t("restaurant_tab_tables_capacity"'
+], "BASIC restaurant detail duplicate capacity-tab hiding");
+
 excludesAll(functionBody(app, "offerAnalyticsTable"), [
   "analytics_revenue_placeholder",
   "revenue_placeholder"
