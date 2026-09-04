@@ -1926,7 +1926,7 @@ function headerSearchIcon(name = "search") {
 
 function headerSearchPanelMarkup() {
   const filters = state.filters;
-  const neighborhoods = filterOptionValues("district");
+  const neighborhoods = guestOfferNeighborhoodOptions(filters.neighborhood);
   const cuisines = filterOptionValues("cuisine");
   return `
     <div class="header-search-panel__inner">
@@ -4508,6 +4508,55 @@ function filterOptionValues(field) {
   return [...new Set(values)].sort((a, b) => a.localeCompare(b));
 }
 
+const guestNeighborhoodFallbacks = [
+  "Manhattan",
+  "West Village",
+  "Greenwich Village",
+  "East Village",
+  "SoHo",
+  "Nolita",
+  "Chelsea",
+  "Tribeca",
+  "Lower East Side",
+  "Financial District",
+  "Midtown",
+  "Upper West Side",
+  "Upper East Side",
+  "Harlem",
+  "Brooklyn",
+  "Williamsburg",
+  "DUMBO",
+  "Brooklyn Heights",
+  "Downtown Brooklyn",
+  "Park Slope",
+  "Greenpoint",
+  "Bushwick",
+  "Cobble Hill",
+  "Carroll Gardens",
+  "Fort Greene",
+  "Prospect Heights",
+  "Crown Heights",
+  "Bedford-Stuyvesant",
+  "Red Hook",
+  "Queens",
+  "Long Island City",
+  "Astoria",
+  "Flushing",
+  "Bronx",
+  "Staten Island"
+];
+
+function guestOfferNeighborhoodOptions(current = "") {
+  const restaurantNeighborhoods = [
+    ...filterOptionValues("district"),
+    ...filterOptionValues("neighborhood")
+  ];
+  const values = [current, ...restaurantNeighborhoods, ...guestNeighborhoodFallbacks]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean);
+  return [...new Set(values)].sort((a, b) => a.localeCompare(b));
+}
+
 function optionSelect(name, label, value, options, placeholder) {
   return `
     <label class="guest-select">
@@ -4555,7 +4604,7 @@ function filterBar() {
       </div>
       <form id="guestOfferFilters" class="filters offers-filters guest-offer-filters">
         <label class="guest-filter-wide">${escapeHtml(t("filter_restaurant_name_label", "Restaurant name"))}<input name="restaurantName" value="${escapeAttr(filters.restaurantName)}" placeholder="${escapeAttr(t("filter_restaurant_placeholder", "Hudson Hearth"))}"></label>
-        <label>${escapeHtml(t("filter_neighborhood_label", "Neighborhood"))}<input name="neighborhood" value="${escapeAttr(filters.neighborhood)}" placeholder="${escapeAttr(t("filter_neighborhood_placeholder", "West Village"))}"></label>
+        ${optionSelect("neighborhood", t("filter_neighborhood_label", "Neighborhood"), filters.neighborhood, guestOfferNeighborhoodOptions(filters.neighborhood), t("all_neighborhoods_label", "All neighborhoods"))}
         <label>${escapeHtml(t("filter_cuisine_label", "Cuisine"))}<input name="cuisine" value="${escapeAttr(filters.cuisine)}" placeholder="${escapeAttr(t("filter_cuisine_placeholder", "Italian"))}"></label>
         <label>${escapeHtml(t("filter_discount_label", "Minimum discount"))}<input name="discount" type="number" min="0" max="90" value="${escapeAttr(filters.discount)}" placeholder="${escapeAttr(t("filter_discount_placeholder", "20"))}"></label>
         <label>${escapeHtml(t("filter_date_label", "Date"))}
