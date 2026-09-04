@@ -12847,6 +12847,121 @@ function restaurantWizardTextarea(name, label, value = "", attrs = "") {
   return `<label>${escapeHtml(label)}<textarea name="${escapeAttr(name)}" ${attrs}>${escapeHtml(value)}</textarea></label>`;
 }
 
+const restaurantChoiceCatalog = Object.freeze({
+  country: [
+    { value: "US", label: "United States" },
+    { value: "HU", label: "Hungary" },
+    { value: "CA", label: "Canada" },
+    { value: "GB", label: "United Kingdom" },
+    { value: "AT", label: "Austria" },
+    { value: "DE", label: "Germany" },
+    { value: "FR", label: "France" },
+    { value: "IT", label: "Italy" },
+    { value: "ES", label: "Spain" }
+  ],
+  cuisine: [
+    "American", "New American", "Italian", "French", "Spanish", "Mediterranean",
+    "Modern European", "Hungarian", "Greek", "Mexican", "Latin American", "Caribbean",
+    "Chinese", "Japanese", "Korean", "Thai", "Vietnamese", "Indian", "Middle Eastern",
+    "Seafood", "Steakhouse", "Vegetarian", "Vegan", "Bakery", "Café", "Dessert", "Other"
+  ],
+  priceLevel: ["$", "$$", "$$$", "$$$$"],
+  timezone: [
+    { value: "America/New_York", label: "Eastern Time — New York / Boston" },
+    { value: "America/Chicago", label: "Central Time — Chicago" },
+    { value: "America/Denver", label: "Mountain Time — Denver" },
+    { value: "America/Phoenix", label: "Arizona Time — Phoenix" },
+    { value: "America/Los_Angeles", label: "Pacific Time — Los Angeles" },
+    { value: "Europe/Budapest", label: "Central European Time — Budapest" },
+    { value: "Europe/London", label: "United Kingdom Time — London" },
+    { value: "UTC", label: "UTC" }
+  ],
+  currency: [
+    { value: "USD", label: "USD — US dollar" },
+    { value: "HUF", label: "HUF — Hungarian forint" },
+    { value: "EUR", label: "EUR — Euro" },
+    { value: "GBP", label: "GBP — British pound" },
+    { value: "CAD", label: "CAD — Canadian dollar" }
+  ],
+  defaultLanguage: [
+    { value: "en", label: "English" },
+    { value: "es", label: "Español" },
+    { value: "hu", label: "Magyar" }
+  ],
+  supportedLanguages: [
+    { value: "en", label: "English" },
+    { value: "es", label: "Español" },
+    { value: "hu", label: "Magyar" },
+    { value: "en,es", label: "English + Español" },
+    { value: "en,hu", label: "English + Magyar" },
+    { value: "es,hu", label: "Español + Magyar" },
+    { value: "en,es,hu", label: "English + Español + Magyar" }
+  ],
+  diningStyle: [
+    "Fine dining", "Casual dining", "Fast casual", "Family style", "Bistro", "Café",
+    "Bar / Pub", "Buffet", "Food hall", "Pop-up", "Takeout / Delivery focused"
+  ],
+  dressCode: ["No dress code", "Casual", "Smart casual", "Business casual", "Formal", "Jacket required"],
+  servicePeriod: [
+    { value: "breakfast", label: "Breakfast" },
+    { value: "brunch", label: "Brunch" },
+    { value: "lunch", label: "Lunch" },
+    { value: "dinner", label: "Dinner" },
+    { value: "late_night", label: "Late night" },
+    { value: "all_day", label: "All day" }
+  ]
+});
+
+function normalizedRestaurantChoices(options = []) {
+  return options.map((option) => typeof option === "object" ? option : { value: option, label: option });
+}
+
+function restaurantChoicesWithCurrent(options, value) {
+  const current = String(value ?? "").trim();
+  const choices = normalizedRestaurantChoices(options);
+  if (current && !choices.some((option) => String(option.value) === current)) {
+    choices.unshift({ value: current, label: current });
+  }
+  return choices;
+}
+
+function restaurantWizardSelect(name, label, value, options, attrs = "", placeholder = "") {
+  const current = String(value ?? "").trim();
+  const choices = restaurantChoicesWithCurrent(options, current);
+  return `
+    <label>${escapeHtml(label)}
+      <select name="${escapeAttr(name)}" ${attrs}>
+        ${placeholder ? `<option value="" ${current ? "" : "selected"}>${escapeHtml(placeholder)}</option>` : ""}
+        ${choices.map((option) => `<option value="${escapeAttr(option.value)}" ${String(option.value) === current ? "selected" : ""}>${escapeHtml(option.label)}</option>`).join("")}
+      </select>
+    </label>
+  `;
+}
+
+function restaurantWizardDatalist(name, label, value, options, attrs = "", listSuffix = "") {
+  const listId = `restaurant-${String(name).replace(/[^a-z0-9_-]/gi, "-")}-${String(listSuffix || "default").replace(/[^a-z0-9_-]/gi, "-")}-choices`;
+  return `
+    <label>${escapeHtml(label)}
+      <input name="${escapeAttr(name)}" value="${escapeAttr(value)}" list="${escapeAttr(listId)}" ${attrs}>
+      <datalist id="${escapeAttr(listId)}">
+        ${normalizedRestaurantChoices(options).map((option) => `<option value="${escapeAttr(option.value)}">${escapeHtml(option.label)}</option>`).join("")}
+      </datalist>
+    </label>
+  `;
+}
+
+function restaurantLanguageSetValue(value) {
+  const order = ["en", "es", "hu"];
+  const values = (Array.isArray(value) ? value : String(value || "").split(","))
+    .map((item) => String(item || "").trim().toLowerCase())
+    .filter(Boolean);
+  return [...new Set(values)].sort((left, right) => {
+    const leftIndex = order.indexOf(left);
+    const rightIndex = order.indexOf(right);
+    return (leftIndex < 0 ? order.length : leftIndex) - (rightIndex < 0 ? order.length : rightIndex) || left.localeCompare(right);
+  }).join(",");
+}
+
 function restaurantOnboardingWizard() {
   if (isFieldRepresentativeSession()) {
     const markets = assignedFieldRepresentativeMarkets();
@@ -12868,7 +12983,7 @@ function restaurantOnboardingWizard() {
           ${restaurantWizardField("name", t("restaurant_name_label", "Restaurant name"), "", "required autocomplete=\"organization\"")}
           ${restaurantWizardField("email", t("restaurant_primary_email_label", "Primary email"), "", "type=\"email\" required autocomplete=\"email\"")}
           ${restaurantWizardField("address", t("street_address_label", "Street address"), "", "required autocomplete=\"street-address\"")}
-          ${restaurantWizardField("cuisine_type", t("filter_cuisine_label", "Cuisine"), "", "required autocomplete=\"off\"")}
+          ${restaurantWizardDatalist("cuisine_type", t("filter_cuisine_label", "Cuisine"), "", restaurantChoiceCatalog.cuisine, "required autocomplete=\"off\"", "field-draft")}
         </fieldset>
         <details class="restaurant-create-options">
           <summary>${escapeHtml(t("restaurant_quick_create_optional", "Optional details"))}</summary>
@@ -12876,7 +12991,7 @@ function restaurantOnboardingWizard() {
             ${restaurantWizardField("legal_name", t("restaurant_legal_name_label", "Legal business name"))}
             ${restaurantWizardField("reservation_email", t("restaurant_reservation_email_label", "Reservation email"), "", "type=\"email\"")}
             ${restaurantWizardField("phone", t("phone_label", "Phone"), "", "type=\"tel\" autocomplete=\"tel\"")}
-            ${restaurantWizardField("country", t("country_label", "Country"), "US", "autocomplete=\"country\"")}
+            ${restaurantWizardSelect("country", t("country_label", "Country"), "US", restaurantChoiceCatalog.country, "autocomplete=\"country\"")}
             ${restaurantWizardField("city", t("city_label", "City"), "", "autocomplete=\"address-level2\"")}
             ${restaurantWizardField("district", t("filter_neighborhood_label", "Neighborhood"))}
             ${restaurantWizardTextarea("short_description", t("restaurant_short_description_label", "Short description"))}
@@ -12916,7 +13031,7 @@ function restaurantOnboardingWizard() {
         ${restaurantWizardField("name", t("restaurant_name_label", "Restaurant name"), "", "required autocomplete=\"organization\"")}
         ${restaurantWizardField("email", t("restaurant_primary_email_label", "Primary email"), "", "type=\"email\" required autocomplete=\"email\"")}
         ${restaurantWizardField("address", t("street_address_label", "Street address"), "", "required autocomplete=\"street-address\"")}
-        ${restaurantWizardField("cuisine_type", t("filter_cuisine_label", "Cuisine"), "", "required autocomplete=\"off\"")}
+        ${restaurantWizardDatalist("cuisine_type", t("filter_cuisine_label", "Cuisine"), "", restaurantChoiceCatalog.cuisine, "required autocomplete=\"off\"", "admin-draft")}
       </fieldset>
       <details class="restaurant-create-options">
         <summary>${escapeHtml(t("restaurant_quick_create_optional", "Optional details"))}</summary>
@@ -12924,7 +13039,7 @@ function restaurantOnboardingWizard() {
           ${restaurantWizardField("slug", t("restaurant_slug_label", "Public slug"), "", "placeholder=\"auto-generated-if-empty\"")}
           ${restaurantWizardField("reservation_email", t("restaurant_reservation_email_label", "Reservation email"), "", "type=\"email\" placeholder=\"same-as-primary-email\"")}
           ${restaurantWizardField("phone", t("phone_label", "Phone"), "", "type=\"tel\" autocomplete=\"tel\"")}
-          ${restaurantWizardField("country", t("country_label", "Country"), "US", "autocomplete=\"country\"")}
+          ${restaurantWizardSelect("country", t("country_label", "Country"), "US", restaurantChoiceCatalog.country, "autocomplete=\"country\"")}
           ${restaurantWizardField("city", t("city_label", "City"), "New York", "autocomplete=\"address-level2\"")}
           ${restaurantWizardField("district", t("filter_neighborhood_label", "Neighborhood"), "New York")}
           ${restaurantWizardTextarea("short_description", t("restaurant_short_description_label", "Short description"))}
@@ -13199,11 +13314,11 @@ function restaurantDetailProfile(detail) {
         ${restaurantWizardField("district", t("filter_neighborhood_label", "Neighborhood"), restaurant.district || "")}
         ${restaurantWizardField("state_region", t("state_region_label", "State / region"), restaurant.state_region || "")}
         ${restaurantWizardField("postal_code", t("postal_code_label", "Postal code"), restaurant.postal_code || "")}
-        ${restaurantWizardField("country", t("country_label", "Country"), restaurant.country || "US")}
-        ${restaurantWizardField("cuisine_type", t("filter_cuisine_label", "Cuisine"), restaurant.cuisine_type || restaurant.cuisine || "", "required")}
-        ${restaurantWizardField("price_level", t("price_level_label", "Price level"), restaurant.price_level || restaurant.price_range || "$$")}
-        ${restaurantWizardField("primary_timezone", t("timezone_label", "Timezone"), restaurant.primary_timezone || "America/New_York", "required")}
-        ${restaurantWizardField("currency_code", t("currency_label", "Currency"), restaurant.currency_code || "USD")}
+        ${restaurantWizardSelect("country", t("country_label", "Country"), restaurant.country || "US", restaurantChoiceCatalog.country)}
+        ${restaurantWizardDatalist("cuisine_type", t("filter_cuisine_label", "Cuisine"), restaurant.cuisine_type || restaurant.cuisine || "", restaurantChoiceCatalog.cuisine, "required", "admin-profile")}
+        ${restaurantWizardSelect("price_level", t("price_level_label", "Price level"), restaurant.price_level || restaurant.price_range || "$$", restaurantChoiceCatalog.priceLevel)}
+        ${restaurantWizardSelect("primary_timezone", t("timezone_label", "Timezone"), restaurant.primary_timezone || "America/New_York", restaurantChoiceCatalog.timezone, "required")}
+        ${restaurantWizardSelect("currency_code", t("currency_label", "Currency"), restaurant.currency_code || "USD", restaurantChoiceCatalog.currency)}
         ${restaurantWizardTextarea("short_description", t("restaurant_short_description_label", "Short description"), restaurant.short_description || restaurant.description_en || restaurant.description || "")}
         ${restaurantWizardTextarea("full_description", t("restaurant_full_description_label", "Full description"), restaurant.full_description || restaurant.description_en || restaurant.description || "")}
         ${representativeMode ? "" : restaurantBooleanSetupField("visible_on_guest_site", t("restaurant_visible_label", "Visible on guest site"), restaurant.visible_on_guest_site === true)}
@@ -13217,10 +13332,10 @@ function restaurantDetailProfile(detail) {
           ${restaurantWizardField("facebook", "Facebook", restaurant.facebook || "", "type=\"url\"")}
           ${restaurantWizardField("tiktok", "TikTok", restaurant.tiktok || "", "type=\"url\"")}
           ${restaurantWizardField("google_maps_url", "Google Maps", restaurant.google_maps_url || "", "type=\"url\"")}
-          ${restaurantWizardField("default_language", t("default_language_label", "Default language"), restaurant.default_language || "en")}
-          ${restaurantWizardField("supported_languages", t("supported_languages_label", "Supported languages"), Array.isArray(restaurant.supported_languages) ? restaurant.supported_languages.join(",") : "en,es,hu")}
-          ${restaurantWizardField("dining_style", t("restaurant_dining_style_label", "Dining style"), restaurant.dining_style || "")}
-          ${restaurantWizardField("dress_code", t("restaurant_dress_code_label", "Dress code"), restaurant.dress_code || "")}
+          ${restaurantWizardSelect("default_language", t("default_language_label", "Default language"), restaurant.default_language || "en", restaurantChoiceCatalog.defaultLanguage)}
+          ${restaurantWizardSelect("supported_languages", t("supported_languages_label", "Supported languages"), restaurantLanguageSetValue(restaurant.supported_languages || ["en", "es", "hu"]), restaurantChoiceCatalog.supportedLanguages)}
+          ${restaurantWizardSelect("dining_style", t("restaurant_dining_style_label", "Dining style"), restaurant.dining_style || "", restaurantChoiceCatalog.diningStyle, "", t("choose_option", "Choose an option"))}
+          ${restaurantWizardSelect("dress_code", t("restaurant_dress_code_label", "Dress code"), restaurant.dress_code || "", restaurantChoiceCatalog.dressCode, "", t("choose_option", "Choose an option"))}
           ${restaurantWizardField("latitude", t("latitude_label", "Latitude"), restaurant.latitude ?? "", "type=\"number\" step=\"any\"")}
           ${restaurantWizardField("longitude", t("longitude_label", "Longitude"), restaurant.longitude ?? "", "type=\"number\" step=\"any\"")}
           ${restaurantWizardTextarea("gallery_images", t("restaurant_gallery_images_label", "Gallery image URLs"), Array.isArray(restaurant.gallery_images) ? restaurant.gallery_images.join("\n") : "", "placeholder=\"https://...\"")}
@@ -13249,7 +13364,7 @@ function restaurantServicePeriodRow(period = {}, rowId = "new") {
           ${Object.entries(dayLabels).map(([value, label]) => `<option value="${escapeAttr(value)}" ${selectedDay === value ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}
         </select>
       </label>
-      ${restaurantWizardField("period_label", t("service_period_label", "Service"), period.period || "dinner", "data-service-period-field=\"period\"")}
+      ${restaurantWizardSelect("period_label", t("service_period_label", "Service"), period.period || "dinner", restaurantChoiceCatalog.servicePeriod, "data-service-period-field=\"period\"")}
       ${restaurantWizardField("opens_at", t("opens_label", "Opens"), period.opens || period.start_time || "17:00", "type=\"time\" data-service-period-field=\"opens\" required")}
       ${restaurantWizardField("closes_at", t("closes_label", "Closes"), period.closes || period.end_time || "22:00", "type=\"time\" data-service-period-field=\"closes\" required")}
       <button class="ghost-button danger" type="button" data-remove-service-period>${escapeHtml(t("remove_button", "Remove"))}</button>
@@ -19038,8 +19153,10 @@ function renderBasicPartner(restaurant, stats, greeting) {
         ${textInput("facebook", "Facebook", restaurant.facebook, "url")}
         ${textInput("google_maps_url", "Google Maps", restaurant.google_maps_url, "url")}
         <div class="form-grid">
-          ${textInput("cuisine_type", t("cuisine_label", "Cuisine"), restaurant.cuisine_type || restaurant.cuisine)}
-          ${textInput("price_range", t("price_range_label", "Price range"), restaurant.price_range || "$$")}
+          ${restaurantWizardDatalist("cuisine_type", t("cuisine_label", "Cuisine"), restaurant.cuisine_type || restaurant.cuisine, restaurantChoiceCatalog.cuisine, "", "partner-basic")}
+          ${restaurantWizardSelect("price_range", t("price_range_label", "Price range"), restaurant.price_range || "$$", restaurantChoiceCatalog.priceLevel)}
+          ${restaurantWizardSelect("dining_style", t("restaurant_dining_style_label", "Dining style"), restaurant.dining_style || "", restaurantChoiceCatalog.diningStyle, "", t("choose_option", "Choose an option"))}
+          ${restaurantWizardSelect("dress_code", t("restaurant_dress_code_label", "Dress code"), restaurant.dress_code || "", restaurantChoiceCatalog.dressCode, "", t("choose_option", "Choose an option"))}
         </div>
         ${textInput("logo_url", t("logo_url_label", "Logo URL"), restaurant.logo_url || restaurant.icon_image || restaurant.card_image)}
         ${mediaUploadControl("logo", "logo_url", t("upload_logo_button", "Upload logo"))}
@@ -19340,10 +19457,11 @@ function renderPartner() {
             ${textInput("longitude", "Longitude", restaurant.longitude ?? "", "number", "step=\"0.000001\"")}
           </div>
           <div class="form-grid">
-            ${textInput("cuisine_type", "Cuisine", restaurant.cuisine_type || restaurant.cuisine)}
+            ${restaurantWizardDatalist("cuisine_type", "Cuisine", restaurant.cuisine_type || restaurant.cuisine, restaurantChoiceCatalog.cuisine, "", "partner-full")}
             ${textInput("opening_hours", "Business hours", restaurant.opening_hours)}
-            ${textInput("price_range", "Price range", restaurant.price_range || "$$")}
-            ${textInput("dress_code", "Dress code", restaurant.dress_code || "")}
+            ${restaurantWizardSelect("price_range", "Price range", restaurant.price_range || "$$", restaurantChoiceCatalog.priceLevel)}
+            ${restaurantWizardSelect("dining_style", "Dining style", restaurant.dining_style || "", restaurantChoiceCatalog.diningStyle, "", "Choose an option")}
+            ${restaurantWizardSelect("dress_code", "Dress code", restaurant.dress_code || "", restaurantChoiceCatalog.dressCode, "", "Choose an option")}
           </div>
           ${textInput("logo_url", "Logo URL", restaurant.logo_url || restaurant.icon_image || restaurant.card_image)}
           ${mediaUploadControl("logo", "logo_url", "Upload logo")}

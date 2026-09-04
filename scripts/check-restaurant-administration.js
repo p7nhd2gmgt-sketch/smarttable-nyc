@@ -93,6 +93,8 @@ function restaurantPayload(prefix = "restaurant-admin") {
     website: `https://${prefix}-${stamp}.example.test`,
     cuisine_type: "Modern American",
     price_level: "$$",
+    dining_style: "Casual dining",
+    dress_code: "Smart casual",
     description: "Restaurant administration verification restaurant.",
     short_description: "Restaurant administration verification restaurant.",
     full_description: "Restaurant administration verification restaurant.",
@@ -162,6 +164,9 @@ async function assertRestaurantAdministrationRuntime() {
   assert.equal(restaurant.visible_on_guest_site, false, "Draft restaurants must not be publicly visible by default.");
   assert.equal(restaurant.reservation_acceptance_mode, "manual", "Reservation settings must be saved.");
   assert.equal(restaurant.primary_timezone, "America/New_York", "Structured timezone must be saved.");
+  assert.equal(restaurant.price_range, "$$", "The selected price level must remain synchronized with the public price range.");
+  assert.equal(restaurant.dining_style, "Casual dining", "Dining-style selection must be saved.");
+  assert.equal(restaurant.dress_code, "Smart casual", "Dress-code selection must be saved.");
   assert.ok(Array.isArray(restaurant.service_periods) && restaurant.service_periods.length === 2, "Structured service periods must be saved.");
 
   const incompletePayload = restaurantPayload("activation-readiness");
@@ -425,6 +430,10 @@ async function assertRestaurantAdministrationStaticContracts() {
     "adminRestaurantFilters",
     "restaurantWizardField",
     "restaurantWizardTextarea",
+    "restaurantWizardSelect",
+    "restaurantWizardDatalist",
+    "restaurantChoiceCatalog",
+    "restaurantLanguageSetValue",
     "restaurant_quick_create_title",
     "restaurant_create_draft_button",
     "restaurantProfileSetupForm",
@@ -442,6 +451,31 @@ async function assertRestaurantAdministrationStaticContracts() {
     "api(\"/admin/partners\""
   ]) {
     assert.ok(app.includes(token), `Admin restaurant UI contract missing ${token}.`);
+  }
+  for (const token of [
+    'restaurantWizardSelect("country"',
+    'restaurantWizardSelect("price_level"',
+    'restaurantWizardSelect("primary_timezone"',
+    'restaurantWizardSelect("currency_code"',
+    'restaurantWizardSelect("default_language"',
+    'restaurantWizardSelect("supported_languages"',
+    'restaurantWizardSelect("dining_style"',
+    'restaurantWizardSelect("dress_code"',
+    'restaurantChoiceCatalog.servicePeriod',
+    'restaurantWizardDatalist("cuisine_type"'
+  ]) {
+    assert.ok(app.includes(token), `Restaurant choice-field UI contract missing ${token}.`);
+  }
+  for (const legacyTextField of [
+    'restaurantWizardField("price_level"',
+    'restaurantWizardField("primary_timezone"',
+    'restaurantWizardField("currency_code"',
+    'restaurantWizardField("default_language"',
+    'restaurantWizardField("supported_languages"',
+    'restaurantWizardField("dining_style"',
+    'restaurantWizardField("dress_code"'
+  ]) {
+    assert.ok(!app.includes(legacyTextField), `Closed restaurant choice must not regress to a free-text field: ${legacyTextField}.`);
   }
 
   for (const source of [routeProtection, routeMap]) {

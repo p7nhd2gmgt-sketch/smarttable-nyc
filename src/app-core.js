@@ -25205,6 +25205,8 @@ function restaurantPayload(body, options = {}) {
   for (const field of fields) {
     if (body[field] !== undefined || options.full) payload[field] = stripUnsafeHtml(body[field]);
   }
+  if (body.price_level !== undefined && body.price_range === undefined) payload.price_range = stripUnsafeHtml(body.price_level);
+  if (body.price_range !== undefined && body.price_level === undefined) payload.price_level = stripUnsafeHtml(body.price_range);
   if (body.market_id !== undefined || options.full) {
     const marketId = clean(body.market_id || defaultMarket().id);
     if (!looksLikeUuid(marketId)) {
