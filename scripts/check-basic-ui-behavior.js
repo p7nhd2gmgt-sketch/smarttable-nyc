@@ -109,7 +109,11 @@ includesAll(styles, [
   "input[type=\"date\"]",
   ".guest-native-filter-placeholder",
   ".guest-native-filter-control.has-value",
+  ".guest-native-filter-control:not(.has-value) input[type=\"date\"]",
+  ".guest-native-filter-control:not(.has-value) input[type=\"time\"]",
   "::-webkit-date-and-time-value",
+  "::-webkit-datetime-edit-fields-wrapper",
+  "-webkit-text-fill-color: transparent",
   "-webkit-text-fill-color: #f4f2e9"
 ], "Responsive, high-contrast guest offer filters");
 

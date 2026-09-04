@@ -7325,6 +7325,27 @@ html[data-theme="dark"] .guest-offer-filters input::-webkit-calendar-picker-indi
   opacity: 0.9;
 }
 
+/* Empty native date/time controls render locale format hints (for example
+   mm/dd/yyyy) inside the input. Hide only that native text while the custom
+   "Any date / Any time" placeholder is visible so the two labels never
+   overlap. The picker indicator remains visible and selected values return as
+   soon as syncGuestNativeFilterControl adds .has-value. */
+.guest-native-filter-control:not(.has-value) input[type="date"],
+.guest-native-filter-control:not(.has-value) input[type="time"],
+.guest-native-filter-control:not(.has-value) input[type="date"]::-webkit-date-and-time-value,
+.guest-native-filter-control:not(.has-value) input[type="time"]::-webkit-date-and-time-value,
+.guest-native-filter-control:not(.has-value) input[type="date"]::-webkit-datetime-edit,
+.guest-native-filter-control:not(.has-value) input[type="time"]::-webkit-datetime-edit,
+.guest-native-filter-control:not(.has-value) input[type="date"]::-webkit-datetime-edit-fields-wrapper,
+.guest-native-filter-control:not(.has-value) input[type="time"]::-webkit-datetime-edit-fields-wrapper {
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+}
+
+.guest-native-filter-control:not(.has-value) input::-webkit-calendar-picker-indicator {
+  opacity: 0.9;
+}
+
 /* Field operations keeps dense desktop data tables, but on phones each
    partner account becomes a readable card instead of forcing page overflow. */
 @media (max-width: 760px) {
